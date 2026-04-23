@@ -13,6 +13,8 @@
 // For SV_IF_MODE, instantiate pcie_tl_if and set it via config_db.
 // ============================================================================
 
+`timescale 1ns/1ps
+
 module virtio_tb_top;
 
     import uvm_pkg::*;
