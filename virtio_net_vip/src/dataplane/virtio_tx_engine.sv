@@ -31,6 +31,8 @@ class virtio_buf_tracker extends uvm_object;
     endfunction
 endclass : virtio_buf_tracker
 
+typedef byte unsigned virtio_byte_queue_t[$];
+
 // ============================================================================
 // virtio_tx_engine
 //
@@ -212,11 +214,19 @@ class virtio_tx_engine extends uvm_object;
 
         // ---- 2. Allocate host memory for header buffer ----
         hdr_gpa = mem.alloc(hdr_bytes.size(), .align(1));
-        mem.write_mem(hdr_gpa, hdr_bytes);
+        begin
+            byte hdr_tmp[] = new[hdr_bytes.size()];
+            foreach (hdr_bytes[i]) hdr_tmp[i] = hdr_bytes[i];
+            mem.write_mem(hdr_gpa, hdr_tmp);
+        end
 
         // ---- 3. Allocate host memory for data buffer ----
         data_gpa = mem.alloc(pkt_data.size(), .align(1));
-        mem.write_mem(data_gpa, pkt_data);
+        begin
+            byte data_tmp[] = new[pkt_data.size()];
+            foreach (pkt_data[i]) data_tmp[i] = pkt_data[i];
+            mem.write_mem(data_gpa, data_tmp);
+        end
 
         // ---- 4. DMA map both (device reads these) ----
         hdr_iova  = iommu.map(bdf, hdr_gpa,  hdr_bytes.size(), DMA_TO_DEVICE);
@@ -349,7 +359,7 @@ class virtio_tx_engine extends uvm_object;
     // integration, $cast to packet_item would access pkt.raw_data
     // directly.
     // ==================================================================
-    protected virtual function byte unsigned extract_pkt_data[$](uvm_object pkt);
+    protected virtual function virtio_byte_queue_t extract_pkt_data(uvm_object pkt);
         byte unsigned data[$];
         uvm_packer packer;
         int unsigned pack_size;
@@ -360,7 +370,7 @@ class virtio_tx_engine extends uvm_object;
         end
 
         packer = new();
-        pkt.pack(packer);
+        pkt.do_pack(packer);
         pack_size = packer.get_packed_size();
 
         if (pack_size > 0) begin
@@ -368,7 +378,7 @@ class virtio_tx_engine extends uvm_object;
             byte unsigned byte_val;
             int unsigned num_bytes;
 
-            packer.get_packed_bits(bitstream);
+            packer.get_bits(bitstream);
             num_bytes = bitstream.size() / 8;
             for (int i = 0; i < num_bytes; i++) begin
                 byte_val = 0;

@@ -1,6 +1,9 @@
 `ifndef VIRTIO_BASE_SEQ_SV
 `define VIRTIO_BASE_SEQ_SV
 
+// Forward declaration for circular dependency
+typedef class virtio_init_seq;
+
 // Base class for all virtio sequences
 class virtio_base_seq extends uvm_sequence #(virtio_transaction);
     `uvm_object_utils(virtio_base_seq)

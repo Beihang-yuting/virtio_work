@@ -70,7 +70,7 @@ class virtio_coverage extends uvm_component;
     covergroup cg_features;
         cp_vq_type: coverpoint sampled_vq_type {
             bins split  = {VQ_SPLIT};
-            bins packed = {VQ_PACKED};
+            bins packed_vq = {VQ_PACKED};
             bins custom = {VQ_CUSTOM};
         }
         cp_csum: coverpoint sampled_features[VIRTIO_NET_F_CSUM] {
@@ -117,14 +117,14 @@ class virtio_coverage extends uvm_component;
         }
         cp_queue_size: coverpoint sampled_queue_size {
             bins tiny   = {[1:32]};
-            bins small  = {[33:128]};
-            bins medium = {[129:512]};
-            bins large  = {[513:1024]};
+            bins small_sz  = {[33:128]};
+            bins medium_sz = {[129:512]};
+            bins large_sz  = {[513:1024]};
             bins huge   = {[1025:$]};
         }
         cp_vq_type: coverpoint sampled_vq_type {
             bins split  = {VQ_SPLIT};
-            bins packed = {VQ_PACKED};
+            bins packed_vq = {VQ_PACKED};
         }
         cx_qid_type: cross cp_queue_id, cp_vq_type;
     endgroup
@@ -132,17 +132,17 @@ class virtio_coverage extends uvm_component;
     covergroup cg_dataplane;
         cp_pkt_size: coverpoint sampled_pkt_size {
             bins tiny    = {[0:63]};
-            bins small   = {[64:127]};
-            bins medium  = {[128:511]};
+            bins small_sz   = {[64:127]};
+            bins medium_sz  = {[128:511]};
             bins normal  = {[512:1514]};
             bins jumbo   = {[1515:9000]};
             bins huge    = {[9001:$]};
         }
         cp_burst_len: coverpoint sampled_burst_len {
             bins single  = {1};
-            bins small   = {[2:8]};
-            bins medium  = {[9:32]};
-            bins large   = {[33:64]};
+            bins small_sz   = {[2:8]};
+            bins medium_sz  = {[9:32]};
+            bins large_sz   = {[33:64]};
             bins huge    = {[65:$]};
         }
         cp_txn_type: coverpoint sampled_txn_type {
@@ -164,9 +164,9 @@ class virtio_coverage extends uvm_component;
         }
         cp_gso_size: coverpoint sampled_gso_size {
             bins zero     = {0};
-            bins small    = {[1:536]};
+            bins small_sz    = {[1:536]};
             bins normal   = {[537:1460]};
-            bins large    = {[1461:$]};
+            bins large_sz    = {[1461:$]};
         }
         cp_needs_csum: coverpoint sampled_hdr_flags[0] {
             bins off = {0};

@@ -402,7 +402,7 @@ class virtio_atomic_ops extends uvm_object;
     );
         virtqueue_base   vq;
         byte unsigned    hdr_bytes[$];
-        byte unsigned    pkt_bytes[$];
+        byte unsigned    pkt_bytes[];
         int unsigned     hdr_size;
         int unsigned     pkt_size;
         bit [63:0]       hdr_gpa;
@@ -878,16 +878,20 @@ class virtio_atomic_ops extends uvm_object;
         virtio_ctrl_ack_e ack;
         int unsigned offset;
         int unsigned total_size;
+        int unsigned uc_count;
+        int unsigned mc_count;
 
-        total_size = 4 + unicast_macs.size() * 6 + 4 + multicast_macs.size() * 6;
+        uc_count = unicast_macs.size();
+        mc_count = multicast_macs.size();
+        total_size = 4 + uc_count * 6 + 4 + mc_count * 6;
         data = new[total_size];
 
         // Unicast count (32-bit LE)
         offset = 0;
-        data[offset]   = unicast_macs.size()[7:0];
-        data[offset+1] = unicast_macs.size()[15:8];
-        data[offset+2] = unicast_macs.size()[23:16];
-        data[offset+3] = unicast_macs.size()[31:24];
+        data[offset]   = uc_count[7:0];
+        data[offset+1] = uc_count[15:8];
+        data[offset+2] = uc_count[23:16];
+        data[offset+3] = uc_count[31:24];
         offset += 4;
 
         // Unicast MACs
@@ -902,10 +906,10 @@ class virtio_atomic_ops extends uvm_object;
         end
 
         // Multicast count (32-bit LE)
-        data[offset]   = multicast_macs.size()[7:0];
-        data[offset+1] = multicast_macs.size()[15:8];
-        data[offset+2] = multicast_macs.size()[23:16];
-        data[offset+3] = multicast_macs.size()[31:24];
+        data[offset]   = mc_count[7:0];
+        data[offset+1] = mc_count[15:8];
+        data[offset+2] = mc_count[23:16];
+        data[offset+3] = mc_count[31:24];
         offset += 4;
 
         // Multicast MACs
@@ -1019,7 +1023,7 @@ class virtio_atomic_ops extends uvm_object;
     // ctrl_announce_ack -- Acknowledge a gratuitous ARP/ND announcement
     // ------------------------------------------------------------------------
     virtual task ctrl_announce_ack(ref bit success);
-        byte unsigned data[0];
+        byte unsigned data[];
         virtio_ctrl_ack_e ack;
 
         ctrl_send(VIRTIO_NET_CTRL_CLS_ANNOUNCE, VIRTIO_NET_CTRL_ANNOUNCE_ACK, data, ack);

@@ -438,7 +438,7 @@ class virtio_scoreboard extends uvm_component;
     // Helper: extract packet data bytes from a uvm_object packet reference
     // ========================================================================
 
-    protected function byte unsigned get_pkt_data(uvm_object pkt)[$];
+    protected function virtio_byte_queue_t get_pkt_data(uvm_object pkt);
         byte unsigned empty[$];
         // Packet data extraction is implementation-specific.
         // The actual packet_item class (from the test layer) should provide

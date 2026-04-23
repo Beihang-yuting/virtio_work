@@ -16,6 +16,8 @@ package virtio_net_pkg;
   `include "uvm_macros.svh"
 
   import host_mem_pkg::*;
+  import pcie_tl_pkg::*;
+  `include "host_mem_manager.sv"
 
   // ---------------------------------------------------------------------------
   // Phase 1 – Types and shared utilities
@@ -44,8 +46,8 @@ package virtio_net_pkg;
   // Phase 4 – Transport (PCI)
   // ---------------------------------------------------------------------------
   `include "transport/virtio_pci_regs.sv"
-  `include "transport/virtio_pci_cap_manager.sv"
   `include "transport/virtio_bar_accessor.sv"
+  `include "transport/virtio_pci_cap_manager.sv"
   `include "transport/virtio_notification_manager.sv"
   `include "transport/virtio_pci_transport.sv"
 

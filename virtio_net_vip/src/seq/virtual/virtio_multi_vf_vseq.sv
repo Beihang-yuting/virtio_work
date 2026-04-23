@@ -32,7 +32,7 @@ class virtio_multi_vf_vseq extends uvm_sequence;
     endfunction
 
     virtual task body();
-        if (vf_seqrs == null || vf_seqrs.size() == 0)
+        if (vf_seqrs.size() == 0)
             `uvm_fatal("MULTI_VF_VSEQ", "vf_seqrs[] not set -- test must assign before start()")
 
         if (num_vfs == 0)

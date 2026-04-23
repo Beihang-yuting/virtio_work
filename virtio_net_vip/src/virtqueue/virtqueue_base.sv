@@ -158,6 +158,15 @@ virtual class virtqueue_base extends uvm_object;
     // =================================================================
 
     // ------------------------------------------------------------------
+    // detach -- Reset and disable this queue
+    // ------------------------------------------------------------------
+    virtual function void detach();
+        reset_queue();
+        queue_enable = 0;
+        state = VQ_RESET;
+    endfunction
+
+    // ------------------------------------------------------------------
     // dump_ring -- Log queue state summary
     //
     // Logs queue_id, state, size, free/pending counts at UVM_LOW.

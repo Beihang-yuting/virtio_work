@@ -40,7 +40,7 @@ class virtio_stress_vseq extends uvm_sequence;
     virtual task body();
         int unsigned num_vfs;
 
-        if (vf_seqrs == null || vf_seqrs.size() == 0)
+        if (vf_seqrs.size() == 0)
             `uvm_fatal("STRESS_VSEQ", "vf_seqrs[] not set -- test must assign before start()")
 
         num_vfs = vf_seqrs.size();

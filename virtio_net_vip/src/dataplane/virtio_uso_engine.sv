@@ -84,7 +84,7 @@ class virtio_uso_engine extends uvm_object;
     function void segment(
         byte unsigned pkt_data[$],
         int unsigned  mss,
-        ref byte unsigned segments[$][$]
+        ref byte unsigned segments[][$]
     );
         int unsigned all_hdr_len;
         int unsigned payload_len;

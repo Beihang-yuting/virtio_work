@@ -62,7 +62,7 @@ class virtio_dynamic_reconfig extends uvm_object;
         bit traffic_active
     );
         byte unsigned ctrl_data[];
-        byte unsigned result[];
+        virtio_ctrl_ack_e result;
 
         `uvm_info("DYN_RECONFIG",
             $sformatf("live_mq_resize: VF%0d, %0d -> %0d pairs, traffic_active=%0b",
@@ -88,7 +88,7 @@ class virtio_dynamic_reconfig extends uvm_object;
                 result
             );
 
-            if (result.size() > 0 && result[0] == VIRTIO_NET_OK) begin
+            if (result == VIRTIO_NET_CTRL_ACK_OK) begin
                 `uvm_info("DYN_RECONFIG",
                     $sformatf("live_mq_resize: VF%0d MQ resize to %0d pairs accepted",
                               vf.vf_index, new_pairs),
@@ -257,7 +257,7 @@ class virtio_dynamic_reconfig extends uvm_object;
         bit [47:0] new_mac
     );
         byte unsigned ctrl_data[];
-        byte unsigned result[];
+        virtio_ctrl_ack_e result;
 
         `uvm_info("DYN_RECONFIG",
             $sformatf("live_mac_change: VF%0d, new_mac=%012h",
@@ -281,7 +281,7 @@ class virtio_dynamic_reconfig extends uvm_object;
                 result
             );
 
-            if (result.size() > 0 && result[0] == VIRTIO_NET_OK) begin
+            if (result == VIRTIO_NET_CTRL_ACK_OK) begin
                 `uvm_info("DYN_RECONFIG",
                     $sformatf("live_mac_change: VF%0d MAC change accepted", vf.vf_index),
                     UVM_MEDIUM)
@@ -313,7 +313,7 @@ class virtio_dynamic_reconfig extends uvm_object;
         bit add_or_remove
     );
         byte unsigned ctrl_data[];
-        byte unsigned result[];
+        virtio_ctrl_ack_e result;
         bit [7:0] cmd;
 
         cmd = add_or_remove ? VIRTIO_NET_CTRL_VLAN_ADD : VIRTIO_NET_CTRL_VLAN_DEL;
@@ -336,7 +336,7 @@ class virtio_dynamic_reconfig extends uvm_object;
                 result
             );
 
-            if (result.size() > 0 && result[0] == VIRTIO_NET_OK) begin
+            if (result == VIRTIO_NET_CTRL_ACK_OK) begin
                 `uvm_info("DYN_RECONFIG",
                     $sformatf("live_vlan_update: VF%0d VLAN %0d %s accepted",
                               vf.vf_index, vlan_id,

@@ -214,8 +214,7 @@ class virtio_auto_fsm extends uvm_object;
             #(interval * 2 * 1ns);
         end
 
-        // Kill all remaining background tasks
-        disable dataplane_tasks;
+        // Background tasks exit via dataplane_running flag and stop_event
 
         state = FSM_READY;
 
@@ -441,7 +440,9 @@ class virtio_auto_fsm extends uvm_object;
             virtqueue_base vq;
             vq = ops.vq_mgr.get_queue(q);
             if (vq != null) begin
-                vq.save_state(snap.queue_snapshots[q]);
+                virtqueue_snapshot_t tmp_snap;
+                vq.save_state(tmp_snap);
+                snap.queue_snapshots[q] = tmp_snap;
             end
         end
 
@@ -532,7 +533,6 @@ class virtio_auto_fsm extends uvm_object;
                 int unsigned interval = ops.wait_pol.default_poll_interval_ns;
                 #(interval * 2 * 1ns);
             end
-            disable dataplane_tasks;
         end
 
         state = FSM_RECOVERING;

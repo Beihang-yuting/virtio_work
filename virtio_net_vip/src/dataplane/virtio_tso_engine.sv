@@ -115,7 +115,7 @@ class virtio_tso_engine extends uvm_object;
     // ------------------------------------------------------------------------
     // set_tcp_seq — write 32-bit TCP sequence number into packet
     // ------------------------------------------------------------------------
-    function void set_tcp_seq(ref byte unsigned pkt_data[$], bit [31:0] seq);
+    function void set_tcp_seq(ref byte unsigned pkt_data[$], input bit [31:0] seq);
         int unsigned l2_len, l3_len, tcp_off;
         bit [15:0] etype;
         bit [3:0] ihl;
@@ -146,7 +146,7 @@ class virtio_tso_engine extends uvm_object;
     // IPv4: bytes 2-3 of IP header (big-endian)
     // IPv6: bytes 4-5 payload length (big-endian)
     // ------------------------------------------------------------------------
-    function void set_ip_total_length(ref byte unsigned pkt_data[$], int unsigned total_len);
+    function void set_ip_total_length(ref byte unsigned pkt_data[$], input int unsigned total_len);
         int unsigned l2_len;
         bit [15:0] etype;
 
@@ -173,7 +173,7 @@ class virtio_tso_engine extends uvm_object;
     // set_ip_identification — update IPv4 identification field (bytes 4-5)
     // No-op for IPv6 (no identification field)
     // ------------------------------------------------------------------------
-    function void set_ip_identification(ref byte unsigned pkt_data[$], bit [15:0] id);
+    function void set_ip_identification(ref byte unsigned pkt_data[$], input bit [15:0] id);
         int unsigned l2_len;
         bit [15:0] etype;
 
@@ -248,7 +248,7 @@ class virtio_tso_engine extends uvm_object;
     function void segment(
         byte unsigned pkt_data[$],
         int unsigned  mss,
-        ref byte unsigned segments[$][$]
+        ref byte unsigned segments[][$]
     );
         int unsigned all_hdr_len;
         int unsigned payload_len;

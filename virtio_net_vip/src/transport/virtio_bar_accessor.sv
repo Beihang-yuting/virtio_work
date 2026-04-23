@@ -59,12 +59,14 @@ class virtio_bar_mem_rd_seq extends uvm_sequence #(pcie_tl_tlp);
             get_response(rsp);
             if (rsp != null) begin
                 cpl_ok = 1;
+                rdata = '0;
                 if (rsp.payload.size() >= 4) begin
                     // Little-endian assembly from payload bytes
                     rdata = {rsp.payload[3], rsp.payload[2],
                              rsp.payload[1], rsp.payload[0]};
                 end else begin
-                    rdata = rsp.cpl_data;
+                    for (int i = 0; i < rsp.payload.size(); i++)
+                        rdata[i*8 +: 8] = rsp.payload[i];
                 end
             end else begin
                 cpl_ok = 0;
@@ -145,11 +147,13 @@ class virtio_bar_cfg_rd_seq extends uvm_sequence #(pcie_tl_tlp);
             get_response(rsp);
             if (rsp != null) begin
                 cpl_ok = 1;
+                rdata = '0;
                 if (rsp.payload.size() >= 4) begin
                     rdata = {rsp.payload[3], rsp.payload[2],
                              rsp.payload[1], rsp.payload[0]};
                 end else begin
-                    rdata = rsp.cpl_data;
+                    for (int i = 0; i < rsp.payload.size(); i++)
+                        rdata[i*8 +: 8] = rsp.payload[i];
                 end
             end else begin
                 cpl_ok = 0;

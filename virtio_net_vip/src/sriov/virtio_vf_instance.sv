@@ -147,7 +147,7 @@ class virtio_vf_instance extends uvm_component;
 
         // Wire into transport
         transport.wait_pol = wpol;
-        transport.bar.pcie_rc_seqr = pcie_rc_seqr;
+        $cast(transport.bar.pcie_rc_seqr, pcie_rc_seqr);
         transport.notify_mgr.bar   = transport.bar;
         transport.cap_mgr.bar_ref  = transport.bar;
 

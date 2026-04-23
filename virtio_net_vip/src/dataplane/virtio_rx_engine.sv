@@ -28,6 +28,29 @@
 //   - virtio_buf_tracker (buffer lifecycle tracking)
 // ============================================================================
 
+// ============================================================================
+// virtio_rx_pkt_wrapper
+//
+// Lightweight uvm_object that carries a received packet's payload and
+// parsed virtio_net_hdr back to the caller. In a full net_packet
+// integration, this would be replaced by packet_item with proper
+// protocol parsing via $cast.
+// ============================================================================
+
+class virtio_rx_pkt_wrapper extends uvm_object;
+    `uvm_object_utils(virtio_rx_pkt_wrapper)
+
+    byte unsigned    payload[$];
+    virtio_net_hdr_t net_hdr;
+    int unsigned     pkt_len;
+
+    function new(string name = "virtio_rx_pkt_wrapper");
+        super.new(name);
+        pkt_len = 0;
+    endfunction
+
+endclass : virtio_rx_pkt_wrapper
+
 class virtio_rx_engine extends uvm_object;
     `uvm_object_utils(virtio_rx_engine)
 
@@ -217,7 +240,7 @@ class virtio_rx_engine extends uvm_object;
 
         while (count < budget) begin
             virtio_buf_tracker tracker;
-            byte unsigned      buf_data[$];
+            byte              buf_data[];
             byte unsigned      payload[$];
             virtio_net_hdr_t   net_hdr;
             bit [63:0]         buf_gpa;
@@ -250,11 +273,15 @@ class virtio_rx_engine extends uvm_object;
                 continue;
             end
 
-            virtio_net_hdr_util::unpack_hdr(buf_data, negotiated_features, net_hdr);
+            begin
+                byte unsigned buf_data_u[$];
+                foreach (buf_data[i]) buf_data_u.push_back(buf_data[i]);
+                virtio_net_hdr_util::unpack_hdr(buf_data_u, negotiated_features, net_hdr);
 
-            // 5. Extract payload (everything after the header)
-            for (int i = hdr_size; i < len; i++)
-                payload.push_back(buf_data[i]);
+                // 5. Extract payload (everything after the header)
+                for (int i = hdr_size; i < len; i++)
+                    payload.push_back(buf_data_u[i]);
+            end
 
             // 6. Cleanup first buffer
             cleanup_rx_buffer(buf_gpa);
@@ -269,7 +296,7 @@ class virtio_rx_engine extends uvm_object;
                     uvm_object         merge_token;
                     int unsigned       merge_len;
                     virtio_buf_tracker merge_tracker;
-                    byte unsigned      merge_data[$];
+                    byte              merge_data[];
                     bit [63:0]         merge_gpa;
 
                     if (!vq.poll_used(merge_token, merge_len)) begin
@@ -387,7 +414,7 @@ class virtio_rx_engine extends uvm_object;
 
         while (count < budget) begin
             virtio_buf_tracker tracker;
-            byte unsigned      buf_data[$];
+            byte              buf_data[];
             byte unsigned      payload[$];
             virtio_net_hdr_t   net_hdr;
             bit [63:0]         buf_gpa;
@@ -416,11 +443,15 @@ class virtio_rx_engine extends uvm_object;
             end
 
             // Parse header
-            virtio_net_hdr_util::unpack_hdr(buf_data, negotiated_features, net_hdr);
+            begin
+                byte unsigned buf_data_u[$];
+                foreach (buf_data[i]) buf_data_u.push_back(buf_data[i]);
+                virtio_net_hdr_util::unpack_hdr(buf_data_u, negotiated_features, net_hdr);
 
-            // Extract payload
-            for (int i = hdr_size; i < len; i++)
-                payload.push_back(buf_data[i]);
+                // Extract payload
+                for (int i = hdr_size; i < len; i++)
+                    payload.push_back(buf_data_u[i]);
+            end
 
             // Cleanup buffer
             cleanup_rx_buffer(buf_gpa);
@@ -481,7 +512,7 @@ class virtio_rx_engine extends uvm_object;
         count = 0;
         while (count < budget) begin
             virtio_buf_tracker tracker;
-            byte unsigned      buf_data[$];
+            byte              buf_data[];
             virtio_net_hdr_t   net_hdr;
             uvm_object         parsed_pkt;
             bit [63:0]         buf_gpa;
@@ -499,7 +530,11 @@ class virtio_rx_engine extends uvm_object;
             mem.read_mem(buf_gpa, len, buf_data);
 
             // Delegate to custom callback for parsing
-            custom_cb.custom_rx_parse_buf(buf_data, net_hdr, parsed_pkt);
+            begin
+                byte unsigned buf_data_u[$];
+                foreach (buf_data[i]) buf_data_u.push_back(buf_data[i]);
+                custom_cb.custom_rx_parse_buf(buf_data_u, net_hdr, parsed_pkt);
+            end
 
             cleanup_rx_buffer(buf_gpa);
 
@@ -567,28 +602,5 @@ class virtio_rx_engine extends uvm_object;
     endfunction : leak_check
 
 endclass : virtio_rx_engine
-
-// ============================================================================
-// virtio_rx_pkt_wrapper
-//
-// Lightweight uvm_object that carries a received packet's payload and
-// parsed virtio_net_hdr back to the caller. In a full net_packet
-// integration, this would be replaced by packet_item with proper
-// protocol parsing via $cast.
-// ============================================================================
-
-class virtio_rx_pkt_wrapper extends uvm_object;
-    `uvm_object_utils(virtio_rx_pkt_wrapper)
-
-    byte unsigned    payload[$];
-    virtio_net_hdr_t net_hdr;
-    int unsigned     pkt_len;
-
-    function new(string name = "virtio_rx_pkt_wrapper");
-        super.new(name);
-        pkt_len = 0;
-    endfunction
-
-endclass : virtio_rx_pkt_wrapper
 
 `endif // VIRTIO_RX_ENGINE_SV

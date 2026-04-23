@@ -1,6 +1,10 @@
 `ifndef VIRTIO_SMOKE_TEST_SV
 `define VIRTIO_SMOKE_TEST_SV
 
+import uvm_pkg::*;
+`include "uvm_macros.svh"
+import virtio_net_pkg::*;
+
 // ============================================================================
 // virtio_smoke_test
 //

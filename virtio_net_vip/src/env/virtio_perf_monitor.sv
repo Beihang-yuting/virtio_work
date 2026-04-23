@@ -91,7 +91,7 @@ class virtio_perf_monitor extends uvm_component;
         // tokens = elapsed_ns * rate_bytes_per_ns
         // rate_bytes_per_ns = bw_limit_mbps * 1e6 / 8 / 1e9 = bw_limit_mbps / 8000
         // To avoid floating point: tokens = elapsed_ns * bw_limit_mbps / 8000
-        tokens_to_add = (int unsigned)(elapsed_ns) * bw_limit_mbps / 8000;
+        tokens_to_add = $rtoi(elapsed_ns) * bw_limit_mbps / 8000;
 
         if (tokens_to_add > 0) begin
             token_bucket = token_bucket + tokens_to_add;
