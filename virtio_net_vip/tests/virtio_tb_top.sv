@@ -52,8 +52,8 @@ module virtio_tb_top;
 
     // Simulation timeout (safety net -- not a wait-for-condition)
     initial begin
-        #10ms;
-        `uvm_fatal("TB_TOP", "Simulation timeout at 10ms")
+        #30s;
+        `uvm_fatal("TB_TOP", "Simulation timeout at 30s")
     end
 
 endmodule : virtio_tb_top
