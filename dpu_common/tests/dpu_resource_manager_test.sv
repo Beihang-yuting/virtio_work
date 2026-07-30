@@ -98,10 +98,6 @@ class dpu_resource_manager_test extends uvm_test;
             `uvm_fatal("DPU_RESOURCE", $sformatf(
                 "guard PF registration failed: %s", why))
         end
-        if (!guard_manager.configure_mmio_aperture(
-            64'h0001_1000_0000_0000, 64'h0001_1010_0000_0000)) begin
-            `uvm_fatal("DPU_RESOURCE", "guard MMIO aperture configuration failed")
-        end
         if (guard_manager.activate_function(parent_key, bars, why)) begin
             `uvm_fatal("DPU_RESOURCE", "activation succeeded before resource profiles sealed")
         end
@@ -118,9 +114,6 @@ class dpu_resource_manager_test extends uvm_test;
         dpu_resource_lease_t leases[$];
         int unsigned global_id;
         string why;
-
-        manager.configure_mmio_aperture(
-            64'h0001_0000_0000_0000, 64'h0001_0010_0000_0000);
 
         for (int unsigned host_id = 0; host_id < DPU_MAX_HOSTS; host_id++) begin
             for (int unsigned pf_id = 0; pf_id < DPU_MAX_PFS_PER_HOST; pf_id++) begin
@@ -182,6 +175,16 @@ class dpu_resource_manager_test extends uvm_test;
         if (!manager.mark_function_device_ready(overflow_key, why)) begin
             `uvm_fatal("DPU_RESOURCE", $sformatf(
                 "overflow VF readiness failed: %s", why))
+        end
+        if (manager.acquire_leases(
+            overflow_key, qpair_class_id, 0, 32'hffff_ffff, leases, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "overflow VF unexpectedly acquired an enormous QP range")
+        end
+        if (why != "resource-class per-function quota would be exceeded") begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "enormous QP range did not reject by quota: %s", why))
         end
         if (manager.acquire_leases(
             overflow_key, qpair_class_id, 0, 1, leases, why
@@ -290,6 +293,14 @@ class dpu_resource_manager_test extends uvm_test;
             `uvm_fatal("DPU_RESOURCE",
                 "Fabric client bypassed profile sealing before apply")
         end
+        if (manager.configure_mmio_aperture(
+            64'h0001_1000_0000_0000, 64'h0001_1010_0000_0000
+        )) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "Fabric client bypassed shared MMIO aperture configuration")
+        end
+        fabric_cfg.mmio_aperture_base = 64'h0001_0000_0000_0000;
+        fabric_cfg.mmio_aperture_limit = 64'h0001_0010_0000_0000;
         fabric_cfg.resource_profiles.push_back(qpair_profile);
         if (!fabric.apply_resource_profiles(fabric_cfg, why)) begin
             `uvm_fatal("DPU_RESOURCE", $sformatf(

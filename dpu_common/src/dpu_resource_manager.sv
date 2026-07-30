@@ -146,14 +146,16 @@ class dpu_resource_manager extends uvm_object;
         return count;
     endfunction
 
-    protected function bit has_local_id(
+    protected function bit local_range_overlaps_existing_lease(
         input dpu_resource_function_state state,
         input dpu_resource_class_id_t class_id,
-        input int unsigned local_id
+        input int unsigned first_local_id,
+        input int unsigned last_local_id
     );
         for (int unsigned index = 0; index < state.leases.size(); index++) begin
             if ((state.leases[index].class_id == class_id) &&
-                (state.leases[index].local_id == local_id))
+                (state.leases[index].local_id >= first_local_id) &&
+                (state.leases[index].local_id <= last_local_id))
                 return 1;
         end
         return 0;
@@ -278,20 +280,37 @@ class dpu_resource_manager extends uvm_object;
         return 1;
     endfunction
 
-    function bit configure_mmio_aperture(
+    protected function bit configure_mmio_aperture_internal(
         input bit [63:0] base,
-        input bit [63:0] limit
+        input bit [63:0] limit,
+        output string why
     );
-        if (base >= limit)
+        if (base >= limit) begin
+            why = "MMIO aperture base must be below its limit";
             return 0;
-        if ((function_states.num() != 0) && (next_bar_address != aperture_base))
+        end
+        if (aperture_configured) begin
+            why = "MMIO aperture is already configured";
             return 0;
+        end
 
         aperture_configured = 1;
         aperture_base = base;
         aperture_limit = limit;
         next_bar_address = base;
+        why = "";
         return 1;
+    endfunction
+
+    function bit configure_mmio_aperture(
+        input bit [63:0] base,
+        input bit [63:0] limit
+    );
+        string ignored_why;
+
+        if (fabric_registry_authority_claimed)
+            return 0;
+        return configure_mmio_aperture_internal(base, limit, ignored_why);
     endfunction
 
     function bit has_activated_functions();
@@ -306,6 +325,20 @@ class dpu_resource_manager extends uvm_object;
             return null;
         fabric_registry_authority_claimed = 1;
         return fabric_registry_authority;
+    endfunction
+
+    function bit fabric_configure_mmio_aperture(
+        input dpu_resource_fabric_authority authority,
+        input bit [63:0] base,
+        input bit [63:0] limit,
+        output string why
+    );
+        if (!fabric_registry_authority_claimed || (authority == null) ||
+            (authority != fabric_registry_authority)) begin
+            why = "MMIO aperture configuration requires the Fabric authority";
+            return 0;
+        end
+        return configure_mmio_aperture_internal(base, limit, why);
     endfunction
 
     protected function bit register_resource_class_internal(
@@ -540,6 +573,7 @@ class dpu_resource_manager extends uvm_object;
         dpu_resource_lease_t lease;
         int unsigned current_function_count;
         int unsigned current_class_count;
+        int unsigned last_local_id;
         int unsigned global_ids[$];
 
         leases.delete();
@@ -565,12 +599,13 @@ class dpu_resource_manager extends uvm_object;
             why = "local resource ID range overflows";
             return 0;
         end
+        last_local_id = first_local_id + (count - 1);
 
-        for (int unsigned offset = 0; offset < count; offset++) begin
-            if (has_local_id(state, class_id, first_local_id + offset)) begin
-                why = "local resource ID is already leased by this function";
-                return 0;
-            end
+        if (local_range_overlaps_existing_lease(
+            state, class_id, first_local_id, last_local_id
+        )) begin
+            why = "local resource ID is already leased by this function";
+            return 0;
         end
 
         profile = resource_profiles_by_id[class_id];

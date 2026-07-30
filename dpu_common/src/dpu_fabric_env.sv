@@ -12,6 +12,8 @@
 class dpu_fabric_env_config extends uvm_object;
     `uvm_object_utils(dpu_fabric_env_config)
 
+    bit [63:0] mmio_aperture_base;
+    bit [63:0] mmio_aperture_limit;
     dpu_resource_pool_config_t resource_profiles[$];
 
     function new(string name = "dpu_fabric_env_config");
@@ -71,6 +73,17 @@ class dpu_fabric_env extends uvm_env;
             why = "DPU Fabric resource profiles cannot be applied after activation";
             return 0;
         end
+        if (cfg.mmio_aperture_base >= cfg.mmio_aperture_limit) begin
+            why = "DPU Fabric MMIO aperture base must be below its limit";
+            return 0;
+        end
+        if (!resource_manager.fabric_configure_mmio_aperture(
+            registry_authority,
+            cfg.mmio_aperture_base,
+            cfg.mmio_aperture_limit,
+            why
+        ))
+            return 0;
 
         for (int unsigned index = 0;
              index < cfg.resource_profiles.size(); index++) begin
