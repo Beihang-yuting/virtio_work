@@ -271,7 +271,8 @@ make test TEST=virtio_unit_test
 submodule 固定 SHA、VCS 环境以及外部源码完整性。
 
 `host_mem@3b9e000d5df4d10efbb3029f43605e0362e0caca` 固定提供
-`host_mem_pkg.sv` 和 `host_mem_manager.sv`，并由 filelist 在 PCIe package 前编译。
+`host_mem_pkg.sv` 和 `host_mem_manager.sv`；filelist 在 PCIe package 前编译
+`host_mem_pkg.sv`，而 `virtio_net_pkg` 在自身 package 内包含 manager。
 固定 SHA 使依赖可复现；实际的 VCS 编译和动态 UVM 回归结果仍取决于运行环境。
 
 ---
