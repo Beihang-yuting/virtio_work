@@ -250,10 +250,12 @@ virtio_net_vip/
 ```bash
 make bootstrap
 make check-deps
+make compile TEST=virtio_unit_test
 make test TEST=virtio_unit_test
 ```
 
-`make regression` 会顺序运行当前支持的五个测试。`make check-deps` 会验证
+`make compile` 仅编译；`make test` 编译后运行指定测试。`make regression` 会顺序运行
+当前支持的五个测试。`make check-deps` 会验证
 submodule 固定 SHA、VCS 环境以及外部源码完整性。
 
 当前指定的 `host_mem@ef056b331047f51125c2aaf248a8767b9b84862a` 仅包含 README，

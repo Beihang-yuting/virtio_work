@@ -10,7 +10,7 @@ check-deps:
 	./scripts/check_deps.sh
 
 compile:
-	TEST="$(TEST)" ./scripts/vcs.sh
+	TEST="$(TEST)" ./scripts/vcs.sh --compile-only
 
 test:
 	TEST="$(TEST)" ./scripts/vcs.sh
