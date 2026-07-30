@@ -218,7 +218,7 @@ virtio_net_vip/
 │   ├── virtio_full_test.sv                 ← 完整集成测试（含 Completion Bridge）
 │   ├── virtio_traffic_test.sv              ← 大流量测试（1000 包）
 │   └── virtio_dual_test.sv                 ← 双 VIP 互打测试（2 万包 + 带宽控制）
-└── ext/                                    ← 外部组件符号链接
+└── ext/                                    ← 固定版本的外部 Git submodule
     ├── host_mem       → 内存管理组件
     ├── net_packet     → 协议报文产生器
     └── pcie_tl_vip    → PCIe TL 层 VIP
@@ -228,7 +228,7 @@ virtio_net_vip/
 
 ## 外部依赖
 
-本 VIP 依赖三个外部组件，通过 `ext/` 目录的符号链接集成，**不修改任何外部组件代码**：
+本 VIP 依赖三个外部组件，通过 `ext/` 目录中的固定 Git submodule 集成，**不修改任何外部组件代码**：
 
 | 组件 | 功能 | 主要接口 |
 |------|------|---------|
@@ -242,70 +242,24 @@ virtio_net_vip/
 
 ### 环境要求
 
-- Synopsys VCS（已验证版本：Q-2020.03-SP2-7）
-- UVM 1.2 或更高版本
-- 上述三个外部组件已就位
+- Synopsys VCS（通过 `$VCS_HOME` 提供）和 UVM 1.2
+- 可访问 Git submodule 远端
 
-### 编译命令
-
-```bash
-VCS_HOME=/opt/synopsys/vcs/Q-2020.03-SP2-7
-
-$VCS_HOME/bin/vcs -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps \
-    +incdir+<host_mem>/src \
-    +incdir+<pcie_tl_vip>/src \
-    +incdir+<pcie_tl_vip>/src/types \
-    +incdir+<pcie_tl_vip>/src/shared \
-    +incdir+<pcie_tl_vip>/src/agent \
-    +incdir+<pcie_tl_vip>/src/adapter \
-    +incdir+<pcie_tl_vip>/src/env \
-    +incdir+<pcie_tl_vip>/src/seq/base \
-    +incdir+<pcie_tl_vip>/src/seq/constraints \
-    +incdir+<pcie_tl_vip>/src/seq/scenario \
-    +incdir+<pcie_tl_vip>/src/seq/virtual \
-    +incdir+src +incdir+src/types +incdir+src/shared +incdir+src/iommu \
-    +incdir+src/virtqueue +incdir+src/transport +incdir+src/callbacks \
-    +incdir+src/agent +incdir+src/dataplane +incdir+src/sriov +incdir+src/env \
-    +incdir+src/seq/base \
-    +incdir+src/seq/scenario/lifecycle +incdir+src/seq/scenario/dataplane \
-    +incdir+src/seq/scenario/interrupt +incdir+src/seq/scenario/migration \
-    +incdir+src/seq/scenario/sriov +incdir+src/seq/scenario/error \
-    +incdir+src/seq/scenario/concurrency +incdir+src/seq/scenario/dynamic \
-    +incdir+src/seq/scenario/boundary +incdir+src/seq/virtual \
-    <host_mem>/src/host_mem_pkg.sv \
-    <pcie_tl_vip>/src/pcie_tl_if.sv \
-    <pcie_tl_vip>/src/pcie_tl_pkg.sv \
-    src/virtio_net_pkg.sv \
-    tests/*.sv \
-    -top virtio_tb_top -o simv
-```
-
-> 将 `<host_mem>`、`<pcie_tl_vip>` 替换为实际路径。
-
-### 运行测试
+所有构建和测试均通过 Make 入口执行：
 
 ```bash
-# 单元测试（无需 PCIe 环境，验证基础组件）
-./simv +UVM_TESTNAME=virtio_unit_test +UVM_VERBOSITY=UVM_LOW
-
-# 压力测试（256 描述符填满/排空、带宽限制、故障注入、Packed 队列）
-./simv +UVM_TESTNAME=virtio_stress_unit_test +UVM_VERBOSITY=UVM_LOW
-
-# 协议测试（virtio_net_hdr 打包解包、校验和、TSO、RSS）
-./simv +UVM_TESTNAME=virtio_protocol_test +UVM_VERBOSITY=UVM_LOW
-
-# 端到端集成测试（完整 virtio 初始化流程通过 PCIe TLP）
-./simv +UVM_TESTNAME=virtio_e2e_test +UVM_VERBOSITY=UVM_MEDIUM
-
-# 完整集成测试（Completion Bridge + 完整初始化 + 1250 个 TLP）
-./simv +UVM_TESTNAME=virtio_full_integration_test +UVM_VERBOSITY=UVM_LOW
-
-# 大流量测试（1000 包回环 + 带宽控制 + 协议完整性 + 队列压力）
-./simv +UVM_TESTNAME=virtio_traffic_test +UVM_VERBOSITY=UVM_LOW
-
-# 双 VIP 互打测试（双向各 1 万包 + 带宽控制验证）
-./simv +UVM_TESTNAME=virtio_dual_test +UVM_VERBOSITY=UVM_LOW
+make bootstrap
+make check-deps
+make test TEST=virtio_unit_test
 ```
+
+`make regression` 会顺序运行当前支持的五个测试。`make check-deps` 会验证
+submodule 固定 SHA、VCS 环境以及外部源码完整性。
+
+当前指定的 `host_mem@ef056b331047f51125c2aaf248a8767b9b84862a` 仅包含 README，
+未提供本 VIP 所需的 `host_mem_pkg.sv` 与 `host_mem_manager.sv`。在 VCS 环境可用时，
+依赖检查会以明确诊断停止；需由上游提供兼容源码，或经用户批准后更新固定 SHA。
+因此，固定依赖已可复现，但当前版本尚不能声称 VCS 编译或动态 UVM 回归已通过。
 
 ---
 

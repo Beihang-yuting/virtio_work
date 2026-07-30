@@ -1,0 +1,9 @@
+[submodule "virtio_net_vip/ext/pcie_tl_vip"]
+	path = virtio_net_vip/ext/pcie_tl_vip
+	url = https://github.com/Beihang-yuting/pcie_work.git
+[submodule "virtio_net_vip/ext/host_mem"]
+	path = virtio_net_vip/ext/host_mem
+	url = https://github.com/Beihang-yuting/host_mem.git
+[submodule "virtio_net_vip/ext/net_packet"]
+	path = virtio_net_vip/ext/net_packet
+	url = https://github.com/Beihang-yuting/net_packet.git
