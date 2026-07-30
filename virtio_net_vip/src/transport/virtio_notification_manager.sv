@@ -66,7 +66,7 @@ class virtio_notification_manager extends uvm_object;
     // ========================================================================
     // setup_msix
     //
-    // Writes MSI-X table entries to BAR space via bar.write_reg().
+    // Writes MSI-X table entries through the dedicated BAR accessor path.
     // Each MSI-X table entry is 16 bytes:
     //   Offset 0x00: Message Address (lower 32)
     //   Offset 0x04: Message Address (upper 32)
@@ -94,20 +94,20 @@ class virtio_notification_manager extends uvm_object;
             msix_mask[i]           = 1;
 
             // Write Message Address (lower 32)
-            bar.write_reg(msix_table_bar, entry_offset + 32'h00, 4,
-                          msix_table[i].msg_addr[31:0]);
+            bar.write_msix_reg(msix_table_bar, entry_offset + 32'h00, 4,
+                               msix_table[i].msg_addr[31:0]);
 
             // Write Message Address (upper 32)
-            bar.write_reg(msix_table_bar, entry_offset + 32'h04, 4,
-                          msix_table[i].msg_addr[63:32]);
+            bar.write_msix_reg(msix_table_bar, entry_offset + 32'h04, 4,
+                               msix_table[i].msg_addr[63:32]);
 
             // Write Message Data
-            bar.write_reg(msix_table_bar, entry_offset + 32'h08, 4,
-                          msix_table[i].msg_data);
+            bar.write_msix_reg(msix_table_bar, entry_offset + 32'h08, 4,
+                               msix_table[i].msg_data);
 
             // Write Vector Control (masked)
-            bar.write_reg(msix_table_bar, entry_offset + 32'h0C, 4,
-                          32'h0000_0001);
+            bar.write_msix_reg(msix_table_bar, entry_offset + 32'h0C, 4,
+                               32'h0000_0001);
 
             `uvm_info("NOTIFY_MGR",
                 $sformatf("MSI-X vector %0d: addr=0x%016h data=0x%08h masked=%0b",

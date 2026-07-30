@@ -48,7 +48,6 @@ class virtio_function_instance extends virtio_vf_instance;
     endfunction
 
     protected function void apply_function_configuration();
-        dpu_bar_pair_lease_t bar;
         string why;
 
         if ((transport == null) || (vq_mgr == null))
@@ -58,28 +57,8 @@ class virtio_function_instance extends virtio_vf_instance;
         transport.is_vf = (function_kind == DPU_FUNCTION_VF);
         transport.vf_index = vf_index;
         transport.bar.requester_id = bdf;
-        transport.bar.bar_base = '{default:'0};
-        transport.bar.bar_size = '{default:'0};
-
-        // Program the complete Fabric BAR placement before any transport
-        // capability discovery.  Only the function device and MSI-X pairs
-        // have transport-facing BAR bases; BAR2/3 remains inaccessible here.
-        foreach (bar_pairs[index]) begin
-            bar = bar_pairs[index];
-            case (bar.role)
-                DPU_BAR_FUNCTION_DEVICE: begin
-                    transport.bar.bar_base[bar.even_bar_id] = bar.base;
-                    transport.bar.bar_size[bar.even_bar_id] = bar.size;
-                end
-                DPU_BAR_MSIX: begin
-                    transport.bar.bar_base[bar.even_bar_id] = bar.base;
-                    transport.bar.bar_size[bar.even_bar_id] = bar.size;
-                end
-                default: begin
-                    // Deliberately leave BAR2/3 with base/size zero.
-                end
-            endcase
-        end
+        if ((resource_manager != null) || (bar_pairs.size() != 0))
+            transport.bar.configure_fabric_bar_pairs(bar_pairs);
         vq_mgr.bdf = bdf;
 
         if (resource_manager != null) begin
@@ -92,12 +71,7 @@ class virtio_function_instance extends virtio_vf_instance;
                     function_key.host_id, function_key.pf_id, function_key.kind,
                     function_key.vf_id, why))
             end
-            if (!resource_client.mark_device_ready(why)) begin
-                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                    "BAR discovery did not make function %0d:%0d:%0d:%0d ready: %s",
-                    function_key.host_id, function_key.pf_id, function_key.kind,
-                    function_key.vf_id, why))
-            end
+            transport.configure_fabric_managed(resource_client);
         end
     endfunction
 endclass : virtio_function_instance

@@ -45,6 +45,13 @@ class virtio_pci_transport extends uvm_object;
     bit           notification_data_enable = 0;
     bit [7:0]     current_status = DEV_STATUS_RESET;
 
+    // Fabric functions receive immutable BAR placements from the DPU
+    // resource manager.  Discovery scans capabilities only; it never runs
+    // PCI BAR sizing or assigns a local address.
+    bit                     fabric_managed = 0;
+    bit                     fabric_capability_discovered = 0;
+    virtio_resource_client  fabric_resource_client;
+
     // ========================================================================
     // Constructor
     // ========================================================================
@@ -64,6 +71,18 @@ class virtio_pci_transport extends uvm_object;
         device_features = '0;
         driver_features = '0;
         bdf             = 16'h0;
+    endfunction
+
+    virtual function void configure_fabric_managed(
+        input virtio_resource_client resource_client
+    );
+        fabric_managed = 1;
+        fabric_capability_discovered = 0;
+        fabric_resource_client = resource_client;
+    endfunction
+
+    function bit is_fabric_managed();
+        return fabric_managed;
     endfunction
 
     // ========================================================================
@@ -707,6 +726,10 @@ class virtio_pci_transport extends uvm_object;
     // ========================================================================
 
     virtual task discover_and_init_bars();
+        if (fabric_managed) begin
+            discover_fabric_preconfigured_bars();
+            return;
+        end
         `uvm_info("TRANSPORT", "Starting BAR discovery and capability enumeration", UVM_MEDIUM)
 
         // Set BDF on bar accessor
@@ -722,6 +745,67 @@ class virtio_pci_transport extends uvm_object;
         cap_mgr.discover_capabilities();
 
         `uvm_info("TRANSPORT", "BAR discovery and capability enumeration complete", UVM_MEDIUM)
+    endtask
+
+    protected function bit fabric_capabilities_use_device_window(
+        output string why
+    );
+        why = "";
+        if (!cap_mgr.common_cfg_found || !cap_mgr.notify_found ||
+            !cap_mgr.isr_found) begin
+            why = "mandatory virtio capabilities were not discovered";
+            return 0;
+        end
+        if ((cap_mgr.common_cfg_cap.bar != 0) ||
+            (cap_mgr.notify_cap.bar != 0) ||
+            (cap_mgr.isr_cap.bar != 0) ||
+            (cap_mgr.device_cfg_found && (cap_mgr.device_cfg_cap.bar != 0)) ||
+            (cap_mgr.pci_cfg_found && (cap_mgr.pci_cfg_cap.bar != 0))) begin
+            why = "virtio functional capability did not resolve to Fabric BAR0/1";
+            return 0;
+        end
+        if (cap_mgr.msix_found && (cap_mgr.msix_table_bir != 4)) begin
+            why = "MSI-X capability did not resolve to Fabric BAR4/5";
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    // Fabric BARs are already programmed.  This path performs the real PCI
+    // capability scan while preserving all three pairs, then lets the virtio
+    // resource client mark the function device-ready.
+    virtual task discover_fabric_preconfigured_bars();
+        string why;
+
+        if (!fabric_managed) begin
+            `uvm_fatal("TRANSPORT",
+                "Fabric preconfigured discovery requested for a non-Fabric function")
+        end
+        if (!bar.fabric_bar_layout_is_active()) begin
+            `uvm_fatal("TRANSPORT",
+                "Fabric function has no preconfigured BAR role layout")
+        end
+        if (fabric_resource_client == null) begin
+            `uvm_fatal("TRANSPORT",
+                "Fabric function has no resource client for device-ready lifecycle")
+        end
+
+        bar.requester_id = bdf;
+        cap_mgr.bar_ref = bar;
+        notify_mgr.bar = bar;
+        cap_mgr.discover_capabilities();
+        if (!fabric_capabilities_use_device_window(why)) begin
+            `uvm_fatal("TRANSPORT", $sformatf(
+                "Fabric capability discovery rejected BAR roles: %s", why))
+        end
+        fabric_capability_discovered = 1;
+        if (!fabric_resource_client.mark_device_ready(why)) begin
+            `uvm_fatal("TRANSPORT", $sformatf(
+                "Fabric device-ready transition failed after discovery: %s", why))
+        end
+        `uvm_info("TRANSPORT",
+            "Fabric BAR capability discovery complete without BAR enumeration",
+            UVM_MEDIUM)
     endtask
 
     // ========================================================================

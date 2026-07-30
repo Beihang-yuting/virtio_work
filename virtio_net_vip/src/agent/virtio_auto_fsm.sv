@@ -77,7 +77,10 @@ class virtio_auto_fsm extends uvm_object;
         state = FSM_DISCOVERING;
         `uvm_info("AUTO_FSM",
             $sformatf("full_init: state=%s -- discovering BARs", state.name()), UVM_MEDIUM)
-        ops.transport.discover_and_init_bars();
+        if (ops.transport.is_fabric_managed())
+            ops.transport.discover_fabric_preconfigured_bars();
+        else
+            ops.transport.discover_and_init_bars();
 
         // ---- Step 2: Feature negotiation ----
         state = FSM_NEGOTIATING;

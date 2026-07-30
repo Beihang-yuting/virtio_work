@@ -177,6 +177,8 @@ class virtio_net_env_config extends uvm_object;
             end
             total_functions = 0;
             for (int unsigned host_id = 0; host_id < num_hosts; host_id++) begin
+                longint unsigned pf_block_bdf;
+
                 if ((host_id >= num_pfs_per_host.size()) ||
                     (host_id >= num_vfs_per_pf.size()))
                     continue;
@@ -195,10 +197,20 @@ class virtio_net_env_config extends uvm_object;
                 end
                 total_functions += num_pfs_per_host[host_id];
                 foreach (num_vfs_per_pf[host_id][pf_id]) begin
+                    pf_block_bdf = pf_bdf +
+                        ((host_id * DPU_MAX_PFS_PER_HOST + pf_id) *
+                         (DPU_MAX_VFS_PER_PF + 1));
                     if ((num_vfs_per_pf[host_id][pf_id] > max_vfs_per_pf) ||
                         (num_vfs_per_pf[host_id][pf_id] > DPU_MAX_VFS_PER_PF)) begin
                         `uvm_error("ENV_CFG", $sformatf(
                             "host %0d PF %0d VF count exceeds the DPU limit",
+                            host_id, pf_id))
+                        ok = 0;
+                    end
+                    if ((pf_block_bdf + num_vfs_per_pf[host_id][pf_id]) >
+                        16'hffff) begin
+                        `uvm_error("ENV_CFG", $sformatf(
+                            "host %0d PF %0d BDF block overflows 16 bits",
                             host_id, pf_id))
                         ok = 0;
                     end

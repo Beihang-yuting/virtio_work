@@ -43,6 +43,10 @@ package virtio_net_pkg;
   `include "virtqueue/custom_virtqueue.sv"
   `include "virtqueue/virtqueue_manager.sv"
 
+  // Resource clients are transport discovery callbacks and need to be
+  // complete before the PCI transport class is compiled.
+  `include "sriov/virtio_resource_client.sv"
+
   // ---------------------------------------------------------------------------
   // Phase 4 – Transport (PCI)
   // ---------------------------------------------------------------------------
@@ -82,7 +86,6 @@ package virtio_net_pkg;
   // ---------------------------------------------------------------------------
   // Phase 7 – SR-IOV
   // ---------------------------------------------------------------------------
-  `include "sriov/virtio_resource_client.sv"
   `include "sriov/virtio_vf_resource_pool.sv"
   `include "sriov/virtio_vf_instance.sv"
   `include "sriov/virtio_pf_manager.sv"

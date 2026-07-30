@@ -206,6 +206,10 @@ class virtio_bar_accessor extends uvm_object;
     bit [63:0]  bar_base[6];        // BAR0-5 base addresses
     bit [63:0]  bar_size[6];        // BAR0-5 sizes (for enumeration)
     bit [2:0]   bar_type[6];        // 0=32-bit MMIO, 2=64-bit MMIO
+    bit         fabric_bar_layout_active;
+    bit         fabric_bar_role_valid[6];
+    dpu_bar_role_e fabric_bar_role[6];
+    protected int unsigned reserved_bar_access_error_count;
 
     // ===== PCIe layer references =====
     uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr;   // RC Agent's sequencer
@@ -222,11 +226,87 @@ class virtio_bar_accessor extends uvm_object;
         super.new(name);
         requester_id        = 16'h0;
         next_bar_alloc_addr = 64'h0000_0000_C000_0000;  // Default MMIO window
+        fabric_bar_layout_active = 0;
+        reserved_bar_access_error_count = 0;
         for (int i = 0; i < 6; i++) begin
             bar_base[i] = '0;
             bar_size[i] = '0;
             bar_type[i] = '0;
+            fabric_bar_role_valid[i] = 0;
+            fabric_bar_role[i] = DPU_BAR_RESERVED;
         end
+    endfunction
+
+    // Fabric owns physical BAR placement.  These pairs must therefore never
+    // pass through PCI BAR sizing/enumeration or the local address allocator.
+    virtual function void configure_fabric_bar_pairs(
+        input dpu_bar_pair_lease_t bars[$]
+    );
+        fabric_bar_layout_active = 1;
+        reserved_bar_access_error_count = 0;
+        for (int unsigned bar_id = 0; bar_id < 6; bar_id++) begin
+            bar_base[bar_id] = '0;
+            bar_size[bar_id] = '0;
+            bar_type[bar_id] = '0;
+            fabric_bar_role_valid[bar_id] = 0;
+            fabric_bar_role[bar_id] = DPU_BAR_RESERVED;
+        end
+        foreach (bars[index]) begin
+            if ((bars[index].even_bar_id > 4) ||
+                ((bars[index].even_bar_id % 2) != 0)) begin
+                `uvm_error("BAR_ACCESSOR", $sformatf(
+                    "Fabric supplied invalid even BAR index %0d",
+                    bars[index].even_bar_id))
+                continue;
+            end
+            bar_base[bars[index].even_bar_id] = bars[index].base;
+            bar_size[bars[index].even_bar_id] = bars[index].size;
+            bar_type[bars[index].even_bar_id] = 3'b010;
+            fabric_bar_role_valid[bars[index].even_bar_id] = 1;
+            fabric_bar_role[bars[index].even_bar_id] = bars[index].role;
+            fabric_bar_role_valid[bars[index].even_bar_id + 1] = 1;
+            fabric_bar_role[bars[index].even_bar_id + 1] = bars[index].role;
+        end
+    endfunction
+
+    function bit fabric_bar_layout_is_active();
+        return fabric_bar_layout_active;
+    endfunction
+
+    function int unsigned get_reserved_bar_access_error_count();
+        return reserved_bar_access_error_count;
+    endfunction
+
+    protected function bit allow_functional_bar_access(input int unsigned bar_id);
+        if (!fabric_bar_layout_active)
+            return 1;
+        if ((bar_id == 2) || (bar_id == 3)) begin
+            reserved_bar_access_error_count++;
+            `uvm_error("BAR_RESERVED", $sformatf(
+                "functional MMIO access to Fabric-reserved BAR%0d was blocked", bar_id))
+            return 0;
+        end
+        if ((bar_id == 4) || (bar_id == 5)) begin
+            `uvm_error("BAR_MSIX_ONLY", $sformatf(
+                "functional MMIO access to MSI-X-only BAR%0d was blocked", bar_id))
+            return 0;
+        end
+        if (bar_id != 0) begin
+            `uvm_error("BAR_FUNCTION_WINDOW", $sformatf(
+                "functional MMIO access must use Fabric BAR0/1, not BAR%0d", bar_id))
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    protected function bit allow_msix_bar_access(input int unsigned bar_id);
+        if (!fabric_bar_layout_active)
+            return 1;
+        if (bar_id == 4)
+            return 1;
+        `uvm_error("BAR_MSIX_ONLY", $sformatf(
+            "MSI-X access must use Fabric BAR4/5, not BAR%0d", bar_id))
+        return 0;
     endfunction
 
     // ========================================================================
@@ -312,6 +392,11 @@ class virtio_bar_accessor extends uvm_object;
             return;
         end
 
+        if (!allow_functional_bar_access(bar_id)) begin
+            data = '0;
+            return;
+        end
+
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("BAR_ACCESSOR",
                 "pcie_rc_seqr is null; set it before calling read_reg()")
@@ -345,17 +430,11 @@ class virtio_bar_accessor extends uvm_object;
     // MMIO register write via PCIe Memory Write TLP.
     // ========================================================================
 
-    virtual task write_reg(int unsigned bar_id, bit [31:0] offset,
-                           int unsigned size, bit [31:0] data);
+    protected task issue_write_reg(int unsigned bar_id, bit [31:0] offset,
+                                   int unsigned size, bit [31:0] data);
         bit [63:0] addr;
         bit [3:0]  be;
         virtio_bar_mem_wr_seq wr_seq;
-
-        if (bar_id > 5) begin
-            `uvm_error("BAR_ACCESSOR",
-                $sformatf("Invalid bar_id=%0d (must be 0-5)", bar_id))
-            return;
-        end
 
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("BAR_ACCESSOR",
@@ -376,6 +455,32 @@ class virtio_bar_accessor extends uvm_object;
         `uvm_info("BAR_ACCESSOR",
             $sformatf("write_reg: BAR%0d offset=0x%08h size=%0d addr=0x%016h be=0x%01h data=0x%08h",
                       bar_id, offset, size, addr, be, data), UVM_HIGH)
+    endtask
+
+    virtual task write_reg(int unsigned bar_id, bit [31:0] offset,
+                           int unsigned size, bit [31:0] data);
+        if (bar_id > 5) begin
+            `uvm_error("BAR_ACCESSOR",
+                $sformatf("Invalid bar_id=%0d (must be 0-5)", bar_id))
+            return;
+        end
+        if (!allow_functional_bar_access(bar_id))
+            return;
+        issue_write_reg(bar_id, offset, size, data);
+    endtask
+
+    // MSI-X table writes use an explicit path so Fabric can reserve BAR4/5
+    // for interrupts while generic transport accesses remain on BAR0/1.
+    virtual task write_msix_reg(int unsigned bar_id, bit [31:0] offset,
+                                int unsigned size, bit [31:0] data);
+        if (bar_id > 5) begin
+            `uvm_error("BAR_ACCESSOR",
+                $sformatf("Invalid bar_id=%0d (must be 0-5)", bar_id))
+            return;
+        end
+        if (!allow_msix_bar_access(bar_id))
+            return;
+        issue_write_reg(bar_id, offset, size, data);
     endtask
 
     // ========================================================================
@@ -465,6 +570,12 @@ class virtio_bar_accessor extends uvm_object;
         bit [63:0] size_mask;
         bit [11:0] bar_cfg_addr;
         int i;
+
+        if (fabric_bar_layout_active) begin
+            `uvm_error("BAR_FABRIC_OWNED",
+                "BAR enumeration is forbidden for Fabric-owned BAR placements")
+            return;
+        end
 
         `uvm_info("BAR_ACCESSOR", "Starting BAR enumeration", UVM_MEDIUM)
 
@@ -599,6 +710,11 @@ class virtio_bar_accessor extends uvm_object;
             return;
         end
 
+        if (!allow_functional_bar_access(bar_id)) begin
+            data = '0;
+            return;
+        end
+
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("BAR_ACCESSOR",
                 "pcie_rc_seqr is null; set it before calling read_reg_with_error()")
@@ -639,6 +755,9 @@ class virtio_bar_accessor extends uvm_object;
                 $sformatf("Invalid bar_id=%0d (must be 0-5)", bar_id))
             return;
         end
+
+        if (!allow_functional_bar_access(bar_id))
+            return;
 
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("BAR_ACCESSOR",

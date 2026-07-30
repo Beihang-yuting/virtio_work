@@ -122,27 +122,15 @@ class virtio_vf_instance extends uvm_component;
             UVM_MEDIUM)
     endfunction
 
-    // Retain all Fabric-programmed BAR pairs for ownership and monitor
-    // checks.  Only BAR0/1 and BAR4/5 receive functional transport bindings;
-    // BAR2/3 remains a consumed reservation without an accessor.
+    // Retain and program Fabric BAR roles.  The accessor enforces BAR0/1 as
+    // the functional window, rejects BAR2/3, and reserves BAR4/5 for MSI-X.
     virtual function void configure_bar_pairs(
         input dpu_bar_pair_lease_t bars[$]
     );
         bar_pairs = bars;
         if (transport == null)
             return;
-        foreach (bar_pairs[index]) begin
-            case (bar_pairs[index].role)
-                DPU_BAR_FUNCTION_DEVICE:
-                    transport.bar.bar_base[bar_pairs[index].even_bar_id] =
-                        bar_pairs[index].base;
-                DPU_BAR_MSIX:
-                    transport.bar.bar_base[bar_pairs[index].even_bar_id] =
-                        bar_pairs[index].base;
-                default:
-                    ;
-            endcase
-        end
+        transport.bar.configure_fabric_bar_pairs(bar_pairs);
     endfunction
 
     // Bind this compatibility wrapper to a VF Fabric function.  New Fabric
@@ -171,11 +159,7 @@ class virtio_vf_instance extends uvm_component;
                 function_key.host_id, function_key.pf_id, function_key.kind,
                 function_key.vf_id, why))
         end
-        if (!resource_client.mark_device_ready(why)) begin
-            `uvm_fatal("VF_INSTANCE", $sformatf(
-                "BAR discovery did not make VF %0d device-ready: %s",
-                function_key.vf_id, why))
-        end
+        transport.configure_fabric_managed(resource_client);
     endfunction
 
     // ========================================================================

@@ -80,7 +80,9 @@ class virtio_net_env extends uvm_env;
         input int unsigned host_id,
         input int unsigned pf_id
     );
-        return cfg.pf_bdf + ((host_id * DPU_MAX_PFS_PER_HOST + pf_id) << 4);
+        return cfg.pf_bdf +
+               ((host_id * DPU_MAX_PFS_PER_HOST + pf_id) *
+                (DPU_MAX_VFS_PER_PF + 1));
     endfunction
 
     protected function void build_fabric_topology();
@@ -177,8 +179,13 @@ class virtio_net_env extends uvm_env;
             `uvm_fatal("VIRTIO_ENV", "No virtio_net_env_config found in config_db")
 
         // Validate config
-        if (!cfg.validate())
+        if (!cfg.validate()) begin
+            if (cfg.uses_fabric_topology()) begin
+                `uvm_fatal("VIRTIO_ENV",
+                    "Invalid Fabric topology; refusing to index or build it")
+            end
             `uvm_warning("VIRTIO_ENV", "Config validation reported issues -- continuing")
+        end
 
         `uvm_info("VIRTIO_ENV",
             $sformatf("build_phase: %s", cfg.convert2string()),

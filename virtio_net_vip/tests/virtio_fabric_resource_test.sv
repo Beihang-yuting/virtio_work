@@ -6,6 +6,50 @@ import uvm_pkg::*;
 import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
 
+// A config-space-only endpoint model lets the focused Fabric test exercise
+// real virtio capability discovery without taking ownership of PCIe binding.
+class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
+    `uvm_object_utils(virtio_fabric_cfg_stub_accessor)
+
+    int unsigned config_write_count;
+
+    function new(string name = "virtio_fabric_cfg_stub_accessor");
+        super.new(name);
+        config_write_count = 0;
+    endfunction
+
+    virtual task config_read(bit [11:0] addr, ref bit [31:0] data);
+        data = '0;
+        case (addr)
+            12'h034: data = 32'h0000_0040;
+            12'h040: data = {8'd1, 8'd20, 8'h50, PCI_CAP_ID_VENDOR};
+            12'h044: data = 32'h0000_0000;
+            12'h048: data = 32'h0000_0000;
+            12'h04c: data = 32'h0000_0100;
+            12'h050: data = {8'd2, 8'd20, 8'h64, PCI_CAP_ID_VENDOR};
+            12'h054: data = 32'h0000_0000;
+            12'h058: data = 32'h0000_0100;
+            12'h05c: data = 32'h0000_0100;
+            12'h060: data = 32'h0000_0004;
+            12'h064: data = {8'd3, 8'd16, 8'h74, PCI_CAP_ID_VENDOR};
+            12'h068: data = 32'h0000_0000;
+            12'h06c: data = 32'h0000_0200;
+            12'h070: data = 32'h0000_0001;
+            12'h074: data = {8'd4, 8'd16, 8'h00, PCI_CAP_ID_VENDOR};
+            12'h078: data = 32'h0000_0000;
+            12'h07c: data = 32'h0000_0300;
+            12'h080: data = 32'h0000_0100;
+            default: ;
+        endcase
+    endtask
+
+    virtual task config_write(
+        bit [11:0] addr, bit [31:0] data, bit [3:0] be
+    );
+        config_write_count++;
+    endtask
+endclass : virtio_fabric_cfg_stub_accessor
+
 class virtio_fabric_resource_test extends uvm_test;
     `uvm_component_utils(virtio_fabric_resource_test)
 
@@ -126,6 +170,44 @@ class virtio_fabric_resource_test extends uvm_test;
         global_rx_qids.push_back(global_rx_qid);
     endtask
 
+    task discover_fabric_function(input virtio_function_instance function_instance);
+        virtio_fabric_cfg_stub_accessor config_stub;
+        bit [31:0] reserved_data;
+        int unsigned reserved_errors;
+
+        config_stub = virtio_fabric_cfg_stub_accessor::type_id::create(
+            $sformatf("cfg_stub_%0d_%0d_%0d_%0d",
+                function_instance.function_key.host_id,
+                function_instance.function_key.pf_id,
+                function_instance.function_key.kind,
+                function_instance.function_key.vf_id)
+        );
+        config_stub.configure_fabric_bar_pairs(function_instance.bar_pairs);
+        config_stub.set_report_severity_id_override(
+            UVM_ERROR, "BAR_RESERVED", UVM_INFO
+        );
+        function_instance.transport.bar = config_stub;
+        function_instance.transport.notify_mgr.bar = config_stub;
+        function_instance.transport.cap_mgr.bar_ref = config_stub;
+
+        function_instance.transport.discover_fabric_preconfigured_bars();
+        if ((config_stub.config_write_count != 0) ||
+            !function_instance.transport.fabric_capability_discovered) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "Fabric discovery enumerated or rewrote a Fabric BAR")
+        end
+        assert_bar_layout(function_instance);
+
+        reserved_errors = config_stub.get_reserved_bar_access_error_count();
+        config_stub.read_reg(2, 32'h0, 4, reserved_data);
+        if ((reserved_data != '0) ||
+            (config_stub.get_reserved_bar_access_error_count() !=
+             (reserved_errors + 1))) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "BAR2/3 access did not produce a reserved-BAR monitor error")
+        end
+    endtask
+
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
 
@@ -138,7 +220,7 @@ class virtio_fabric_resource_test extends uvm_test;
         foreach (cfg.num_vfs_per_pf[host_id]) begin
             cfg.num_vfs_per_pf[host_id] = new[cfg.num_pfs_per_host[host_id]];
         end
-        cfg.num_vfs_per_pf[0][0] = 1;
+        cfg.num_vfs_per_pf[0][0] = DPU_MAX_VFS_PER_PF;
         cfg.num_vfs_per_pf[0][1] = 2;
         cfg.num_vfs_per_pf[1][0] = 3;
         cfg.num_vfs_per_pf[1][1] = 1;
@@ -150,24 +232,30 @@ class virtio_fabric_resource_test extends uvm_test;
     virtual task run_phase(uvm_phase phase);
         int unsigned expected_vfs[];
         int unsigned global_rx_qids[$];
+        bit [15:0] all_bdfs[$];
         bar_range_t all_bars[$];
         string why;
 
         phase.raise_objection(this);
         expected_vfs = new[4];
-        expected_vfs[0] = 1;
+        expected_vfs[0] = DPU_MAX_VFS_PER_PF;
         expected_vfs[1] = 2;
         expected_vfs[2] = 3;
         expected_vfs[3] = 1;
 
         if ((env.pf_instances.size() != 4) ||
-            (env.vf_instances.size() != 7)) begin
+            (env.vf_instances.size() != 22)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "expected 4 PFs and 7 VFs, received %0d and %0d",
+                "expected 4 PFs and 22 VFs, received %0d and %0d",
                 env.pf_instances.size(), env.vf_instances.size()))
         end
 
         foreach (env.pf_instances[pf_index]) begin
+            if ((env.pf_instances[pf_index].host_id != (pf_index / 2)) ||
+                (env.pf_instances[pf_index].pf_id != (pf_index % 2))) begin
+                `uvm_fatal("FABRIC_RESOURCE",
+                    "flattened PF array lost its host/PF coordinates")
+            end
             if (env.pf_instances[pf_index].num_vfs != expected_vfs[pf_index]) begin
                 `uvm_fatal("FABRIC_RESOURCE", $sformatf(
                     "PF %0d VF count does not match the requested topology", pf_index))
@@ -175,26 +263,59 @@ class virtio_fabric_resource_test extends uvm_test;
             if (env.pf_instances[pf_index].pf_function.transport.is_vf) begin
                 `uvm_fatal("FABRIC_RESOURCE", "PF function was modeled as a VF")
             end
+            foreach (all_bdfs[known_bdf]) begin
+                if (all_bdfs[known_bdf] == env.pf_instances[pf_index].pf_bdf)
+                    `uvm_fatal("FABRIC_RESOURCE", "PF BDF is not unique")
+            end
+            all_bdfs.push_back(env.pf_instances[pf_index].pf_bdf);
             assert_bar_layout(env.pf_instances[pf_index].pf_function);
             assert_unique_bars(env.pf_instances[pf_index].pf_function, all_bars);
-            assert_unique_qpair(env.pf_instances[pf_index].pf_function,
-                                global_rx_qids);
+            if (env.pf_instances[pf_index].pf_function.resource_client.reserve_qpairs(
+                0, 1, why
+            )) begin
+                `uvm_fatal("FABRIC_RESOURCE",
+                    "Fabric QP lease was accepted before capability discovery")
+            end
+            discover_fabric_function(env.pf_instances[pf_index].pf_function);
+            assert_unique_qpair(env.pf_instances[pf_index].pf_function, global_rx_qids);
 
             foreach (env.pf_instances[pf_index].vf_functions[vf_index]) begin
                 if (!env.pf_instances[pf_index].vf_functions[vf_index].transport.is_vf) begin
                     `uvm_fatal("FABRIC_RESOURCE", "VF function lost its VF identity")
                 end
+                foreach (all_bdfs[known_bdf]) begin
+                    if (all_bdfs[known_bdf] ==
+                        env.pf_instances[pf_index].vf_bdfs[vf_index]) begin
+                        `uvm_fatal("FABRIC_RESOURCE", "VF BDF is not unique")
+                    end
+                end
+                all_bdfs.push_back(env.pf_instances[pf_index].vf_bdfs[vf_index]);
                 assert_bar_layout(env.pf_instances[pf_index].vf_functions[vf_index]);
                 assert_unique_bars(env.pf_instances[pf_index].vf_functions[vf_index],
                                    all_bars);
+                if (env.pf_instances[pf_index].vf_functions[vf_index].resource_client.reserve_qpairs(
+                    0, 1, why
+                )) begin
+                    `uvm_fatal("FABRIC_RESOURCE",
+                        "Fabric QP lease was accepted before capability discovery")
+                end
+                discover_fabric_function(env.pf_instances[pf_index].vf_functions[vf_index]);
                 assert_unique_qpair(env.pf_instances[pf_index].vf_functions[vf_index],
                                     global_rx_qids);
             end
         end
 
-        if (global_rx_qids.size() != 11) begin
+        if ((env.pf_instances[0].vf_bdfs[DPU_MAX_VFS_PER_PF - 1] >=
+             env.pf_instances[1].pf_bdf) ||
+            (env.pf_instances[1].pf_bdf !=
+             (env.pf_instances[0].pf_bdf + DPU_MAX_VFS_PER_PF + 1))) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "maximum VF BDF range overlaps the adjacent PF BDF block")
+        end
+
+        if (global_rx_qids.size() != 26) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "expected one global RX queue ID for 11 functions, received %0d",
+                "expected one global RX queue ID for 26 functions, received %0d",
                 global_rx_qids.size()))
         end
 
