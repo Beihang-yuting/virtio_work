@@ -8,9 +8,8 @@ import dpu_resource_pkg::*;
 // ============================================================================
 // dpu_resource_manager_test
 //
-// Defines the topology boundary contract for the future resource manager:
+// Defines the topology boundary contract for the Fabric resource manager:
 // 4 hosts x 16 PFs plus 60 x 16 VFs consume all 1024 function identities.
-// The manager implementation is intentionally deferred to Task 3.
 // ============================================================================
 
 class dpu_resource_manager_test extends uvm_test;
@@ -60,6 +59,54 @@ class dpu_resource_manager_test extends uvm_test;
         return profile;
     endfunction
 
+    task assert_pf_bar_layout(input dpu_bar_pair_lease_t bars[$]);
+        if (bars.size() != 3) begin
+            `uvm_fatal("DPU_RESOURCE", "PF activation did not return three BAR pairs")
+        end
+        if ((bars[0].role != DPU_BAR_FUNCTION_DEVICE) ||
+            (bars[0].even_bar_id != 0) ||
+            (bars[0].size != 64'h0000_0000_0200_0000)) begin
+            `uvm_fatal("DPU_RESOURCE", "PF function-device BAR pair is incorrect")
+        end
+        if ((bars[1].role != DPU_BAR_RESERVED) ||
+            (bars[1].even_bar_id != 2) ||
+            (bars[1].size != 64'h0000_0000_0001_0000)) begin
+            `uvm_fatal("DPU_RESOURCE", "PF reserved BAR pair is incorrect")
+        end
+        if ((bars[2].role != DPU_BAR_MSIX) ||
+            (bars[2].even_bar_id != 4) ||
+            (bars[2].size != 64'h0000_0000_0001_0000)) begin
+            `uvm_fatal("DPU_RESOURCE", "PF MSI-X BAR pair is incorrect")
+        end
+    endtask
+
+    task assert_registration_and_activation_guards();
+        dpu_resource_manager guard_manager;
+        dpu_function_key_t parent_key;
+        dpu_function_key_t orphan_vf_key;
+        dpu_bar_pair_lease_t bars[$];
+        string why;
+
+        guard_manager = dpu_resource_manager::type_id::create("guard_manager");
+        parent_key = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
+        orphan_vf_key = make_function_key(0, 0, DPU_FUNCTION_VF, 0);
+
+        if (guard_manager.register_function(orphan_vf_key, why)) begin
+            `uvm_fatal("DPU_RESOURCE", "VF registration succeeded without its PF parent")
+        end
+        if (!guard_manager.register_function(parent_key, why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "guard PF registration failed: %s", why))
+        end
+        if (!guard_manager.configure_mmio_aperture(
+            64'h0001_1000_0000_0000, 64'h0001_1010_0000_0000)) begin
+            `uvm_fatal("DPU_RESOURCE", "guard MMIO aperture configuration failed")
+        end
+        if (guard_manager.activate_function(parent_key, bars, why)) begin
+            `uvm_fatal("DPU_RESOURCE", "activation succeeded before resource profiles sealed")
+        end
+    endtask
+
     task assert_fabric_global_qpair_capacity(
         dpu_resource_manager manager,
         dpu_resource_class_id_t qpair_class_id
@@ -68,6 +115,7 @@ class dpu_resource_manager_test extends uvm_test;
         dpu_function_key_t overflow_key;
         dpu_bar_pair_lease_t bars[$];
         dpu_resource_lease_t leases[$];
+        int unsigned global_id;
         string why;
 
         manager.configure_mmio_aperture(
@@ -81,6 +129,8 @@ class dpu_resource_manager_test extends uvm_test;
                         "PF activation failed for host %0d PF %0d: %s",
                         host_id, pf_id, why))
                 end
+                if ((host_id == 0) && (pf_id == 0))
+                    assert_pf_bar_layout(bars);
                 if (manager.acquire_leases(
                     key, qpair_class_id, 0, 1, leases, why
                 )) begin
@@ -119,6 +169,33 @@ class dpu_resource_manager_test extends uvm_test;
         end
 
         key = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
+        if (!manager.local_to_global(key, qpair_class_id, 0, global_id)) begin
+            `uvm_fatal("DPU_RESOURCE", "PF local QP ID did not resolve globally")
+        end
+        if (global_id != 0) begin
+            `uvm_fatal("DPU_RESOURCE", "first PF QP lease did not retain global ID zero")
+        end
+        if (manager.acquire_leases(
+            key, qpair_class_id, 32, 1, leases, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", "per-function QP quota unexpectedly exceeded")
+        end
+        if (!manager.freeze_function(key, why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "PF freeze failed: %s", why))
+        end
+        if (manager.acquire_leases(
+            key, qpair_class_id, 32, 1, leases, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", "frozen PF unexpectedly acquired a QP lease")
+        end
+        if (manager.release_leases(key, qpair_class_id, why)) begin
+            `uvm_fatal("DPU_RESOURCE", "frozen PF unexpectedly released QP leases")
+        end
+        if (!manager.restore_function(key, why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "PF restore failed: %s", why))
+        end
         if (!manager.release_leases(key, qpair_class_id, why)) begin
             `uvm_fatal("DPU_RESOURCE", $sformatf(
                 "PF QP release failed: %s", why))
@@ -129,10 +206,22 @@ class dpu_resource_manager_test extends uvm_test;
             `uvm_fatal("DPU_RESOURCE", $sformatf(
                 "QP lease did not recover after release: %s", why))
         end
+        if (!manager.local_to_global(
+            overflow_key, qpair_class_id, 0, global_id
+        )) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "recovered VF QP lease has no global ID")
+        end
+        if (global_id >= 2048) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "recovered VF QP global ID %0d exceeds the 2048-QP pool",
+                global_id))
+        end
     endtask
 
     virtual task run_phase(uvm_phase phase);
         dpu_resource_manager manager;
+        dpu_resource_manager child_manager;
         dpu_function_key_t key;
         dpu_resource_pool_config_t qpair_profile;
         dpu_resource_class_id_t qpair_class_id;
@@ -140,6 +229,8 @@ class dpu_resource_manager_test extends uvm_test;
         string why;
 
         phase.raise_objection(this);
+
+        assert_registration_and_activation_guards();
 
         qpair_profile = make_resource_profile(
             "virtio.qpair", DPU_RESOURCE_KIND_QUEUE, 2048, 32);
@@ -159,6 +250,14 @@ class dpu_resource_manager_test extends uvm_test;
         )) begin
             `uvm_fatal("DPU_RESOURCE", $sformatf(
                 "Fabric did not publish its resource manager"))
+        end
+        if (!uvm_config_db#(dpu_resource_manager)::get(
+            this, "fabric.protocol_client", "dpu_resource_manager", child_manager
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", "Fabric did not publish its manager to child scope")
+        end
+        if (child_manager != manager) begin
+            `uvm_fatal("DPU_RESOURCE", "Fabric child scope received a different manager")
         end
         if (manager.register_resource_class(
             qpair_profile.name, qpair_profile.kind, qpair_profile.capacity,

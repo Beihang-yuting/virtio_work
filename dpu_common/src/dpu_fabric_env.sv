@@ -39,6 +39,9 @@ class dpu_fabric_env extends uvm_env;
         uvm_config_db#(dpu_resource_manager)::set(
             this, "", "dpu_resource_manager", resource_manager
         );
+        uvm_config_db#(dpu_resource_manager)::set(
+            this, "*", "dpu_resource_manager", resource_manager
+        );
     endfunction
 
     function bit apply_resource_profiles(
@@ -58,6 +61,10 @@ class dpu_fabric_env extends uvm_env;
         end
         if (cfg == null) begin
             why = "DPU Fabric resource profile configuration is null";
+            return 0;
+        end
+        if (resource_manager.has_activated_functions()) begin
+            why = "DPU Fabric resource profiles cannot be applied after activation";
             return 0;
         end
 

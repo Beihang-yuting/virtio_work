@@ -37,6 +37,7 @@ class dpu_resource_manager extends uvm_object;
 
     protected dpu_resource_class_id_t next_resource_class_id;
     protected int unsigned            next_global_id;
+    protected int unsigned            activated_function_count;
     protected bit                     resource_classes_sealed;
 
     protected bit        aperture_configured;
@@ -48,6 +49,7 @@ class dpu_resource_manager extends uvm_object;
         super.new(name);
         next_resource_class_id = 0;
         next_global_id = 0;
+        activated_function_count = 0;
         resource_classes_sealed = 0;
         aperture_configured = 0;
         aperture_base = '0;
@@ -208,6 +210,8 @@ class dpu_resource_manager extends uvm_object;
         output string why
     );
         string key_name;
+        string parent_key_name;
+        dpu_function_key_t parent_key;
 
         if (!validate_function_key(key, why))
             return 0;
@@ -216,6 +220,17 @@ class dpu_resource_manager extends uvm_object;
         if (function_states.exists(key_name)) begin
             why = "function key is already registered";
             return 0;
+        end
+        if (key.kind == DPU_FUNCTION_VF) begin
+            parent_key.host_id = key.host_id;
+            parent_key.pf_id = key.pf_id;
+            parent_key.kind = DPU_FUNCTION_PF;
+            parent_key.vf_id = 0;
+            parent_key_name = function_key_name(parent_key);
+            if (!function_states.exists(parent_key_name)) begin
+                why = "VF function requires its PF parent to be registered";
+                return 0;
+            end
         end
         if (function_states.num() >= DPU_MAX_FUNCTIONS) begin
             why = "DPU_MAX_FUNCTIONS registrations have already been consumed";
@@ -241,6 +256,10 @@ class dpu_resource_manager extends uvm_object;
         aperture_limit = limit;
         next_bar_address = base;
         return 1;
+    endfunction
+
+    function bit has_activated_functions();
+        return (activated_function_count != 0);
     endfunction
 
     function bit register_resource_class(
@@ -338,6 +357,10 @@ class dpu_resource_manager extends uvm_object;
             why = "function is frozen";
             return 0;
         end
+        if (!resource_classes_sealed) begin
+            why = "resource classes must be sealed before function activation";
+            return 0;
+        end
         if (!aperture_configured) begin
             why = "MMIO aperture has not been configured";
             return 0;
@@ -371,6 +394,7 @@ class dpu_resource_manager extends uvm_object;
         state.bars = proposed_bars;
         state.activated = 1;
         state.device_ready = 0;
+        activated_function_count++;
         next_bar_address = cursor;
         bars = state.bars;
         why = "";
@@ -487,6 +511,10 @@ class dpu_resource_manager extends uvm_object;
 
         if (!lookup_function_state(key, state, why))
             return 0;
+        if (state.frozen) begin
+            why = "frozen function cannot release resource leases";
+            return 0;
+        end
         if (!resource_profiles_by_id.exists(class_id)) begin
             why = "resource-class ID is not registered";
             return 0;
