@@ -39,7 +39,7 @@
 
 Fabric 使用层次 function key：`(host_id, pf_id, function_kind={PF,VF}, vf_id_or_none)`。每个 PF 和 VF 都是独立的 function，拥有自己的 virtio device、BAR binding、transport、agent、virtqueue manager 和 dataplane。PCIe function manager 提供 BDF/config-space 访问；DPU manager 是 BAR 地址分配与唯一性检查的权威。
 
-资源服务只管理身份、容量、配额、亲和性、状态和 lease，不理解协议报文。core 仅定义 `dpu_resource_kind_e={FUNCTION,BAR,QUEUE,INTERRUPT_VECTOR,DMA_WINDOW}` 与 opaque `dpu_resource_class_id_t`；协议 client 在运行时注册自己的 class，并保存返回的 ID。注册 API 为 `register_resource_class(string name, dpu_resource_kind_e kind, int unsigned capacity, int unsigned max_per_function, output dpu_resource_class_id_t class_id, output string why)`。`name` 是 client 提供的 opaque label，manager 不内置、不匹配也不从中推导 virtio/RDMA/block 语义。`acquire_leases` 与 `release_leases` 只接收注册返回的 `class_id`。virtio-net 将其 queue-class lease 映射为 RX/TX 逻辑队列；RDMA 和 virtio-blk 将来注册各自的 QP/CQ 或 block queue class，而无需修改通用生命周期逻辑。
+资源服务只管理身份、容量、配额、亲和性、状态和 lease，不理解协议报文。core 仅定义 `dpu_resource_kind_e={FUNCTION,BAR,QUEUE,INTERRUPT_VECTOR,DMA_WINDOW}` 与 opaque `dpu_resource_class_id_t`。`dpu_fabric_env` 是唯一的 resource-class 注册 owner：它在 build/configuration 阶段、任何 function activation 前读取 `dpu_resource_pool_config_t` profile，逐个调用 `register_resource_class(string name, dpu_resource_kind_e kind, int unsigned capacity, int unsigned max_per_function, output dpu_resource_class_id_t class_id, output string why)`，将返回 ID 写回/inject 到 client，并在所有 profile 完成后封存 registry。`name` 是 Fabric 配置提供的 opaque label，manager 不内置、不匹配也不从中推导 virtio/RDMA/block 语义；相同 name+kind+capacity+quota 的注册幂等返回同一 ID，同 name 的冲突 profile 失败，封存后未知 profile 失败。client 只能 `lookup_resource_class(name, class_id, why)` 或接收 Fabric 注入的 ID；`acquire_leases` 与 `release_leases` 只接收该 ID。virtio-net 将其 queue-class lease 映射为 RX/TX 逻辑队列；RDMA 和 virtio-blk 将来只增加 profile data，而无需修改通用生命周期逻辑。
 
 ### BAR-first function activation
 
@@ -62,7 +62,7 @@ virtio 数据队列以 QP 原子租约分配：
 
 `(function_key, virtio_device, local_pair_id[0..31]) -> (global_qpair_id[0..2047], global_rx_qid, global_tx_qid)`。
 
-`global_rx_qid` 和 `global_tx_qid` 是由同一 QP lease 派生的方向性逻辑标识，不能分配给不同 device。创建 function 时不预留 QP；只有 BAR0/1 分配、写入 config space 并成功发现 virtio capability 后，virtio client 才能通过 `register_resource_class("virtio.qpair", DPU_RESOURCE_KIND_QUEUE, 2048, 32, virtio_qpair_class_id, why)` 注册其 profile、保存 `virtio_qpair_class_id`，并在协商和 queue setup 时以该 opaque ID 调用通用 lease API。2048 与 32 是这个 client profile 的数值，不属于 DPU core 类型。因而 64 个 device 可以各开满 32 QP，或 2048 个 device 各申请 1 QP。FLR、device reset、迁移和 SR-IOV disable 必须执行相应的冻结、恢复或释放操作。Control VQ 与 Admin VQ 也由 client 注册为独立 class 与容量，绝不隐式消耗或绕开数据 QP 池。
+`global_rx_qid` 和 `global_tx_qid` 是由同一 QP lease 派生的方向性逻辑标识，不能分配给不同 device。创建 function 时不预留 QP；`dpu_fabric_env` 在 activation 前一次性从 profile data 注册 `name="virtio.qpair"`, `kind=DPU_RESOURCE_KIND_QUEUE`, `capacity=2048`, `max_per_function=32`，封存 registry，并把唯一的 `virtio_qpair_class_id` 注入或供 client lookup。2048 与 32 是这个 client profile 的数值，不属于 DPU core 类型。BAR0/1 分配、写入 config space 并成功发现 virtio capability 后，virtio client 只能使用该同一 opaque ID 调用通用 lease API；它不得注册 resource class。因而 64 个已就绪 function 可以各申请 32 QP，恰好耗尽全局 2048 池。FLR、device reset、迁移和 SR-IOV disable 必须执行相应的冻结、恢复或释放操作。Control VQ 与 Admin VQ 也由 Fabric 配置注册为独立 class 与容量，绝不隐式消耗或绕开数据 QP 池。
 
 当前 `virtio_vf_resource_pool` 仅为 virtio client 的本地映射视图；它不再分配全局 ID。其 mapping key 扩展为完整 function key 与 `local_qid`，global QP allocator 才是 global ID 的唯一来源。
 
@@ -124,8 +124,8 @@ PF manager 保存独立的 Admin VQ transport/queue 上下文。`admin_cmd()` �
 - 迁移 dirty-page 正反向测试及 SVA pass/fail 测试。
 - Fabric 拓扑测试：4 host、16 PF/host、PF/VF 合并 1024 function 边界、16 VF/PF 局部上限和全局 960 VF 余量。
 - BAR allocator 测试：PF/VF 的三组 pair size、64-bit paired-BAR config encoding、对齐与不重叠、2,116 MiB 最大激活布局；验证 BAR0/1 仅为 device window、BAR4/5 仅为 MSI-X table/PBA、BAR2/3 虽已分配但无 binding 且功能性访问被拒绝；并验证 BAR0/1 discovery 早于动态资源 lease。
-- QP allocator 测试：2048 QP 耗尽、32 QP/device 上限、不同 function 的 local-q 重名、RX/TX 不可拆分、FLR/迁移后的 lease 回收与 BAR 唯一性。
-- 跨协议 client contract 测试：virtio client 与模拟 RDMA/block client 在同一 manager 下申请不同 resource class，验证不发生 ID 或配额串扰。
+- QP allocator 测试：Fabric 对同 profile 的幂等注册返回一个 ID、冲突 profile 被拒绝、封存后未知 profile 被拒绝、64 个已就绪 function 各申请 32 QP 后耗尽全局 2048 池、不同 function 的 local-q 重名、RX/TX 不可拆分、FLR/迁移后的 lease 回收与 BAR 唯一性。
+- 跨协议 client contract 测试：Fabric 为 virtio 与模拟 RDMA/block client 预注册不同 profile；各 client 仅 lookup/inject 相应 ID 并申请 lease，验证不发生 ID 或配额串扰。
 
 完成条件为：`make check-deps`、全部可用的 VCS 回归、git diff 检查和 submodule 状态检查通过；若执行环境没有 VCS，则必须明确报告该外部限制，并完成所有无需 VCS 的静态与依赖验证。
 

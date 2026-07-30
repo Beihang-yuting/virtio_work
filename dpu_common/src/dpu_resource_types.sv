@@ -49,6 +49,7 @@ typedef struct {
 } dpu_resource_lease_t;
 
 typedef struct {
+  string name;
   dpu_resource_class_id_t class_id;
   dpu_resource_kind_e kind;
   int unsigned capacity;

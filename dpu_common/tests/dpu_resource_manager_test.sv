@@ -35,13 +35,147 @@ class dpu_resource_manager_test extends uvm_test;
         return key;
     endfunction
 
+    function automatic dpu_resource_pool_config_t make_resource_profile(
+        string name,
+        dpu_resource_kind_e kind,
+        int unsigned capacity,
+        int unsigned max_per_function
+    );
+        dpu_resource_pool_config_t profile;
+
+        profile.name = name;
+        profile.kind = kind;
+        profile.capacity = capacity;
+        profile.max_per_function = max_per_function;
+        return profile;
+    endfunction
+
+    task assert_fabric_global_qpair_capacity(
+        dpu_resource_manager manager,
+        dpu_resource_class_id_t qpair_class_id
+    );
+        dpu_function_key_t key;
+        dpu_function_key_t overflow_key;
+        dpu_bar_pair_lease_t bars[$];
+        dpu_resource_lease_t leases[$];
+        string why;
+
+        manager.configure_mmio_aperture(
+            64'h0001_0000_0000_0000, 64'h0001_0010_0000_0000);
+
+        for (int unsigned host_id = 0; host_id < DPU_MAX_HOSTS; host_id++) begin
+            for (int unsigned pf_id = 0; pf_id < DPU_MAX_PFS_PER_HOST; pf_id++) begin
+                key = make_function_key(host_id, pf_id, DPU_FUNCTION_PF, 0);
+                if (!manager.activate_function(key, bars, why)) begin
+                    `uvm_fatal("DPU_RESOURCE", $sformatf(
+                        "PF activation failed for host %0d PF %0d: %s",
+                        host_id, pf_id, why))
+                end
+                if (!manager.mark_function_device_ready(key, why)) begin
+                    `uvm_fatal("DPU_RESOURCE", $sformatf(
+                        "PF readiness failed for host %0d PF %0d: %s",
+                        host_id, pf_id, why))
+                end
+                if (!manager.acquire_leases(
+                    key, qpair_class_id, 0, 32, leases, why
+                )) begin
+                    `uvm_fatal("DPU_RESOURCE", $sformatf(
+                        "QP lease failed for host %0d PF %0d: %s",
+                        host_id, pf_id, why))
+                end
+            end
+        end
+
+        overflow_key = make_function_key(0, 0, DPU_FUNCTION_VF, 0);
+        if (!manager.activate_function(overflow_key, bars, why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "overflow VF activation failed: %s", why))
+        end
+        if (!manager.mark_function_device_ready(overflow_key, why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "overflow VF readiness failed: %s", why))
+        end
+        if (manager.acquire_leases(
+            overflow_key, qpair_class_id, 0, 1, leases, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", "the 2,049th QP lease unexpectedly succeeded")
+        end
+
+        key = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
+        if (!manager.release_leases(key, qpair_class_id, why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "PF QP release failed: %s", why))
+        end
+        if (!manager.acquire_leases(
+            overflow_key, qpair_class_id, 0, 1, leases, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "QP lease did not recover after release: %s", why))
+        end
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         dpu_resource_manager manager;
         dpu_function_key_t key;
+        dpu_resource_pool_config_t qpair_profile;
+        dpu_resource_pool_config_t conflicting_profile;
+        dpu_resource_class_id_t qpair_class_id;
+        dpu_resource_class_id_t repeated_class_id;
+        dpu_resource_class_id_t lookup_class_id;
+        dpu_resource_class_id_t rejected_class_id;
         string why;
 
         phase.raise_objection(this);
         manager = dpu_resource_manager::type_id::create("manager");
+
+        qpair_profile = make_resource_profile(
+            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE, 2048, 32);
+        if (!manager.register_resource_class(
+            qpair_profile.name, qpair_profile.kind, qpair_profile.capacity,
+            qpair_profile.max_per_function, qpair_class_id, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "initial QP profile registration failed: %s", why))
+        end
+        if (!manager.register_resource_class(
+            qpair_profile.name, qpair_profile.kind, qpair_profile.capacity,
+            qpair_profile.max_per_function, repeated_class_id, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "idempotent QP profile registration failed: %s", why))
+        end
+        if (qpair_class_id != repeated_class_id) begin
+            `uvm_fatal("DPU_RESOURCE", "same QP profile received distinct class IDs")
+        end
+
+        conflicting_profile = make_resource_profile(
+            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE, 2047, 32);
+        if (manager.register_resource_class(
+            conflicting_profile.name, conflicting_profile.kind,
+            conflicting_profile.capacity, conflicting_profile.max_per_function,
+            rejected_class_id, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", "conflicting QP profile unexpectedly registered")
+        end
+        if (!manager.seal_resource_classes(why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "resource-class registry seal failed: %s", why))
+        end
+        if (manager.register_resource_class(
+            "future.unknown", DPU_RESOURCE_KIND_QUEUE, 1, 1,
+            rejected_class_id, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", "sealed registry accepted an unknown profile")
+        end
+        if (!manager.lookup_resource_class(
+            qpair_profile.name, lookup_class_id, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "registered QP profile lookup failed: %s", why))
+        end
+        if (lookup_class_id != qpair_class_id) begin
+            `uvm_fatal("DPU_RESOURCE", "QP profile lookup returned a different class ID")
+        end
 
         for (int unsigned host_id = 0; host_id < DPU_MAX_HOSTS; host_id++) begin
             for (int unsigned pf_id = 0; pf_id < DPU_MAX_PFS_PER_HOST; pf_id++) begin
@@ -79,6 +213,8 @@ class dpu_resource_manager_test extends uvm_test;
         if (manager.validate_vf_key(key, why)) begin
             `uvm_fatal("DPU_RESOURCE", "VF key with vf_id == 16 unexpectedly validated")
         end
+
+        assert_fabric_global_qpair_capacity(manager, qpair_class_id);
 
         phase.drop_objection(this);
     endtask

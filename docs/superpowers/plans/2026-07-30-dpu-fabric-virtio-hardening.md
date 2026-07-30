@@ -183,6 +183,7 @@ typedef struct {
   bit frozen;
 } dpu_resource_lease_t;
 typedef struct {
+  string name;
   dpu_resource_class_id_t class_id;
   dpu_resource_kind_e kind;
   int unsigned capacity;
@@ -223,11 +224,39 @@ git commit -m "feat: define shared DPU resource identities"
 Extend the test with these expectations:
 
 ```systemverilog
+dpu_resource_pool_config_t virtio_qpair_profile;
 dpu_resource_class_id_t virtio_qpair_class_id;
+dpu_resource_class_id_t repeated_class_id;
+dpu_resource_class_id_t lookup_class_id;
+dpu_resource_class_id_t rejected_class_id;
+virtio_qpair_profile.name = "virtio.qpair";
+virtio_qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
+virtio_qpair_profile.capacity = 2048;
+virtio_qpair_profile.max_per_function = 32;
 rm.configure_mmio_aperture(64'h0001_0000_0000_0000, 64'h0001_0010_0000_0000);
-assert(rm.register_resource_class("virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
-                                  2048, 32, virtio_qpair_class_id, why))
+assert(rm.register_resource_class(virtio_qpair_profile.name, virtio_qpair_profile.kind,
+                                  virtio_qpair_profile.capacity,
+                                  virtio_qpair_profile.max_per_function,
+                                  virtio_qpair_class_id, why))
   else `uvm_fatal("DPU_TEST", why)
+assert(rm.register_resource_class(virtio_qpair_profile.name, virtio_qpair_profile.kind,
+                                  virtio_qpair_profile.capacity,
+                                  virtio_qpair_profile.max_per_function,
+                                  repeated_class_id, why))
+  else `uvm_fatal("DPU_TEST", why)
+assert(repeated_class_id == virtio_qpair_class_id)
+  else `uvm_error("DPU_TEST", "same profile produced multiple global pools")
+assert(!rm.register_resource_class("virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
+                                   2047, 32, rejected_class_id, why))
+  else `uvm_error("DPU_TEST", "same name with conflicting profile was accepted")
+assert(rm.seal_resource_classes(why)) else `uvm_fatal("DPU_TEST", why)
+assert(!rm.register_resource_class("future.unknown", DPU_RESOURCE_KIND_QUEUE,
+                                   1, 1, rejected_class_id, why))
+  else `uvm_error("DPU_TEST", "sealed registry accepted an unknown profile")
+assert(rm.lookup_resource_class("virtio.qpair", lookup_class_id, why))
+  else `uvm_fatal("DPU_TEST", why)
+assert(lookup_class_id == virtio_qpair_class_id)
+  else `uvm_error("DPU_TEST", "lookup did not return the Fabric-owned pool ID")
 assert(rm.activate_function(pf_key, pf_bars, why)) else `uvm_fatal("DPU_TEST", why)
 assert(pf_bars[0].role == DPU_BAR_FUNCTION_DEVICE && pf_bars[0].even_bar_id == 0 && pf_bars[0].size == 32*1024*1024)
   else `uvm_error("DPU_TEST", "PF BAR0/1 layout is wrong")
@@ -243,7 +272,7 @@ assert(!rm.acquire_leases(pf_key, virtio_qpair_class_id, 32, 33, leases_b, why))
   else `uvm_error("DPU_TEST", "per-device QP limit accepted")
 ```
 
-For `host_id in [0:3]` and `pf_id in [0:15]`, activate and mark each PF function ready, then acquire local QP IDs `[0:31]` using the returned `virtio_qpair_class_id`. Verify that the 65th request fails due to this 2,048-QP client profile, call `release_leases()` for the PF at `(0,0)` with that ID, and verify that this PF can reacquire 32 QPs. This proves capacity exhaustion and recovery without a manager-side virtio-specific API.
+`dpu_fabric_env` alone applies `resource_profiles[$]` before any function activation; the unit test calls the same manager contract to verify its semantics. For `host_id in [0:3]` and `pf_id in [0:15]`, activate and mark each of the 64 PF functions ready, then acquire local QP IDs `[0:31]` using the one returned `virtio_qpair_class_id`. This exactly consumes the global 2,048-QP profile. Activate and ready a registered VF, verify its next lease fails, release the PF at `(0,0)`, then verify the VF can acquire a lease. This proves global exhaustion and recovery without a manager-side virtio-specific API or an invalid request for more than 1,024 functions.
 
 - [ ] **Step 2: Run the new test to verify it fails**
 
@@ -265,6 +294,10 @@ class dpu_resource_manager extends uvm_object;
     string name, dpu_resource_kind_e kind,
     int unsigned capacity, int unsigned max_per_function,
     output dpu_resource_class_id_t class_id, output string why);
+  function bit lookup_resource_class(string name,
+                                     output dpu_resource_class_id_t class_id,
+                                     output string why);
+  function bit seal_resource_classes(output string why);
   function bit activate_function(dpu_function_key_t key, ref dpu_bar_pair_lease_t bars[$], output string why);
   function bit mark_function_device_ready(dpu_function_key_t key, output string why);
   function bit acquire_leases(
@@ -282,9 +315,9 @@ endclass : dpu_resource_manager
 
 `activate_function()` first validates the hierarchy/function count, then allocates three aligned non-overlapping 64-bit BAR pairs from the configured MMIO aperture: PF `{BAR0/1:32 MiB function-device, BAR2/3:64 KiB reserved, BAR4/5:64 KiB MSI-X}` and VF `{BAR0/1:16 KiB function-device, BAR2/3:16 KiB reserved, BAR4/5:32 KiB MSI-X}`. It emits only even BAR leases; the caller writes each base low/high to its even/odd PCI config slots. BAR2/3 is a consumed but unbound reservation: its lease is retained solely for config programming and ownership tracking, and is never exposed through a functional MMIO accessor. `mark_function_device_ready()` is called only after the client has completed BAR0/1 discovery.
 
-`register_resource_class()` validates and records a client-supplied opaque label, generic kind, capacity and per-function quota, then returns an opaque ID. The manager never branches on the label or derives protocol behavior from an ID. `acquire_leases()` accepts only a registered ID, assigns unique global IDs, rejects duplicate local IDs, and is unavailable before device readiness or while frozen. The virtio client registers `"virtio.qpair"` with kind `DPU_RESOURCE_KIND_QUEUE`, capacity 2048 and per-function limit 32, saves the returned ID, acquires one lease per QP, and derives RX/TX IDs as `2*global_id` and `2*global_id+1`. RDMA and block clients register and acquire their own IDs through the same API. Reject a duplicate function key, invalid hierarchy, insufficient aperture, an unregistered ID, an unready/frozen function, count zero, quota violation and exhausted capacity. `release_leases()` removes only the requesting function/class leases. `freeze_function` retains BAR/resource ownership and blocks new allocation; `restore_function` unfreezes it.
+`register_resource_class()` validates and records a Fabric-supplied opaque label, generic kind, capacity and per-function quota, then returns an opaque ID. Equal name+kind+capacity+quota registration is idempotent and returns the existing ID; a reused name with any different profile fails. `lookup_resource_class()` returns an existing ID by name. `seal_resource_classes()` prevents unknown future registration after Fabric has applied all profiles. The manager never branches on a label or derives protocol behavior from an ID. `acquire_leases()` accepts only a registered ID, assigns unique global IDs, rejects duplicate local IDs, and is unavailable before device readiness or while frozen. `dpu_fabric_env` registers the `"virtio.qpair"` profile once with kind `DPU_RESOURCE_KIND_QUEUE`, capacity 2048 and per-function limit 32; clients only receive/inquire its returned ID, acquire one lease per QP, and derive RX/TX IDs as `2*global_id` and `2*global_id+1`. RDMA and block support adds Fabric profile data and client lookup only. Reject a duplicate function key, invalid hierarchy, insufficient aperture, an unregistered ID, an unready/frozen function, count zero, quota violation and exhausted capacity. `release_leases()` removes only the requesting function/class leases. `freeze_function` retains BAR/resource ownership and blocks new allocation; `restore_function` unfreezes it.
 
-`dpu_fabric_env` creates exactly one manager in `build_phase` and places it into `uvm_config_db#(dpu_resource_manager)` under key `dpu_resource_manager` for child protocol environments.
+`dpu_fabric_env` creates exactly one manager in `build_phase`, reads generic `dpu_resource_pool_config_t resource_profiles[$]` from its configuration, calls `register_resource_class()` for every profile before any function activation, stores each returned `class_id`, seals the registry only after all profiles are registered, and then places the manager plus injected/lookupable IDs into `uvm_config_db#(dpu_resource_manager)` for child protocol environments. It is the sole registration owner; protocol clients never call `register_resource_class()`.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -331,7 +364,7 @@ Add topology fields `num_hosts`, `max_hosts`, `num_pfs_per_host[]`, `num_vfs_per
 
 `virtio_function_instance` owns one driver agent, transport, queue manager, dataplane, `dpu_function_key_t`, and three `dpu_bar_pair_lease_t` records; its `configure_function()` receives function kind, BDF, BAR leases and resource manager. Program BAR0/1, BAR2/3 and BAR4/5 into config space before transport discovery. Bind `transport.bar.bar_base[0]` only to BAR0/1 and add an MSI-X table/PBA aperture binding only to BAR4/5; BAR2/3 has no functional accessor and a direct TLP to it is classified as a reserved-BAR monitor error. `virtio_pf_instance` owns one PF function plus `vf_functions[]` and its PF manager. Preserve a compatibility `virtio_vf_instance` wrapper extending `virtio_function_instance` and forcing `DPU_FUNCTION_VF` until external users migrate.
 
-After `transport.discover_and_init_bars()` validates BAR0/1 virtio capabilities, `virtio_resource_client` registers `"virtio.qpair"` as `DPU_RESOURCE_KIND_QUEUE` with its 2048/32 profile, saves the returned `virtio_qpair_class_id`, calls `mark_function_device_ready()`, then calls `acquire_leases(key, virtio_qpair_class_id, ...)`. It stores `{local_pair, rx_global_qid, tx_global_qid}` and exposes `local_qid_to_global_qid()`. It alone derives RX/TX IDs from its generic lease IDs. Reserve at queue setup, release the saved class ID at teardown/FLR/disable, freeze before migration and restore after migration. Update `virtio_vf_resource_pool` to become a local view keyed by full function key and never increment `next_global_qid`.
+During Fabric configuration, `dpu_fabric_env` pre-registers the `"virtio.qpair"` `DPU_RESOURCE_KIND_QUEUE` 2048/32 profile once, seals the registry, and injects its `virtio_qpair_class_id`; `virtio_resource_client` may only lookup that existing name during binding, never register it. After `transport.discover_and_init_bars()` validates BAR0/1 virtio capabilities, the client calls `mark_function_device_ready()` then `acquire_leases(key, virtio_qpair_class_id, ...)`. It stores `{local_pair, rx_global_qid, tx_global_qid}` and exposes `local_qid_to_global_qid()`. It alone derives RX/TX IDs from its generic lease IDs. Reserve at queue setup, release the saved class ID at teardown/FLR/disable, freeze before migration and restore after migration. Update `virtio_vf_resource_pool` to become a local view keyed by full function key and never increment `next_global_qid`.
 
 - [ ] **Step 4: Run topology and existing unit tests**
 
@@ -582,7 +615,7 @@ Expected: all listed tests PASS when VCS is available. If VCS is unavailable, `m
 
 - [ ] **Step 3: Document exact operating model**
 
-Update README/manual with the 4-host/16-PF/16-VF-local/1024-function-global limits, the virtio client QP registration profile of 2048 global QPs and 32 QPs/function (not DPU enum constants), the fact that full-PF activation leaves 960 active VF slots, and the BAR-first mapping: PF `BAR0/1=32 MiB function-device`, `BAR2/3=64 KiB reserved`, `BAR4/5=64 KiB MSI-X table/PBA`; VF `BAR0/1=16 KiB function-device`, `BAR2/3=16 KiB reserved`, `BAR4/5=32 KiB MSI-X table/PBA`. State that current virtio capability discovery is only in BAR0/1, BAR2/3 consumes address space but has no binding and all functional accesses are violations, and BAR4/5 is only MSI-X table/PBA. Document 64-bit MMIO aperture configuration, alignment/no-overlap checks, capability discovery before dynamic-resource acquisition, runtime registration of opaque class IDs and the generic resource-pool/lease API as the future RDMA/virtio-blk integration point, and special-VQ capacity as a separate client registration.
+Update README/manual with the 4-host/16-PF/16-VF-local/1024-function-global limits, the Fabric-owned virtio QP profile of 2048 global QPs and 32 QPs/function (not DPU enum constants), the fact that full-PF activation leaves 960 active VF slots, and the BAR-first mapping: PF `BAR0/1=32 MiB function-device`, `BAR2/3=64 KiB reserved`, `BAR4/5=64 KiB MSI-X table/PBA`; VF `BAR0/1=16 KiB function-device`, `BAR2/3=16 KiB reserved`, `BAR4/5=32 KiB MSI-X table/PBA`. State that current virtio capability discovery is only in BAR0/1, BAR2/3 consumes address space but has no binding and all functional accesses are violations, and BAR4/5 is only MSI-X table/PBA. Document 64-bit MMIO aperture configuration, alignment/no-overlap checks, Fabric pre-registration and sealing of opaque class IDs before function activation, capability discovery before dynamic-resource acquisition, the generic resource-pool/lease API as the future RDMA/virtio-blk integration point, and special-VQ capacity as a separate Fabric profile.
 
 - [ ] **Step 4: Run final repository verification**
 
