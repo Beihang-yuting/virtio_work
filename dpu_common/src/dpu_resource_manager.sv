@@ -565,6 +565,14 @@ class dpu_resource_manager extends uvm_object;
             why = "local resource ID range overflows";
             return 0;
         end
+
+        for (int unsigned offset = 0; offset < count; offset++) begin
+            if (has_local_id(state, class_id, first_local_id + offset)) begin
+                why = "local resource ID is already leased by this function";
+                return 0;
+            end
+        end
+
         profile = resource_profiles_by_id[class_id];
         current_function_count = function_class_lease_count(state, class_id);
         if ((current_function_count > profile.max_per_function) ||
@@ -577,13 +585,6 @@ class dpu_resource_manager extends uvm_object;
             ((profile.capacity - current_class_count) < count)) begin
             why = "resource-class capacity would be exceeded";
             return 0;
-        end
-
-        for (int unsigned offset = 0; offset < count; offset++) begin
-            if (has_local_id(state, class_id, first_local_id + offset)) begin
-                why = "local resource ID is already leased by this function";
-                return 0;
-            end
         end
 
         if (!allocate_global_ids(

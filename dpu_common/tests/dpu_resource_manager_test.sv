@@ -197,6 +197,16 @@ class dpu_resource_manager_test extends uvm_test;
             `uvm_fatal("DPU_RESOURCE", "first PF QP lease did not retain global ID zero")
         end
         if (manager.acquire_leases(
+            key, qpair_class_id, 0, 1, leases, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "quota-exhausted PF unexpectedly reacquired local QP ID zero")
+        end
+        if (why != "local resource ID is already leased by this function") begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "duplicate local QP ID was masked by another rejection: %s", why))
+        end
+        if (manager.acquire_leases(
             key, qpair_class_id, 32, 1, leases, why
         )) begin
             `uvm_fatal("DPU_RESOURCE", "per-function QP quota unexpectedly exceeded")
