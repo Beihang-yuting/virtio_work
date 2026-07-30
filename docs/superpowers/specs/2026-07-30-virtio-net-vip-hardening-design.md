@@ -32,14 +32,32 @@
 | PF/Host | 16 | 每个 host 可枚举的 PF 数 |
 | VF/PF | 16 | 单 PF 的局部 VF 能力上限 |
 | Function/DPU | 1024 | PF 与 VF 合并计数的激活 function 上限 |
-| virtio client QP profile/DPU | 2048 | virtio client 注册 queue class 时使用的容量，不是 DPU 类型 enum/常数 |
-| virtio client QP profile/device | 32 | 同一注册 profile 的每-function 上限，不是 DPU 类型 enum/常数 |
+| Fabric startup virtio QP profile/DPU | 2048 | Fabric 启动期登记的当前 virtio profile 容量，不是 DPU 类型 enum/常数 |
+| Fabric startup virtio QP profile/function | 32 | 同一 Fabric 登记 profile 的每-function 上限，不是 DPU 类型 enum/常数 |
 
 64 个 PF（4 host × 16 PF）本身已占用 64 个 function slot。因此全部 PF 激活时，DPU 最多再激活 960 个 VF；`16 VF/PF` 是局部能力而非可在全部 64 个 PF 同时达到的全局保证。配置验证在创建任何 function 前检查 `active_pf_count + active_vf_count <= 1024`。
 
 Fabric 使用层次 function key：`(host_id, pf_id, function_kind={PF,VF}, vf_id_or_none)`。每个 PF 和 VF 都是独立的 function，拥有自己的 virtio device、BAR binding、transport、agent、virtqueue manager 和 dataplane。PCIe function manager 提供 BDF/config-space 访问；DPU manager 是 BAR 地址分配与唯一性检查的权威。
 
 资源服务只管理身份、容量、配额、亲和性、状态和 lease，不理解协议报文。core 仅定义 `dpu_resource_kind_e={FUNCTION,BAR,QUEUE,INTERRUPT_VECTOR,DMA_WINDOW}` 与 opaque `dpu_resource_class_id_t`。`dpu_fabric_env` 是唯一的 resource-class 注册 owner：它在 build/configuration 阶段、任何 function activation 前读取 `dpu_resource_pool_config_t` profile，逐个调用 `register_resource_class(string name, dpu_resource_kind_e kind, int unsigned capacity, int unsigned max_per_function, output dpu_resource_class_id_t class_id, output string why)`，将返回 ID 写回/inject 到 client，并在所有 profile 完成后封存 registry。`name` 是 Fabric 配置提供的 opaque label，manager 不内置、不匹配也不从中推导 virtio/RDMA/block 语义；相同 name+kind+capacity+quota 的注册幂等返回同一 ID，同 name 的冲突 profile 失败，封存后未知 profile 失败。client 只能 `lookup_resource_class(name, class_id, why)` 或接收 Fabric 注入的 ID；`acquire_leases` 与 `release_leases` 只接收该 ID。virtio-net 将其 queue-class lease 映射为 RX/TX 逻辑队列；RDMA 和 virtio-blk 将来只增加 profile data，而无需修改通用生命周期逻辑。
+
+Future Fabric API is deliberately separate from client APIs:
+
+```systemverilog
+class dpu_fabric_env_config extends uvm_object;
+  `uvm_object_utils(dpu_fabric_env_config)
+  dpu_resource_pool_config_t resource_profiles[$];
+endclass
+
+class dpu_fabric_env extends uvm_env;
+  function bit apply_resource_profiles(
+    dpu_fabric_env_config cfg, output string why);
+  function bit lookup_resource_class(
+    string name, output dpu_resource_class_id_t class_id, output string why);
+endclass
+```
+
+`apply_resource_profiles()` is the only path that invokes manager registration: it registers every profile before activation, then calls `seal_resource_classes()`. Client lookup may delegate to the manager but never exposes a client registration path. A direct manager registration attempted after Fabric sealing, including an otherwise identical profile, must fail.
 
 ### BAR-first function activation
 
@@ -50,7 +68,7 @@ Fabric 使用层次 function key：`(host_id, pf_id, function_kind={PF,VF}, vf_i
 | PF | virtio device, 32 MiB | reserved, 64 KiB | MSI-X table/PBA, 64 KiB |
 | VF | virtio device, 16 KiB | reserved, 16 KiB | MSI-X table/PBA, 32 KiB |
 
-`dpu_resource_manager::activate_function()` 顺序为：验证 function 容量与层次 → 分配并记录三个 BAR pair → 将 BAR 值写入 PCI config space → 将 BAR0/1 绑定为该 function 唯一的 device window、BAR4/5 绑定为该 function 的 MSI-X table/PBA aperture → client 在 BAR0/1 内完成 device capability discovery → 允许该 function 的动态资源 lease。对于本次 virtio client，动态资源是 QP 与 MSI-X vector。
+`dpu_resource_manager::activate_function()` 顺序为：验证 function 容量与层次 → 分配并记录三个 BAR pair → 将 BAR 值写入 PCI config space → 将 BAR0/1 绑定为该 function 唯一的 device window、BAR4/5 绑定为该 function 的 MSI-X table/PBA aperture → client 在 BAR0/1 内完成 device capability discovery → `mark_function_device_ready()` → 允许该 function 的动态资源 lease。对于本次 virtio client，动态资源是 QP 与 MSI-X vector。
 
 BAR2/3 始终消耗地址空间，但没有 function、transport 或 MSI-X binding；它既不是 device window，也不是 MSI-X window，不能经由功能性 accessor 读写。直接到达 BAR2/3 的 PCIe memory transaction 由 monitor 作为 reserved-BAR violation 报错；BAR0/1 的普通 device MMIO 与 BAR4/5 的 MSI-X table/PBA MMIO 必须分别按其角色解码和检查。FLR 保留 function/BAR ownership，SR-IOV disable 或 function destroy 才释放 BAR lease；迁移 freeze/restore 保留原地址。
 
@@ -62,7 +80,7 @@ virtio 数据队列以 QP 原子租约分配：
 
 `(function_key, virtio_device, local_pair_id[0..31]) -> (global_qpair_id[0..2047], global_rx_qid, global_tx_qid)`。
 
-`global_rx_qid` 和 `global_tx_qid` 是由同一 QP lease 派生的方向性逻辑标识，不能分配给不同 device。创建 function 时不预留 QP；`dpu_fabric_env` 在 activation 前一次性从 profile data 注册 `name="virtio.qpair"`, `kind=DPU_RESOURCE_KIND_QUEUE`, `capacity=2048`, `max_per_function=32`，封存 registry，并把唯一的 `virtio_qpair_class_id` 注入或供 client lookup。2048 与 32 是这个 client profile 的数值，不属于 DPU core 类型。BAR0/1 分配、写入 config space 并成功发现 virtio capability 后，virtio client 只能使用该同一 opaque ID 调用通用 lease API；它不得注册 resource class。因而 64 个已就绪 function 可以各申请 32 QP，恰好耗尽全局 2048 池。FLR、device reset、迁移和 SR-IOV disable 必须执行相应的冻结、恢复或释放操作。Control VQ 与 Admin VQ 也由 Fabric 配置注册为独立 class 与容量，绝不隐式消耗或绕开数据 QP 池。
+`global_rx_qid` 和 `global_tx_qid` 是由同一 QP lease 派生的方向性逻辑标识，不能分配给不同 device。创建 function 时不预留 QP；`dpu_fabric_env` 在 activation 前一次性从 profile data 注册 `name="virtio.qpair"`, `kind=DPU_RESOURCE_KIND_QUEUE`, `capacity=2048`, `max_per_function=32`，封存 registry，并把唯一的 `virtio_qpair_class_id` 注入或供 client lookup。2048 与 32 是这个 client profile 的数值，不属于 DPU core 类型。BAR0/1 分配、写入 config space 并成功发现 virtio capability 后，virtio client 只能使用该同一 opaque ID 调用通用 lease API；resource-class registration 保持为 Fabric-only。对每个已激活 function，`acquire_leases` 必须在 `mark_function_device_ready()` 前失败，且仅在 ready 后允许成功。因而 64 个已就绪 function 可以各申请 32 QP，恰好耗尽全局 2048 池。FLR、device reset、迁移和 SR-IOV disable 必须执行相应的冻结、恢复或释放操作。Control VQ 与 Admin VQ 也由 Fabric 配置注册为独立 class 与容量，绝不隐式消耗或绕开数据 QP 池。
 
 当前 `virtio_vf_resource_pool` 仅为 virtio client 的本地映射视图；它不再分配全局 ID。其 mapping key 扩展为完整 function key 与 `local_qid`，global QP allocator 才是 global ID 的唯一来源。
 
@@ -124,7 +142,7 @@ PF manager 保存独立的 Admin VQ transport/queue 上下文。`admin_cmd()` �
 - 迁移 dirty-page 正反向测试及 SVA pass/fail 测试。
 - Fabric 拓扑测试：4 host、16 PF/host、PF/VF 合并 1024 function 边界、16 VF/PF 局部上限和全局 960 VF 余量。
 - BAR allocator 测试：PF/VF 的三组 pair size、64-bit paired-BAR config encoding、对齐与不重叠、2,116 MiB 最大激活布局；验证 BAR0/1 仅为 device window、BAR4/5 仅为 MSI-X table/PBA、BAR2/3 虽已分配但无 binding 且功能性访问被拒绝；并验证 BAR0/1 discovery 早于动态资源 lease。
-- QP allocator 测试：Fabric 对同 profile 的幂等注册返回一个 ID、冲突 profile 被拒绝、封存后未知 profile 被拒绝、64 个已就绪 function 各申请 32 QP 后耗尽全局 2048 池、不同 function 的 local-q 重名、RX/TX 不可拆分、FLR/迁移后的 lease 回收与 BAR 唯一性。
+- QP allocator 测试：Fabric 对同 profile 的幂等注册返回一个 ID、冲突 profile 被拒绝、封存后直接 manager 注册被拒绝、已激活 function 在 ready 前申请失败而在 ready 后成功、64 个已就绪 function 各申请 32 QP 后耗尽全局 2048 池、不同 function 的 local-q 重名、RX/TX 不可拆分、FLR/迁移后的 lease 回收与 BAR 唯一性。
 - 跨协议 client contract 测试：Fabric 为 virtio 与模拟 RDMA/block client 预注册不同 profile；各 client 仅 lookup/inject 相应 ID 并申请 lease，验证不发生 ID 或配额串扰。
 
 完成条件为：`make check-deps`、全部可用的 VCS 回归、git diff 检查和 submodule 状态检查通过；若执行环境没有 VCS，则必须明确报告该外部限制，并完成所有无需 VCS 的静态与依赖验证。

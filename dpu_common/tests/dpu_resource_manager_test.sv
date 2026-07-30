@@ -16,8 +16,18 @@ import dpu_resource_pkg::*;
 class dpu_resource_manager_test extends uvm_test;
     `uvm_component_utils(dpu_resource_manager_test)
 
+    dpu_fabric_env fabric;
+    dpu_fabric_env_config fabric_cfg;
+
     function new(string name, uvm_component parent);
         super.new(name, parent);
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+
+        fabric_cfg = dpu_fabric_env_config::type_id::create("fabric_cfg");
+        fabric = dpu_fabric_env::type_id::create("fabric", this);
     endfunction
 
     function automatic dpu_function_key_t make_function_key(
@@ -71,6 +81,13 @@ class dpu_resource_manager_test extends uvm_test;
                         "PF activation failed for host %0d PF %0d: %s",
                         host_id, pf_id, why))
                 end
+                if (manager.acquire_leases(
+                    key, qpair_class_id, 0, 1, leases, why
+                )) begin
+                    `uvm_fatal("DPU_RESOURCE", $sformatf(
+                        "QP lease succeeded before readiness for host %0d PF %0d",
+                        host_id, pf_id))
+                end
                 if (!manager.mark_function_device_ready(key, why)) begin
                     `uvm_fatal("DPU_RESOURCE", $sformatf(
                         "PF readiness failed for host %0d PF %0d: %s",
@@ -118,63 +135,37 @@ class dpu_resource_manager_test extends uvm_test;
         dpu_resource_manager manager;
         dpu_function_key_t key;
         dpu_resource_pool_config_t qpair_profile;
-        dpu_resource_pool_config_t conflicting_profile;
         dpu_resource_class_id_t qpair_class_id;
-        dpu_resource_class_id_t repeated_class_id;
-        dpu_resource_class_id_t lookup_class_id;
         dpu_resource_class_id_t rejected_class_id;
         string why;
 
         phase.raise_objection(this);
-        manager = dpu_resource_manager::type_id::create("manager");
 
         qpair_profile = make_resource_profile(
             "virtio.qpair", DPU_RESOURCE_KIND_QUEUE, 2048, 32);
-        if (!manager.register_resource_class(
-            qpair_profile.name, qpair_profile.kind, qpair_profile.capacity,
-            qpair_profile.max_per_function, qpair_class_id, why
+        fabric_cfg.resource_profiles.push_back(qpair_profile);
+        if (!fabric.apply_resource_profiles(fabric_cfg, why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "Fabric QP profile application failed: %s", why))
+        end
+        if (!fabric.lookup_resource_class(
+            qpair_profile.name, qpair_class_id, why
         )) begin
             `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "initial QP profile registration failed: %s", why))
+                "Fabric QP profile lookup failed: %s", why))
         end
-        if (!manager.register_resource_class(
-            qpair_profile.name, qpair_profile.kind, qpair_profile.capacity,
-            qpair_profile.max_per_function, repeated_class_id, why
+        if (!uvm_config_db#(dpu_resource_manager)::get(
+            this, "fabric", "dpu_resource_manager", manager
         )) begin
             `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "idempotent QP profile registration failed: %s", why))
-        end
-        if (qpair_class_id != repeated_class_id) begin
-            `uvm_fatal("DPU_RESOURCE", "same QP profile received distinct class IDs")
-        end
-
-        conflicting_profile = make_resource_profile(
-            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE, 2047, 32);
-        if (manager.register_resource_class(
-            conflicting_profile.name, conflicting_profile.kind,
-            conflicting_profile.capacity, conflicting_profile.max_per_function,
-            rejected_class_id, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", "conflicting QP profile unexpectedly registered")
-        end
-        if (!manager.seal_resource_classes(why)) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "resource-class registry seal failed: %s", why))
+                "Fabric did not publish its resource manager"))
         end
         if (manager.register_resource_class(
-            "future.unknown", DPU_RESOURCE_KIND_QUEUE, 1, 1,
+            qpair_profile.name, qpair_profile.kind, qpair_profile.capacity,
+            qpair_profile.max_per_function,
             rejected_class_id, why
         )) begin
-            `uvm_fatal("DPU_RESOURCE", "sealed registry accepted an unknown profile")
-        end
-        if (!manager.lookup_resource_class(
-            qpair_profile.name, lookup_class_id, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "registered QP profile lookup failed: %s", why))
-        end
-        if (lookup_class_id != qpair_class_id) begin
-            `uvm_fatal("DPU_RESOURCE", "QP profile lookup returned a different class ID")
+            `uvm_fatal("DPU_RESOURCE", "sealed Fabric registry accepted direct QP registration")
         end
 
         for (int unsigned host_id = 0; host_id < DPU_MAX_HOSTS; host_id++) begin
