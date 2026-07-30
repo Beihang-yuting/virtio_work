@@ -1,1 +1,3 @@
-// Intentionally empty in Task 1. Task 2 will add the DPU common package.
++incdir+dpu_common/src
+dpu_common/src/dpu_resource_types.sv
+dpu_common/src/dpu_resource_pkg.sv

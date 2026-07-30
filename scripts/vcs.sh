@@ -33,7 +33,7 @@ esac
 
 TEST="${TEST:-}"
 case "$TEST" in
-  virtio_unit_test|virtio_stress_unit_test|virtio_protocol_test|virtio_e2e_test|virtio_full_integration_test)
+  virtio_unit_test|virtio_stress_unit_test|virtio_protocol_test|virtio_e2e_test|virtio_full_integration_test|dpu_resource_manager_test)
     ;;
   *)
     echo "unsupported TEST: $TEST" >&2

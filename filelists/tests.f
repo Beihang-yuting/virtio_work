@@ -5,4 +5,5 @@ virtio_net_vip/tests/virtio_stress_unit_test.sv
 virtio_net_vip/tests/virtio_protocol_test.sv
 virtio_net_vip/tests/virtio_e2e_test.sv
 virtio_net_vip/tests/virtio_full_test.sv
+dpu_common/tests/dpu_resource_manager_test.sv
 virtio_net_vip/tests/virtio_tb_top.sv
