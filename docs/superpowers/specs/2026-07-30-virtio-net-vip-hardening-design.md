@@ -37,15 +37,32 @@
 
 64 个 PF（4 host × 16 PF）本身已占用 64 个 function slot。因此全部 PF 激活时，DPU 最多再激活 960 个 VF；`16 VF/PF` 是局部能力而非可在全部 64 个 PF 同时达到的全局保证。配置验证在创建任何 function 前检查 `active_pf_count + active_vf_count <= 1024`。
 
-Fabric 使用层次 function key：`(host_id, pf_id, function_kind={PF,VF}, vf_id_or_none)`。每个 PF 和 VF 都是独立的 function，拥有自己的 virtio device、BAR binding、transport、agent、virtqueue manager 和 dataplane。每个 virtio device 恰好绑定一个 BAR lease；PCIe function manager 提供 BDF/BAR 信息，DPU manager 记录并验证唯一性。
+Fabric 使用层次 function key：`(host_id, pf_id, function_kind={PF,VF}, vf_id_or_none)`。每个 PF 和 VF 都是独立的 function，拥有自己的 virtio device、BAR binding、transport、agent、virtqueue manager 和 dataplane。PCIe function manager 提供 BDF/config-space 访问；DPU manager 是 BAR 地址分配与唯一性检查的权威。
 
-资源服务只管理身份、容量、配额、亲和性、状态和 lease，不理解协议报文。通用资源类型包括 function、BAR、queue、interrupt vector 和 DMA window；协议以 resource-class 注册其特定资源。virtio-net 的 global QP allocator 是该服务上的协议 adapter，RDMA 和 virtio-blk 将来注册各自的 QP/CQ 或 block queue class，而无需修改 allocator 的通用生命周期逻辑。
+资源服务只管理身份、容量、配额、亲和性、状态和 lease，不理解协议报文。通用资源类型包括 function、BAR、queue、interrupt vector 和 DMA window；协议以 resource-class 注册其特定资源。资源管理器只暴露通用 resource-pool 配置与 acquire/release/freeze/restore lease API，不出现 `virtio`、`rx`、`tx` 或 RDMA 专用方法。virtio-net 的 client 将一个 `DPU_RES_VIRTIO_QPAIR` lease 映射为 RX/TX 逻辑队列；RDMA 和 virtio-blk 将来注册各自的 QP/CQ 或 block queue class，而无需修改通用生命周期逻辑。
+
+### BAR-first function activation
+
+每个激活的 PF/VF function 先在由配置给出的 64-bit MMIO aperture 中获得三个 64-bit BAR pair。一个 pair 的偶数 BAR 保存 64-bit base/size，奇数 BAR 仅为该 BAR 的高 32 位 config-space slot，不能作为独立 aperture 分配。所有 base 必须按自身 size 对齐，任何 pair 不得重叠。资源管理器只将 BAR role 标为 `FUNCTION_DEVICE`、`RESERVED` 或 `MSIX`；当前 virtio client 在 `FUNCTION_DEVICE` window 内发现 virtio capability。
+
+| Function | BAR0/1 | BAR2/3 | BAR4/5 |
+|---|---:|---:|---:|
+| PF | virtio device, 32 MiB | reserved, 64 KiB | MSI-X table/PBA, 64 KiB |
+| VF | virtio device, 16 KiB | reserved, 16 KiB | MSI-X table/PBA, 32 KiB |
+
+`dpu_resource_manager::activate_function()` 顺序为：验证 function 容量与层次 → 分配并记录三个 BAR pair → 将 BAR 值写入 PCI config space → 将 BAR0/1 绑定为该 function 唯一的 device window、BAR4/5 绑定为该 function 的 MSI-X table/PBA aperture → client 在 BAR0/1 内完成 device capability discovery → 允许该 function 的动态资源 lease。对于本次 virtio client，动态资源是 QP 与 MSI-X vector。
+
+BAR2/3 始终消耗地址空间，但没有 function、transport 或 MSI-X binding；它既不是 device window，也不是 MSI-X window，不能经由功能性 accessor 读写。直接到达 BAR2/3 的 PCIe memory transaction 由 monitor 作为 reserved-BAR violation 报错；BAR0/1 的普通 device MMIO 与 BAR4/5 的 MSI-X table/PBA MMIO 必须分别按其角色解码和检查。FLR 保留 function/BAR ownership，SR-IOV disable 或 function destroy 才释放 BAR lease；迁移 freeze/restore 保留原地址。
+
+MMIO aperture 的 `base` 与 `limit` 是 `dpu_fabric_env_config` 的必填 64-bit 配置，且不得与 host DMA memory region 重叠。全部 64 PF 和 960 VF 激活时，三组 BAR window 共需要 2,116 MiB：PF 为 2,056 MiB，VF 为 60 MiB；配置验证需在激活前确认 aperture 容量充足。
+
+### virtio QP allocation after BAR discovery
 
 virtio 数据队列以 QP 原子租约分配：
 
 `(function_key, virtio_device, local_pair_id[0..31]) -> (global_qpair_id[0..2047], global_rx_qid, global_tx_qid)`。
 
-`global_rx_qid` 和 `global_tx_qid` 是由同一 QP lease 派生的方向性逻辑标识，不能分配给不同 device。创建 function 时不预留 QP；device 在协商和 queue setup 时按需申请。因而 64 个 device 可以各开满 32 QP，或 2048 个 device 各申请 1 QP。FLR、device reset、迁移和 SR-IOV disable 必须执行相应的冻结、恢复或释放操作。Control VQ 与 Admin VQ 使用明确的 special-VQ resource class 和独立容量配置，绝不隐式消耗或绕开数据 QP 池。
+`global_rx_qid` 和 `global_tx_qid` 是由同一 QP lease 派生的方向性逻辑标识，不能分配给不同 device。创建 function 时不预留 QP；只有 BAR0/1 分配、写入 config space 并成功发现 virtio capability 后，virtio client 才能在协商和 queue setup 时通过通用 lease API 按需申请 `DPU_RES_VIRTIO_QPAIR`。因而 64 个 device 可以各开满 32 QP，或 2048 个 device 各申请 1 QP。FLR、device reset、迁移和 SR-IOV disable 必须执行相应的冻结、恢复或释放操作。Control VQ 与 Admin VQ 使用明确的 special-VQ resource class 和独立容量配置，绝不隐式消耗或绕开数据 QP 池。
 
 当前 `virtio_vf_resource_pool` 仅为 virtio client 的本地映射视图；它不再分配全局 ID。其 mapping key 扩展为完整 function key 与 `local_qid`，global QP allocator 才是 global ID 的唯一来源。
 
@@ -67,7 +84,7 @@ virtio 数据队列以 QP 原子租约分配：
 
 1. `virtio_vf_instance` 重构为可同时表示 PF 与 VF 的 `virtio_function_instance`；PF 实例不再伪装为 VF。每个 `virtio_pf_instance` 持有独立 PF function、其 `virtio_pf_manager` 与所属 VF function array。
 2. `virtio_vf_instance::wire_shared()` 的后继 API 与虚拟 sequencer 使用实际的 `uvm_sequencer #(pcie_tl_tlp)` 类型。
-3. `virtio_net_env::bind_pcie()` 接收 RC sequencer、DPU resource manager 和可选 TLM adapter，向每个已激活 function 一次性注入 host memory、IOMMU、barrier、queue manager、transport、atomic ops、FSM、driver 和 monitor 引用。
+3. `virtio_net_env::bind_pcie()` 接收 RC sequencer、DPU resource manager 和可选 TLM adapter，激活每个 function 的 BAR layout 后，一次性注入 host memory、IOMMU、barrier、queue manager、transport、atomic ops、FSM、driver 和 monitor 引用。
 4. 现有 TLM completion shim、bridge 和 bridged BAR sequences 移入 transport 源码，作为 `virtio_tlm_completion_adapter`。TLM 测试通过 adapter 启用它；SV-interface/DUT 模式不启用它。
 5. 所有集成测试改为调用公共 binding、Fabric resource lease 与 adapter API，不再复制实现细节。
 
@@ -106,6 +123,7 @@ PF manager 保存独立的 Admin VQ transport/queue 上下文。`admin_cmd()` �
 - Admin VQ 成功、设备拒绝、非法 VF 和 completion timeout 测试。
 - 迁移 dirty-page 正反向测试及 SVA pass/fail 测试。
 - Fabric 拓扑测试：4 host、16 PF/host、PF/VF 合并 1024 function 边界、16 VF/PF 局部上限和全局 960 VF 余量。
+- BAR allocator 测试：PF/VF 的三组 pair size、64-bit paired-BAR config encoding、对齐与不重叠、2,116 MiB 最大激活布局；验证 BAR0/1 仅为 device window、BAR4/5 仅为 MSI-X table/PBA、BAR2/3 虽已分配但无 binding 且功能性访问被拒绝；并验证 BAR0/1 discovery 早于动态资源 lease。
 - QP allocator 测试：2048 QP 耗尽、32 QP/device 上限、不同 function 的 local-q 重名、RX/TX 不可拆分、FLR/迁移后的 lease 回收与 BAR 唯一性。
 - 跨协议 client contract 测试：virtio client 与模拟 RDMA/block client 在同一 manager 下申请不同 resource class，验证不发生 ID 或配额串扰。
 
