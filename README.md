@@ -245,6 +245,18 @@ virtio_net_vip/
 - Synopsys VCS（通过 `$VCS_HOME` 提供）和 UVM 1.2
 - 可访问 Git submodule 远端
 
+### 远程 UVM 验证环境
+
+可用的远程验证机是 `ubuntu@10.11.10.53`，其 VCS 安装路径为
+`/home/ubuntu/synopsys/vcs/W-2024.09-SP1`，并包含 UVM 1.2。登录后设置：
+
+```bash
+export VCS_HOME=/home/ubuntu/synopsys/vcs/W-2024.09-SP1
+$VCS_HOME/bin/vcs -ID
+```
+
+访问凭据不写入仓库；使用已获授权的交互式 SSH 认证。
+
 所有构建和测试均通过 Make 入口执行：
 
 ```bash
