@@ -4,7 +4,7 @@
 // ============================================================================
 // virtio_vf_instance
 //
-// Per-VF wrapper holding all virtio driver components. References
+// Compatibility VF wrapper holding all virtio driver components. References
 // pcie_tl_func_context (via uvm_object handle) for BDF/BAR -- no duplication
 // of PCIe-level data.
 //
@@ -32,6 +32,12 @@ class virtio_vf_instance extends uvm_component;
     // ===== Identity (from pcie_tl_func_context) =====
     int unsigned         vf_index;
     bit [15:0]           bdf;          // copied from func_context for convenience
+    dpu_bar_pair_lease_t bar_pairs[$];
+
+    // ===== Fabric ownership (references, not owned) =====
+    dpu_function_key_t      function_key;
+    dpu_resource_manager    resource_manager;
+    virtio_resource_client  resource_client;
 
     // ===== PCIe context reference (not owned) =====
     // pcie_tl_func_context from func_manager -- provides BDF, BAR, config space
@@ -78,6 +84,9 @@ class virtio_vf_instance extends uvm_component;
         vq_mgr       = virtqueue_manager::type_id::create("vq_mgr");
         dataplane    = virtio_net_dataplane::type_id::create("dataplane");
         transport    = virtio_pci_transport::type_id::create("transport");
+        resource_client = virtio_resource_client::type_id::create(
+            "resource_client"
+        );
     endfunction
 
     // ========================================================================
@@ -111,6 +120,62 @@ class virtio_vf_instance extends uvm_component;
             $sformatf("configure: vf_index=%0d, bdf=0x%04h, bar_base=0x%016h",
                       vf_idx, device_bdf, bar_base),
             UVM_MEDIUM)
+    endfunction
+
+    // Retain all Fabric-programmed BAR pairs for ownership and monitor
+    // checks.  Only BAR0/1 and BAR4/5 receive functional transport bindings;
+    // BAR2/3 remains a consumed reservation without an accessor.
+    virtual function void configure_bar_pairs(
+        input dpu_bar_pair_lease_t bars[$]
+    );
+        bar_pairs = bars;
+        if (transport == null)
+            return;
+        foreach (bar_pairs[index]) begin
+            case (bar_pairs[index].role)
+                DPU_BAR_FUNCTION_DEVICE:
+                    transport.bar.bar_base[bar_pairs[index].even_bar_id] =
+                        bar_pairs[index].base;
+                DPU_BAR_MSIX:
+                    transport.bar.bar_base[bar_pairs[index].even_bar_id] =
+                        bar_pairs[index].base;
+                default:
+                    ;
+            endcase
+        end
+    endfunction
+
+    // Bind this compatibility wrapper to a VF Fabric function.  New Fabric
+    // topology code uses virtio_function_instance; this preserves old paths
+    // while forcing their transport identity to remain a VF.
+    // This is intentionally separate from configure(), which remains usable by
+    // the legacy flat-VF environment without a Fabric resource manager.
+    virtual function void configure_fabric_function(
+        input dpu_function_key_t key,
+        input dpu_bar_pair_lease_t bars[$],
+        input dpu_resource_manager manager
+    );
+        string why;
+
+        if (key.kind != DPU_FUNCTION_VF) begin
+            `uvm_fatal("VF_INSTANCE",
+                "compatibility virtio_vf_instance requires a VF function key")
+        end
+        function_key = key;
+        resource_manager = manager;
+        configure_bar_pairs(bars);
+        if ((resource_client == null) ||
+            !resource_client.bind_to_fabric(resource_manager, function_key, why)) begin
+            `uvm_fatal("VF_INSTANCE", $sformatf(
+                "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
+                function_key.host_id, function_key.pf_id, function_key.kind,
+                function_key.vf_id, why))
+        end
+        if (!resource_client.mark_device_ready(why)) begin
+            `uvm_fatal("VF_INSTANCE", $sformatf(
+                "BAR discovery did not make VF %0d device-ready: %s",
+                function_key.vf_id, why))
+        end
     endfunction
 
     // ========================================================================

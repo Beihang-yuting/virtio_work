@@ -39,6 +39,11 @@ class virtio_net_env extends uvm_env;
     // ===== PF manager =====
     virtio_pf_manager pf_mgr;
 
+    // ===== DPU Fabric function topology =====
+    dpu_fabric_env             fabric;
+    virtio_pf_instance         pf_instances[];
+    protected bit              fabric_topology;
+
     // ===== VF instances (dynamic array based on num_vfs) =====
     virtio_vf_instance vf_instances[];
 
@@ -69,6 +74,90 @@ class virtio_net_env extends uvm_env;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
+    endfunction
+
+    protected function bit [15:0] fabric_pf_bdf(
+        input int unsigned host_id,
+        input int unsigned pf_id
+    );
+        return cfg.pf_bdf + ((host_id * DPU_MAX_PFS_PER_HOST + pf_id) << 4);
+    endfunction
+
+    protected function void build_fabric_topology();
+        int unsigned flat_pf_id;
+
+        pf_instances = new[cfg.total_fabric_pfs()];
+        flat_pf_id = 0;
+        for (int unsigned host_id = 0; host_id < cfg.num_hosts; host_id++) begin
+            for (int unsigned pf_id = 0;
+                 pf_id < cfg.num_pfs_per_host[host_id];
+                 pf_id++) begin
+                pf_instances[flat_pf_id] = virtio_pf_instance::type_id::create(
+                    $sformatf("pf_%0d_%0d", host_id, pf_id), this
+                );
+                pf_instances[flat_pf_id].configure_topology(
+                    host_id, pf_id, cfg.num_vfs_per_pf[host_id][pf_id],
+                    fabric_pf_bdf(host_id, pf_id)
+                );
+                flat_pf_id++;
+            end
+        end
+    endfunction
+
+    protected function void configure_fabric_resources();
+        dpu_fabric_env_config fabric_cfg;
+        dpu_resource_pool_config_t qpair_profile;
+        dpu_resource_manager resource_manager;
+        string why;
+
+        fabric_cfg = dpu_fabric_env_config::type_id::create("fabric_cfg");
+        fabric_cfg.mmio_aperture_base = 64'h0001_0000_0000_0000;
+        fabric_cfg.mmio_aperture_limit = 64'h0001_0100_0000_0000;
+        qpair_profile.name = "virtio.qpair";
+        qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
+        qpair_profile.capacity = 2048;
+        qpair_profile.max_per_function = 32;
+        fabric_cfg.resource_profiles.push_back(qpair_profile);
+        if (!fabric.apply_resource_profiles(fabric_cfg, why)) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "Fabric QP profile registration failed: %s", why))
+        end
+        if (!uvm_config_db#(dpu_resource_manager)::get(
+            this, "fabric", "dpu_resource_manager", resource_manager
+        )) begin
+            `uvm_fatal("VIRTIO_ENV", "Fabric did not publish a resource manager")
+        end
+        foreach (pf_instances[index]) begin
+            if (!resource_manager.register_function(pf_instances[index].pf_key, why)) begin
+                `uvm_fatal("VIRTIO_ENV", $sformatf(
+                    "PF registration failed for topology entry %0d: %s", index, why))
+            end
+            foreach (pf_instances[index].vf_keys[vf_id]) begin
+                if (!resource_manager.register_function(
+                    pf_instances[index].vf_keys[vf_id], why
+                )) begin
+                    `uvm_fatal("VIRTIO_ENV", $sformatf(
+                        "VF registration failed for topology entry %0d VF %0d: %s",
+                        index, vf_id, why))
+                end
+            end
+        end
+        foreach (pf_instances[index])
+            pf_instances[index].configure_fabric_resources(resource_manager);
+    endfunction
+
+    protected function void flatten_fabric_vfs();
+        int unsigned flat_vf_id;
+
+        vf_instances = new[cfg.total_fabric_vfs()];
+        flat_vf_id = 0;
+        foreach (pf_instances[pf_index]) begin
+            foreach (pf_instances[pf_index].vf_functions[vf_id]) begin
+                vf_instances[flat_vf_id] =
+                    pf_instances[pf_index].vf_functions[vf_id];
+                flat_vf_id++;
+            end
+        end
     endfunction
 
     // ========================================================================
@@ -110,16 +199,22 @@ class virtio_net_env extends uvm_env;
         perf_mon.bw_limit_enable = cfg.bw_limit_enable;
         perf_mon.bw_limit_mbps   = cfg.bw_limit_mbps;
 
-        // Create PF manager
-        pf_mgr = virtio_pf_manager::type_id::create("pf_mgr");
-        pf_mgr.wait_pol = wait_pol;
-
-        // Create VF instances (at least 1 for pure PF mode)
-        num_instances = (cfg.num_vfs > 0) ? cfg.num_vfs : 1;
-        vf_instances = new[num_instances];
-        foreach (vf_instances[i]) begin
-            vf_instances[i] = virtio_vf_instance::type_id::create(
-                $sformatf("vf_%0d", i), this);
+        fabric_topology = cfg.uses_fabric_topology();
+        if (fabric_topology) begin
+            fabric = dpu_fabric_env::type_id::create("fabric", this);
+            build_fabric_topology();
+            vf_instances = new[0];
+        end
+        else begin
+            // Compatibility path for existing flat-VF tests and sequences.
+            pf_mgr = virtio_pf_manager::type_id::create("pf_mgr");
+            pf_mgr.wait_pol = wait_pol;
+            num_instances = (cfg.num_vfs > 0) ? cfg.num_vfs : 1;
+            vf_instances = new[num_instances];
+            foreach (vf_instances[i]) begin
+                vf_instances[i] = virtio_vf_instance::type_id::create(
+                    $sformatf("vf_%0d", i), this);
+            end
         end
 
         // Create verification components (conditionally)
@@ -151,7 +246,28 @@ class virtio_net_env extends uvm_env;
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
 
-        // Wire shared components into VF instances
+        if (fabric_topology) begin
+            configure_fabric_resources();
+            flatten_fabric_vfs();
+            pf_mgr = pf_instances[0].pf_manager;
+            pf_mgr.wait_pol = wait_pol;
+            foreach (pf_instances[pf_index]) begin
+                pf_instances[pf_index].pf_function.drv_cfg =
+                    cfg.get_default_driver_config();
+                if (scb != null) begin
+                    pf_instances[pf_index].pf_function.driver_agent.monitor.txn_ap.connect(
+                        scb.txn_imp
+                    );
+                end
+                if (cov != null) begin
+                    pf_instances[pf_index].pf_function.driver_agent.monitor.txn_ap.connect(
+                        cov.analysis_imp
+                    );
+                end
+            end
+        end
+
+        // Wire shared components into the compatibility VF view.
         foreach (vf_instances[i]) begin
             // Set VF config from env config
             vf_instances[i].drv_cfg = cfg.get_vf_config(i);
@@ -175,7 +291,7 @@ class virtio_net_env extends uvm_env;
         conc_ctrl.vf_instances = vf_instances;
         conc_ctrl.wait_pol     = wait_pol;
 
-        // Wire PF manager
+        // Wire the compatibility PF manager alias.
         pf_mgr.vf_instances = vf_instances;
 
         // Connect monitor analysis ports to scoreboard/coverage
@@ -206,6 +322,10 @@ class virtio_net_env extends uvm_env;
         iommu.leak_check();
         foreach (vf_instances[i])
             vf_instances[i].vq_mgr.leak_check();
+        if (fabric_topology) begin
+            foreach (pf_instances[index])
+                pf_instances[index].pf_function.vq_mgr.leak_check();
+        end
 
         // Barrier stats
         barrier.print_stats();

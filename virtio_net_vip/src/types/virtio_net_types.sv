@@ -256,6 +256,12 @@ typedef struct { bit [7:0] cap_id, cap_next, cfg_type, bar; bit [31:0] offset, l
 typedef struct { bit [63:0] msg_addr; bit [31:0] msg_data; bit masked; } msix_entry_t;
 
 typedef struct {
+    int unsigned local_pair;
+    int unsigned rx_global_qid;
+    int unsigned tx_global_qid;
+} virtio_qpair_mapping_t;
+
+typedef struct {
     int unsigned hash_key_size; byte unsigned hash_key[];
     int unsigned indirection_table[]; bit [31:0] hash_types;
 } virtio_rss_config_t;

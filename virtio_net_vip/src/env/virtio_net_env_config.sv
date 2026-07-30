@@ -23,6 +23,13 @@ class virtio_net_env_config extends uvm_object;
     // ===== Topology =====
     int unsigned         num_vfs = 0;            // 0 = pure PF mode
     int unsigned         max_vfs = 256;
+    int unsigned         num_hosts = 0;           // 0 selects legacy flat-VF mode
+    int unsigned         max_hosts = DPU_MAX_HOSTS;
+    int unsigned         num_pfs_per_host[];
+    int unsigned         num_vfs_per_pf[][];
+    int unsigned         max_pfs_per_host = DPU_MAX_PFS_PER_HOST;
+    int unsigned         max_vfs_per_pf = DPU_MAX_VFS_PER_PF;
+    int unsigned         max_functions = DPU_MAX_FUNCTIONS;
 
     // Per-VF configs (optional, falls back to defaults)
     virtio_driver_config_t  vf_configs[];
@@ -70,6 +77,28 @@ class virtio_net_env_config extends uvm_object;
 
     function new(string name = "virtio_net_env_config");
         super.new(name);
+    endfunction
+
+    function bit uses_fabric_topology();
+        return (num_hosts != 0) || (num_pfs_per_host.size() != 0) ||
+               (num_vfs_per_pf.size() != 0);
+    endfunction
+
+    function int unsigned total_fabric_pfs();
+        int unsigned total;
+        total = 0;
+        foreach (num_pfs_per_host[host_id])
+            total += num_pfs_per_host[host_id];
+        return total;
+    endfunction
+
+    function int unsigned total_fabric_vfs();
+        int unsigned total;
+        total = 0;
+        foreach (num_vfs_per_pf[host_id])
+            foreach (num_vfs_per_pf[host_id][pf_id])
+                total += num_vfs_per_pf[host_id][pf_id];
+        return total;
     endfunction
 
     // ========================================================================
@@ -126,6 +155,64 @@ class virtio_net_env_config extends uvm_object;
             ok = 0;
         end
 
+        if (uses_fabric_topology()) begin
+            int unsigned total_functions;
+
+            if ((max_hosts > DPU_MAX_HOSTS) ||
+                (max_pfs_per_host > DPU_MAX_PFS_PER_HOST) ||
+                (max_vfs_per_pf > DPU_MAX_VFS_PER_PF) ||
+                (max_functions > DPU_MAX_FUNCTIONS)) begin
+                `uvm_error("ENV_CFG", "configured topology maxima exceed DPU limits")
+                ok = 0;
+            end
+            if ((num_hosts == 0) || (num_hosts > max_hosts) ||
+                (num_hosts > DPU_MAX_HOSTS)) begin
+                `uvm_error("ENV_CFG", "num_hosts is outside the supported DPU range")
+                ok = 0;
+            end
+            if (num_pfs_per_host.size() != num_hosts ||
+                num_vfs_per_pf.size() != num_hosts) begin
+                `uvm_error("ENV_CFG", "topology arrays must contain one entry per host")
+                ok = 0;
+            end
+            total_functions = 0;
+            for (int unsigned host_id = 0; host_id < num_hosts; host_id++) begin
+                if ((host_id >= num_pfs_per_host.size()) ||
+                    (host_id >= num_vfs_per_pf.size()))
+                    continue;
+                if ((num_pfs_per_host[host_id] == 0) ||
+                    (num_pfs_per_host[host_id] > max_pfs_per_host) ||
+                    (num_pfs_per_host[host_id] > DPU_MAX_PFS_PER_HOST)) begin
+                    `uvm_error("ENV_CFG", $sformatf(
+                        "host %0d PF count exceeds the supported DPU range", host_id))
+                    ok = 0;
+                end
+                if (num_vfs_per_pf[host_id].size() != num_pfs_per_host[host_id]) begin
+                    `uvm_error("ENV_CFG", $sformatf(
+                        "host %0d VF topology does not match its PF count", host_id))
+                    ok = 0;
+                    continue;
+                end
+                total_functions += num_pfs_per_host[host_id];
+                foreach (num_vfs_per_pf[host_id][pf_id]) begin
+                    if ((num_vfs_per_pf[host_id][pf_id] > max_vfs_per_pf) ||
+                        (num_vfs_per_pf[host_id][pf_id] > DPU_MAX_VFS_PER_PF)) begin
+                        `uvm_error("ENV_CFG", $sformatf(
+                            "host %0d PF %0d VF count exceeds the DPU limit",
+                            host_id, pf_id))
+                        ok = 0;
+                    end
+                    total_functions += num_vfs_per_pf[host_id][pf_id];
+                end
+            end
+            if (total_functions > max_functions ||
+                total_functions > DPU_MAX_FUNCTIONS) begin
+                `uvm_error("ENV_CFG", $sformatf(
+                    "requested %0d functions exceeds the DPU limit", total_functions))
+                ok = 0;
+            end
+        end
+
         if (mem_base >= mem_end) begin
             `uvm_error("ENV_CFG",
                 $sformatf("mem_base=0x%016h >= mem_end=0x%016h", mem_base, mem_end))
@@ -153,6 +240,8 @@ class virtio_net_env_config extends uvm_object;
         string s;
         s = $sformatf("virtio_net_env_config:\n");
         s = {s, $sformatf("  num_vfs=%0d, max_vfs=%0d\n", num_vfs, max_vfs)};
+        s = {s, $sformatf("  fabric: hosts=%0d, PFs=%0d, VFs=%0d\n",
+                          num_hosts, total_fabric_pfs(), total_fabric_vfs())};
         s = {s, $sformatf("  pf_bdf=0x%04h\n", pf_bdf)};
         s = {s, $sformatf("  mem_base=0x%016h, mem_end=0x%016h\n", mem_base, mem_end)};
         s = {s, $sformatf("  iommu_strict=%0b\n", iommu_strict)};

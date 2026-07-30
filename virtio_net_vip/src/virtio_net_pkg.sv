@@ -17,6 +17,7 @@ package virtio_net_pkg;
 
   import host_mem_pkg::*;
   import pcie_tl_pkg::*;
+  import dpu_resource_pkg::*;
   `include "host_mem_manager.sv"
 
   // ---------------------------------------------------------------------------
@@ -81,9 +82,12 @@ package virtio_net_pkg;
   // ---------------------------------------------------------------------------
   // Phase 7 – SR-IOV
   // ---------------------------------------------------------------------------
+  `include "sriov/virtio_resource_client.sv"
   `include "sriov/virtio_vf_resource_pool.sv"
   `include "sriov/virtio_vf_instance.sv"
   `include "sriov/virtio_pf_manager.sv"
+  `include "sriov/virtio_function_instance.sv"
+  `include "sriov/virtio_pf_instance.sv"
 
   // ---------------------------------------------------------------------------
   // Phase 8 – Environment
