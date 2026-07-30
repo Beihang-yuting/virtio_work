@@ -11,7 +11,7 @@ submodules=(
 )
 expected_revisions=(
   "6913793a42dc58873935f802fab50a395ab56ff3"
-  "ef056b331047f51125c2aaf248a8767b9b84862a"
+  "3b9e000d5df4d10efbb3029f43605e0362e0caca"
   "e2af70204f53ede65e366c7a65f695c59acdbbc5"
 )
 
@@ -33,16 +33,6 @@ for index in "${!submodules[@]}"; do
   fi
 done
 
-if [[ -z "${VCS_HOME:-}" ]]; then
-  echo "VCS_HOME is not set; source the VCS environment before running check-deps" >&2
-  exit 3
-fi
-
-if [[ ! -x "$VCS_HOME/bin/vcs" ]]; then
-  echo "VCS executable not found: $VCS_HOME/bin/vcs" >&2
-  exit 4
-fi
-
 missing_host_mem_sources=()
 for source_file in src/host_mem_pkg.sv src/host_mem_manager.sv; do
   if [[ ! -f "$root_dir/virtio_net_vip/ext/host_mem/$source_file" ]]; then
@@ -51,7 +41,16 @@ for source_file in src/host_mem_pkg.sv src/host_mem_manager.sv; do
 done
 
 if (( ${#missing_host_mem_sources[@]} > 0 )); then
-  echo "pinned host_mem dependency ef056b331047f51125c2aaf248a8767b9b84862a is missing: ${missing_host_mem_sources[*]}" >&2
-  echo "fix: upstream must provide compatible sources, or obtain user approval to update the pinned SHA" >&2
+  echo "pinned host_mem dependency 3b9e000d5df4d10efbb3029f43605e0362e0caca is missing: ${missing_host_mem_sources[*]}" >&2
   exit 6
+fi
+
+if [[ -z "${VCS_HOME:-}" ]]; then
+  echo "VCS_HOME is not set; source the VCS environment before running check-deps" >&2
+  exit 3
+fi
+
+if [[ ! -x "$VCS_HOME/bin/vcs" ]]; then
+  echo "VCS executable not found: $VCS_HOME/bin/vcs" >&2
+  exit 4
 fi

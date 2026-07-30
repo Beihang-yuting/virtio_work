@@ -258,10 +258,9 @@ make test TEST=virtio_unit_test
 当前支持的五个测试。`make check-deps` 会验证
 submodule 固定 SHA、VCS 环境以及外部源码完整性。
 
-当前指定的 `host_mem@ef056b331047f51125c2aaf248a8767b9b84862a` 仅包含 README，
-未提供本 VIP 所需的 `host_mem_pkg.sv` 与 `host_mem_manager.sv`。在 VCS 环境可用时，
-依赖检查会以明确诊断停止；需由上游提供兼容源码，或经用户批准后更新固定 SHA。
-因此，固定依赖已可复现，但当前版本尚不能声称 VCS 编译或动态 UVM 回归已通过。
+`host_mem@3b9e000d5df4d10efbb3029f43605e0362e0caca` 固定提供
+`host_mem_pkg.sv` 和 `host_mem_manager.sv`，并由 filelist 在 PCIe package 前编译。
+固定 SHA 使依赖可复现；实际的 VCS 编译和动态 UVM 回归结果仍取决于运行环境。
 
 ---
 
@@ -348,8 +347,7 @@ endclass
 virtio 驱动 VIP → PCIe RC Agent → TLM 回环 → EP Agent（自动响应）
 ```
 
-该模式面向 VIP 自身验证和功能开发。当前固定依赖因缺少 `host_mem` 源码，
-尚无可证明的该模式回归结果。
+该模式面向 VIP 自身验证和功能开发。运行结果以当前环境的 VCS 回归日志为准。
 
 ### SV Interface 模式（连接真实 RTL）
 

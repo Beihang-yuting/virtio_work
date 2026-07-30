@@ -63,8 +63,8 @@ Replace the three legacy links with gitlinks. Use token-free URLs and pin exactl
 ```bash
 git submodule add -b main https://github.com/Beihang-yuting/pcie_work.git virtio_net_vip/ext/pcie_tl_vip
 git -C virtio_net_vip/ext/pcie_tl_vip checkout 6913793a42dc58873935f802fab50a395ab56ff3
-git submodule add -b main https://github.com/Beihang-yuting/host_mem.git virtio_net_vip/ext/host_mem
-git -C virtio_net_vip/ext/host_mem checkout ef056b331047f51125c2aaf248a8767b9b84862a
+git submodule add -b master https://github.com/Beihang-yuting/host_mem.git virtio_net_vip/ext/host_mem
+git -C virtio_net_vip/ext/host_mem checkout 3b9e000d5df4d10efbb3029f43605e0362e0caca
 git submodule add -b main https://github.com/Beihang-yuting/net_packet.git virtio_net_vip/ext/net_packet
 git -C virtio_net_vip/ext/net_packet checkout e2af70204f53ede65e366c7a65f695c59acdbbc5
 ```

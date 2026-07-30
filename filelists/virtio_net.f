@@ -1,6 +1,10 @@
 // All paths are relative to the repository root.
-// host_mem@ef056b3 and net_packet@e2af702 have no SystemVerilog sources at
-// their pinned revisions, so they deliberately contribute no paths here.
+// Compile host_mem before the PCIe package that imports host_mem_pkg. The
+// pinned net_packet revision currently contributes no SystemVerilog sources.
+
++incdir+virtio_net_vip/ext/host_mem/src
+virtio_net_vip/ext/host_mem/src/host_mem_pkg.sv
+virtio_net_vip/ext/host_mem/src/host_mem_manager.sv
 
 // PCIe TL VIP: interface before the package that uses it.
 +incdir+virtio_net_vip/ext/pcie_tl_vip/pcie_tl_vip/src

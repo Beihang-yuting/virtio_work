@@ -10,12 +10,12 @@
 
 ## 外部依赖与安全
 
-`virtio_net_vip/ext/` 使用 Git submodule 固定以下公开仓库的当前 `main` 提交：
+`virtio_net_vip/ext/` 使用 Git submodule 固定以下公开仓库的明确提交：
 
 | 路径 | 仓库 | 固定提交 |
 |---|---|---|
 | `ext/pcie_tl_vip` | `https://github.com/Beihang-yuting/pcie_work.git` | `6913793a42dc58873935f802fab50a395ab56ff3` |
-| `ext/host_mem` | `https://github.com/Beihang-yuting/host_mem.git` | `ef056b331047f51125c2aaf248a8767b9b84862a` |
+| `ext/host_mem` | `https://github.com/Beihang-yuting/host_mem.git` | `3b9e000d5df4d10efbb3029f43605e0362e0caca` |
 | `ext/net_packet` | `https://github.com/Beihang-yuting/net_packet.git` | `e2af70204f53ede65e366c7a65f695c59acdbbc5` |
 
 失效的绝对符号链接将被 submodule gitlink 替代。所有 remote URL、`.gitmodules` 和脚本只使用无令牌 HTTPS URL。构建不修改外部仓库，submodule SHA 是唯一的依赖锁定记录。
