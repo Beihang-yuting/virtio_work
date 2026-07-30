@@ -13,7 +13,7 @@ class virtio_pf_instance extends uvm_component;
     dpu_function_key_t          pf_key;
     dpu_function_key_t          vf_keys[];
     virtio_function_instance    pf_function;
-    virtio_function_instance    vf_functions[];
+    virtio_vf_instance          vf_functions[];
     virtio_pf_manager           pf_manager;
 
     function new(string name, uvm_component parent);
@@ -58,7 +58,7 @@ class virtio_pf_instance extends uvm_component;
 
         vf_functions = new[num_vfs];
         foreach (vf_functions[vf_id]) begin
-            vf_functions[vf_id] = virtio_function_instance::type_id::create(
+            vf_functions[vf_id] = virtio_vf_instance::type_id::create(
                 $sformatf("vf_function_%0d", vf_id), this
             );
             vf_functions[vf_id].configure_function(

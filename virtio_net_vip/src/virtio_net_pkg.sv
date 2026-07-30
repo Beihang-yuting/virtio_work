@@ -87,9 +87,9 @@ package virtio_net_pkg;
   // Phase 7 – SR-IOV
   // ---------------------------------------------------------------------------
   `include "sriov/virtio_vf_resource_pool.sv"
+  `include "sriov/virtio_function_instance.sv"
   `include "sriov/virtio_vf_instance.sv"
   `include "sriov/virtio_pf_manager.sv"
-  `include "sriov/virtio_function_instance.sv"
   `include "sriov/virtio_pf_instance.sv"
 
   // ---------------------------------------------------------------------------

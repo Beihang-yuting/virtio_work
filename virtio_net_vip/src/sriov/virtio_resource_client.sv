@@ -91,16 +91,25 @@ class virtio_resource_client extends uvm_object;
             why = "virtio resource client function is not device-ready";
             return 0;
         end
-        if (qpairs_frozen) begin
-            why = "frozen virtio resource client cannot release QP leases";
+        // Teardown, FLR, and disable own their leases even if migration left
+        // them saved.  Restore makes the saved Fabric class lease set
+        // releasable; it neither assigns a new global ID nor changes mappings.
+        if (qpairs_frozen && !restore_qpairs(why))
             return 0;
-        end
         if (!resource_manager.release_leases(function_key, qpair_class_id, why))
             return 0;
         qpair_leases.delete();
         qpair_mappings.delete();
         why = "";
         return 1;
+    endfunction
+
+    // A migration freeze needs teardown even when no local QP was allocated.
+    // The function owner uses this to decide whether FLR/disable must invoke
+    // release_qpairs(), which restores the Fabric manager state first.
+    function bit has_pending_qpair_cleanup();
+        return qpairs_frozen || (qpair_leases.size() != 0) ||
+               (qpair_mappings.size() != 0);
     endfunction
 
     // Freezing preserves the generic leases and their virtio pair mapping;

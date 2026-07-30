@@ -50,6 +50,26 @@ class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
     endtask
 endclass : virtio_fabric_cfg_stub_accessor
 
+// Temporarily demotes only the deliberate reserved-BAR negative access.  It
+// is registered immediately around that access and then removed, so discovery
+// cannot be made green by a persistent global report override.
+class virtio_expected_bar_reserved_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "expected_bar_reserved_catcher");
+        super.new(name);
+        caught_count = 0;
+    endfunction
+
+    function action_e catch();
+        if ((get_id() == "BAR_RESERVED") && (get_severity() == UVM_ERROR)) begin
+            caught_count++;
+            set_severity(UVM_INFO);
+        end
+        return THROW;
+    endfunction
+endclass : virtio_expected_bar_reserved_catcher
+
 class virtio_fabric_resource_test extends uvm_test;
     `uvm_component_utils(virtio_fabric_resource_test)
 
@@ -60,6 +80,7 @@ class virtio_fabric_resource_test extends uvm_test;
 
     virtio_net_env_config cfg;
     virtio_net_env        env;
+    virtio_vf_instance    compatibility_vf;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -111,8 +132,10 @@ class virtio_fabric_resource_test extends uvm_test;
 
         if ((function_instance.transport.bar.bar_base[0] != bars[0].base) ||
             (function_instance.transport.bar.bar_size[0] != bars[0].size) ||
-            (function_instance.transport.bar.bar_base[2] != '0) ||
-            (function_instance.transport.bar.bar_size[2] != '0) ||
+            // BAR2/3 is programmed as a Fabric reservation, but the accessor
+            // must reject functional use of it.
+            (function_instance.transport.bar.bar_base[2] != bars[1].base) ||
+            (function_instance.transport.bar.bar_size[2] != bars[1].size) ||
             (function_instance.transport.bar.bar_base[3] != '0) ||
             (function_instance.transport.bar.bar_size[3] != '0) ||
             (function_instance.transport.bar.bar_base[4] != bars[2].base) ||
@@ -172,6 +195,7 @@ class virtio_fabric_resource_test extends uvm_test;
 
     task discover_fabric_function(input virtio_function_instance function_instance);
         virtio_fabric_cfg_stub_accessor config_stub;
+        virtio_expected_bar_reserved_catcher expected_bar_error;
         bit [31:0] reserved_data;
         int unsigned reserved_errors;
 
@@ -183,9 +207,6 @@ class virtio_fabric_resource_test extends uvm_test;
                 function_instance.function_key.vf_id)
         );
         config_stub.configure_fabric_bar_pairs(function_instance.bar_pairs);
-        config_stub.set_report_severity_id_override(
-            UVM_ERROR, "BAR_RESERVED", UVM_INFO
-        );
         function_instance.transport.bar = config_stub;
         function_instance.transport.notify_mgr.bar = config_stub;
         function_instance.transport.cap_mgr.bar_ref = config_stub;
@@ -199,8 +220,23 @@ class virtio_fabric_resource_test extends uvm_test;
         assert_bar_layout(function_instance);
 
         reserved_errors = config_stub.get_reserved_bar_access_error_count();
+        if (reserved_errors != 0) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "Fabric discovery made %0d functional access(es) to BAR2/3",
+                reserved_errors))
+        end
+        // Demote only the deliberate negative access.  A discovery-time
+        // BAR2/3 access above remains visible and fatal.
+        expected_bar_error = new($sformatf("expected_bar_error_%0d_%0d_%0d_%0d",
+            function_instance.function_key.host_id,
+            function_instance.function_key.pf_id,
+            function_instance.function_key.kind,
+            function_instance.function_key.vf_id));
+        uvm_report_cb::add(null, expected_bar_error);
         config_stub.read_reg(2, 32'h0, 4, reserved_data);
+        uvm_report_cb::delete(null, expected_bar_error);
         if ((reserved_data != '0) ||
+            (expected_bar_error.caught_count != 1) ||
             (config_stub.get_reserved_bar_access_error_count() !=
              (reserved_errors + 1))) begin
             `uvm_fatal("FABRIC_RESOURCE",
@@ -227,6 +263,9 @@ class virtio_fabric_resource_test extends uvm_test;
 
         uvm_config_db#(virtio_net_env_config)::set(this, "env", "cfg", cfg);
         env = virtio_net_env::type_id::create("env", this);
+        compatibility_vf = virtio_vf_instance::type_id::create(
+            "compatibility_vf", this
+        );
     endfunction
 
     virtual task run_phase(uvm_phase phase);
@@ -234,9 +273,49 @@ class virtio_fabric_resource_test extends uvm_test;
         int unsigned global_rx_qids[$];
         bit [15:0] all_bdfs[$];
         bar_range_t all_bars[$];
+        int unsigned stale_global_rx_qid;
         string why;
+        virtio_function_instance function_view;
+        dpu_function_key_t compatibility_vf_key;
+        dpu_function_key_t invalid_pf_key;
+        dpu_bar_pair_lease_t no_bars[$];
 
         phase.raise_objection(this);
+
+        // A legacy VF wrapper must remain substitutable for a generic
+        // function while retaining immutable VF identity.  The assignment is
+        // intentionally compile-time coverage for the inheritance direction.
+        function_view = compatibility_vf;
+        if (function_view.function_kind != DPU_FUNCTION_VF) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "compatibility virtio_vf_instance did not force VF identity")
+        end
+
+        // A severity override used by a negative-path test must not let the
+        // VF wrapper fall through and reconfigure itself as a PF.
+        compatibility_vf_key.host_id = 0;
+        compatibility_vf_key.pf_id = 0;
+        compatibility_vf_key.kind = DPU_FUNCTION_VF;
+        compatibility_vf_key.vf_id = 0;
+        compatibility_vf.configure_function(
+            DPU_FUNCTION_VF, compatibility_vf_key, 16'h0400, no_bars
+        );
+        invalid_pf_key = compatibility_vf_key;
+        invalid_pf_key.kind = DPU_FUNCTION_PF;
+        invalid_pf_key.vf_id = 0;
+        compatibility_vf.set_report_severity_id_override(
+            UVM_FATAL, "VF_INSTANCE", UVM_INFO
+        );
+        compatibility_vf.configure_function(
+            DPU_FUNCTION_PF, invalid_pf_key, 16'h0401, no_bars
+        );
+        if ((compatibility_vf.function_kind != DPU_FUNCTION_VF) ||
+            !compatibility_vf.transport.is_vf ||
+            (compatibility_vf.function_key.kind != DPU_FUNCTION_VF)) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "compatibility VF accepted a PF function configuration")
+        end
+
         expected_vfs = new[4];
         expected_vfs[0] = DPU_MAX_VFS_PER_PF;
         expected_vfs[1] = 2;
@@ -248,6 +327,25 @@ class virtio_fabric_resource_test extends uvm_test;
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
                 "expected 4 PFs and 22 VFs, received %0d and %0d",
                 env.pf_instances.size(), env.vf_instances.size()))
+        end
+
+        // A generic function must not be able to take its transport role
+        // from one kind while Fabric ownership comes from a different key.
+        // Override the expected rejection so the test can verify state was
+        // left unchanged without ending this negative-path regression.
+        function_view = env.pf_instances[0].pf_function;
+        function_view.set_report_severity_id_override(
+            UVM_ERROR, "FUNCTION_INSTANCE", UVM_INFO
+        );
+        function_view.configure_function(
+            DPU_FUNCTION_VF, function_view.function_key, function_view.bdf,
+            function_view.bar_pairs, function_view.resource_manager
+        );
+        if ((function_view.function_kind != DPU_FUNCTION_PF) ||
+            function_view.transport.is_vf ||
+            (function_view.function_key.kind != DPU_FUNCTION_PF)) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "function accepted a transport kind that disagrees with its Fabric key")
         end
 
         foreach (env.pf_instances[pf_index]) begin
@@ -326,6 +424,67 @@ class virtio_fabric_resource_test extends uvm_test;
             !env.pf_instances[0].pf_function.resource_client.restore_qpairs(why)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
                 "QP freeze/restore lifecycle was not enforced: %s", why))
+        end
+
+        // Function reset owns lease cleanup.  Call the public FLR path rather
+        // than releasing through the client so a reset cannot leak Fabric QPs.
+        env.pf_instances[0].pf_function.on_flr();
+        if ((env.pf_instances[0].pf_function.resource_client.qpair_leases.size() != 0) ||
+            (env.pf_instances[0].pf_function.resource_client.qpair_mappings.size() != 0) ||
+            env.pf_instances[0].pf_function.resource_client.local_qid_to_global_qid(
+                0, stale_global_rx_qid
+            )) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "FLR did not release the function's Fabric QP leases")
+        end
+
+        // A migration freeze is stateful even when this function has no local
+        // QP leases.  FLR teardown must still restore it, so a later QP
+        // reservation is not rejected as frozen.
+        if (!env.pf_instances[0].pf_function.resource_client.freeze_qpairs(why)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "could not freeze zero-lease function before FLR: %s", why))
+        end
+        env.pf_instances[0].pf_function.on_flr();
+        if (!env.pf_instances[0].pf_function.resource_client.reserve_qpairs(
+            0, 1, why
+        )) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "zero-lease frozen FLR left Fabric QP state frozen: %s", why))
+        end
+
+        // Return to a zero-lease state so disabled-function teardown covers
+        // the same migration edge case independently of FLR.
+        if (!env.pf_instances[0].pf_function.resource_client.release_qpairs(why)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "could not clear QP lease before zero-lease shutdown: %s", why))
+        end
+        if (!env.pf_instances[0].pf_function.resource_client.freeze_qpairs(why)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "could not freeze zero-lease function before shutdown: %s", why))
+        end
+        env.pf_instances[0].pf_function.shutdown();
+        if (!env.pf_instances[0].pf_function.resource_client.reserve_qpairs(
+            0, 1, why
+        )) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "zero-lease frozen shutdown left Fabric QP state frozen: %s", why))
+        end
+
+        // Shutdown is the disabled-function teardown path and must release
+        // the same Fabric-owned QP leases even when migration left them saved.
+        if (!env.pf_instances[0].vf_functions[0].resource_client.freeze_qpairs(why)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "could not freeze VF QP lease before shutdown: %s", why))
+        end
+        env.pf_instances[0].vf_functions[0].shutdown();
+        if ((env.pf_instances[0].vf_functions[0].resource_client.qpair_leases.size() != 0) ||
+            (env.pf_instances[0].vf_functions[0].resource_client.qpair_mappings.size() != 0) ||
+            env.pf_instances[0].vf_functions[0].resource_client.local_qid_to_global_qid(
+                0, stale_global_rx_qid
+            )) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "function shutdown did not release Fabric QP leases")
         end
 
         foreach (env.pf_instances[pf_index]) begin
