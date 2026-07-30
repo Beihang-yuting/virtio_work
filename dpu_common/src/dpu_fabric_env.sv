@@ -24,6 +24,7 @@ class dpu_fabric_env extends uvm_env;
     `uvm_component_utils(dpu_fabric_env)
 
     protected dpu_resource_manager resource_manager;
+    protected dpu_resource_fabric_authority registry_authority;
     protected bit                  resource_profiles_applied;
 
     function new(string name, uvm_component parent);
@@ -36,6 +37,9 @@ class dpu_fabric_env extends uvm_env;
         resource_manager = dpu_resource_manager::type_id::create(
             "dpu_resource_manager"
         );
+        registry_authority = resource_manager.claim_fabric_registry_authority();
+        if (registry_authority == null)
+            `uvm_fatal("DPU_RESOURCE", "DPU Fabric could not claim registry authority")
         uvm_config_db#(dpu_resource_manager)::set(
             this, "", "dpu_resource_manager", resource_manager
         );
@@ -70,7 +74,8 @@ class dpu_fabric_env extends uvm_env;
 
         for (int unsigned index = 0;
              index < cfg.resource_profiles.size(); index++) begin
-            if (!resource_manager.register_resource_class(
+            if (!resource_manager.fabric_register_resource_class(
+                registry_authority,
                 cfg.resource_profiles[index].name,
                 cfg.resource_profiles[index].kind,
                 cfg.resource_profiles[index].capacity,
@@ -80,7 +85,7 @@ class dpu_fabric_env extends uvm_env;
             ))
                 return 0;
         end
-        if (!resource_manager.seal_resource_classes(why))
+        if (!resource_manager.fabric_seal_resource_classes(registry_authority, why))
             return 0;
 
         resource_profiles_applied = 1;

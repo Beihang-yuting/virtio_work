@@ -23,6 +23,12 @@ class dpu_resource_function_state;
 endclass : dpu_resource_function_state
 
 
+// The Fabric environment claims this capability before publishing a manager to
+// config_db. Clients cannot obtain this manager-owned handle afterwards.
+class dpu_resource_fabric_authority;
+endclass : dpu_resource_fabric_authority
+
+
 class dpu_resource_manager extends uvm_object;
     `uvm_object_utils(dpu_resource_manager)
 
@@ -34,11 +40,15 @@ class dpu_resource_manager extends uvm_object;
     protected int unsigned                 class_allocated_count[
         dpu_resource_class_id_t
     ];
+    protected bit                          active_global_ids[
+        dpu_resource_class_id_t
+    ][int unsigned];
 
     protected dpu_resource_class_id_t next_resource_class_id;
-    protected int unsigned            next_global_id;
     protected int unsigned            activated_function_count;
     protected bit                     resource_classes_sealed;
+    protected dpu_resource_fabric_authority fabric_registry_authority;
+    protected bit                           fabric_registry_authority_claimed;
 
     protected bit        aperture_configured;
     protected bit [63:0] aperture_base;
@@ -48,9 +58,10 @@ class dpu_resource_manager extends uvm_object;
     function new(string name = "dpu_resource_manager");
         super.new(name);
         next_resource_class_id = 0;
-        next_global_id = 0;
         activated_function_count = 0;
         resource_classes_sealed = 0;
+        fabric_registry_authority = new();
+        fabric_registry_authority_claimed = 0;
         aperture_configured = 0;
         aperture_base = '0;
         aperture_limit = '0;
@@ -153,6 +164,31 @@ class dpu_resource_manager extends uvm_object;
     );
         if (class_allocated_count.exists(class_id))
             return class_allocated_count[class_id];
+        return 0;
+    endfunction
+
+    protected function bit allocate_global_ids(
+        input dpu_resource_class_id_t class_id,
+        input int unsigned capacity,
+        input int unsigned count,
+        ref int unsigned global_ids[$],
+        output string why
+    );
+        global_ids.delete();
+        why = "";
+
+        for (int unsigned candidate = 0;
+             candidate < capacity;
+             candidate++) begin
+            if (!active_global_ids[class_id].exists(candidate)) begin
+                global_ids.push_back(candidate);
+                if (global_ids.size() == count)
+                    return 1;
+            end
+        end
+
+        global_ids.delete();
+        why = "resource-class active IDs are inconsistent with capacity";
         return 0;
     endfunction
 
@@ -262,7 +298,17 @@ class dpu_resource_manager extends uvm_object;
         return (activated_function_count != 0);
     endfunction
 
-    function bit register_resource_class(
+    // Fabric claims this one-shot capability before publishing the manager in
+    // config_db. A client can name the capability type but cannot obtain this
+    // manager-owned handle after that claim.
+    function dpu_resource_fabric_authority claim_fabric_registry_authority();
+        if (fabric_registry_authority_claimed)
+            return null;
+        fabric_registry_authority_claimed = 1;
+        return fabric_registry_authority;
+    endfunction
+
+    protected function bit register_resource_class_internal(
         input string name,
         input dpu_resource_kind_e kind,
         input int unsigned capacity,
@@ -311,6 +357,44 @@ class dpu_resource_manager extends uvm_object;
         return 1;
     endfunction
 
+    function bit register_resource_class(
+        input string name,
+        input dpu_resource_kind_e kind,
+        input int unsigned capacity,
+        input int unsigned max_per_function,
+        output dpu_resource_class_id_t class_id,
+        output string why
+    );
+        class_id = '0;
+        if (fabric_registry_authority_claimed) begin
+            why = "only the DPU Fabric environment can register resource classes";
+            return 0;
+        end
+        return register_resource_class_internal(
+            name, kind, capacity, max_per_function, class_id, why
+        );
+    endfunction
+
+    function bit fabric_register_resource_class(
+        input dpu_resource_fabric_authority authority,
+        input string name,
+        input dpu_resource_kind_e kind,
+        input int unsigned capacity,
+        input int unsigned max_per_function,
+        output dpu_resource_class_id_t class_id,
+        output string why
+    );
+        class_id = '0;
+        if (!fabric_registry_authority_claimed || (authority == null) ||
+            (authority != fabric_registry_authority)) begin
+            why = "resource-class registration requires the Fabric authority";
+            return 0;
+        end
+        return register_resource_class_internal(
+            name, kind, capacity, max_per_function, class_id, why
+        );
+    endfunction
+
     function bit lookup_resource_class(
         input string name,
         output dpu_resource_class_id_t class_id,
@@ -327,10 +411,30 @@ class dpu_resource_manager extends uvm_object;
         return 1;
     endfunction
 
-    function bit seal_resource_classes(output string why);
+    protected function bit seal_resource_classes_internal(output string why);
         resource_classes_sealed = 1;
         why = "";
         return 1;
+    endfunction
+
+    function bit seal_resource_classes(output string why);
+        if (fabric_registry_authority_claimed) begin
+            why = "only the DPU Fabric environment can seal resource classes";
+            return 0;
+        end
+        return seal_resource_classes_internal(why);
+    endfunction
+
+    function bit fabric_seal_resource_classes(
+        input dpu_resource_fabric_authority authority,
+        output string why
+    );
+        if (!fabric_registry_authority_claimed || (authority == null) ||
+            (authority != fabric_registry_authority)) begin
+            why = "resource-class sealing requires the Fabric authority";
+            return 0;
+        end
+        return seal_resource_classes_internal(why);
     endfunction
 
     function bit activate_function(
@@ -436,6 +540,7 @@ class dpu_resource_manager extends uvm_object;
         dpu_resource_lease_t lease;
         int unsigned current_function_count;
         int unsigned current_class_count;
+        int unsigned global_ids[$];
 
         leases.delete();
         if (!lookup_function_state(key, state, why))
@@ -460,11 +565,6 @@ class dpu_resource_manager extends uvm_object;
             why = "local resource ID range overflows";
             return 0;
         end
-        if (next_global_id > (32'hffff_ffff - (count - 1))) begin
-            why = "global resource ID space is exhausted";
-            return 0;
-        end
-
         profile = resource_profiles_by_id[class_id];
         current_function_count = function_class_lease_count(state, class_id);
         if ((current_function_count > profile.max_per_function) ||
@@ -486,13 +586,19 @@ class dpu_resource_manager extends uvm_object;
             end
         end
 
+        if (!allocate_global_ids(
+            class_id, profile.capacity, count, global_ids, why
+        )) begin
+            return 0;
+        end
+
         for (int unsigned offset = 0; offset < count; offset++) begin
             lease.owner = key;
             lease.local_id = first_local_id + offset;
             lease.class_id = class_id;
-            lease.global_id = next_global_id;
+            lease.global_id = global_ids[offset];
             lease.frozen = 0;
-            next_global_id++;
+            active_global_ids[class_id][lease.global_id] = 1;
             state.leases.push_back(lease);
             leases.push_back(lease);
         end
@@ -523,6 +629,9 @@ class dpu_resource_manager extends uvm_object;
         released_count = 0;
         for (int index = state.leases.size(); index > 0; index--) begin
             if (state.leases[index - 1].class_id == class_id) begin
+                active_global_ids[class_id].delete(
+                    state.leases[index - 1].global_id
+                );
                 state.leases.delete(index - 1);
                 released_count++;
             end

@@ -109,7 +109,8 @@ class dpu_resource_manager_test extends uvm_test;
 
     task assert_fabric_global_qpair_capacity(
         dpu_resource_manager manager,
-        dpu_resource_class_id_t qpair_class_id
+        dpu_resource_class_id_t qpair_class_id,
+        int unsigned qpair_capacity
     );
         dpu_function_key_t key;
         dpu_function_key_t overflow_key;
@@ -143,7 +144,27 @@ class dpu_resource_manager_test extends uvm_test;
                         "PF readiness failed for host %0d PF %0d: %s",
                         host_id, pf_id, why))
                 end
-                if (!manager.acquire_leases(
+                if ((host_id == 0) && (pf_id == 0)) begin
+                    if (!manager.acquire_leases(
+                        key, qpair_class_id, 0, 1, leases, why
+                    )) begin
+                        `uvm_fatal("DPU_RESOURCE", $sformatf(
+                            "first PF QP lease failed: %s", why))
+                    end
+                    if (manager.acquire_leases(
+                        key, qpair_class_id, 0, 1, leases, why
+                    )) begin
+                        `uvm_fatal("DPU_RESOURCE",
+                            "duplicate local QP ID unexpectedly succeeded")
+                    end
+                    if (!manager.acquire_leases(
+                        key, qpair_class_id, 1, 31, leases, why
+                    )) begin
+                        `uvm_fatal("DPU_RESOURCE", $sformatf(
+                            "remaining first-PF QP leases failed: %s", why))
+                    end
+                end
+                else if (!manager.acquire_leases(
                     key, qpair_class_id, 0, 32, leases, why
                 )) begin
                     `uvm_fatal("DPU_RESOURCE", $sformatf(
@@ -212,10 +233,10 @@ class dpu_resource_manager_test extends uvm_test;
             `uvm_fatal("DPU_RESOURCE",
                 "recovered VF QP lease has no global ID")
         end
-        if (global_id >= 2048) begin
+        if (global_id >= qpair_capacity) begin
             `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "recovered VF QP global ID %0d exceeds the 2048-QP pool",
-                global_id))
+                "recovered VF QP global ID %0d exceeds the QP pool capacity %0d",
+                global_id, qpair_capacity))
         end
     endtask
 
@@ -234,17 +255,6 @@ class dpu_resource_manager_test extends uvm_test;
 
         qpair_profile = make_resource_profile(
             "virtio.qpair", DPU_RESOURCE_KIND_QUEUE, 2048, 32);
-        fabric_cfg.resource_profiles.push_back(qpair_profile);
-        if (!fabric.apply_resource_profiles(fabric_cfg, why)) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "Fabric QP profile application failed: %s", why))
-        end
-        if (!fabric.lookup_resource_class(
-            qpair_profile.name, qpair_class_id, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "Fabric QP profile lookup failed: %s", why))
-        end
         if (!uvm_config_db#(dpu_resource_manager)::get(
             this, "fabric", "dpu_resource_manager", manager
         )) begin
@@ -258,6 +268,28 @@ class dpu_resource_manager_test extends uvm_test;
         end
         if (child_manager != manager) begin
             `uvm_fatal("DPU_RESOURCE", "Fabric child scope received a different manager")
+        end
+        if (manager.register_resource_class(
+            qpair_profile.name, qpair_profile.kind, qpair_profile.capacity,
+            qpair_profile.max_per_function, rejected_class_id, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "Fabric client bypassed profile registration before apply")
+        end
+        if (manager.seal_resource_classes(why)) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "Fabric client bypassed profile sealing before apply")
+        end
+        fabric_cfg.resource_profiles.push_back(qpair_profile);
+        if (!fabric.apply_resource_profiles(fabric_cfg, why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "Fabric QP profile application failed: %s", why))
+        end
+        if (!fabric.lookup_resource_class(
+            qpair_profile.name, qpair_class_id, why
+        )) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "Fabric QP profile lookup failed: %s", why))
         end
         if (manager.register_resource_class(
             qpair_profile.name, qpair_profile.kind, qpair_profile.capacity,
@@ -304,7 +336,9 @@ class dpu_resource_manager_test extends uvm_test;
             `uvm_fatal("DPU_RESOURCE", "VF key with vf_id == 16 unexpectedly validated")
         end
 
-        assert_fabric_global_qpair_capacity(manager, qpair_class_id);
+        assert_fabric_global_qpair_capacity(
+            manager, qpair_class_id, qpair_profile.capacity
+        );
 
         phase.drop_objection(this);
     endtask
