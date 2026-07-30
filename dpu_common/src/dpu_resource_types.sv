@@ -1,17 +1,14 @@
 // =============================================================================
 // DPU Fabric resource identities and leases
 //
-// This file is an include fragment for dpu_resource_pkg.  It remains listed
-// before the package in dpu_common.f so shared declarations have an explicit
-// dependency order for tools that consume the filelist directly.
+// This file is included only by dpu_resource_pkg so the package owns one
+// canonical set of shared declarations.
 // =============================================================================
 
 localparam int unsigned DPU_MAX_HOSTS = 4;
 localparam int unsigned DPU_MAX_PFS_PER_HOST = 16;
 localparam int unsigned DPU_MAX_VFS_PER_PF = 16;
 localparam int unsigned DPU_MAX_FUNCTIONS = 1024;
-localparam int unsigned DPU_MAX_VIRTIO_QPAIRS = 2048;
-localparam int unsigned DPU_MAX_VIRTIO_QPAIRS_PER_DEVICE = 32;
 
 typedef enum int unsigned {
   DPU_FUNCTION_PF,
@@ -19,16 +16,14 @@ typedef enum int unsigned {
 } dpu_function_kind_e;
 
 typedef enum int unsigned {
-  DPU_RES_FUNCTION,
-  DPU_RES_BAR,
-  DPU_RES_VIRTIO_QPAIR,
-  DPU_RES_VIRTIO_SPECIAL_VQ,
-  DPU_RES_RDMA_QP,
-  DPU_RES_RDMA_CQ,
-  DPU_RES_BLOCK_QUEUE,
-  DPU_RES_MSIX_VECTOR,
-  DPU_RES_DMA_WINDOW
-} dpu_resource_class_e;
+  DPU_RESOURCE_KIND_FUNCTION,
+  DPU_RESOURCE_KIND_BAR,
+  DPU_RESOURCE_KIND_QUEUE,
+  DPU_RESOURCE_KIND_INTERRUPT_VECTOR,
+  DPU_RESOURCE_KIND_DMA_WINDOW
+} dpu_resource_kind_e;
+
+typedef int unsigned dpu_resource_class_id_t;
 
 typedef enum int unsigned {
   // These roles describe generic function BAR placement, not protocol roles.
@@ -48,13 +43,14 @@ typedef struct {
 typedef struct {
   dpu_function_key_t owner;
   int unsigned local_id;
-  dpu_resource_class_e class_id;
+  dpu_resource_class_id_t class_id;
   int unsigned global_id;
   bit frozen;
 } dpu_resource_lease_t;
 
 typedef struct {
-  dpu_resource_class_e class_id;
+  dpu_resource_class_id_t class_id;
+  dpu_resource_kind_e kind;
   int unsigned capacity;
   int unsigned max_per_function;
 } dpu_resource_pool_config_t;

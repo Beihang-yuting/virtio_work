@@ -41,7 +41,7 @@ class dpu_resource_manager_test extends uvm_test;
         string why;
 
         phase.raise_objection(this);
-        manager = new();
+        manager = dpu_resource_manager::type_id::create("manager");
 
         for (int unsigned host_id = 0; host_id < DPU_MAX_HOSTS; host_id++) begin
             for (int unsigned pf_id = 0; pf_id < DPU_MAX_PFS_PER_HOST; pf_id++) begin

@@ -95,6 +95,8 @@ Add Make targets `bootstrap`, `check-deps`, `compile`, `test`, and `regression`;
 "$root_dir/build/simv" +UVM_TESTNAME="$TEST" +UVM_VERBOSITY="${UVM_VERBOSITY:-UVM_LOW}"
 ```
 
+When `TEST=dpu_resource_manager_test`, append `-f "$root_dir/filelists/dpu_red_tests.f"` before `tests.f`; no other TEST receives that red-only source. The external dependency preflight remains before every VCS invocation.
+
 Use paths relative to `root_dir` in the filelists and update README to use `make bootstrap`, `make check-deps`, and `make test TEST=virtio_unit_test`.
 
 - [ ] **Step 5: Verify and commit**
@@ -112,11 +114,13 @@ git commit -m "build: add pinned external VIP dependencies"
 
 **Files:**
 - Create: `dpu_common/src/dpu_resource_types.sv`, `dpu_common/src/dpu_resource_pkg.sv`
-- Test: `dpu_common/tests/dpu_resource_manager_test.sv`
+- Create: `filelists/dpu_red_tests.f`
+- Modify: `filelists/dpu_common.f`, `filelists/tests.f`, `scripts/vcs.sh`
+- Test: `dpu_common/tests/dpu_resource_manager_test.sv` (red-only until Task 3 implements the manager)
 
 - [ ] **Step 1: Write topology boundary tests**
 
-Add a UVM test class that constructs `dpu_resource_manager` and asserts: 64 active PFs plus 960 VFs succeeds, a 961st VF fails, and VF index 16 fails. QP quota is tested only after Task 3 has configured its generic resource pool.
+Add a UVM test class that factory-creates `dpu_resource_manager` and asserts: 64 active PFs plus 960 VFs succeeds, a 961st VF fails, and VF index 16 fails. Keep it only in `dpu_red_tests.f` until Task 3 implements `uvm_object_utils` and the manager methods, so ordinary virtio compilations do not compile an intentional red test. QP quota is tested only after Task 3 has registered its generic resource class.
 
 ```systemverilog
 function automatic dpu_function_key_t make_pf_key(int unsigned host_id, int unsigned pf_id);
@@ -157,10 +161,11 @@ Create `dpu_resource_types.sv` with the following API, before any protocol impor
 ```systemverilog
 typedef enum int unsigned { DPU_FUNCTION_PF, DPU_FUNCTION_VF } dpu_function_kind_e;
 typedef enum int unsigned {
-  DPU_RES_FUNCTION, DPU_RES_BAR, DPU_RES_VIRTIO_QPAIR,
-  DPU_RES_VIRTIO_SPECIAL_VQ, DPU_RES_RDMA_QP, DPU_RES_RDMA_CQ,
-  DPU_RES_BLOCK_QUEUE, DPU_RES_MSIX_VECTOR, DPU_RES_DMA_WINDOW
-} dpu_resource_class_e;
+  DPU_RESOURCE_KIND_FUNCTION, DPU_RESOURCE_KIND_BAR,
+  DPU_RESOURCE_KIND_QUEUE, DPU_RESOURCE_KIND_INTERRUPT_VECTOR,
+  DPU_RESOURCE_KIND_DMA_WINDOW
+} dpu_resource_kind_e;
+typedef int unsigned dpu_resource_class_id_t;
 typedef enum int unsigned { DPU_BAR_FUNCTION_DEVICE, DPU_BAR_RESERVED, DPU_BAR_MSIX } dpu_bar_role_e;
 
 typedef struct {
@@ -173,12 +178,13 @@ typedef struct {
 typedef struct {
   dpu_function_key_t owner;
   int unsigned local_id;
-  dpu_resource_class_e class_id;
+  dpu_resource_class_id_t class_id;
   int unsigned global_id;
   bit frozen;
 } dpu_resource_lease_t;
 typedef struct {
-  dpu_resource_class_e class_id;
+  dpu_resource_class_id_t class_id;
+  dpu_resource_kind_e kind;
   int unsigned capacity;
   int unsigned max_per_function;
 } dpu_resource_pool_config_t;
@@ -190,18 +196,18 @@ typedef struct {
 } dpu_bar_pair_lease_t;
 ```
 
-Define constants `DPU_MAX_HOSTS=4`, `DPU_MAX_PFS_PER_HOST=16`, `DPU_MAX_VFS_PER_PF=16`, `DPU_MAX_FUNCTIONS=1024`, `DPU_MAX_VIRTIO_QPAIRS=2048`, and `DPU_MAX_VIRTIO_QPAIRS_PER_DEVICE=32`. Package the types and manager with `package dpu_resource_pkg; import uvm_pkg::*;`.
+Define only core topology constants `DPU_MAX_HOSTS=4`, `DPU_MAX_PFS_PER_HOST=16`, `DPU_MAX_VFS_PER_PF=16`, and `DPU_MAX_FUNCTIONS=1024`. `dpu_resource_types.sv` is an include fragment, and `dpu_common.f` compiles only `dpu_resource_pkg.sv`, which includes that fragment exactly once. Package the types with `package dpu_resource_pkg; import uvm_pkg::*;`; manager implementation remains deferred to Task 3. The core never declares protocol QP constants or resource-name enums.
 
 - [ ] **Step 4: Run the type compile check**
 
 Run: `make compile TEST=dpu_resource_manager_test`
 
-Expected: the test advances from missing-type errors to missing-manager-method errors.
+Expected: once the external dependency blocker is resolved, the red-only test advances from missing-type errors to missing factory-capable manager/method errors.
 
 - [ ] **Step 5: Commit the type boundary**
 
 ```bash
-git add dpu_common/src/dpu_resource_types.sv dpu_common/src/dpu_resource_pkg.sv dpu_common/tests/dpu_resource_manager_test.sv filelists/dpu_common.f
+git add dpu_common/src/dpu_resource_types.sv dpu_common/src/dpu_resource_pkg.sv dpu_common/tests/dpu_resource_manager_test.sv filelists/dpu_common.f filelists/dpu_red_tests.f filelists/tests.f scripts/vcs.sh
 git commit -m "feat: define shared DPU resource identities"
 ```
 
@@ -217,8 +223,10 @@ git commit -m "feat: define shared DPU resource identities"
 Extend the test with these expectations:
 
 ```systemverilog
+dpu_resource_class_id_t virtio_qpair_class_id;
 rm.configure_mmio_aperture(64'h0001_0000_0000_0000, 64'h0001_0010_0000_0000);
-assert(rm.configure_resource_pool(DPU_RES_VIRTIO_QPAIR, 2048, 32, why))
+assert(rm.register_resource_class("virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
+                                  2048, 32, virtio_qpair_class_id, why))
   else `uvm_fatal("DPU_TEST", why)
 assert(rm.activate_function(pf_key, pf_bars, why)) else `uvm_fatal("DPU_TEST", why)
 assert(pf_bars[0].role == DPU_BAR_FUNCTION_DEVICE && pf_bars[0].even_bar_id == 0 && pf_bars[0].size == 32*1024*1024)
@@ -227,15 +235,15 @@ assert(pf_bars[1].role == DPU_BAR_RESERVED && pf_bars[1].even_bar_id == 2 && pf_
   else `uvm_error("DPU_TEST", "PF BAR2/3 layout is wrong")
 assert(pf_bars[2].role == DPU_BAR_MSIX && pf_bars[2].even_bar_id == 4 && pf_bars[2].size == 64*1024)
   else `uvm_error("DPU_TEST", "PF BAR4/5 layout is wrong")
-assert(!rm.acquire_leases(pf_key, DPU_RES_VIRTIO_QPAIR, 0, 1, leases_a, why))
+assert(!rm.acquire_leases(pf_key, virtio_qpair_class_id, 0, 1, leases_a, why))
   else `uvm_error("DPU_TEST", "QP allocation preceded BAR capability discovery")
 assert(rm.mark_function_device_ready(pf_key, why)) else `uvm_fatal("DPU_TEST", why)
-assert(rm.acquire_leases(pf_key, DPU_RES_VIRTIO_QPAIR, 0, 32, leases_a, why)) else `uvm_fatal("DPU_TEST", why)
-assert(!rm.acquire_leases(pf_key, DPU_RES_VIRTIO_QPAIR, 32, 33, leases_b, why))
+assert(rm.acquire_leases(pf_key, virtio_qpair_class_id, 0, 32, leases_a, why)) else `uvm_fatal("DPU_TEST", why)
+assert(!rm.acquire_leases(pf_key, virtio_qpair_class_id, 32, 33, leases_b, why))
   else `uvm_error("DPU_TEST", "per-device QP limit accepted")
 ```
 
-For `host_id in [0:3]` and `pf_id in [0:15]`, activate and mark each PF function ready, then acquire local QP IDs `[0:31]` from `DPU_RES_VIRTIO_QPAIR`. Verify that the 65th request fails due to the 2,048-QP pool, call `release_leases()` for the PF at `(0,0)`, and verify that this PF can reacquire 32 QPs. This proves capacity exhaustion and recovery without relying on a virtio-specific manager API.
+For `host_id in [0:3]` and `pf_id in [0:15]`, activate and mark each PF function ready, then acquire local QP IDs `[0:31]` using the returned `virtio_qpair_class_id`. Verify that the 65th request fails due to this 2,048-QP client profile, call `release_leases()` for the PF at `(0,0)` with that ID, and verify that this PF can reacquire 32 QPs. This proves capacity exhaustion and recovery without a manager-side virtio-specific API.
 
 - [ ] **Step 2: Run the new test to verify it fails**
 
@@ -248,27 +256,33 @@ Expected: failure because no lease methods exist.
 Implement these public methods on `dpu_resource_manager`:
 
 ```systemverilog
-function bit register_function(dpu_function_key_t key, output string why);
-function void configure_mmio_aperture(bit [63:0] base, bit [63:0] limit);
-function bit configure_resource_pool(dpu_resource_class_e class_id, int unsigned capacity,
-                                     int unsigned max_per_function, output string why);
-function bit activate_function(dpu_function_key_t key, ref dpu_bar_pair_lease_t bars[$], output string why);
-function bit mark_function_device_ready(dpu_function_key_t key, output string why);
-function bit acquire_leases(
-  dpu_function_key_t key, dpu_resource_class_e class_id,
-  int unsigned first_local_id, int unsigned count,
-  ref dpu_resource_lease_t leases[$], output string why);
-function bit release_leases(dpu_function_key_t key, dpu_resource_class_e class_id,
-                            output string why);
-function bit freeze_function(dpu_function_key_t key, output string why);
-function bit restore_function(dpu_function_key_t key, output string why);
-function bit local_to_global(dpu_function_key_t key, dpu_resource_class_e class_id,
-                             int unsigned local_id, output int unsigned global_id);
+class dpu_resource_manager extends uvm_object;
+  `uvm_object_utils(dpu_resource_manager)
+
+  function bit register_function(dpu_function_key_t key, output string why);
+  function void configure_mmio_aperture(bit [63:0] base, bit [63:0] limit);
+  function bit register_resource_class(
+    string name, dpu_resource_kind_e kind,
+    int unsigned capacity, int unsigned max_per_function,
+    output dpu_resource_class_id_t class_id, output string why);
+  function bit activate_function(dpu_function_key_t key, ref dpu_bar_pair_lease_t bars[$], output string why);
+  function bit mark_function_device_ready(dpu_function_key_t key, output string why);
+  function bit acquire_leases(
+    dpu_function_key_t key, dpu_resource_class_id_t class_id,
+    int unsigned first_local_id, int unsigned count,
+    ref dpu_resource_lease_t leases[$], output string why);
+  function bit release_leases(dpu_function_key_t key, dpu_resource_class_id_t class_id,
+                              output string why);
+  function bit freeze_function(dpu_function_key_t key, output string why);
+  function bit restore_function(dpu_function_key_t key, output string why);
+  function bit local_to_global(dpu_function_key_t key, dpu_resource_class_id_t class_id,
+                               int unsigned local_id, output int unsigned global_id);
+endclass : dpu_resource_manager
 ```
 
 `activate_function()` first validates the hierarchy/function count, then allocates three aligned non-overlapping 64-bit BAR pairs from the configured MMIO aperture: PF `{BAR0/1:32 MiB function-device, BAR2/3:64 KiB reserved, BAR4/5:64 KiB MSI-X}` and VF `{BAR0/1:16 KiB function-device, BAR2/3:16 KiB reserved, BAR4/5:32 KiB MSI-X}`. It emits only even BAR leases; the caller writes each base low/high to its even/odd PCI config slots. BAR2/3 is a consumed but unbound reservation: its lease is retained solely for config programming and ownership tracking, and is never exposed through a functional MMIO accessor. `mark_function_device_ready()` is called only after the client has completed BAR0/1 discovery.
 
-`configure_resource_pool()` validates and records each protocol resource class's capacity and per-function quota. `acquire_leases()` accepts any configured class, assigns unique global IDs, rejects duplicate local IDs, and is unavailable before device readiness or while frozen. The manager does not derive protocol values from an ID. The virtio client configures `DPU_RES_VIRTIO_QPAIR={capacity:2048,max_per_function:32}`, acquires one lease per QP, and derives RX/TX IDs as `2*global_id` and `2*global_id+1`. RDMA and block clients configure and acquire their own classes through the same API. Reject a duplicate function key, invalid hierarchy, insufficient aperture, an unconfigured class, an unready/frozen function, count zero, quota violation and exhausted capacity. `release_leases()` removes only the requesting function/class leases. `freeze_function` retains BAR/resource ownership and blocks new allocation; `restore_function` unfreezes it.
+`register_resource_class()` validates and records a client-supplied opaque label, generic kind, capacity and per-function quota, then returns an opaque ID. The manager never branches on the label or derives protocol behavior from an ID. `acquire_leases()` accepts only a registered ID, assigns unique global IDs, rejects duplicate local IDs, and is unavailable before device readiness or while frozen. The virtio client registers `"virtio.qpair"` with kind `DPU_RESOURCE_KIND_QUEUE`, capacity 2048 and per-function limit 32, saves the returned ID, acquires one lease per QP, and derives RX/TX IDs as `2*global_id` and `2*global_id+1`. RDMA and block clients register and acquire their own IDs through the same API. Reject a duplicate function key, invalid hierarchy, insufficient aperture, an unregistered ID, an unready/frozen function, count zero, quota violation and exhausted capacity. `release_leases()` removes only the requesting function/class leases. `freeze_function` retains BAR/resource ownership and blocks new allocation; `restore_function` unfreezes it.
 
 `dpu_fabric_env` creates exactly one manager in `build_phase` and places it into `uvm_config_db#(dpu_resource_manager)` under key `dpu_resource_manager` for child protocol environments.
 
@@ -317,7 +331,7 @@ Add topology fields `num_hosts`, `max_hosts`, `num_pfs_per_host[]`, `num_vfs_per
 
 `virtio_function_instance` owns one driver agent, transport, queue manager, dataplane, `dpu_function_key_t`, and three `dpu_bar_pair_lease_t` records; its `configure_function()` receives function kind, BDF, BAR leases and resource manager. Program BAR0/1, BAR2/3 and BAR4/5 into config space before transport discovery. Bind `transport.bar.bar_base[0]` only to BAR0/1 and add an MSI-X table/PBA aperture binding only to BAR4/5; BAR2/3 has no functional accessor and a direct TLP to it is classified as a reserved-BAR monitor error. `virtio_pf_instance` owns one PF function plus `vf_functions[]` and its PF manager. Preserve a compatibility `virtio_vf_instance` wrapper extending `virtio_function_instance` and forcing `DPU_FUNCTION_VF` until external users migrate.
 
-After `transport.discover_and_init_bars()` validates BAR0/1 virtio capabilities, `virtio_resource_client::reserve_data_qpairs()` calls `mark_function_device_ready()` then `acquire_leases(key, DPU_RES_VIRTIO_QPAIR, ...)`, stores `{local_pair, rx_global_qid, tx_global_qid}`, and exposes `local_qid_to_global_qid()`. It alone derives RX/TX IDs from its generic lease IDs. Reserve at queue setup, release `DPU_RES_VIRTIO_QPAIR` at teardown/FLR/disable, freeze before migration and restore after migration. Update `virtio_vf_resource_pool` to become a local view keyed by full function key and never increment `next_global_qid`.
+After `transport.discover_and_init_bars()` validates BAR0/1 virtio capabilities, `virtio_resource_client` registers `"virtio.qpair"` as `DPU_RESOURCE_KIND_QUEUE` with its 2048/32 profile, saves the returned `virtio_qpair_class_id`, calls `mark_function_device_ready()`, then calls `acquire_leases(key, virtio_qpair_class_id, ...)`. It stores `{local_pair, rx_global_qid, tx_global_qid}` and exposes `local_qid_to_global_qid()`. It alone derives RX/TX IDs from its generic lease IDs. Reserve at queue setup, release the saved class ID at teardown/FLR/disable, freeze before migration and restore after migration. Update `virtio_vf_resource_pool` to become a local view keyed by full function key and never increment `next_global_qid`.
 
 - [ ] **Step 4: Run topology and existing unit tests**
 
@@ -568,7 +582,7 @@ Expected: all listed tests PASS when VCS is available. If VCS is unavailable, `m
 
 - [ ] **Step 3: Document exact operating model**
 
-Update README/manual with the 4-host/16-PF/16-VF-local/1024-function-global limits, 2048 global QP and 32-QP/device limits, the fact that full-PF activation leaves 960 active VF slots, and the BAR-first mapping: PF `BAR0/1=32 MiB function-device`, `BAR2/3=64 KiB reserved`, `BAR4/5=64 KiB MSI-X table/PBA`; VF `BAR0/1=16 KiB function-device`, `BAR2/3=16 KiB reserved`, `BAR4/5=32 KiB MSI-X table/PBA`. State that current virtio capability discovery is only in BAR0/1, BAR2/3 consumes address space but has no binding and all functional accesses are violations, and BAR4/5 is only MSI-X table/PBA. Document 64-bit MMIO aperture configuration, alignment/no-overlap checks, capability discovery before dynamic-resource acquisition, the generic resource-pool/lease API as the future RDMA/virtio-blk integration point, and special-VQ capacity as a separate hardware configuration.
+Update README/manual with the 4-host/16-PF/16-VF-local/1024-function-global limits, the virtio client QP registration profile of 2048 global QPs and 32 QPs/function (not DPU enum constants), the fact that full-PF activation leaves 960 active VF slots, and the BAR-first mapping: PF `BAR0/1=32 MiB function-device`, `BAR2/3=64 KiB reserved`, `BAR4/5=64 KiB MSI-X table/PBA`; VF `BAR0/1=16 KiB function-device`, `BAR2/3=16 KiB reserved`, `BAR4/5=32 KiB MSI-X table/PBA`. State that current virtio capability discovery is only in BAR0/1, BAR2/3 consumes address space but has no binding and all functional accesses are violations, and BAR4/5 is only MSI-X table/PBA. Document 64-bit MMIO aperture configuration, alignment/no-overlap checks, capability discovery before dynamic-resource acquisition, runtime registration of opaque class IDs and the generic resource-pool/lease API as the future RDMA/virtio-blk integration point, and special-VQ capacity as a separate client registration.
 
 - [ ] **Step 4: Run final repository verification**
 

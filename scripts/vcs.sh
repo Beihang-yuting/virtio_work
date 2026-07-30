@@ -45,11 +45,26 @@ esac
 cd "$root_dir"
 mkdir -p build
 
-"$VCS_HOME/bin/vcs" -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps \
-  -f "$root_dir/filelists/dpu_common.f" \
-  -f "$root_dir/filelists/virtio_net.f" \
-  -f "$root_dir/filelists/tests.f" \
-  -top virtio_tb_top -o "$root_dir/build/simv"
+vcs_args=(
+  -full64
+  -sverilog
+  -ntb_opts uvm-1.2
+  -timescale=1ns/1ps
+  -f "$root_dir/filelists/dpu_common.f"
+  -f "$root_dir/filelists/virtio_net.f"
+)
+
+if [[ "$TEST" == "dpu_resource_manager_test" ]]; then
+  vcs_args+=(-f "$root_dir/filelists/dpu_red_tests.f")
+fi
+
+vcs_args+=(
+  -f "$root_dir/filelists/tests.f"
+  -top virtio_tb_top
+  -o "$root_dir/build/simv"
+)
+
+"$VCS_HOME/bin/vcs" "${vcs_args[@]}"
 if (( compile_only )); then
   exit 0
 fi
