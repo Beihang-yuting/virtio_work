@@ -179,6 +179,10 @@ class split_virtqueue extends virtqueue_base;
     // free_rings -- Deallocate all three ring regions
     // ------------------------------------------------------------------
     virtual function void free_rings();
+        release_all_dma_mappings();
+        discard_staged_migration_ownership();
+        token_map.delete();
+        release_all_indirect_tables();
         if (desc_table_addr != 0)  mem.free(desc_table_addr);
         if (driver_ring_addr != 0) mem.free(driver_ring_addr);
         if (device_ring_addr != 0) mem.free(device_ring_addr);
@@ -203,7 +207,8 @@ class split_virtqueue extends virtqueue_base;
         avail_idx         = 0;
         event_idx_enabled = 0;
         token_map.delete();
-        dma_mappings.delete();
+        release_all_dma_mappings();
+        discard_staged_migration_ownership();
         total_add_buf_ops   = 0;
         total_poll_used_ops = 0;
         total_kick_ops      = 0;
@@ -221,13 +226,10 @@ class split_virtqueue extends virtqueue_base;
             tokens.push_back(token_map[desc_id]);
         end
 
-        // Unmap all outstanding DMA mappings
-        foreach (dma_mappings[i]) begin
-            iommu.unmap(bdf, dma_mappings[i].iova);
-        end
-
         token_map.delete();
-        dma_mappings.delete();
+        release_all_dma_mappings();
+        discard_staged_migration_ownership();
+        release_all_indirect_tables();
 
         `uvm_info("SPLIT_VQ",
             $sformatf("detach_all_unused: queue_id=%0d returned %0d tokens",
@@ -256,8 +258,25 @@ class split_virtqueue extends virtqueue_base;
         int unsigned head;
         int unsigned idx;
         int unsigned sg_idx = 0;
-        int unsigned total_sgs = n_out_sgs + n_in_sgs;
+        int unsigned total_sgs;
         bit          is_write;
+        bit [63:0]   indirect_iova;
+        int unsigned indirect_size;
+        int unsigned ring_desc_count;
+
+        if (n_out_sgs > (32'hffff_ffff - n_in_sgs)) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d SG count overflow out=%0d in=%0d",
+                queue_id, n_out_sgs, n_in_sgs))
+            return '1;
+        end
+        total_sgs = n_out_sgs + n_in_sgs;
+        if (total_sgs == 0 || total_sgs > sgs.size()) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d invalid SG list count=%0d available=%0d",
+                queue_id, total_sgs, sgs.size()))
+            return '1;
+        end
 
         // Calculate total descriptors needed
         for (int unsigned s = 0; s < total_sgs; s++) begin
@@ -270,48 +289,62 @@ class split_virtqueue extends virtqueue_base;
             return '1;
         end
 
-        // Check free descriptors
-        if (num_free < total_needed) begin
+        ring_desc_count = indirect ? 1 : total_needed;
+
+        // Check free descriptors.  An indirect submission has one main-ring
+        // descriptor; its SG entries live in separately allocated table memory.
+        if (num_free < ring_desc_count) begin
             `uvm_error("SPLIT_VQ",
                 $sformatf("add_buf: queue_id=%0d need %0d descriptors but only %0d free",
-                          queue_id, total_needed, num_free))
+                          queue_id, ring_desc_count, num_free))
             return '1;
         end
 
         head = free_head;
 
-        // Process each sg list
-        for (int unsigned s = 0; s < total_sgs; s++) begin
-            is_write = (s >= n_out_sgs);  // in_sgs are device-writable
+        if (indirect) begin
+            if (!prepare_indirect_table(sgs, n_out_sgs, n_in_sgs, head, token,
+                                        indirect_iova, indirect_size))
+                return '1;
 
-            for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
-                bit [15:0] flags = 0;
-                bit [15:0] next_val;
+            idx = free_head;
+            free_head = read_desc_next(idx);
+            num_free--;
+            write_desc(idx, indirect_iova, indirect_size, VIRTQ_DESC_F_INDIRECT, 0);
+        end else begin
+            // Process each sg list
+            for (int unsigned s = 0; s < total_sgs; s++) begin
+                is_write = (s >= n_out_sgs);  // in_sgs are device-writable
 
-                // Take descriptor from free list
-                idx = free_head;
-                free_head = read_desc_next(idx);
-                num_free--;
+                for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
+                    bit [15:0] flags = 0;
+                    bit [15:0] next_val;
 
-                // Set flags
-                if (is_write)
-                    flags = flags | VIRTQ_DESC_F_WRITE;
+                    // Take descriptor from free list
+                    idx = free_head;
+                    free_head = read_desc_next(idx);
+                    num_free--;
 
-                // Determine if this is the last entry in the entire chain
-                sg_idx++;
-                if (sg_idx < total_needed) begin
-                    flags = flags | VIRTQ_DESC_F_NEXT;
-                    next_val = free_head[15:0];
-                end else begin
-                    next_val = 0;
+                    // Set flags
+                    if (is_write)
+                        flags = flags | VIRTQ_DESC_F_WRITE;
+
+                    // Determine if this is the last entry in the entire chain
+                    sg_idx++;
+                    if (sg_idx < total_needed) begin
+                        flags = flags | VIRTQ_DESC_F_NEXT;
+                        next_val = free_head[15:0];
+                    end else begin
+                        next_val = 0;
+                    end
+
+                    // Write descriptor
+                    write_desc(idx,
+                               sgs[s].entries[e].addr,
+                               sgs[s].entries[e].len,
+                               flags,
+                               next_val);
                 end
-
-                // Write descriptor
-                write_desc(idx,
-                           sgs[s].entries[e].addr,
-                           sgs[s].entries[e].len,
-                           flags,
-                           next_val);
             end
         end
 
@@ -337,7 +370,7 @@ class split_virtqueue extends virtqueue_base;
 
         `uvm_info("SPLIT_VQ",
             $sformatf("add_buf: queue_id=%0d head=%0d n_out=%0d n_in=%0d total_desc=%0d free=%0d",
-                      queue_id, head, n_out_sgs, n_in_sgs, total_needed, num_free),
+                      queue_id, head, n_out_sgs, n_in_sgs, ring_desc_count, num_free),
             UVM_HIGH)
 
         return head;
@@ -397,6 +430,7 @@ class split_virtqueue extends virtqueue_base;
         end
         token = token_map[desc_idx];
         token_map.delete(desc_idx);
+        release_indirect_table(desc_idx);
 
         // Reclaim descriptor chain back to free list
         begin
@@ -503,6 +537,8 @@ class split_virtqueue extends virtqueue_base;
     endfunction
 
     virtual function int unsigned get_pending_count();
+        if (state == VQ_RESET)
+            return 0;
         return queue_size - num_free;
     endfunction
 
@@ -569,8 +605,7 @@ class split_virtqueue extends virtqueue_base;
         end
 
         if (found_idx >= 0) begin
-            iommu.unmap(bdf, iova);
-            dma_mappings.delete(found_idx);
+            release_dma_mapping(found_idx);
             `uvm_info("SPLIT_VQ",
                 $sformatf("dma_unmap_buf: queue_id=%0d iova=0x%016x", queue_id, iova),
                 UVM_HIGH)
@@ -643,6 +678,10 @@ class split_virtqueue extends virtqueue_base;
         foreach (desc_data[i])  snap.ring_data[i] = desc_data[i];
         foreach (avail_data[i]) snap.ring_data[desc_size + i] = avail_data[i];
         foreach (used_data[i])  snap.ring_data[desc_size + avail_size + i] = used_data[i];
+        snap.split_free_head = free_head;
+        snap.split_num_free = num_free;
+        snap.packed_free_ids.delete();
+        save_migration_ownership(snap);
 
         `uvm_info("SPLIT_VQ",
             $sformatf("save_state: queue_id=%0d avail_idx=%0d last_used_idx=%0d ring_data=%0d bytes",
@@ -653,25 +692,29 @@ class split_virtqueue extends virtqueue_base;
     // ------------------------------------------------------------------
     // restore_state -- Restore queue state from a migration snapshot
     // ------------------------------------------------------------------
-    virtual function void restore_state(virtqueue_snapshot_t snap);
+    virtual function bit restore_state(virtqueue_snapshot_t snap);
         int unsigned desc_size  = 16 * snap.queue_size;
         int unsigned avail_size = 6 + 2 * snap.queue_size;
         int unsigned used_size  = 6 + 8 * snap.queue_size;
         byte region_data[];
 
-        queue_id   = snap.queue_id;
-        queue_size = snap.queue_size;
-
-        // Allocate new rings
-        desc_table_addr  = mem.alloc(desc_size,  .align(4096));
-        driver_ring_addr = mem.alloc(avail_size, .align(2));
-        device_ring_addr = mem.alloc(used_size,  .align(4096));
-
-        if (desc_table_addr == '1 || driver_ring_addr == '1 || device_ring_addr == '1) begin
+        // setup_queue() is the sole destination allocator and transport
+        // programmer.  Restore only overlays the snapshot on those live
+        // rings; replacing their addresses would orphan the programmed IOVA
+        // mappings and leave transport pointing at stale zeroed memory.
+        if ((queue_id != snap.queue_id) || (queue_size != snap.queue_size) ||
+            (desc_table_addr == 0) || (driver_ring_addr == 0) ||
+            (device_ring_addr == 0) ||
+            (snap.ring_data.size() != (desc_size + avail_size + used_size))) begin
             `uvm_error("SPLIT_VQ",
-                $sformatf("restore_state: alloc failed for queue_id=%0d", queue_id))
-            return;
+                $sformatf("restore_state: missing or incompatible setup rings for queue_id=%0d",
+                          snap.queue_id))
+            return 0;
         end
+        if ((snap.split_num_free > queue_size) ||
+            ((snap.split_num_free != 0) && (snap.split_free_head >= queue_size)) ||
+            !restore_migration_ownership(snap))
+            return 0;
 
         // Write descriptor table data back
         region_data = new[desc_size];
@@ -692,16 +735,16 @@ class split_virtqueue extends virtqueue_base;
         avail_idx     = snap.last_avail_idx;
         last_used_idx = snap.last_used_idx;
 
-        // Restore free count based on outstanding tokens
-        num_free  = queue_size - token_map.size();
-        free_head = 0;
-
-        state = VQ_CONFIGURE;
+        // Preserve the exact descriptor free-list state: one direct request
+        // can consume several descriptors while contributing one token.
+        num_free  = snap.split_num_free;
+        free_head = snap.split_free_head;
 
         `uvm_info("SPLIT_VQ",
             $sformatf("restore_state: queue_id=%0d avail_idx=%0d last_used_idx=%0d",
                       queue_id, avail_idx, last_used_idx),
             UVM_MEDIUM)
+        return 1;
     endfunction
 
 endclass : split_virtqueue

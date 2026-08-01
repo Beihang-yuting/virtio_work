@@ -51,6 +51,19 @@ class virtio_pf_manager extends uvm_object;
     // ===== Wait policy =====
     virtio_wait_policy        wait_pol;
 
+    // ===== PF-owned Admin VQ context =====
+    // This is independent from the PF dataplane/control queue managers.  It
+    // is configured only after Admin-VQ feature negotiation and after the
+    // caller/Fabric has supplied a special-VQ lease.
+    virtio_admin_vq_context   admin_vq;
+    virtio_atomic_ops         admin_ops;
+    // Serializes Admin-VQ context replacement/teardown against a command
+    // taking ownership of the context's submission lock.
+    semaphore                 admin_vq_config_lock;
+    // Set only by the authoritative PF lifecycle owner.  The callback owns
+    // normal PF queues/state for full reset; Admin VQ merely requests it.
+    virtio_admin_full_reset_owner pf_lifecycle_reset_owner;
+
     // ===== PF index (for multi-PF support) =====
     int unsigned              pf_index = 0;
 
@@ -61,7 +74,219 @@ class virtio_pf_manager extends uvm_object;
     function new(string name = "virtio_pf_manager");
         super.new(name);
         resource_pool = virtio_vf_resource_pool::type_id::create("resource_pool");
+        admin_vq = virtio_admin_vq_context::type_id::create("admin_vq");
+        admin_ops = virtio_atomic_ops::type_id::create("admin_ops");
+        admin_vq_config_lock = new(1);
     endfunction
+
+    // Admin descriptors are owned by ctx.vq, while DMA and notification use
+    // the context fields.  They must describe the same queue, requester, and
+    // memory/IOMMU domains before any lifecycle operation can touch them.
+    protected function bit admin_vq_bindings_are_consistent(
+        virtio_admin_vq_context admin_context,
+        string                  operation
+    );
+        if ((admin_context == null) || (admin_context.vq == null) ||
+            (admin_context.transport == null) || (admin_context.mem == null) ||
+            (admin_context.iommu == null) ||
+            (admin_context.queue_id != admin_context.vq.queue_id) ||
+            (admin_context.vq.bdf != admin_context.transport.bdf) ||
+            (admin_context.vq.mem != admin_context.mem) ||
+            (admin_context.vq.iommu != admin_context.iommu)) begin
+            `uvm_error("PF_MGR", $sformatf(
+                "%s: Admin VQ binding is inconsistent", operation))
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    virtual task configure_admin_vq(virtio_admin_vq_context admin_context);
+        virtio_admin_vq_context current_context;
+        bit                     current_locked;
+
+        if (admin_context == null) begin
+            `uvm_error("PF_MGR", "configure_admin_vq: null Admin VQ context")
+            return;
+        end
+        if (admin_vq_config_lock == null) begin
+            `uvm_error("PF_MGR", "configure_admin_vq: Admin VQ config lock is null")
+            return;
+        end
+
+        current_locked = 0;
+        admin_vq_config_lock.get(1);
+        do begin
+            if (pf_transport == null) begin
+                `uvm_error("PF_MGR", "configure_admin_vq: PF transport is not configured")
+                break;
+            end
+            if ((admin_context.transport == null) ||
+                (admin_context.transport != pf_transport)) begin
+                `uvm_error("PF_MGR",
+                    "configure_admin_vq: Admin VQ transport does not match PF transport")
+                break;
+            end
+            if (admin_context.submit_lock == null) begin
+                `uvm_error("PF_MGR", "configure_admin_vq: Admin VQ has no submission lock")
+                break;
+            end
+            if (!admin_vq_bindings_are_consistent(
+                admin_context, "configure_admin_vq")) begin
+                break;
+            end
+
+            // A replacement must wait for any in-flight command and must not
+            // overwrite the only quarantine ownership record.
+            current_context = admin_vq;
+            if (current_context != null) begin
+                if (current_context.submit_lock == null) begin
+                    `uvm_error("PF_MGR",
+                        "configure_admin_vq: current Admin VQ has no submission lock")
+                    break;
+                end
+                current_context.submit_lock.get(1);
+                current_locked = 1;
+                if (current_context.dma_quarantined ||
+                    (current_context.quarantined_iovas.size() != 0) ||
+                    (current_context.quarantined_gpas.size() != 0)) begin
+                    `uvm_error("PF_MGR",
+                        "configure_admin_vq: current Admin VQ has quarantined DMA")
+                    break;
+                end
+            end
+
+            admin_vq = admin_context;
+            if (pf_lifecycle_reset_owner != null)
+                admin_vq.full_reset_owner = pf_lifecycle_reset_owner;
+        end while (0);
+        if (current_locked)
+            current_context.submit_lock.put(1);
+        admin_vq_config_lock.put(1);
+    endtask
+
+    virtual function void configure_pf_lifecycle_reset_owner(
+        virtio_admin_full_reset_owner reset_owner
+    );
+        if (reset_owner == null) begin
+            `uvm_error("PF_MGR", "configure_pf_lifecycle_reset_owner: null reset owner")
+            return;
+        end
+        pf_lifecycle_reset_owner = reset_owner;
+        if (admin_vq != null)
+            admin_vq.full_reset_owner = reset_owner;
+    endfunction
+
+    virtual task clear_admin_vq();
+        virtio_admin_vq_context admin_context;
+
+        if (admin_vq_config_lock == null) begin
+            `uvm_error("PF_MGR", "clear_admin_vq: Admin VQ config lock is null")
+            return;
+        end
+
+        admin_vq_config_lock.get(1);
+        admin_context = admin_vq;
+        if (admin_context == null) begin
+            `uvm_error("PF_MGR", "clear_admin_vq: Admin VQ context is null")
+        end else if (admin_context.submit_lock == null) begin
+            `uvm_error("PF_MGR", "clear_admin_vq: Admin VQ has no submission lock")
+        end else begin
+            admin_context.submit_lock.get(1);
+            if (admin_context.dma_quarantined ||
+                (admin_context.quarantined_iovas.size() != 0) ||
+                (admin_context.quarantined_gpas.size() != 0)) begin
+                `uvm_error("PF_MGR", "clear_admin_vq: Admin VQ has quarantined DMA")
+            end else begin
+                admin_vq = virtio_admin_vq_context::type_id::create("admin_vq");
+                admin_vq.full_reset_owner = pf_lifecycle_reset_owner;
+            end
+            admin_context.submit_lock.put(1);
+        end
+        admin_vq_config_lock.put(1);
+    endtask
+
+    // ========================================================================
+    // recover_admin_vq -- Retire Admin DMA only after a verified full PF reset
+    //
+    // A failed Q_RESET leaves request/response memory reachable by the device.
+    // This is the sole release path for that quarantine record: it serializes
+    // context handoff, verifies the PF identity, asks the PF owner to reset,
+    // then releases DMA and leaves the Admin VQ unconfigured.
+    // ========================================================================
+    virtual task recover_admin_vq(ref bit recovery_complete);
+        virtio_admin_vq_context admin_context;
+        uvm_object              detached_tokens[$];
+
+        recovery_complete = 0;
+        if (admin_vq_config_lock == null) begin
+            `uvm_error("PF_MGR", "recover_admin_vq: Admin VQ config lock is null")
+            return;
+        end
+
+        admin_vq_config_lock.get(1);
+        admin_context = admin_vq;
+        if (admin_context == null) begin
+            `uvm_error("PF_MGR", "recover_admin_vq: Admin VQ context is null")
+        end else if (admin_context.submit_lock == null) begin
+            `uvm_error("PF_MGR", "recover_admin_vq: Admin VQ has no submission lock")
+        end else begin
+            admin_context.submit_lock.get(1);
+            do begin
+                if (!admin_context.dma_quarantined ||
+                    !admin_context.recovery_required ||
+                    (admin_context.quarantined_iovas.size() == 0) ||
+                    (admin_context.quarantined_gpas.size() == 0)) begin
+                    `uvm_error("PF_MGR", "recover_admin_vq: Admin VQ has no quarantined DMA")
+                    break;
+                end
+                if (pf_transport == null) begin
+                    `uvm_error("PF_MGR", "recover_admin_vq: PF transport is not configured")
+                    break;
+                end
+                if ((admin_context.transport == null) ||
+                    (admin_context.transport != pf_transport)) begin
+                    `uvm_error("PF_MGR",
+                        "recover_admin_vq: Admin VQ transport does not match PF transport")
+                    break;
+                end
+                if ((admin_context.vq == null) || (admin_context.mem == null) ||
+                    (admin_context.iommu == null) ||
+                    (admin_context.full_reset_owner == null)) begin
+                    `uvm_error("PF_MGR", "recover_admin_vq: incomplete Admin VQ context")
+                    break;
+                end
+                if (!admin_vq_bindings_are_consistent(
+                    admin_context, "recover_admin_vq")) begin
+                    break;
+                end
+
+                admin_context.full_reset_owner.reset_pf_lifecycle(recovery_complete);
+                if (!recovery_complete) begin
+                    `uvm_error("PF_MGR",
+                        "recover_admin_vq: PF lifecycle reset did not complete")
+                    break;
+                end
+
+                admin_context.vq.detach_all_unused(detached_tokens);
+                admin_context.vq.reset_queue();
+                admin_context.vq.alloc_rings();
+                foreach (admin_context.quarantined_iovas[index])
+                    admin_context.iommu.unmap(
+                        admin_context.transport.bdf,
+                        admin_context.quarantined_iovas[index]
+                    );
+                foreach (admin_context.quarantined_gpas[index])
+                    admin_context.mem.free(admin_context.quarantined_gpas[index]);
+                admin_context.quarantined_iovas.delete();
+                admin_context.quarantined_gpas.delete();
+                admin_context.dma_quarantined = 0;
+                admin_context.recovery_required = 0;
+                admin_context.configured = 0;
+            end while (0);
+            admin_context.submit_lock.put(1);
+        end
+        admin_vq_config_lock.put(1);
+    endtask
 
     // ========================================================================
     // enable_sriov -- Enable SR-IOV with specified number of VFs
@@ -364,48 +589,113 @@ class virtio_pf_manager extends uvm_object;
     // ========================================================================
     // admin_cmd -- Admin VQ (virtio 1.2+)
     //
-    // Placeholder for PF-level admin virtqueue commands. In virtio 1.2+,
-    // the PF can send administrative commands to target specific VFs
-    // (e.g., migration state save/restore).
-    //
-    // Parameters:
-    //   target_vf  -- VF index to target
-    //   cmd_data   -- Command payload bytes
-    //   result     -- Result payload bytes (output)
+    // The PF can send administrative commands to an active target VF only
+    // through its independently configured Admin VQ.  result excludes the
+    // device status byte; ok reports the full request lifecycle outcome.
     // ========================================================================
 
     virtual task admin_cmd(int unsigned target_vf,
                            byte unsigned cmd_data[],
-                           ref byte unsigned result[]);
-        `uvm_info("PF_MGR",
-            $sformatf("admin_cmd: target_vf=%0d, cmd_size=%0d bytes (placeholder)",
-                      target_vf, cmd_data.size()),
-            UVM_LOW)
+                           ref byte unsigned result[],
+                           ref bit ok);
+        bit [7:0]                device_status;
+        virtio_admin_vq_context  admin_context;
 
-        // Validate target VF
-        if (target_vf >= active_vf_count) begin
-            `uvm_error("PF_MGR",
-                $sformatf("admin_cmd: target_vf=%0d >= active_vf_count=%0d",
-                          target_vf, active_vf_count))
-            result = new[1];
-            result[0] = 8'hFF;  // Error indicator
+        ok = 0;
+        result = new[0];
+
+        // Serialize the context handoff with configure/clear/recovery, then
+        // retain the selected context's lock through submission and cleanup.
+        // A queued caller must not retain an obsolete context after teardown.
+        if (admin_vq_config_lock == null) begin
+            `uvm_error("PF_MGR", "admin_cmd: Admin VQ config lock is null")
+            return;
+        end
+        admin_vq_config_lock.get(1);
+        admin_context = admin_vq;
+        if (admin_context == null) begin
+            `uvm_error("PF_MGR", "admin_cmd: Admin VQ is not configured")
+            admin_vq_config_lock.put(1);
+            return;
+        end
+        if (admin_context.submit_lock == null) begin
+            `uvm_error("PF_MGR", "admin_cmd: Admin VQ has no submission lock")
+            admin_vq_config_lock.put(1);
             return;
         end
 
-        // Placeholder: admin VQ command submission
-        // In a full implementation, this would:
-        //   1. Select the admin VQ (queue index defined by device)
-        //   2. Build admin command descriptor chain
-        //   3. Submit via virtqueue and wait for completion
-        //   4. Parse result from used buffer
-        //
-        // For now, return success placeholder
-        result = new[1];
-        result[0] = 8'h00;  // Success indicator
+        admin_context.submit_lock.get(1);
+        admin_vq_config_lock.put(1);
+        begin : admin_cmd_locked
+        do begin
+            // The full-PF reset owner is attached to pf_transport.  Refuse a
+            // context that names a different device before DMA, descriptors,
+            // notification, status read, or recovery can touch either one.
+            if (pf_transport == null) begin
+                `uvm_error("PF_MGR", "admin_cmd: PF transport is not configured")
+                break;
+            end
+            if ((admin_context.transport == null) ||
+                (admin_context.transport != pf_transport)) begin
+                `uvm_error("PF_MGR",
+                    "admin_cmd: Admin VQ transport does not match PF transport")
+                break;
+            end
 
-        `uvm_info("PF_MGR",
-            $sformatf("admin_cmd: target_vf=%0d complete (placeholder)", target_vf),
-            UVM_MEDIUM)
+            // Active-count is only a capacity summary; validate the actual VF
+            // object and state so an FLR/disabled VF cannot receive Admin work.
+            if ((target_vf >= active_vf_count) ||
+                (target_vf >= vf_instances.size()) ||
+                (vf_instances[target_vf] == null) ||
+                (vf_instances[target_vf].get_state() != VF_ACTIVE)) begin
+                `uvm_error("PF_MGR",
+                    $sformatf("admin_cmd: target VF%0d is not active", target_vf))
+                break;
+            end
+
+            if (!admin_context.negotiated_features[VIRTIO_F_ADMIN_VQ]) begin
+                `uvm_error("PF_MGR", "admin_cmd: VIRTIO_F_ADMIN_VQ is not negotiated")
+                break;
+            end
+            if (!admin_context.configured || (admin_context.vq == null) ||
+                (admin_context.transport == null) || (admin_context.mem == null) ||
+                (admin_context.iommu == null) || (admin_context.wait_pol == null) ||
+                (admin_context.response_capacity == 0)) begin
+                    `uvm_error("PF_MGR", "admin_cmd: Admin VQ is not configured")
+                break;
+            end
+            if (!admin_vq_bindings_are_consistent(
+                admin_context, "admin_cmd")) begin
+                break;
+            end
+            if (!admin_context.special_vq_lease_valid ||
+                admin_context.special_vq_lease.frozen) begin
+                `uvm_error("PF_MGR", "admin_cmd: Admin VQ has no usable special-VQ lease")
+                break;
+            end
+            if (admin_context.full_reset_owner == null) begin
+                `uvm_error("PF_MGR", "admin_cmd: Admin VQ has no PF lifecycle reset owner")
+                break;
+            end
+            if (admin_context.recovery_required || admin_context.dma_quarantined) begin
+                `uvm_error("PF_MGR", "admin_cmd: Admin VQ requires verified recovery")
+                break;
+            end
+
+            // Use the transport API rather than a cached status field, so the
+            // decision always follows the same device-visible status source.
+            admin_context.transport.read_device_status(device_status);
+            if (device_status & (DEV_STATUS_FAILED | DEV_STATUS_DEVICE_NEEDS_RESET)) begin
+                `uvm_error("PF_MGR", "admin_cmd: device is FAILED or needs reset")
+                break;
+            end
+
+            if (admin_ops == null)
+                admin_ops = virtio_atomic_ops::type_id::create("admin_ops");
+            admin_ops.admin_vq_submit(admin_context, cmd_data, result, ok, 1'b1);
+        end while (0);
+        end : admin_cmd_locked
+        admin_context.submit_lock.put(1);
     endtask
 
     // ========================================================================

@@ -118,6 +118,8 @@ disable fork;  // 杀死调用线程中的所有子进程!
 | `host_mem_manager` | `/ryan/shm_work/host_mem` | Buddy 分配器，用于描述符环和数据缓冲区 | 共享实例 |
 | `net_packet` | `/ryan/shm_work/net_packet` | 协议报文生成器（L2-L4，隧道，RDMA） | `packet_item` UVM 封装 |
 
+本版本固定使用 `pcie_tl_vip@3e2d8c972f1baa78e073f98e8a38ad2f04db6e1a`；`make check-deps` 会在编译前验证该依赖版本。
+
 ---
 
 ## 2. 系统架构
@@ -1480,6 +1482,22 @@ vcs -full64 -sverilog -ntb_opts uvm \
 # 完整集成测试（带 Completion Bridge）
 ./simv +UVM_TESTNAME=virtio_full_integration_test
 ```
+
+#### 6.1.4 DPU Fabric 部署范围与回归入口
+
+Fabric 的固定上限为 4 个 host、每 host 16 个 PF、每 PF 16 个本地 VF，且全局最多 1024 个 function。若完整启用 64 个 PF，则剩余的有效 VF 槽位为 960。Fabric 在 function 激活前预注册并 seal Fabric 所有的 `virtio.qpair` 不透明 class ID；它不是 core enum 常量，该通用 profile 提供 2048 个全局 QP、每 function 32 个 QP。特殊 VQ 使用独立 profile，不占用普通 virtio QP 配额。通用 resource-pool/lease API 是 RDMA 与 virtio-blk 后续接入时应复用的边界。
+
+BAR 布局先于 capability discovery：PF 的 BAR0/1、BAR2/3、BAR4/5 分别为 32 MiB function-device、64 KiB reserved、64 KiB MSI-X table/PBA；VF 分别为 16 KiB、16 KiB、32 KiB。当前 virtio capability 仅在 BAR0/1 发现；BAR2/3 虽保留 aperture 但没有功能绑定，所有功能访问均为违规；BAR4/5 只绑定 MSI-X table/PBA。
+
+配置时 Fabric 必须先建立 64-bit MMIO aperture，并检查对齐和无重叠。正确顺序是 BAR0/1 capability discovery，随后才申请动态 queue lease；不要在发现之前获取资源，也不要把保留 BAR 或 MSI-X aperture 作为 virtio 寄存器窗口。
+
+完整回归使用：
+
+```bash
+make regression
+```
+
+它按固定顺序运行 `dpu_resource_manager_test`、`virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、`virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、`virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、`virtio_e2e_test` 和 `virtio_full_integration_test`。该入口要求 `make check-deps` 先通过；无 VCS 环境时它应在编译前报告 VCS 依赖错误。
 
 ### 6.2 编写测试
 

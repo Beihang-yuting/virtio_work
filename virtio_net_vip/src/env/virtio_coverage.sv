@@ -68,6 +68,7 @@ class virtio_coverage extends uvm_component;
     // ===== Covergroups =====
 
     covergroup cg_features;
+        option.per_instance = 1;
         cp_vq_type: coverpoint sampled_vq_type {
             bins split  = {VQ_SPLIT};
             bins packed_vq = {VQ_PACKED};
@@ -110,6 +111,7 @@ class virtio_coverage extends uvm_component;
     endgroup
 
     covergroup cg_queue_ops;
+        option.per_instance = 1;
         cp_queue_id: coverpoint sampled_queue_id {
             bins low[]  = {[0:3]};
             bins mid    = {[4:15]};
@@ -130,6 +132,7 @@ class virtio_coverage extends uvm_component;
     endgroup
 
     covergroup cg_dataplane;
+        option.per_instance = 1;
         cp_pkt_size: coverpoint sampled_pkt_size {
             bins tiny    = {[0:63]};
             bins small_sz   = {[64:127]};
@@ -155,6 +158,7 @@ class virtio_coverage extends uvm_component;
     endgroup
 
     covergroup cg_offload;
+        option.per_instance = 1;
         cp_gso_type: coverpoint sampled_gso_type {
             bins none     = {VIRTIO_NET_HDR_GSO_NONE};
             bins tcpv4    = {VIRTIO_NET_HDR_GSO_TCPV4};
@@ -180,6 +184,7 @@ class virtio_coverage extends uvm_component;
     endgroup
 
     covergroup cg_notification;
+        option.per_instance = 1;
         cp_irq_mode: coverpoint sampled_irq_mode {
             bins msix_per_q = {IRQ_MSIX_PER_QUEUE};
             bins msix_share = {IRQ_MSIX_SHARED};
@@ -189,6 +194,7 @@ class virtio_coverage extends uvm_component;
     endgroup
 
     covergroup cg_errors;
+        option.per_instance = 1;
         cp_err_type: coverpoint sampled_err_type {
             bins circ_chain     = {VQ_ERR_CIRCULAR_CHAIN};
             bins oob_index      = {VQ_ERR_OOB_INDEX};
@@ -209,6 +215,7 @@ class virtio_coverage extends uvm_component;
     endgroup
 
     covergroup cg_lifecycle;
+        option.per_instance = 1;
         cp_dev_status: coverpoint sampled_dev_status {
             bins reset     = {DEV_STATUS_RESET};
             bins ack       = {DEV_STATUS_ACKNOWLEDGE};
@@ -228,6 +235,7 @@ class virtio_coverage extends uvm_component;
     endgroup
 
     covergroup cg_sriov;
+        option.per_instance = 1;
         cp_vf_count: coverpoint sampled_vf_count {
             bins none   = {0};
             bins single = {1};
@@ -313,6 +321,9 @@ class virtio_coverage extends uvm_component;
         sampled_queue_id = txn.queue_id;
         sampled_vq_type  = txn.vq_type;
         sampled_features = txn.features;
+        sampled_irq_mode = txn.irq_mode;
+        sampled_vf_count = txn.num_vfs;
+        sampled_pkt_size = txn.monitor_length;
 
         // Extract transaction-specific state
         case (txn.txn_type)
@@ -386,21 +397,21 @@ class virtio_coverage extends uvm_component;
 
         report = "\n========== Virtio Coverage Report ==========\n";
         if (cov_feature_enable)
-            report = {report, $sformatf("  features:     %.1f%%\n", cg_features.get_coverage())};
+            report = {report, $sformatf("  features:     %.1f%%\n", cg_features.get_inst_coverage())};
         if (cov_queue_enable)
-            report = {report, $sformatf("  queue_ops:    %.1f%%\n", cg_queue_ops.get_coverage())};
+            report = {report, $sformatf("  queue_ops:    %.1f%%\n", cg_queue_ops.get_inst_coverage())};
         if (cov_dataplane_enable)
-            report = {report, $sformatf("  dataplane:    %.1f%%\n", cg_dataplane.get_coverage())};
+            report = {report, $sformatf("  dataplane:    %.1f%%\n", cg_dataplane.get_inst_coverage())};
         if (cov_offload_enable)
-            report = {report, $sformatf("  offload:      %.1f%%\n", cg_offload.get_coverage())};
+            report = {report, $sformatf("  offload:      %.1f%%\n", cg_offload.get_inst_coverage())};
         if (cov_notification_enable)
-            report = {report, $sformatf("  notification: %.1f%%\n", cg_notification.get_coverage())};
+            report = {report, $sformatf("  notification: %.1f%%\n", cg_notification.get_inst_coverage())};
         if (cov_error_enable)
-            report = {report, $sformatf("  errors:       %.1f%%\n", cg_errors.get_coverage())};
+            report = {report, $sformatf("  errors:       %.1f%%\n", cg_errors.get_inst_coverage())};
         if (cov_lifecycle_enable)
-            report = {report, $sformatf("  lifecycle:    %.1f%%\n", cg_lifecycle.get_coverage())};
+            report = {report, $sformatf("  lifecycle:    %.1f%%\n", cg_lifecycle.get_inst_coverage())};
         if (cov_sriov_enable)
-            report = {report, $sformatf("  sriov:        %.1f%%\n", cg_sriov.get_coverage())};
+            report = {report, $sformatf("  sriov:        %.1f%%\n", cg_sriov.get_inst_coverage())};
         report = {report, "============================================="};
 
         `uvm_info("COV", report, UVM_LOW)

@@ -1,6 +1,14 @@
 `ifndef VIRTIO_NET_TYPES_SV
 `define VIRTIO_NET_TYPES_SV
 
+// Forward declarations keep the Admin-VQ context at the type boundary while
+// its transport and virtqueue implementations remain in their normal package
+// order below this include.
+typedef class virtio_iommu_model;
+typedef class virtqueue_base;
+typedef class virtio_pci_transport;
+typedef class virtio_wait_policy;
+
 // ============================================================================
 // Feature Bit Parameters (per virtio spec numbering)
 // ============================================================================
@@ -48,6 +56,7 @@ parameter int VIRTIO_F_ORDER_PLATFORM      = 36;
 parameter int VIRTIO_F_SR_IOV              = 37;
 parameter int VIRTIO_F_NOTIFICATION_DATA   = 38;
 parameter int VIRTIO_F_RING_RESET          = 40;
+parameter int VIRTIO_F_ADMIN_VQ            = 41;
 
 // ============================================================================
 // Net HDR Constants
@@ -116,14 +125,24 @@ typedef enum { DRV_MODE_AUTO, DRV_MODE_MANUAL, DRV_MODE_HYBRID } driver_mode_e;
 typedef enum { RX_MODE_MERGEABLE, RX_MODE_BIG, RX_MODE_SMALL } rx_buf_mode_e;
 typedef enum { IRQ_MSIX_PER_QUEUE, IRQ_MSIX_SHARED, IRQ_INTX, IRQ_POLLING } interrupt_mode_e;
 typedef enum { DMA_TO_DEVICE, DMA_FROM_DEVICE, DMA_BIDIRECTIONAL } dma_dir_e;
+typedef enum {
+    VIRTIO_MON_BAR_ACCESS,
+    VIRTIO_MON_DMA,
+    VIRTIO_MON_INTERRUPT,
+    VIRTIO_MON_QUEUE_STATE
+} virtio_monitor_event_e;
 
 typedef enum {
     FSM_IDLE, FSM_RESETTING, FSM_DISCOVERING, FSM_NEGOTIATING,
     FSM_QUEUE_SETUP, FSM_MSIX_SETUP, FSM_READY, FSM_RUNNING,
-    FSM_SUSPENDING, FSM_FROZEN, FSM_ERROR, FSM_RECOVERING
+    FSM_SUSPENDING, FSM_FROZEN, FSM_ERROR, FSM_RECOVERING,
+    FSM_REINIT_REQUIRED
 } fsm_state_e;
 
-typedef enum { VF_CREATED, VF_CONFIGURED, VF_ACTIVE, VF_FLR, VF_DISABLED } vf_state_e;
+typedef enum {
+    VF_CREATED, VF_CONFIGURED, VF_ACTIVE, VF_FLR, VF_DISABLED,
+    VF_REINIT_REQUIRED, VF_RESET_FAILED
+} vf_state_e;
 typedef enum { FO_NORMAL, FO_PRIMARY_DOWN, FO_SWITCHING, FO_STANDBY_ACTIVE, FO_FAILBACK } failover_state_e;
 
 typedef enum {
@@ -214,9 +233,29 @@ typedef enum bit [7:0] {
 // Structs
 // ============================================================================
 
-typedef struct { bit [63:0] addr; int unsigned len; } virtio_sg_entry;
+// is_indirect marks an SG entry that already denotes an indirect descriptor
+// table.  An add_buf(..., indirect=1) request must reject such an entry rather
+// than constructing a nested indirect table.
+typedef struct { bit [63:0] addr; int unsigned len; bit is_indirect; } virtio_sg_entry;
 typedef struct { virtio_sg_entry entries[$]; } virtio_sg_list;
 typedef struct { int unsigned desc_id; int unsigned len; realtime submit_time; realtime complete_time; } virtio_used_info;
+
+typedef struct { bit [15:0] bdf; bit [63:0] gpa, iova; int unsigned size; dma_dir_e dir; int unsigned desc_id; } iommu_mapping_t;
+
+// Migration keeps the original VIP token handles so restored completions use
+// the normal queue API and return the original request context.
+typedef struct {
+    int unsigned head_id;
+    uvm_object   token;
+} virtqueue_token_snapshot_t;
+
+typedef struct {
+    int unsigned    head_id;
+    iommu_mapping_t mapping;
+    int unsigned    byte_size;
+    int unsigned    entry_count;
+    uvm_object      token;
+} virtqueue_indirect_snapshot_t;
 
 typedef struct {
     int unsigned queue_id, queue_size;
@@ -224,9 +263,15 @@ typedef struct {
     int unsigned last_avail_idx, last_used_idx;
     bit avail_wrap, used_wrap;
     byte unsigned ring_data[];
+    virtqueue_token_snapshot_t pending_tokens[$];
+    virtqueue_indirect_snapshot_t indirect_tables[$];
+    // dma_map_buf() mappings are queue-owned independently of submitted
+    // request DMA. Restore reattaches their recreated destination GPA while
+    // retaining this descriptor-visible source IOVA.
+    iommu_mapping_t queue_dma_mappings[$];
+    int unsigned split_free_head, split_num_free;
+    int unsigned packed_free_ids[$];
 } virtqueue_snapshot_t;
-
-typedef struct { bit [15:0] bdf; bit [63:0] gpa, iova; int unsigned size; dma_dir_e dir; int unsigned desc_id; } iommu_mapping_t;
 
 typedef struct {
     bit [15:0] bdf; bit [63:0] gpa, iova; int unsigned size; dma_dir_e dir; bit valid;
@@ -293,11 +338,106 @@ typedef struct {
 
 typedef struct { int unsigned vf_id; int unsigned local_qid; int unsigned global_qid; string queue_name; } queue_mapping_t;
 
+// A migration record is anchored by its 4 KiB guest page ID.  It carries an
+// exact copy of the mapping span within that page, rather than assuming the
+// entire page belongs to one host allocation.  The checksum protects that
+// transferred payload and lets restore reject a changed mapped byte or
+// translation without treating unmapped page bytes (or an allocation tail
+// outside the mapping) as migration-owned state.
+typedef struct {
+    bit [63:0]    page_id;
+    iommu_mapping_t mapping;
+    bit [63:0]    mapped_gpa;
+    int unsigned  mapped_size;
+    bit [63:0]    checksum;
+    byte          payload[];
+} virtio_dirty_page_snapshot_t;
+
+// A complete, mapping-scoped migration copy.  Dirty page records preserve
+// device-write generation semantics; this companion record preserves clean
+// live DMA mappings still reachable from saved raw queue state (for example,
+// outstanding TX and indirect descriptors) across the reset boundary.
+typedef struct {
+    iommu_mapping_t mapping;
+    bit [63:0]      checksum;
+    byte            payload[];
+} virtio_mapping_snapshot_t;
+
+// One record per normal data-DMA mapping preserves the existing FIFO order
+// used by tx_complete()/rx_receive(). Ring and indirect-table state belongs
+// to the queue snapshot.
+typedef struct {
+    int unsigned    queue_id;
+    bit             is_tx;
+    iommu_mapping_t mapping;
+} virtio_normal_dma_snapshot_t;
+
 typedef struct {
     bit [63:0] negotiated_features; bit [7:0] device_status;
     virtio_net_device_config_t net_config;
     virtqueue_snapshot_t queue_snapshots[];
     int unsigned num_queue_pairs;
+    int unsigned queue_count;
+    bit [63:0] dirty_generation;
+    bit [63:0] dirty_pages[$];
+    virtio_dirty_page_snapshot_t dirty_page_records[$];
+    virtio_mapping_snapshot_t mapping_records[$];
+    virtio_normal_dma_snapshot_t normal_dma_records[$];
+    // Covers the complete migration-owned state below, including queue bytes,
+    // device configuration, generation identity, and dirty payload records.
+    // It is intentionally not a security primitive; it detects accidental or
+    // test-injected corruption before reset/queue restore can consume it.
+    bit [63:0] integrity_checksum;
 } virtio_device_snapshot_t;
+
+// A bit-41-only recovery must be delegated to the authoritative PF lifecycle.
+// Implementations must invalidate or coordinate normal PF queues and DMA
+// before returning reset_complete=1; Admin VQ never assumes that ownership.
+virtual class virtio_admin_full_reset_owner extends uvm_object;
+    function new(string name = "virtio_admin_full_reset_owner");
+        super.new(name);
+    endfunction
+
+    pure virtual task reset_pf_lifecycle(ref bit reset_complete);
+endclass : virtio_admin_full_reset_owner
+
+// Admin VQ is deliberately separate from normal PF/VF queue managers.  The
+// caller/Fabric injects the special-VQ lease and full-reset owner after
+// configuring the device capability; this type does not acquire either.
+class virtio_admin_vq_context extends uvm_object;
+    `uvm_object_utils(virtio_admin_vq_context)
+
+    virtio_pci_transport  transport;
+    virtqueue_base        vq;
+    host_mem_manager      mem;
+    virtio_iommu_model    iommu;
+    virtio_wait_policy    wait_pol;
+    bit [63:0]            negotiated_features;
+    int unsigned          queue_id;
+    int unsigned          response_capacity;
+    bit                   configured;
+    bit                   special_vq_lease_valid;
+    dpu_resource_lease_t  special_vq_lease;
+    virtio_admin_full_reset_owner full_reset_owner;
+    // Admin commands share one virtqueue, so they must retain exclusive
+    // ownership from descriptor construction through completion/recovery.
+    semaphore             submit_lock;
+    bit                   recovery_required;
+    bit                   dma_quarantined;
+    bit [63:0]            quarantined_iovas[$];
+    bit [63:0]            quarantined_gpas[$];
+
+    function new(string name = "virtio_admin_vq_context");
+        super.new(name);
+        queue_id = 0;
+        response_capacity = 0;
+        configured = 0;
+        special_vq_lease_valid = 0;
+        negotiated_features = '0;
+        submit_lock = new(1);
+        recovery_required = 0;
+        dma_quarantined = 0;
+    endfunction
+endclass : virtio_admin_vq_context
 
 `endif // VIRTIO_NET_TYPES_SV

@@ -1,6 +1,30 @@
 `ifndef VIRTIO_PF_INSTANCE_SV
 `define VIRTIO_PF_INSTANCE_SV
 
+// Bridges an Admin-VQ full-reset request to the owner of the real PF
+// lifecycle.  Success means normal PF queue/DMA state was invalidated after a
+// verified transport reset; Admin VQ does not own or infer this lifecycle.
+class virtio_pf_lifecycle_reset_owner extends virtio_admin_full_reset_owner;
+    `uvm_object_utils(virtio_pf_lifecycle_reset_owner)
+
+    virtio_function_instance pf_function;
+
+    function new(string name = "virtio_pf_lifecycle_reset_owner");
+        super.new(name);
+    endfunction
+
+    virtual task reset_pf_lifecycle(ref bit reset_complete);
+        reset_complete = 0;
+        if (pf_function == null) begin
+            `uvm_error("PF_RESET_OWNER",
+                "full PF reset owner has no bound normal PF lifecycle")
+            return;
+        end
+
+        pf_function.reset_pf_lifecycle(reset_complete);
+    endtask
+endclass : virtio_pf_lifecycle_reset_owner
+
 // Owns one independently addressable PF function and its subordinate VFs.
 class virtio_pf_instance extends uvm_component;
     `uvm_component_utils(virtio_pf_instance)
@@ -15,6 +39,7 @@ class virtio_pf_instance extends uvm_component;
     virtio_function_instance    pf_function;
     virtio_vf_instance          vf_functions[];
     virtio_pf_manager           pf_manager;
+    virtio_pf_lifecycle_reset_owner lifecycle_reset_owner;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -75,6 +100,11 @@ class virtio_pf_instance extends uvm_component;
         foreach (vf_functions[vf_id])
             pf_manager.vf_instances[vf_id] = vf_functions[vf_id];
         pf_manager.pf_transport = pf_function.transport;
+        lifecycle_reset_owner = virtio_pf_lifecycle_reset_owner::type_id::create(
+            "lifecycle_reset_owner"
+        );
+        lifecycle_reset_owner.pf_function = pf_function;
+        pf_manager.configure_pf_lifecycle_reset_owner(lifecycle_reset_owner);
     endfunction
 
     function void configure_fabric_resources(

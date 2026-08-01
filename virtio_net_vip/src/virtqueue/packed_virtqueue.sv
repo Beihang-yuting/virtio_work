@@ -188,6 +188,10 @@ class packed_virtqueue extends virtqueue_base;
     // free_rings -- Deallocate all ring memory
     // ------------------------------------------------------------------
     virtual function void free_rings();
+        release_all_dma_mappings();
+        discard_staged_migration_ownership();
+        token_map.delete();
+        release_all_indirect_tables();
         if (desc_table_addr != 0) mem.free(desc_table_addr);
 
         desc_table_addr   = 0;
@@ -215,7 +219,9 @@ class packed_virtqueue extends virtqueue_base;
         desc_ring_size     = 0;
         free_id_list.delete();
         token_map.delete();
-        dma_mappings.delete();
+        release_all_dma_mappings();
+        discard_staged_migration_ownership();
+        release_all_indirect_tables();
         total_add_buf_ops   = 0;
         total_poll_used_ops = 0;
         total_kick_ops      = 0;
@@ -232,12 +238,10 @@ class packed_virtqueue extends virtqueue_base;
             tokens.push_back(token_map[desc_id]);
         end
 
-        foreach (dma_mappings[i]) begin
-            iommu.unmap(bdf, dma_mappings[i].iova);
-        end
-
         token_map.delete();
-        dma_mappings.delete();
+        release_all_dma_mappings();
+        discard_staged_migration_ownership();
+        release_all_indirect_tables();
 
         `uvm_info("PACKED_VQ",
             $sformatf("detach_all_unused: queue_id=%0d returned %0d tokens",
@@ -267,11 +271,28 @@ class packed_virtqueue extends virtqueue_base;
         bit             indirect
     );
         int unsigned total_needed = 0;
-        int unsigned total_sgs = n_out_sgs + n_in_sgs;
+        int unsigned total_sgs;
         int unsigned head_idx;
         int unsigned head_id;
         int unsigned sg_count = 0;
         bit          is_write;
+        bit [63:0]   indirect_iova;
+        int unsigned indirect_size;
+        int unsigned ring_desc_count;
+
+        if (n_out_sgs > (32'hffff_ffff - n_in_sgs)) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d SG count overflow out=%0d in=%0d",
+                queue_id, n_out_sgs, n_in_sgs))
+            return '1;
+        end
+        total_sgs = n_out_sgs + n_in_sgs;
+        if (total_sgs == 0 || total_sgs > sgs.size()) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d invalid SG list count=%0d available=%0d",
+                queue_id, total_sgs, sgs.size()))
+            return '1;
+        end
 
         // Calculate total descriptors needed
         for (int unsigned s = 0; s < total_sgs; s++) begin
@@ -284,57 +305,80 @@ class packed_virtqueue extends virtqueue_base;
             return '1;
         end
 
-        // Check free descriptors
-        if (free_id_list.size() < total_needed) begin
+        ring_desc_count = indirect ? 1 : total_needed;
+
+        // Check free descriptors.  An indirect request consumes one packed
+        // main descriptor regardless of its scatter-gather entry count.
+        if (free_id_list.size() < ring_desc_count) begin
             `uvm_error("PACKED_VQ",
                 $sformatf("add_buf: queue_id=%0d need %0d descriptors but only %0d free",
-                          queue_id, total_needed, free_id_list.size()))
+                          queue_id, ring_desc_count, free_id_list.size()))
             return '1;
         end
 
         head_idx = next_avail_idx;
 
-        // Process each sg list
-        for (int unsigned s = 0; s < total_sgs; s++) begin
-            is_write = (s >= n_out_sgs);
+        if (indirect) begin
+            bit [15:0] flags;
 
-            for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
-                bit [15:0] flags = 0;
-                int unsigned buf_id;
+            head_id = free_id_list[0];
+            if (!prepare_indirect_table(sgs, n_out_sgs, n_in_sgs, head_id, token,
+                                        indirect_iova, indirect_size))
+                return '1;
 
-                // Take a buffer ID from the free list
-                buf_id = free_id_list.pop_front();
+            flags = VIRTQ_DESC_F_INDIRECT;
+            if (avail_wrap_counter)
+                flags |= VIRTQ_DESC_F_AVAIL;
+            if (!avail_wrap_counter)
+                flags |= VIRTQ_DESC_F_USED;
 
-                // Remember the head buffer ID for token tracking
-                if (sg_count == 0) head_id = buf_id;
+            void'(free_id_list.pop_front());
+            write_packed_desc(next_avail_idx, indirect_iova, indirect_size,
+                              head_id[15:0], flags);
+            advance_idx(next_avail_idx, avail_wrap_counter);
+        end else begin
+            // Process each sg list
+            for (int unsigned s = 0; s < total_sgs; s++) begin
+                is_write = (s >= n_out_sgs);
 
-                // Set flags
-                if (is_write)
-                    flags = flags | VIRTQ_DESC_F_WRITE;
+                for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
+                    bit [15:0] flags = 0;
+                    int unsigned buf_id;
 
-                sg_count++;
-                if (sg_count < total_needed)
-                    flags = flags | VIRTQ_DESC_F_NEXT;
+                    // Take a buffer ID from the free list
+                    buf_id = free_id_list.pop_front();
 
-                // Set AVAIL and USED bits based on wrap counter
-                // AVAIL = avail_wrap_counter, USED = !avail_wrap_counter
-                if (avail_wrap_counter)
-                    flags = flags | VIRTQ_DESC_F_AVAIL;
-                // else AVAIL bit stays 0
+                    // Remember the head buffer ID for token tracking
+                    if (sg_count == 0) head_id = buf_id;
 
-                if (!avail_wrap_counter)
-                    flags = flags | VIRTQ_DESC_F_USED;
-                // else USED bit stays 0
+                    // Set flags
+                    if (is_write)
+                        flags = flags | VIRTQ_DESC_F_WRITE;
 
-                // Write descriptor
-                write_packed_desc(next_avail_idx,
-                                  sgs[s].entries[e].addr,
-                                  sgs[s].entries[e].len,
-                                  buf_id[15:0],
-                                  flags);
+                    sg_count++;
+                    if (sg_count < total_needed)
+                        flags = flags | VIRTQ_DESC_F_NEXT;
 
-                // Advance next_avail_idx
-                advance_idx(next_avail_idx, avail_wrap_counter);
+                    // Set AVAIL and USED bits based on wrap counter
+                    // AVAIL = avail_wrap_counter, USED = !avail_wrap_counter
+                    if (avail_wrap_counter)
+                        flags = flags | VIRTQ_DESC_F_AVAIL;
+                    // else AVAIL bit stays 0
+
+                    if (!avail_wrap_counter)
+                        flags = flags | VIRTQ_DESC_F_USED;
+                    // else USED bit stays 0
+
+                    // Write descriptor
+                    write_packed_desc(next_avail_idx,
+                                      sgs[s].entries[e].addr,
+                                      sgs[s].entries[e].len,
+                                      buf_id[15:0],
+                                      flags);
+
+                    // Advance next_avail_idx
+                    advance_idx(next_avail_idx, avail_wrap_counter);
+                end
             end
         end
 
@@ -350,7 +394,7 @@ class packed_virtqueue extends virtqueue_base;
             $sformatf({"add_buf: queue_id=%0d head_idx=%0d head_id=%0d ",
                        "n_out=%0d n_in=%0d total_desc=%0d free=%0d"},
                       queue_id, head_idx, head_id, n_out_sgs, n_in_sgs,
-                      total_needed, free_id_list.size()),
+                      ring_desc_count, free_id_list.size()),
             UVM_HIGH)
 
         return head_idx;
@@ -411,6 +455,7 @@ class packed_virtqueue extends virtqueue_base;
         end
         token = token_map[buf_id];
         token_map.delete(buf_id);
+        release_indirect_table(buf_id);
 
         // Return buffer ID to free list
         free_id_list.push_back(buf_id);
@@ -538,6 +583,8 @@ class packed_virtqueue extends virtqueue_base;
     endfunction
 
     virtual function int unsigned get_pending_count();
+        if (state == VQ_RESET)
+            return 0;
         return queue_size - free_id_list.size();
     endfunction
 
@@ -618,8 +665,7 @@ class packed_virtqueue extends virtqueue_base;
         end
 
         if (found_idx >= 0) begin
-            iommu.unmap(bdf, iova);
-            dma_mappings.delete(found_idx);
+            release_dma_mapping(found_idx);
             `uvm_info("PACKED_VQ",
                 $sformatf("dma_unmap_buf: queue_id=%0d iova=0x%016x", queue_id, iova),
                 UVM_HIGH)
@@ -684,6 +730,10 @@ class packed_virtqueue extends virtqueue_base;
 
         snap.ring_data = new[total_size];
         foreach (ring_data[i]) snap.ring_data[i] = ring_data[i];
+        snap.split_free_head = 0;
+        snap.split_num_free = 0;
+        snap.packed_free_ids = free_id_list;
+        save_migration_ownership(snap);
 
         `uvm_info("PACKED_VQ",
             $sformatf({"save_state: queue_id=%0d next_avail=%0d next_used=%0d ",
@@ -696,28 +746,52 @@ class packed_virtqueue extends virtqueue_base;
     // ------------------------------------------------------------------
     // restore_state -- Restore packed queue state from a migration snapshot
     // ------------------------------------------------------------------
-    virtual function void restore_state(virtqueue_snapshot_t snap);
+    virtual function bit restore_state(virtqueue_snapshot_t snap);
         int unsigned total_size;
         byte region_data[];
 
-        queue_id       = snap.queue_id;
-        queue_size     = snap.queue_size;
-        desc_ring_size = 16 * queue_size;
-        total_size     = desc_ring_size + 4 + 4;
+        total_size = 16 * snap.queue_size + 4 + 4;
 
-        // Allocate new ring
-        desc_table_addr = mem.alloc(total_size, .align(4096));
-
-        if (desc_table_addr == '1) begin
+        // setup_queue() owns the destination allocation, IOMMU mappings, and
+        // transport programming.  Never replace that contiguous ring during
+        // migration restore; copy the saved bytes into it instead.
+        if ((queue_id != snap.queue_id) || (queue_size != snap.queue_size) ||
+            (desc_ring_size != (16 * snap.queue_size)) ||
+            (desc_table_addr == 0) ||
+            (driver_event_addr != (desc_table_addr + desc_ring_size)) ||
+            (device_event_addr != (driver_event_addr + 4)) ||
+            (snap.ring_data.size() != total_size)) begin
             `uvm_error("PACKED_VQ",
-                $sformatf("restore_state: alloc failed for queue_id=%0d", queue_id))
-            return;
+                $sformatf("restore_state: missing or incompatible setup ring for queue_id=%0d",
+                          snap.queue_id))
+            return 0;
         end
+        if (snap.packed_free_ids.size() > queue_size)
+            return 0;
+        // Validate allocation IDs before attaching request ownership.  An
+        // invalid ID list is an overlay failure, not a reason to leave a
+        // partially restored token/indirect-table map behind.
+        foreach (snap.packed_free_ids[i]) begin
+            int unsigned id;
 
-        driver_event_addr = desc_table_addr + desc_ring_size;
-        device_event_addr = driver_event_addr + 4;
-        driver_ring_addr  = driver_event_addr;
-        device_ring_addr  = device_event_addr;
+            id = snap.packed_free_ids[i];
+            if (id >= queue_size) begin
+                `uvm_error("PACKED_VQ", $sformatf(
+                    "restore_state: invalid free ID %0d for queue_id=%0d",
+                    id, queue_id))
+                return 0;
+            end
+            foreach (snap.packed_free_ids[j]) begin
+                if ((j < i) && (snap.packed_free_ids[j] == id)) begin
+                    `uvm_error("PACKED_VQ", $sformatf(
+                        "restore_state: duplicate free ID %0d for queue_id=%0d",
+                        id, queue_id))
+                    return 0;
+                end
+            end
+        end
+        if (!restore_migration_ownership(snap))
+            return 0;
 
         // Write ring data back
         region_data = new[total_size];
@@ -730,14 +804,15 @@ class packed_virtqueue extends virtqueue_base;
         avail_wrap_counter = snap.avail_wrap;
         used_wrap_counter  = snap.used_wrap;
 
-        // Rebuild free_id_list: IDs not in token_map are free
+        // Preserve the exact allocation order. Reconstructing only from
+        // token_map loses chained direct descriptors and changes packed IDs.
         free_id_list.delete();
-        for (int unsigned i = 0; i < queue_size; i++) begin
-            if (!token_map.exists(i))
-                free_id_list.push_back(i);
-        end
+        foreach (snap.packed_free_ids[i]) begin
+            int unsigned id;
 
-        state = VQ_CONFIGURE;
+            id = snap.packed_free_ids[i];
+            free_id_list.push_back(id);
+        end
 
         `uvm_info("PACKED_VQ",
             $sformatf({"restore_state: queue_id=%0d next_avail=%0d next_used=%0d ",
@@ -745,6 +820,7 @@ class packed_virtqueue extends virtqueue_base;
                       queue_id, next_avail_idx, next_used_idx,
                       avail_wrap_counter, used_wrap_counter),
             UVM_MEDIUM)
+        return 1;
     endfunction
 
 endclass : packed_virtqueue

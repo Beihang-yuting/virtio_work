@@ -266,14 +266,29 @@ make compile TEST=virtio_unit_test
 make test TEST=virtio_unit_test
 ```
 
-`make compile` 仅编译；`make test` 编译后运行指定测试。`make regression` 会顺序运行
-当前支持的五个测试。`make check-deps` 会验证
-submodule 固定 SHA、VCS 环境以及外部源码完整性。
+`make compile` 仅编译；`make test` 编译后运行指定测试。`make regression` 固定顺序运行
+`dpu_resource_manager_test`、`virtio_fabric_resource_test`、`virtio_unit_test`、
+`virtio_stress_unit_test`、`virtio_protocol_test`、`virtio_indirect_desc_test`、
+`virtio_admin_vq_test`、`virtio_migration_dirty_test`、`virtio_monitor_test`、
+`virtio_coverage_test`、`virtio_e2e_test` 和 `virtio_full_integration_test`。
+`make check-deps` 会验证 submodule 固定 SHA、VCS 环境以及外部源码完整性。
 
-`host_mem@3b9e000d5df4d10efbb3029f43605e0362e0caca` 固定提供
-`host_mem_pkg.sv` 和 `host_mem_manager.sv`；filelist 在 PCIe package 前编译
+`pcie_tl_vip@3e2d8c972f1baa78e073f98e8a38ad2f04db6e1a` 和
+`host_mem@3b9e000d5df4d10efbb3029f43605e0362e0caca` 均为固定依赖；仅
+`host_mem@3b9e000d5df4d10efbb3029f43605e0362e0caca` 提供
+`host_mem_pkg.sv` 和 `host_mem_manager.sv`。filelist 在 PCIe package 前编译
 `host_mem_pkg.sv`，而 `virtio_net_pkg` 在自身 package 内包含 manager。
 固定 SHA 使依赖可复现；实际的 VCS 编译和动态 UVM 回归结果仍取决于运行环境。
+
+---
+
+## DPU Fabric 部署边界
+
+Fabric 最多管理 4 个 host、每 host 16 个 PF、每 PF 16 个本地 VF，以及全局 1024 个 function。完整启用 64 个 PF 后，仍可激活 960 个 VF function。它预注册并封存 Fabric 所有的 `virtio.qpair` 通用资源 profile：全局 2048 个 QP、每 function 32 个 QP；该 class ID 是 Fabric 内部不透明值，而非 core enum 常量，function 激活前必须完成预注册和 seal。特殊 VQ 使用独立的 Fabric profile，不消耗该普通 QP 配额。这个通用 resource-pool/lease API 是后续 RDMA 和 virtio-blk 复用的集成点。
+
+PF BAR 映射固定为：BAR0/1 是 32 MiB function-device，BAR2/3 是 64 KiB 保留空间，BAR4/5 是 64 KiB MSI-X table/PBA。VF 的对应大小为 16 KiB、16 KiB、32 KiB。当前 virtio capability 发现仅在 BAR0/1；BAR2/3 虽占地址空间但没有功能绑定，任何功能访问均为违规；BAR4/5 仅承载 MSI-X table/PBA。
+
+Fabric 先配置 64-bit MMIO aperture，并验证对齐和地址无重叠；function 先完成 BAR0/1 capability discovery，之后才获取动态资源 lease。不要在 capability discovery 前分配 queue 资源，也不要把保留 BAR 或 MSI-X aperture 当作 virtio 寄存器窗口。
 
 ---
 

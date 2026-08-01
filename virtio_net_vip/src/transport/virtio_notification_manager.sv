@@ -33,6 +33,9 @@ class virtio_notification_manager extends uvm_object;
     int unsigned      queue_vectors[];        // queue_id -> vector mapping
     bit               msix_mask[];            // per-vector mask
     bit               msix_function_mask = 0; // global function mask
+    // Stable namespace used only for model-generated default table entries.
+    // Explicit table entries retain their caller-provided address/data.
+    bit [15:0]        function_bdf;
 
     // ===== INTx state =====
     bit               intx_enabled = 0;
@@ -61,6 +64,14 @@ class virtio_notification_manager extends uvm_object;
     function new(string name = "virtio_notification_manager");
         super.new(name);
         config_vector = 0;
+        function_bdf = '0;
+    endfunction
+
+    // A transport function assigns this when its Fabric/PCIe identity is
+    // configured.  Its BDF makes otherwise identical default MSI-X entries
+    // unambiguous to a shared passive PCIe observer.
+    virtual function void set_function_bdf(input bit [15:0] device_bdf);
+        function_bdf = device_bdf;
     endfunction
 
     // ========================================================================
@@ -87,9 +98,13 @@ class virtio_notification_manager extends uvm_object;
             bit [31:0] entry_offset;
             entry_offset = msix_table_offset + (i * 16);
 
-            // Initialize with default MSI-X entry values
-            msix_table[i].msg_addr = 64'hFEE0_0000 + (i * 4);  // Default APIC addr
-            msix_table[i].msg_data = i;                          // Vector number as data
+            // The APIC destination address is shared by default.  Preserve
+            // the vector number in the low half of message data while using
+            // the upper half as a stable per-function BDF namespace.  The
+            // complete address/data pair is thus unique across PFs/VFs even
+            // when monitor traffic omits requester_id.
+            msix_table[i].msg_addr = 64'hFEE0_0000 + (i * 4);
+            msix_table[i].msg_data = {function_bdf, i[15:0]};
             msix_table[i].masked   = 1;                          // Start masked
             msix_mask[i]           = 1;
 

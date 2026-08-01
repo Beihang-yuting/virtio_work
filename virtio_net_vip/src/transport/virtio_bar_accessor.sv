@@ -174,20 +174,39 @@ class virtio_bar_cfg_wr_seq extends uvm_sequence #(pcie_tl_tlp);
     bit [15:0]  target_bdf;
     bit [9:0]   reg_num;
     bit [3:0]   first_be;
+    bit [31:0]  wdata;
 
     function new(string name = "virtio_bar_cfg_wr_seq");
         super.new(name);
         first_be = 4'hF;
+        wdata = '0;
     endfunction
 
     virtual task body();
-        pcie_tl_cfg_wr_seq wr_seq;
-        wr_seq = pcie_tl_cfg_wr_seq::type_id::create("cfg_wr_seq");
-        wr_seq.target_bdf = target_bdf;
-        wr_seq.reg_num    = reg_num;
-        wr_seq.first_be   = first_be;
-        wr_seq.is_type1   = 0;
-        wr_seq.start(m_sequencer);
+        pcie_tl_cfg_tlp wr_tlp;
+
+        // Do not delegate this write to pcie_tl_cfg_wr_seq: its public
+        // wr_data field is not copied into the Config TLP payload.  Program
+        // the payload before finish_item() so the PCIe transport observes the
+        // requested DWORD, including in TLM adapter mode.
+        wr_tlp = pcie_tl_cfg_tlp::type_id::create("cfg_wr_tlp");
+        start_item(wr_tlp);
+        if (!wr_tlp.randomize() with {
+            wr_tlp.kind == TLP_CFG_WR0;
+            wr_tlp.completer_id == local::target_bdf;
+            wr_tlp.reg_num == local::reg_num;
+            wr_tlp.first_be == local::first_be;
+            wr_tlp.constraint_mode_sel == CONSTRAINT_LEGAL;
+        }) begin
+            `uvm_fatal("BAR_ACCESSOR",
+                "could not randomize a Type-0 PCI config write TLP")
+        end
+        wr_tlp.payload = new[4];
+        wr_tlp.payload[0] = wdata[7:0];
+        wr_tlp.payload[1] = wdata[15:8];
+        wr_tlp.payload[2] = wdata[23:16];
+        wr_tlp.payload[3] = wdata[31:24];
+        finish_item(wr_tlp);
     endtask
 
 endclass : virtio_bar_cfg_wr_seq
@@ -205,7 +224,7 @@ class virtio_bar_accessor extends uvm_object;
     // ===== BAR configuration =====
     bit [63:0]  bar_base[6];        // BAR0-5 base addresses
     bit [63:0]  bar_size[6];        // BAR0-5 sizes (for enumeration)
-    bit [2:0]   bar_type[6];        // 0=32-bit MMIO, 2=64-bit MMIO
+    bit [2:0]   bar_type[6];        // PCI BAR bits [2:0]; 3'b100=64-bit MMIO
     bit         fabric_bar_layout_active;
     bit         fabric_bar_role_valid[6];
     dpu_bar_role_e fabric_bar_role[6];
@@ -242,6 +261,55 @@ class virtio_bar_accessor extends uvm_object;
     virtual function void configure_fabric_bar_pairs(
         input dpu_bar_pair_lease_t bars[$]
     );
+        bit lease_seen[3];
+
+        if (bars.size() != 3) begin
+            `uvm_error("BAR_ACCESSOR", $sformatf(
+                "Fabric BAR lease set must contain exactly three unique pairs; got %0d",
+                bars.size()))
+            return;
+        end
+        foreach (bars[index]) begin
+            int unsigned lease_slot;
+
+            if ((bars[index].even_bar_id == 0) &&
+                (bars[index].role == DPU_BAR_FUNCTION_DEVICE)) begin
+                lease_slot = 0;
+            end
+            else if ((bars[index].even_bar_id == 2) &&
+                     (bars[index].role == DPU_BAR_RESERVED)) begin
+                lease_slot = 1;
+            end
+            else if ((bars[index].even_bar_id == 4) &&
+                     (bars[index].role == DPU_BAR_MSIX)) begin
+                lease_slot = 2;
+            end
+            else begin
+                `uvm_error("BAR_ACCESSOR", $sformatf(
+                    "Fabric BAR lease %0d has invalid role %0d for even BAR%0d; expected BAR0=function-device, BAR2=reserved, or BAR4=MSI-X",
+                    index, bars[index].role, bars[index].even_bar_id))
+                return;
+            end
+            if (lease_seen[lease_slot]) begin
+                `uvm_error("BAR_ACCESSOR", $sformatf(
+                    "Fabric BAR lease %0d duplicates the required BAR%0d role %0d pair",
+                    index, bars[index].even_bar_id, bars[index].role))
+                return;
+            end
+            lease_seen[lease_slot] = 1;
+        end
+        for (int unsigned lease_slot = 0; lease_slot < 3; lease_slot++) begin
+            if (!lease_seen[lease_slot]) begin
+                `uvm_error("BAR_ACCESSOR", $sformatf(
+                    "Fabric BAR lease set is missing required pair slot %0d",
+                    lease_slot))
+                return;
+            end
+        end
+
+        // Do not mutate an existing Fabric layout until the entire input set
+        // has validated.  A malformed retry must not leave a partial layout
+        // that can later be programmed into PCI config space.
         fabric_bar_layout_active = 1;
         reserved_bar_access_error_count = 0;
         for (int unsigned bar_id = 0; bar_id < 6; bar_id++) begin
@@ -252,16 +320,9 @@ class virtio_bar_accessor extends uvm_object;
             fabric_bar_role[bar_id] = DPU_BAR_RESERVED;
         end
         foreach (bars[index]) begin
-            if ((bars[index].even_bar_id > 4) ||
-                ((bars[index].even_bar_id % 2) != 0)) begin
-                `uvm_error("BAR_ACCESSOR", $sformatf(
-                    "Fabric supplied invalid even BAR index %0d",
-                    bars[index].even_bar_id))
-                continue;
-            end
             bar_base[bars[index].even_bar_id] = bars[index].base;
             bar_size[bars[index].even_bar_id] = bars[index].size;
-            bar_type[bars[index].even_bar_id] = 3'b010;
+            bar_type[bars[index].even_bar_id] = 3'b100;
             fabric_bar_role_valid[bars[index].even_bar_id] = 1;
             fabric_bar_role[bars[index].even_bar_id] = bars[index].role;
             fabric_bar_role_valid[bars[index].even_bar_id + 1] = 1;
@@ -276,6 +337,110 @@ class virtio_bar_accessor extends uvm_object;
     function int unsigned get_reserved_bar_access_error_count();
         return reserved_bar_access_error_count;
     endfunction
+
+    protected function bit fabric_bar_pair_is_programmable(
+        input int unsigned even_bar_id,
+        input dpu_bar_role_e expected_role,
+        output string why
+    );
+        bit [63:0] pair_size;
+
+        why = "";
+        if ((even_bar_id > 4) || ((even_bar_id % 2) != 0)) begin
+            why = $sformatf("invalid even BAR ID %0d", even_bar_id);
+            return 0;
+        end
+        if (!fabric_bar_role_valid[even_bar_id] ||
+            !fabric_bar_role_valid[even_bar_id + 1]) begin
+            why = $sformatf("BAR%0d/%0d has no complete Fabric role lease",
+                            even_bar_id, even_bar_id + 1);
+            return 0;
+        end
+        if ((fabric_bar_role[even_bar_id] != expected_role) ||
+            (fabric_bar_role[even_bar_id + 1] != expected_role)) begin
+            why = $sformatf("BAR%0d/%0d role mismatch (expected %0d)",
+                            even_bar_id, even_bar_id + 1, expected_role);
+            return 0;
+        end
+
+        pair_size = bar_size[even_bar_id];
+        // The low nibble encodes PCI BAR attributes, never Fabric address
+        // bits.  Reject a lease that would be silently changed by attribute
+        // insertion instead of masking its supplied base during programming.
+        if ((bar_base[even_bar_id] & 64'hf) != 0) begin
+            why = $sformatf(
+                "BAR%0d base 0x%016h has nonzero low address nibble before PCI attribute bits",
+                even_bar_id, bar_base[even_bar_id]);
+            return 0;
+        end
+        if ((pair_size < 64'h10) ||
+            ((pair_size & (pair_size - 1)) != 0)) begin
+            why = $sformatf(
+                "BAR%0d pair size 0x%016h must be a power of two and at least 0x10",
+                even_bar_id, pair_size);
+            return 0;
+        end
+        if ((bar_base[even_bar_id] & (pair_size - 1)) != 0) begin
+            why = $sformatf("BAR%0d base 0x%016h is not aligned to size 0x%016h",
+                            even_bar_id, bar_base[even_bar_id], pair_size);
+            return 0;
+        end
+        if ((bar_base[even_bar_id + 1] != '0) ||
+            (bar_size[even_bar_id + 1] != '0) ||
+            (bar_type[even_bar_id + 1] != '0)) begin
+            why = $sformatf("BAR%0d upper slot contains a second lease",
+                            even_bar_id + 1);
+            return 0;
+        end
+        if (bar_type[even_bar_id] != 3'b100) begin
+            why = $sformatf("BAR%0d is not a 64-bit MMIO pair", even_bar_id);
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    // Program the Fabric-owned 64-bit BAR pairs through PCIe config space.
+    // BAR2/3 remains reserved after configuration; it is not an MMIO window.
+    virtual task program_fabric_bar_pairs();
+        string why;
+        bit [31:0] low_dword;
+        bit [11:0] low_addr;
+
+        if (!fabric_bar_layout_active) begin
+            `uvm_fatal("BAR_FABRIC_PROGRAM",
+                "cannot program Fabric BARs without an active Fabric layout")
+            return;
+        end
+        if (!fabric_bar_pair_is_programmable(
+            0, DPU_BAR_FUNCTION_DEVICE, why
+        ) || !fabric_bar_pair_is_programmable(
+            2, DPU_BAR_RESERVED, why
+        ) || !fabric_bar_pair_is_programmable(
+            4, DPU_BAR_MSIX, why
+        )) begin
+            `uvm_fatal("BAR_FABRIC_PROGRAM", $sformatf(
+                "cannot program Fabric BAR pairs for BDF 0x%04h: %s",
+                requester_id, why))
+            return;
+        end
+
+        for (int unsigned even_bar_id = 0;
+             even_bar_id < 6;
+             even_bar_id += 2) begin
+            low_addr = PCI_CFG_BAR0 + (even_bar_id * 4);
+            // bar_base was prevalidated with zero address bits [3:0], so
+            // this replaces only standard 64-bit MMIO attribute bits and
+            // preserves every supplied base-address bit exactly.
+            low_dword = {bar_base[even_bar_id][31:4], 4'b0100};
+            config_write(low_addr, low_dword, 4'hf);
+            config_write(low_addr + 12'h004,
+                         bar_base[even_bar_id][63:32], 4'hf);
+        end
+
+        `uvm_info("BAR_FABRIC_PROGRAM", $sformatf(
+            "programmed Fabric BAR0/1, BAR2/3, and BAR4/5 for BDF 0x%04h",
+            requester_id), UVM_MEDIUM)
+    endtask
 
     protected function bit allow_functional_bar_access(input int unsigned bar_id);
         if (!fabric_bar_layout_active)
@@ -545,6 +710,7 @@ class virtio_bar_accessor extends uvm_object;
         wr_seq.target_bdf = requester_id;
         wr_seq.reg_num    = reg_num;
         wr_seq.first_be   = be;
+        wr_seq.wdata      = data;
         wr_seq.start(pcie_rc_seqr);
 
         `uvm_info("BAR_ACCESSOR",

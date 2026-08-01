@@ -7,6 +7,18 @@ class virtio_transaction extends uvm_sequence_item;
     // ===== Transaction type discriminator =====
     rand virtio_txn_type_e   txn_type;
 
+    // ===== Passive monitor event metadata =====
+    bit                      is_monitor_event;
+    virtio_monitor_event_e   monitor_event;
+    bit                      monitor_error;
+    bit [63:0]               monitor_addr;
+    int unsigned             monitor_length;
+    bit                      monitor_is_write;
+    bit [7:0]                status_old;
+    int unsigned             interrupt_vector;
+    interrupt_mode_e         irq_mode;
+    int unsigned             num_vfs;
+
     // ===== Data plane fields =====
     rand int unsigned        queue_id;
     uvm_object               packets[$];       // packet_item list (TX input)
@@ -58,6 +70,16 @@ class virtio_transaction extends uvm_sequence_item;
     function new(string name = "virtio_transaction");
         super.new(name);
         txn_type = VIO_TXN_INIT;
+        is_monitor_event = 0;
+        monitor_event = VIRTIO_MON_BAR_ACCESS;
+        monitor_error = 0;
+        monitor_addr = '0;
+        monitor_length = 0;
+        monitor_is_write = 0;
+        status_old = '0;
+        interrupt_vector = 0;
+        irq_mode = IRQ_MSIX_PER_QUEUE;
+        num_vfs = 0;
         queue_id = 0;
         expected_count = 0;
         timeout_ns = 50000;  // 50us default
@@ -77,6 +99,16 @@ class virtio_transaction extends uvm_sequence_item;
         super.do_copy(rhs);
         if ($cast(rhs_t, rhs)) begin
             txn_type       = rhs_t.txn_type;
+            is_monitor_event = rhs_t.is_monitor_event;
+            monitor_event  = rhs_t.monitor_event;
+            monitor_error  = rhs_t.monitor_error;
+            monitor_addr   = rhs_t.monitor_addr;
+            monitor_length = rhs_t.monitor_length;
+            monitor_is_write = rhs_t.monitor_is_write;
+            status_old     = rhs_t.status_old;
+            interrupt_vector = rhs_t.interrupt_vector;
+            irq_mode       = rhs_t.irq_mode;
+            num_vfs        = rhs_t.num_vfs;
             queue_id       = rhs_t.queue_id;
             packets        = rhs_t.packets;
             received_pkts  = rhs_t.received_pkts;
@@ -109,6 +141,10 @@ class virtio_transaction extends uvm_sequence_item;
     endfunction
 
     virtual function string convert2string();
+        if (is_monitor_event) begin
+            return $sformatf("virtio_monitor_txn: event=%s addr=0x%016h queue=%0d error=%0b",
+                             monitor_event.name(), monitor_addr, queue_id, monitor_error);
+        end
         return $sformatf("virtio_txn: type=%s queue=%0d", txn_type.name(), queue_id);
     endfunction
 

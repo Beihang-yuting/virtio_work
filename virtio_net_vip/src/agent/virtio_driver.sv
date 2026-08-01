@@ -50,6 +50,8 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // ========================================================================
 
     protected virtual task process_transaction(virtio_transaction req);
+        bit setup_ok;
+
         case (req.txn_type)
             // ----- Lifecycle -----
             VIO_TXN_INIT:       fsm.full_init();
@@ -72,11 +74,14 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
 
             // ----- Migration -----
             VIO_TXN_FREEZE:     fsm.freeze_for_migration(req.snapshot);
-            VIO_TXN_RESTORE:    fsm.restore_from_migration(req.snapshot);
+            VIO_TXN_RESTORE:    fsm.restore_from_migration(req.snapshot, req.success);
 
             // ----- Queue management -----
             VIO_TXN_RESET_QUEUE: fsm.reset_single_queue(req.queue_id);
-            VIO_TXN_SETUP_QUEUE: ops.setup_queue(req.queue_id, req.queue_size, req.vq_type);
+            VIO_TXN_SETUP_QUEUE: begin
+                ops.setup_queue(req.queue_id, req.queue_size, req.vq_type, setup_ok);
+                req.success = setup_ok;
+            end
 
             // ----- Error injection -----
             VIO_TXN_INJECT_ERROR: dispatch_error_injection(req);
@@ -94,6 +99,8 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // ========================================================================
 
     protected virtual task dispatch_atomic_op(virtio_transaction req);
+        bit setup_ok;
+
         case (req.atomic_op)
             ATOMIC_SET_STATUS:
                 ops.transport.write_device_status(req.status_val);
@@ -101,8 +108,10 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
             ATOMIC_READ_STATUS:
                 ops.transport.read_device_status(req.status_val);
 
-            ATOMIC_SETUP_QUEUE:
-                ops.setup_queue(req.queue_id, req.queue_size, req.vq_type);
+            ATOMIC_SETUP_QUEUE: begin
+                ops.setup_queue(req.queue_id, req.queue_size, req.vq_type, setup_ok);
+                req.success = setup_ok;
+            end
 
             ATOMIC_TX_SUBMIT:
                 ops.tx_submit(req.queue_id, req.net_hdr, req.pkt,

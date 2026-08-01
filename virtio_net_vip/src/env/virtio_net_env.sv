@@ -19,11 +19,8 @@
 //   uvm_config_db#(virtio_net_env_config)::set(this, "env", "cfg", cfg)
 //
 // PCIe subenv connection (pcie_tl_env) is deferred to the test's
-// connect_phase because the PCIe env is created by the test, not by this
-// env. The test should:
-//   1. Create both pcie_tl_env and virtio_net_env
-//   2. In connect_phase, wire pcie_rc_seqr into vf_instances via
-//      wire_shared() and into v_seqr.pcie_rc_seqr
+// connect_phase because the PCIe env is created by the test.  Tests bind it
+// once through bind_pcie(), which wires every active function.
 //
 // Depends on:
 //   - All Phase 1-7 components
@@ -64,6 +61,7 @@ class virtio_net_env extends uvm_env;
     // ===== PCIe subenv (stored as uvm_object, $cast at runtime) =====
     // The actual pcie_tl_env is created by the test and passed via config_db
     uvm_object                      pcie_env_ref;
+    protected int unsigned           protocol_event_vif_index;
 
     // ===== Virtual sequencer =====
     virtio_virtual_sequencer        v_seqr;
@@ -309,6 +307,89 @@ class virtio_net_env extends uvm_env;
                 vf_instances[i].driver_agent.monitor.txn_ap.connect(cov.analysis_imp);
         end
 
+    endfunction
+
+    // Bind one RC sequencer and one completion adapter to all live functions.
+    // Fabric topology owns independent PF and VF functions, so it must not be
+    // reduced to the compatibility vf_instances view.
+    virtual function void bind_pcie(
+        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
+        input virtio_tlm_completion_adapter tlm_adapter,
+        input pcie_tl_base_monitor pcie_rc_monitor = null,
+        input pcie_tl_base_monitor pcie_ep_monitor = null
+    );
+        if (pcie_rc_seqr == null) begin
+            `uvm_fatal("VIRTIO_ENV", "bind_pcie() received a null PCIe RC sequencer")
+        end
+        if (tlm_adapter == null) begin
+            `uvm_fatal("VIRTIO_ENV", "bind_pcie() received a null TLM completion adapter")
+        end
+
+        // The adapter owns the factory-created RC shim.  Bind and validate it
+        // here so callers need only this public environment API.
+        tlm_adapter.bind_registered_rc_driver();
+        v_seqr.pcie_rc_seqr = pcie_rc_seqr;
+        protocol_event_vif_index = 0;
+        if (fabric_topology) begin
+            foreach (pf_instances[pf_index]) begin
+                bind_function_pcie(
+                    pf_instances[pf_index].pf_function, pcie_rc_seqr,
+                    pcie_rc_monitor, pcie_ep_monitor);
+                foreach (pf_instances[pf_index].vf_functions[vf_index])
+                    bind_function_pcie(
+                        pf_instances[pf_index].vf_functions[vf_index],
+                        pcie_rc_seqr, pcie_rc_monitor, pcie_ep_monitor);
+            end
+        end
+        else begin
+            foreach (vf_instances[vf_index])
+                bind_function_pcie(vf_instances[vf_index], pcie_rc_seqr,
+                    pcie_rc_monitor, pcie_ep_monitor);
+        end
+    endfunction
+
+    protected virtual function void bind_function_pcie(
+        input virtio_function_instance function_instance,
+        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
+        input pcie_tl_base_monitor pcie_rc_monitor,
+        input pcie_tl_base_monitor pcie_ep_monitor
+    );
+        virtual virtio_protocol_event_if protocol_vif;
+        string protocol_vif_key;
+
+        function_instance.mem = host_mem;
+        function_instance.iommu = iommu;
+        function_instance.barrier = barrier;
+        function_instance.err_inj = err_inj;
+        function_instance.wait_pol = wait_pol;
+        function_instance.bind_pcie(pcie_rc_seqr);
+        if ((function_instance.driver_agent == null) ||
+            (function_instance.driver_agent.observer == null)) begin
+            `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
+        end
+        function_instance.driver_agent.observer.configure_function(
+            function_instance.bdf, function_instance.transport);
+        if (protocol_event_vif_index >= DPU_MAX_FUNCTIONS) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "Protocol event interface pool exhausted at function BDF 0x%04h",
+                function_instance.bdf))
+        end
+        protocol_vif_key = $sformatf("protocol_event_vif_%0d",
+            protocol_event_vif_index);
+        if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
+                null, "uvm_test_top", protocol_vif_key, protocol_vif)) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "No protocol event interface configured for active function %0d",
+                protocol_event_vif_index))
+        end
+        function_instance.driver_agent.monitor.protocol_vif = protocol_vif;
+        protocol_event_vif_index++;
+        if (pcie_rc_monitor != null)
+            pcie_rc_monitor.tlp_ap.connect(
+                function_instance.driver_agent.observer.analysis_export);
+        if ((pcie_ep_monitor != null) && (pcie_ep_monitor != pcie_rc_monitor))
+            pcie_ep_monitor.tlp_ap.connect(
+                function_instance.driver_agent.observer.analysis_export);
     endfunction
 
     // ========================================================================

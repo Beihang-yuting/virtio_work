@@ -131,17 +131,25 @@ class virtio_pci_transport extends uvm_object;
     // Timeout: wait_pol.reset_timeout_ns
     // ========================================================================
 
-    virtual task reset_device();
+    // The verified form lets DMA owners wait for hardware confirmation.
+    // reset_device() remains the backwards-compatible void wrapper.
+    virtual task reset_device_verified(ref bit reset_complete);
         bit [31:0] read_val;
-        bit success = 0;
         int unsigned elapsed = 0;
         int unsigned eff_timeout = wait_pol.effective_timeout(wait_pol.reset_timeout_ns);
         int unsigned interval = wait_pol.default_poll_interval_ns;
         int unsigned attempts = 0;
-        int unsigned max_att = eff_timeout / ((interval > 0) ? interval : 1) + 1;
+        int unsigned max_att;
+        longint unsigned quotient;
 
-        if (max_att > wait_pol.max_poll_attempts)
+        reset_complete = 0;
+        if (interval == 0)
+            interval = 1;
+        quotient = longint'(eff_timeout) / interval;
+        if (quotient >= wait_pol.max_poll_attempts)
             max_att = wait_pol.max_poll_attempts;
+        else
+            max_att = quotient + 1;
 
         // Write 0 to trigger reset
         cc_write(VIRTIO_PCI_COMMON_STATUS, 1, 32'h0);
@@ -151,7 +159,7 @@ class virtio_pci_transport extends uvm_object;
         while (attempts < max_att) begin
             cc_read(VIRTIO_PCI_COMMON_STATUS, 1, read_val);
             if (read_val[7:0] == 8'h0) begin
-                success = 1;
+                reset_complete = 1;
                 break;
             end
             #(interval * 1ns);
@@ -159,11 +167,16 @@ class virtio_pci_transport extends uvm_object;
             attempts++;
         end
 
-        if (!success)
+        if (!reset_complete)
             `uvm_error("TRANSPORT",
                 $sformatf("Device reset timeout after %0dns", elapsed))
         else
             `uvm_info("TRANSPORT", "Device reset complete", UVM_HIGH)
+    endtask
+
+    virtual task reset_device();
+        bit reset_complete;
+        reset_device_verified(reset_complete);
     endtask
 
     // ========================================================================
@@ -400,17 +413,26 @@ class virtio_pci_transport extends uvm_object;
     // Select queue, write 1 to Q_RESET, then poll until Q_RESET reads back 0.
     // ========================================================================
 
-    virtual task write_queue_reset(int unsigned queue_id);
+    // The verified form is required before a caller may release queue DMA.
+    // write_queue_reset() remains the backwards-compatible void wrapper.
+    virtual task write_queue_reset_verified(int unsigned queue_id,
+                                            ref bit reset_complete);
         bit [31:0] read_val;
-        bit success = 0;
         int unsigned elapsed = 0;
         int unsigned eff_timeout = wait_pol.effective_timeout(wait_pol.queue_reset_timeout_ns);
         int unsigned interval = wait_pol.default_poll_interval_ns;
         int unsigned attempts = 0;
-        int unsigned max_att = eff_timeout / ((interval > 0) ? interval : 1) + 1;
+        int unsigned max_att;
+        longint unsigned quotient;
 
-        if (max_att > wait_pol.max_poll_attempts)
+        reset_complete = 0;
+        if (interval == 0)
+            interval = 1;
+        quotient = longint'(eff_timeout) / interval;
+        if (quotient >= wait_pol.max_poll_attempts)
             max_att = wait_pol.max_poll_attempts;
+        else
+            max_att = quotient + 1;
 
         // Select queue and write reset
         select_queue(queue_id);
@@ -423,7 +445,7 @@ class virtio_pci_transport extends uvm_object;
         while (attempts < max_att) begin
             cc_read(VIRTIO_PCI_COMMON_Q_RESET, 2, read_val);
             if (read_val[15:0] == 16'h0) begin
-                success = 1;
+                reset_complete = 1;
                 break;
             end
             #(interval * 1ns);
@@ -431,12 +453,17 @@ class virtio_pci_transport extends uvm_object;
             attempts++;
         end
 
-        if (!success)
+        if (!reset_complete)
             `uvm_error("TRANSPORT",
                 $sformatf("Queue %0d reset timeout after %0dns", queue_id, elapsed))
         else
             `uvm_info("TRANSPORT",
                 $sformatf("Queue %0d reset complete", queue_id), UVM_HIGH)
+    endtask
+
+    virtual task write_queue_reset(int unsigned queue_id);
+        bit reset_complete;
+        write_queue_reset_verified(queue_id, reset_complete);
     endtask
 
     // ========================================================================
@@ -471,21 +498,16 @@ class virtio_pci_transport extends uvm_object;
     //
     // Notifies the device that new buffers are available in the specified queue.
     //
-    // If NOTIFICATION_DATA is enabled:
-    //   For split virtqueue: data = {next_avail_idx[15:0], queue_id[15:0]}
-    //   For packed virtqueue: data = {wrap_counter, next_avail_idx[14:0], queue_id[15:0]}
-    //   Write 32-bit data to notify offset.
-    // Else:
-    //   Write queue_id (16-bit) to notify offset.
-    //
-    // Notify offset = cap_mgr.get_notify_bar_offset(queue_notify_off[queue_id])
+    // The notification capability selects the BAR and base offset.  The
+    // queue-specific notify_off value scales by notify_off_multiplier.
     // ========================================================================
 
     virtual task kick(int unsigned queue_id, int unsigned next_avail_idx, bit wrap_counter);
         bit [31:0] notify_data;
-        bit [63:0] notify_offset;
-        int unsigned notify_bar;
         bit is_packed;
+        int unsigned notify_bar;
+        bit [63:0] notify_offset;
+        int unsigned notify_size;
 
         if (queue_id >= queue_notify_off.size()) begin
             `uvm_error("TRANSPORT",
@@ -493,9 +515,6 @@ class virtio_pci_transport extends uvm_object;
                           queue_id, queue_notify_off.size() - 1))
             return;
         end
-
-        notify_bar    = cap_mgr.get_notify_bar();
-        notify_offset = cap_mgr.get_notify_bar_offset(queue_notify_off[queue_id]);
 
         if (notification_data_enable) begin
             is_packed = driver_features[VIRTIO_F_RING_PACKED];
@@ -506,17 +525,20 @@ class virtio_pci_transport extends uvm_object;
                 // Split: {next_avail_idx[31:16], queue_id[15:0]}
                 notify_data = {next_avail_idx[15:0], queue_id[15:0]};
             end
-            bar.write_reg(notify_bar, notify_offset[31:0], 4, notify_data);
-
-            `uvm_info("TRANSPORT",
-                $sformatf("kick: queue=%0d notify_data=0x%08h (NOTIFICATION_DATA)",
-                          queue_id, notify_data), UVM_HIGH)
+            notify_size = 4;
         end else begin
-            bar.write_reg(notify_bar, notify_offset[31:0], 2, {16'h0, queue_id[15:0]});
-
-            `uvm_info("TRANSPORT",
-                $sformatf("kick: queue=%0d (standard)", queue_id), UVM_HIGH)
+            notify_data = {16'h0, queue_id[15:0]};
+            notify_size = 2;
         end
+
+        notify_bar = cap_mgr.get_notify_bar();
+        notify_offset = cap_mgr.get_notify_bar_offset(queue_notify_off[queue_id]);
+        bar.write_reg(notify_bar, notify_offset[31:0], notify_size, notify_data);
+
+        `uvm_info("TRANSPORT",
+            $sformatf("kick: queue=%0d notify_addr=0x%016h size=%0d data=0x%08h",
+                      queue_id, bar.bar_base[notify_bar] + notify_offset,
+                      notify_size, notify_data), UVM_HIGH)
     endtask
 
     // ========================================================================
@@ -771,9 +793,10 @@ class virtio_pci_transport extends uvm_object;
         return 1;
     endfunction
 
-    // Fabric BARs are already programmed.  This path performs the real PCI
-    // capability scan while preserving all three pairs, then lets the virtio
-    // resource client mark the function device-ready.
+    // Fabric owns BAR placement, but the root complex still must program all
+    // three 64-bit BAR pairs through PCI config space before discovery.  This
+    // path then scans capabilities and lets the virtio resource client mark
+    // the function device-ready.
     virtual task discover_fabric_preconfigured_bars();
         string why;
 
@@ -793,6 +816,7 @@ class virtio_pci_transport extends uvm_object;
         bar.requester_id = bdf;
         cap_mgr.bar_ref = bar;
         notify_mgr.bar = bar;
+        bar.program_fabric_bar_pairs();
         cap_mgr.discover_capabilities();
         if (!fabric_capabilities_use_device_window(why)) begin
             `uvm_fatal("TRANSPORT", $sformatf(
@@ -804,7 +828,7 @@ class virtio_pci_transport extends uvm_object;
                 "Fabric device-ready transition failed after discovery: %s", why))
         end
         `uvm_info("TRANSPORT",
-            "Fabric BAR capability discovery complete without BAR enumeration",
+            "Fabric BAR configuration and capability discovery complete without BAR enumeration",
             UVM_MEDIUM)
     endtask
 

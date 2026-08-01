@@ -13,4 +13,6 @@ virtio_net_vip/ext/pcie_tl_vip/pcie_tl_vip/src/pcie_tl_pkg.sv
 
 // Local virtio-net package; it includes its sources in dependency order.
 +incdir+virtio_net_vip/src
+virtio_net_vip/src/agent/virtio_protocol_event_if.sv
 virtio_net_vip/src/virtio_net_pkg.sv
+virtio_net_vip/src/agent/virtio_protocol_assertions.sv

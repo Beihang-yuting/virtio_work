@@ -18,11 +18,30 @@
 module virtio_tb_top;
 
     import uvm_pkg::*;
+    import dpu_resource_pkg::*;
     `include "uvm_macros.svh"
 
     // Clock and reset
     logic clk;
     logic rst_n;
+    // Protocol assertions retain per-function history, so every possible
+    // Fabric function gets its own clocked event channel.  The environment
+    // assigns active PFs/VFs distinct channels during bind_pcie().
+    localparam int unsigned PROTOCOL_EVENT_VIF_COUNT = DPU_MAX_FUNCTIONS;
+    virtio_protocol_event_if protocol_event_ifs [PROTOCOL_EVENT_VIF_COUNT](
+        .clk(clk), .rst_n(rst_n));
+    for (genvar function_index = 0;
+         function_index < PROTOCOL_EVENT_VIF_COUNT;
+         function_index++) begin : g_protocol_event_vif
+        virtio_protocol_assertions protocol_assertions_i(
+            .events(protocol_event_ifs[function_index]));
+        initial begin
+            uvm_config_db#(virtual virtio_protocol_event_if)::set(
+                null, "uvm_test_top",
+                $sformatf("protocol_event_vif_%0d", function_index),
+                protocol_event_ifs[function_index]);
+        end
+    end
 
     // Clock generation: 250MHz (4ns period)
     initial begin
@@ -43,6 +62,8 @@ module virtio_tb_top;
 
     // UVM test launch
     initial begin
+        // Let the generated interface registrations run before UVM starts.
+        #0;
         // Set interface in config_db if using SV_IF mode
         // uvm_config_db #(virtual pcie_tl_if)::set(
         //     null, "uvm_test_top.env.pcie_env", "vif", pcie_if);

@@ -26,7 +26,7 @@ class virtio_virtual_sequencer extends uvm_sequencer;
     virtio_sequencer  vf_seqrs[];
 
     // ===== PCIe RC sequencer (for direct TLP operations) =====
-    uvm_sequencer #(uvm_sequence_item) pcie_rc_seqr;
+    uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr;
 
     // ===== Shared component refs (for virtual sequences that need them) =====
     uvm_object  pf_mgr_ref;       // virtio_pf_manager

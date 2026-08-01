@@ -52,6 +52,7 @@ package virtio_net_pkg;
   // ---------------------------------------------------------------------------
   `include "transport/virtio_pci_regs.sv"
   `include "transport/virtio_bar_accessor.sv"
+  `include "transport/virtio_tlm_completion_adapter.sv"
   `include "transport/virtio_pci_cap_manager.sv"
   `include "transport/virtio_notification_manager.sv"
   `include "transport/virtio_pci_transport.sv"
@@ -67,6 +68,7 @@ package virtio_net_pkg;
   `include "agent/virtio_auto_fsm.sv"
   `include "agent/virtio_driver.sv"
   `include "agent/virtio_monitor.sv"
+  `include "transport/virtio_pcie_observer_adapter.sv"
   `include "agent/virtio_sequencer.sv"
   `include "agent/virtio_driver_agent.sv"
 

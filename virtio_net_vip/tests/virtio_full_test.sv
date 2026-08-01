@@ -1,15 +1,7 @@
 // ============================================================================
 // virtio_full_test.sv
 //
-// Full integration test with completion bridge middleware that solves the
-// get_response() deadlock between virtio bar_accessor read sequences and
-// the asynchronous PCIe TLM loopback completion path.
-//
-// Architecture:
-//   1. virtio_cpl_bridge       - FIFO-based completion store
-//   2. virtio_rc_driver_shim   - Extends pcie_tl_rc_driver, forwards cpls to bridge
-//   3. Bridged sequences       - Use bridge instead of get_response()
-//   4. virtio_full_integration_test - Full init + traffic through real PCIe TLPs
+// Full integration test using the reusable PCIe TLM completion adapter.
 // ============================================================================
 
 import uvm_pkg::*;
@@ -17,343 +9,6 @@ import uvm_pkg::*;
 import pcie_tl_pkg::*;
 import host_mem_pkg::*;
 import virtio_net_pkg::*;
-
-// ============================================================================
-// Completion Bridge
-//
-// Single-mailbox design works because virtio register access is sequential.
-// ============================================================================
-class virtio_cpl_bridge extends uvm_object;
-    `uvm_object_utils(virtio_cpl_bridge)
-
-    mailbox #(pcie_tl_cpl_tlp) cpl_mbx;
-
-    // Statistics
-    int unsigned completions_received;
-    int unsigned completions_consumed;
-
-    function new(string name = "virtio_cpl_bridge");
-        super.new(name);
-        cpl_mbx = new(0);  // unbounded
-        completions_received = 0;
-        completions_consumed = 0;
-    endfunction
-
-    // Called by the shim RC driver when a completion arrives
-    function void put_completion(pcie_tl_cpl_tlp cpl);
-        void'(cpl_mbx.try_put(cpl));
-        completions_received++;
-    endfunction
-
-    // Called by read sequences to wait for completion
-    task wait_completion(int unsigned timeout_ns, ref pcie_tl_cpl_tlp cpl, ref bit ok);
-        ok = 0;
-        fork : wait_cpl_blk
-            begin
-                cpl_mbx.get(cpl);
-                ok = 1;
-                completions_consumed++;
-            end
-            begin
-                #(timeout_ns * 1ns);
-            end
-        join_any
-        disable wait_cpl_blk;
-    endtask
-
-    // Drain all pending completions from the mailbox
-    function void drain();
-        pcie_tl_cpl_tlp cpl;
-        int drained = 0;
-        while (cpl_mbx.try_get(cpl)) begin
-            drained++;
-        end
-        if (drained > 0)
-            `uvm_info("CPL_BRIDGE", $sformatf("Drained %0d stale completions", drained), UVM_MEDIUM)
-    endfunction
-
-    function void report();
-        `uvm_info("CPL_BRIDGE", $sformatf(
-            "Bridge stats: received=%0d consumed=%0d",
-            completions_received, completions_consumed), UVM_LOW)
-    endfunction
-endclass
-
-// ============================================================================
-// RC Driver Shim
-//
-// Extends pcie_tl_rc_driver to push completions into the bridge.
-// ============================================================================
-class virtio_rc_driver_shim extends pcie_tl_rc_driver;
-    `uvm_component_utils(virtio_rc_driver_shim)
-
-    virtio_cpl_bridge bridge;
-
-    function new(string name = "virtio_rc_driver_shim", uvm_component parent = null);
-        super.new(name, parent);
-    endfunction
-
-    virtual function bit handle_completion(pcie_tl_cpl_tlp cpl);
-        bit result = super.handle_completion(cpl);
-        if (bridge != null)
-            bridge.put_completion(cpl);
-        return result;
-    endfunction
-endclass
-
-// ============================================================================
-// Bridged Memory Read Sequence
-// ============================================================================
-class virtio_bar_mem_rd_seq_bridged extends virtio_bar_mem_rd_seq;
-    `uvm_object_utils(virtio_bar_mem_rd_seq_bridged)
-
-    static virtio_cpl_bridge s_bridge;
-
-    function new(string name = "virtio_bar_mem_rd_seq_bridged");
-        super.new(name);
-    endfunction
-
-    virtual task body();
-        pcie_tl_mem_tlp tlp;
-
-        // Create and send the memory read TLP directly via start_item/finish_item
-        tlp = pcie_tl_mem_tlp::type_id::create("mem_rd_tlp");
-        start_item(tlp);
-        tlp.kind = TLP_MEM_RD;
-        tlp.addr = addr;
-        tlp.length = 10'h1;
-        tlp.first_be = first_be;
-        tlp.last_be = last_be;
-        tlp.is_64bit = is_64bit || (addr[63:32] != 0);
-        tlp.fmt = tlp.is_64bit ? FMT_4DW_NO_DATA : FMT_3DW_NO_DATA;
-        tlp.type_f = TLP_TYPE_MEM_RD;
-        tlp.tc = 0;
-        tlp.attr = 0;
-        tlp.constraint_mode_sel = CONSTRAINT_LEGAL;
-        tlp.inject_ecrc_err = 0;
-        tlp.inject_lcrc_err = 0;
-        tlp.inject_poisoned = 0;
-        tlp.violate_ordering = 0;
-        tlp.field_bitmask = 0;
-        tlp.has_prefix = 0;
-        finish_item(tlp);
-
-        // Wait for completion via bridge instead of get_response()
-        if (s_bridge != null) begin
-            pcie_tl_cpl_tlp cpl;
-            bit ok;
-            s_bridge.wait_completion(50000, cpl, ok);
-            if (ok && cpl != null) begin
-                cpl_ok = 1;
-                rdata = '0;
-                if (cpl.payload.size() >= 4)
-                    rdata = {cpl.payload[3], cpl.payload[2],
-                             cpl.payload[1], cpl.payload[0]};
-                else
-                    for (int i = 0; i < cpl.payload.size(); i++)
-                        rdata[i*8 +: 8] = cpl.payload[i];
-            end else begin
-                cpl_ok = 0;
-                rdata = '0;
-                `uvm_warning("MEM_RD_BRIDGED",
-                    $sformatf("Completion timeout for addr=0x%016h", addr))
-            end
-        end else begin
-            cpl_ok = 0;
-            rdata = '0;
-            `uvm_error("MEM_RD_BRIDGED", "s_bridge is null")
-        end
-    endtask
-endclass
-
-// ============================================================================
-// Bridged Memory Write Sequence
-//
-// Fixes the write data randomization issue by creating the TLP directly.
-// ============================================================================
-class virtio_bar_mem_wr_seq_bridged extends virtio_bar_mem_wr_seq;
-    `uvm_object_utils(virtio_bar_mem_wr_seq_bridged)
-
-    function new(string name = "virtio_bar_mem_wr_seq_bridged");
-        super.new(name);
-    endfunction
-
-    virtual task body();
-        pcie_tl_mem_tlp tlp;
-
-        tlp = pcie_tl_mem_tlp::type_id::create("mem_wr_tlp");
-        start_item(tlp);
-        tlp.kind = TLP_MEM_WR;
-        tlp.addr = addr;
-        tlp.length = 10'h1;
-        tlp.first_be = first_be;
-        tlp.last_be = last_be;
-        tlp.is_64bit = is_64bit || (addr[63:32] != 0);
-        tlp.fmt = tlp.is_64bit ? FMT_4DW_WITH_DATA : FMT_3DW_WITH_DATA;
-        tlp.type_f = TLP_TYPE_MEM_WR;
-        tlp.tc = 0;
-        tlp.attr = 0;
-        tlp.constraint_mode_sel = CONSTRAINT_LEGAL;
-        tlp.inject_ecrc_err = 0;
-        tlp.inject_lcrc_err = 0;
-        tlp.inject_poisoned = 0;
-        tlp.violate_ordering = 0;
-        tlp.field_bitmask = 0;
-        tlp.has_prefix = 0;
-        // Set payload with our actual data (not randomized)
-        tlp.payload = new[4];
-        tlp.payload[0] = wdata[7:0];
-        tlp.payload[1] = wdata[15:8];
-        tlp.payload[2] = wdata[23:16];
-        tlp.payload[3] = wdata[31:24];
-        finish_item(tlp);
-    endtask
-endclass
-
-// ============================================================================
-// Bridged Config Read Sequence
-// ============================================================================
-class virtio_bar_cfg_rd_seq_bridged extends virtio_bar_cfg_rd_seq;
-    `uvm_object_utils(virtio_bar_cfg_rd_seq_bridged)
-
-    static virtio_cpl_bridge s_bridge;
-
-    function new(string name = "virtio_bar_cfg_rd_seq_bridged");
-        super.new(name);
-    endfunction
-
-    virtual task body();
-        pcie_tl_cfg_tlp tlp;
-
-        tlp = pcie_tl_cfg_tlp::type_id::create("cfg_rd_tlp");
-        start_item(tlp);
-        tlp.kind = TLP_CFG_RD0;
-        tlp.fmt = FMT_3DW_NO_DATA;
-        tlp.type_f = TLP_TYPE_CFG_RD0;
-        tlp.completer_id = target_bdf;
-        tlp.reg_num = reg_num;
-        tlp.first_be = first_be;
-        tlp.length = 10'h1;
-        tlp.tc = 0;
-        tlp.attr = 0;
-        tlp.constraint_mode_sel = CONSTRAINT_LEGAL;
-        tlp.inject_ecrc_err = 0;
-        tlp.inject_lcrc_err = 0;
-        tlp.inject_poisoned = 0;
-        tlp.violate_ordering = 0;
-        tlp.field_bitmask = 0;
-        tlp.has_prefix = 0;
-        finish_item(tlp);
-
-        // Wait for completion via bridge
-        if (s_bridge != null) begin
-            pcie_tl_cpl_tlp cpl;
-            bit ok;
-            s_bridge.wait_completion(50000, cpl, ok);
-            if (ok && cpl != null) begin
-                cpl_ok = 1;
-                rdata = '0;
-                if (cpl.payload.size() >= 4)
-                    rdata = {cpl.payload[3], cpl.payload[2],
-                             cpl.payload[1], cpl.payload[0]};
-                else
-                    for (int i = 0; i < cpl.payload.size(); i++)
-                        rdata[i*8 +: 8] = cpl.payload[i];
-            end else begin
-                cpl_ok = 0;
-                rdata = '0;
-                `uvm_warning("CFG_RD_BRIDGED",
-                    $sformatf("Completion timeout for reg_num=%0d", reg_num))
-            end
-        end else begin
-            cpl_ok = 0;
-            rdata = '0;
-            `uvm_error("CFG_RD_BRIDGED", "s_bridge is null")
-        end
-    endtask
-endclass
-
-// ============================================================================
-// Bridged Config Write Sequence
-//
-// Fixes the config write data issue (uvm_do_with randomizes payload).
-// Config writes are non-posted in PCIe, so we also need to consume the
-// completion from the bridge.
-// ============================================================================
-class virtio_bar_cfg_wr_seq_bridged extends virtio_bar_cfg_wr_seq;
-    `uvm_object_utils(virtio_bar_cfg_wr_seq_bridged)
-
-    static virtio_cpl_bridge s_bridge;
-
-    // Static data channel: bar_accessor.config_write() sets this before start()
-    static bit [31:0] s_wdata;
-
-    function new(string name = "virtio_bar_cfg_wr_seq_bridged");
-        super.new(name);
-    endfunction
-
-    virtual task body();
-        pcie_tl_cfg_tlp tlp;
-        bit [31:0] local_wdata;
-
-        // Capture the static data and clear it
-        local_wdata = s_wdata;
-
-        tlp = pcie_tl_cfg_tlp::type_id::create("cfg_wr_tlp");
-        start_item(tlp);
-        tlp.kind = TLP_CFG_WR0;
-        tlp.fmt = FMT_3DW_WITH_DATA;
-        tlp.type_f = TLP_TYPE_CFG_WR0;
-        tlp.completer_id = target_bdf;
-        tlp.reg_num = reg_num;
-        tlp.first_be = first_be;
-        tlp.length = 10'h1;
-        tlp.tc = 0;
-        tlp.attr = 0;
-        tlp.constraint_mode_sel = CONSTRAINT_LEGAL;
-        tlp.inject_ecrc_err = 0;
-        tlp.inject_lcrc_err = 0;
-        tlp.inject_poisoned = 0;
-        tlp.violate_ordering = 0;
-        tlp.field_bitmask = 0;
-        tlp.has_prefix = 0;
-        // Set payload from the static data channel
-        tlp.payload = new[4];
-        tlp.payload[0] = local_wdata[7:0];
-        tlp.payload[1] = local_wdata[15:8];
-        tlp.payload[2] = local_wdata[23:16];
-        tlp.payload[3] = local_wdata[31:24];
-        finish_item(tlp);
-
-        // Config writes are non-posted -- consume the completion
-        if (s_bridge != null) begin
-            pcie_tl_cpl_tlp cpl;
-            bit ok;
-            s_bridge.wait_completion(50000, cpl, ok);
-            // We don't care about the completion data for writes
-        end
-    endtask
-endclass
-
-// ============================================================================
-// Bridged Bar Accessor
-//
-// Overrides config_write to set the static wdata channel before the
-// factory-created bridged config write sequence runs.
-// ============================================================================
-class virtio_bar_accessor_bridged extends virtio_bar_accessor;
-    `uvm_object_utils(virtio_bar_accessor_bridged)
-
-    function new(string name = "virtio_bar_accessor_bridged");
-        super.new(name);
-    endfunction
-
-    virtual task config_write(bit [11:0] addr, bit [31:0] data, bit [3:0] be);
-        // Set the static data channel before the sequence runs
-        virtio_bar_cfg_wr_seq_bridged::s_wdata = data;
-        super.config_write(addr, data, be);
-    endtask
-endclass
 
 // ============================================================================
 // Full Integration Test
@@ -373,10 +28,11 @@ class virtio_full_integration_test extends uvm_test;
     virtio_memory_barrier_model barrier;
     virtqueue_error_injector err_inj;
     virtio_atomic_ops ops;
+    virtio_auto_fsm fsm;
     virtio_perf_monitor perf_mon;
+    virtio_function_instance binding_function;
 
-    // Bridge
-    virtio_cpl_bridge bridge;
+    virtio_tlm_completion_adapter tlm_adapter;
 
     // Test counters
     int unsigned tests_passed;
@@ -397,29 +53,10 @@ class virtio_full_integration_test extends uvm_test;
         pcie_tl_env_config pcie_cfg;
         super.build_phase(phase);
 
-        // 1. Create completion bridge
-        bridge = virtio_cpl_bridge::type_id::create("bridge");
-
-        // 2. Factory override: swap RC driver with shim
-        // The RC agent does its own instance override of base_driver -> rc_driver.
-        // We override rc_driver -> rc_driver_shim at the instance level.
-        pcie_tl_rc_driver::type_id::set_inst_override(
-            virtio_rc_driver_shim::get_type(),
-            "pcie_env.rc_agent.driver", this);
-
-        // 3. Factory override: swap bar accessor sequences with bridged versions
-        virtio_bar_mem_rd_seq::type_id::set_type_override(
-            virtio_bar_mem_rd_seq_bridged::get_type());
-        virtio_bar_cfg_rd_seq::type_id::set_type_override(
-            virtio_bar_cfg_rd_seq_bridged::get_type());
-        virtio_bar_mem_wr_seq::type_id::set_type_override(
-            virtio_bar_mem_wr_seq_bridged::get_type());
-        virtio_bar_cfg_wr_seq::type_id::set_type_override(
-            virtio_bar_cfg_wr_seq_bridged::get_type());
-
-        // 3b. Factory override: swap bar_accessor with bridged version
-        virtio_bar_accessor::type_id::set_type_override(
-            virtio_bar_accessor_bridged::get_type());
+        // Install one reusable adapter before PCIe creates its RC driver.
+        tlm_adapter = virtio_tlm_completion_adapter::type_id::create(
+            "tlm_adapter");
+        tlm_adapter.install_factory_overrides();
 
         // 4. Create and configure PCIe environment
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
@@ -448,39 +85,21 @@ class virtio_full_integration_test extends uvm_test;
         err_inj = virtqueue_error_injector::type_id::create("err_inj");
         ops = virtio_atomic_ops::type_id::create("ops");
         perf_mon = virtio_perf_monitor::type_id::create("perf_mon", this);
-
-        // Set static bridge references on bridged sequences
-        virtio_bar_mem_rd_seq_bridged::s_bridge = bridge;
-        virtio_bar_cfg_rd_seq_bridged::s_bridge = bridge;
-        virtio_bar_cfg_wr_seq_bridged::s_bridge = bridge;
+        binding_function = virtio_function_instance::type_id::create(
+            "binding_function", this);
     endfunction
 
     // ========================================================================
     // Connect Phase
     // ========================================================================
     virtual function void connect_phase(uvm_phase phase);
-        virtio_rc_driver_shim shim;
         super.connect_phase(phase);
 
-        // 1. Inject bridge into RC driver shim
-        if (pcie_env.rc_agent != null && pcie_env.rc_agent.driver != null) begin
-            if ($cast(shim, pcie_env.rc_agent.driver))
-                shim.bridge = bridge;
-            else
-                `uvm_fatal("FULL_TEST", "Failed to cast driver to virtio_rc_driver_shim")
-        end
-
-        // 2. Wire transport to PCIe RC sequencer
-        transport.bar.pcie_rc_seqr = pcie_env.rc_agent.sequencer;
         transport.bdf = 16'h0100;  // Bus=1, Dev=0, Func=0
-
-        // 3. Wire virtio components
-        transport.wait_pol = wait_pol;
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = host_mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        binding_function.bind_pcie_components(
+            "full_function", transport, vq_mgr, null, host_mem, iommu,
+            barrier, err_inj, wait_pol, binding_function.drv_cfg,
+            pcie_env.rc_agent.sequencer, ops, fsm);
 
         // 4. Configure wait policy for fast simulation
         wait_pol.default_poll_interval_ns = 100;
@@ -510,21 +129,21 @@ class virtio_full_integration_test extends uvm_test;
 
         // Drain stale completions before next test
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // Test 2: Large traffic through actual virtqueue + host_mem
         test_large_traffic();
 
         // Drain stale completions before next test
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // Test 3: Bandwidth control
         test_bandwidth_control();
 
         // Drain stale completions before next test
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // Test 4: Protocol integrity checks
         test_protocol_integrity();
@@ -1163,7 +782,10 @@ class virtio_full_integration_test extends uvm_test;
     // Result Reporting
     // ========================================================================
     virtual function void report_results();
-        bridge.report();
+        `uvm_info("FULL_TEST", $sformatf(
+            "Completion adapter stats: received=%0d consumed=%0d",
+            tlm_adapter.completions_received,
+            tlm_adapter.completions_consumed), UVM_LOW)
 
         `uvm_info("FULL_TEST", "============================================================", UVM_LOW)
         `uvm_info("FULL_TEST", $sformatf("Test Results: %0d/%0d passed, %0d failed",

@@ -14,23 +14,65 @@ import virtio_net_pkg::*;
 //   - virtio_tso_engine needs_tso and header length
 //   - virtio_rss_engine hash and queue selection
 //   - virtio_offload_engine GSO type detection
+//   - clocked protocol-SVA traces at the event-interface boundary
 // ============================================================================
+
+// The negative traces below deliberately exercise the checker.  Catch only
+// the exact SVA reports expected by this test so any unrelated UVM error
+// remains visible to the global report server.
+class virtio_protocol_expected_sva_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "virtio_protocol_expected_sva_catcher");
+        super.new(name);
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) &&
+            (get_id() == "VIRTIO_PROTOCOL_SVA") &&
+            (uvm_is_match("*status write cleared a previously set bit without reset*",
+                          get_message()) ||
+             uvm_is_match("*DRIVER_OK observed before FEATURES_OK*", get_message()) ||
+             uvm_is_match("*FEATURES_OK observed before DRIVER*", get_message()) ||
+             uvm_is_match("*notify observed for a disabled queue*", get_message()) ||
+             uvm_is_match("*completion observed without a pending submission*",
+                          get_message()))) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_protocol_expected_sva_catcher
 
 class virtio_protocol_test extends uvm_test;
     `uvm_component_utils(virtio_protocol_test)
+
+    virtual virtio_protocol_event_if protocol_vif;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
 
+    virtual function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
+                null, "uvm_test_top", "protocol_event_vif_0", protocol_vif)) begin
+            `uvm_fatal("PROTO_TEST", "virtio_protocol_event_if was not configured")
+        end
+    endfunction
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
+
+        @(posedge protocol_vif.rst_n);
+        @(posedge protocol_vif.clk);
 
         test_net_hdr_pack_unpack();
         test_csum_engine();
         test_tso_engine();
         test_rss_engine();
         test_offload_gso_detection();
+        test_protocol_sva_event_traces();
 
         `uvm_info("PROTO_TEST", "All protocol tests PASSED", UVM_NONE)
         phase.drop_objection(this);
@@ -269,6 +311,128 @@ class virtio_protocol_test extends uvm_test;
         assert(!offload.needs_gso(tcp4_pkt)) else `uvm_error("TEST", "small pkt shouldn't need GSO")
 
         `uvm_info("PROTO_TEST", "test_offload_gso_detection PASSED", UVM_LOW)
+    endtask
+
+    // Drive one monitor-equivalent status write across a complete clock
+    // cycle.  The event interface clears pulse fields at the following
+    // rising edge, which mirrors the production monitor's nonblocking drive.
+    protected task drive_status_write(
+        input bit [7:0] old_status,
+        input bit [7:0] new_status
+    );
+        @(negedge protocol_vif.clk);
+        protocol_vif.status_old = old_status;
+        protocol_vif.status_new = new_status;
+        protocol_vif.status_write = 1;
+        protocol_vif.features_ok = ((new_status & DEV_STATUS_FEATURES_OK) != 0);
+        protocol_vif.driver_ok = ((new_status & DEV_STATUS_DRIVER_OK) != 0);
+        @(negedge protocol_vif.clk);
+    endtask
+
+    protected task drive_completion();
+        @(negedge protocol_vif.clk);
+        protocol_vif.set_direct_completion_queue(protocol_vif.queue_id);
+        protocol_vif.completion = 1;
+        @(negedge protocol_vif.clk);
+    endtask
+
+    // A raw observed notify is intentionally distinct from a monitor-verified
+    // submission.  Both an unconfigured and a disabled queue must be caught.
+    protected task drive_raw_notify(
+        input bit configured,
+        input bit enabled,
+        input bit [15:0] queue_id
+    );
+        @(negedge protocol_vif.clk);
+        protocol_vif.queue_id = queue_id;
+        protocol_vif.queue_configured = configured;
+        protocol_vif.queue_enabled = enabled;
+        protocol_vif.notify = 1;
+        protocol_vif.verified_submission = 0;
+        @(negedge protocol_vif.clk);
+    endtask
+
+    // A valid queue notification is the actual submission boundary observed
+    // in production through the virtio PCI notify capability.
+    protected task drive_valid_submission();
+        @(negedge protocol_vif.clk);
+        protocol_vif.queue_configured = 1;
+        protocol_vif.queue_enabled = 1;
+        protocol_vif.notify = 1;
+        protocol_vif.verified_submission = 1;
+        @(negedge protocol_vif.clk);
+    endtask
+
+    // Direct event-interface traces prove the checker rather than merely
+    // exercising utility code.  Seven illegal transitions must be reported:
+    // one non-reset status clear, DRIVER_OK before FEATURES_OK, FEATURES_OK
+    // before DRIVER, two raw invalid notifies, a completion without a
+    // submission, and an extra completion after one submission.
+    protected task test_protocol_sva_event_traces();
+        virtio_protocol_expected_sva_catcher catcher;
+
+        protocol_vif.assertions_enable = 1;
+        protocol_vif.protocol_error_count = 0;
+        catcher = new("protocol_sva_catcher");
+        uvm_report_cb::add(null, catcher);
+
+        drive_status_write(DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER,
+                           DEV_STATUS_ACKNOWLEDGE);
+        drive_status_write(DEV_STATUS_ACKNOWLEDGE, DEV_STATUS_RESET);
+        drive_status_write(DEV_STATUS_RESET, DEV_STATUS_DRIVER_OK);
+        drive_status_write(DEV_STATUS_DRIVER_OK, DEV_STATUS_RESET);
+        drive_status_write(DEV_STATUS_RESET,
+                           DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_FEATURES_OK);
+        drive_raw_notify(1'b0, 1'b0, 16'd9);
+        drive_raw_notify(1'b1, 1'b0, 16'd10);
+        drive_completion();
+        drive_status_write(DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_FEATURES_OK,
+                           DEV_STATUS_RESET);
+        drive_valid_submission();
+        drive_completion();
+        drive_completion();
+
+        // Two notifications retain two independent unmatched submissions.
+        // Both completions are legal, which rules out an implementation that
+        // merely remembers one static "has submitted" bit.
+        drive_status_write(DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_FEATURES_OK,
+                           DEV_STATUS_RESET);
+        drive_valid_submission();
+        drive_valid_submission();
+        drive_completion();
+        drive_completion();
+
+        assert(catcher.caught_count == 7)
+            else `uvm_fatal("PROTO_TEST", $sformatf(
+                "expected seven scoped SVA reports, saw %0d", catcher.caught_count))
+        assert(protocol_vif.protocol_error_count == 7)
+            else `uvm_fatal("PROTO_TEST", $sformatf(
+                "expected seven protocol SVA errors, saw %0d",
+                protocol_vif.protocol_error_count))
+        uvm_report_cb::delete(null, catcher);
+
+        // The standard lifecycle followed by one notify/completion pair is
+        // legal and must leave the checker entirely quiet.
+        protocol_vif.protocol_error_count = 0;
+        drive_status_write(DEV_STATUS_RESET, DEV_STATUS_RESET);
+        drive_status_write(DEV_STATUS_RESET, DEV_STATUS_ACKNOWLEDGE);
+        drive_status_write(DEV_STATUS_ACKNOWLEDGE,
+                           DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER);
+        drive_status_write(DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER,
+                           DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER |
+                           DEV_STATUS_FEATURES_OK);
+        drive_status_write(DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER |
+                           DEV_STATUS_FEATURES_OK,
+                           DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER |
+                           DEV_STATUS_FEATURES_OK | DEV_STATUS_DRIVER_OK);
+        drive_valid_submission();
+        drive_completion();
+
+        assert(protocol_vif.protocol_error_count == 0)
+            else `uvm_fatal("PROTO_TEST", $sformatf(
+                "legal protocol trace produced %0d SVA errors",
+                protocol_vif.protocol_error_count))
+        `uvm_info("PROTO_TEST", "Protocol SVA event traces PASSED", UVM_LOW)
     endtask
 
 endclass

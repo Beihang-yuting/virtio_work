@@ -28,6 +28,7 @@ class virtio_driver_agent extends uvm_agent;
     // ===== Sub-components =====
     virtio_driver       driver;
     virtio_monitor      monitor;
+    virtio_pcie_observer_adapter observer;
     virtio_sequencer    sequencer;
 
     // ===== Shared component references (set by env before build) =====
@@ -54,6 +55,7 @@ class virtio_driver_agent extends uvm_agent;
 
         // Monitor is always present (passive observation)
         monitor = virtio_monitor::type_id::create("monitor", this);
+        observer = virtio_pcie_observer_adapter::type_id::create("observer", this);
 
         // Driver and sequencer only in active mode
         if (get_is_active() == UVM_ACTIVE) begin
@@ -101,6 +103,7 @@ class virtio_driver_agent extends uvm_agent;
                 monitor.vq_mgr = ops.vq_mgr;
             monitor.negotiated_features = ops.negotiated_features;
         end
+        observer.monitor = monitor;
     endfunction
 
 endclass : virtio_driver_agent

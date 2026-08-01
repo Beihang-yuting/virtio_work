@@ -50,6 +50,28 @@ virtual class virtqueue_base extends uvm_object;
 
     // ===== DMA mapping tracking =====
     protected iommu_mapping_t dma_mappings[$];
+    // Migration recreates queue-owned DMA with a fresh backing allocation at
+    // the saved IOVA.  Only these records own their GPA; ordinary dma_map_buf
+    // callers retain ownership of the GPA they supplied.
+    protected bit migration_owned_dma_iovas[bit [63:0]];
+
+    // Queue restore preflights mappings while the atomic-ops layer still owns
+    // their temporary migration records.  Commit only after that layer has
+    // atomically transferred every mapping in this queue snapshot.
+    protected iommu_mapping_t staged_migration_dma_mappings[$];
+
+    // ===== Indirect descriptor table ownership =====
+    // Each entry is owned by one main-ring descriptor.  The table itself is
+    // device-readable DMA memory and therefore has an independent IOMMU map.
+    typedef struct {
+        bit [63:0] gpa;
+        bit [63:0] iova;
+        int unsigned byte_size;
+        int unsigned entry_count;
+        uvm_object token;
+    } indirect_table_record_t;
+    protected indirect_table_record_t indirect_table_records[int unsigned];
+    protected indirect_table_record_t staged_indirect_table_records[int unsigned];
 
     // ===== Statistics =====
     int unsigned    total_add_buf_ops = 0;
@@ -151,7 +173,7 @@ virtual class virtqueue_base extends uvm_object;
 
     // ----- Migration snapshot -----
     pure virtual function void save_state(ref virtqueue_snapshot_t snap);
-    pure virtual function void restore_state(virtqueue_snapshot_t snap);
+    pure virtual function bit restore_state(virtqueue_snapshot_t snap);
 
     // =================================================================
     // Common methods -- base class provides implementation
@@ -164,6 +186,378 @@ virtual class virtqueue_base extends uvm_object;
         reset_queue();
         queue_enable = 0;
         state = VQ_RESET;
+    endfunction
+
+    // ------------------------------------------------------------------
+    // prepare_indirect_table -- validate, allocate, map and populate one
+    // standard virtq_desc-format indirect table for a main descriptor.
+    // ------------------------------------------------------------------
+    protected function bit prepare_indirect_table(
+        virtio_sg_list sgs[],
+        int unsigned n_out_sgs,
+        int unsigned n_in_sgs,
+        int unsigned head_id,
+        uvm_object token,
+        ref bit [63:0] table_iova,
+        ref int unsigned table_size
+    );
+        int unsigned total_sgs;
+        int unsigned entry_count;
+        int unsigned table_entry;
+        bit [63:0] table_gpa;
+        indirect_table_record_t record;
+
+        table_iova = 0;
+        table_size = 0;
+        if (n_out_sgs > (32'hffff_ffff - n_in_sgs)) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d indirect SG count overflow out=%0d in=%0d",
+                queue_id, n_out_sgs, n_in_sgs))
+            return 0;
+        end
+        total_sgs = n_out_sgs + n_in_sgs;
+        entry_count = 0;
+
+        if (total_sgs == 0 || total_sgs > sgs.size()) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d invalid SG list count=%0d available=%0d",
+                queue_id, total_sgs, sgs.size()))
+            return 0;
+        end
+
+        for (int unsigned s = 0; s < total_sgs; s++) begin
+            for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
+                if (sgs[s].entries[e].is_indirect) begin
+                    `uvm_error("VQ_INDIRECT", $sformatf(
+                        "queue_id=%0d nested indirect descriptor at sg=%0d entry=%0d",
+                        queue_id, s, e))
+                    return 0;
+                end
+                if (sgs[s].entries[e].addr >
+                        (64'hffff_ffff_ffff_ffff - sgs[s].entries[e].len)) begin
+                    `uvm_error("VQ_INDIRECT", $sformatf(
+                        "queue_id=%0d invalid indirect SG range at sg=%0d entry=%0d addr=0x%016x len=%0d",
+                        queue_id, s, e, sgs[s].entries[e].addr,
+                        sgs[s].entries[e].len))
+                    return 0;
+                end
+                if (entry_count == 32'hffff_ffff) begin
+                    `uvm_error("VQ_INDIRECT", $sformatf(
+                        "queue_id=%0d indirect descriptor count overflow", queue_id))
+                    return 0;
+                end
+                entry_count++;
+            end
+        end
+
+        if (entry_count == 0 || entry_count > (32'hffff_ffff / 16)) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d invalid indirect descriptor count=%0d",
+                queue_id, entry_count))
+            return 0;
+        end
+        table_size = entry_count * 16;
+        if (table_size == 0 || (table_size / 16) != entry_count) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d indirect table size overflow", queue_id))
+            return 0;
+        end
+
+        table_gpa = mem.alloc(table_size, .align(16));
+        if (table_gpa == '1 || table_gpa == 0) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d failed to allocate %0d-byte indirect table",
+                queue_id, table_size))
+            return 0;
+        end
+        mem.mem_set(table_gpa, 0, table_size);
+
+        table_iova = iommu.map(bdf, table_gpa, table_size, DMA_TO_DEVICE);
+        if (table_iova == '1 || table_iova == 0) begin
+            `uvm_error("VQ_INDIRECT", $sformatf(
+                "queue_id=%0d failed to map indirect table GPA=0x%016x",
+                queue_id, table_gpa))
+            mem.free(table_gpa);
+            table_iova = 0;
+            table_size = 0;
+            return 0;
+        end
+
+        table_entry = 0;
+        for (int unsigned s = 0; s < total_sgs; s++) begin
+            bit is_write = (s >= n_out_sgs);
+            for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
+                bit [15:0] flags;
+                bit [15:0] next;
+
+                flags = is_write ? VIRTQ_DESC_F_WRITE : 16'h0;
+                next = 0;
+                if (table_entry + 1 < entry_count) begin
+                    flags |= VIRTQ_DESC_F_NEXT;
+                    next = table_entry + 1;
+                end
+                write_indirect_desc(table_gpa, table_entry,
+                                    sgs[s].entries[e].addr,
+                                    sgs[s].entries[e].len,
+                                    flags, next);
+                table_entry++;
+            end
+        end
+
+        record.gpa         = table_gpa;
+        record.iova        = table_iova;
+        record.byte_size   = table_size;
+        record.entry_count = entry_count;
+        record.token       = token;
+        indirect_table_records[head_id] = record;
+        return 1;
+    endfunction
+
+    // Indirect tables always use the standard (split) virtq_desc layout,
+    // including when their owning main descriptor is in a packed ring.
+    protected function void write_indirect_desc(
+        bit [63:0] table_gpa,
+        int unsigned index,
+        bit [63:0] addr,
+        bit [31:0] len,
+        bit [15:0] flags,
+        bit [15:0] next
+    );
+        byte data[16];
+
+        for (int i = 0; i < 8; i++) data[i]    = addr[i * 8 +: 8];
+        for (int i = 0; i < 4; i++) data[8 + i] = len[i * 8 +: 8];
+        for (int i = 0; i < 2; i++) data[12 + i] = flags[i * 8 +: 8];
+        for (int i = 0; i < 2; i++) data[14 + i] = next[i * 8 +: 8];
+        mem.write_mem(table_gpa + index * 16, data);
+    endfunction
+
+    protected function void release_indirect_table(int unsigned head_id);
+        indirect_table_record_t record;
+
+        if (!indirect_table_records.exists(head_id))
+            return;
+
+        record = indirect_table_records[head_id];
+        if (iommu != null && record.iova != 0)
+            iommu.unmap(bdf, record.iova);
+        if (mem != null && record.gpa != 0)
+            mem.free(record.gpa);
+        indirect_table_records.delete(head_id);
+    endfunction
+
+    protected function void release_all_indirect_tables();
+        int unsigned heads[$];
+
+        foreach (indirect_table_records[head_id])
+            heads.push_back(head_id);
+        foreach (heads[i])
+            release_indirect_table(heads[i]);
+    endfunction
+
+    // Queue-owned DMA normally borrows its caller's GPA, whereas a migration
+    // destination owns the fresh GPA allocated by materialize_migration_mapping().
+    // Keep that distinction here so dma_unmap_buf(), detach, and destroy all
+    // retire exactly the resources each mapping owns.
+    protected function void release_dma_mapping(int unsigned mapping_index);
+        iommu_mapping_t mapping;
+
+        mapping = dma_mappings[mapping_index];
+        if (iommu != null && mapping.iova != 0)
+            iommu.unmap(bdf, mapping.iova);
+        if (migration_owned_dma_iovas.exists(mapping.iova)) begin
+            if (mem != null && mapping.gpa != 0)
+                mem.free(mapping.gpa);
+            migration_owned_dma_iovas.delete(mapping.iova);
+        end
+        dma_mappings.delete(mapping_index);
+    endfunction
+
+    protected function void release_all_dma_mappings();
+        while (dma_mappings.size() != 0)
+            release_dma_mapping(dma_mappings.size() - 1);
+    endfunction
+
+    protected function void discard_staged_migration_ownership();
+        staged_migration_dma_mappings.delete();
+        staged_indirect_table_records.delete();
+    endfunction
+
+    // Save queue-owned request identity separately from the device-visible
+    // ring image. A reset destroys the source queue objects, so raw ring bytes
+    // alone cannot reconstruct completion tokens or indirect-table ownership.
+    protected function void save_migration_ownership(ref virtqueue_snapshot_t snap);
+        snap.pending_tokens.delete();
+        snap.indirect_tables.delete();
+        snap.queue_dma_mappings.delete();
+        foreach (token_map[head_id]) begin
+            virtqueue_token_snapshot_t token_record;
+
+            token_record.head_id = head_id;
+            token_record.token = token_map[head_id];
+            snap.pending_tokens.push_back(token_record);
+        end
+        foreach (indirect_table_records[head_id]) begin
+            indirect_table_record_t source_record;
+            virtqueue_indirect_snapshot_t snapshot_record;
+
+            source_record = indirect_table_records[head_id];
+            snapshot_record.head_id = head_id;
+            snapshot_record.mapping.bdf = bdf;
+            snapshot_record.mapping.gpa = source_record.gpa;
+            snapshot_record.mapping.iova = source_record.iova;
+            snapshot_record.mapping.size = source_record.byte_size;
+            snapshot_record.mapping.dir = DMA_TO_DEVICE;
+            snapshot_record.mapping.desc_id = head_id;
+            snapshot_record.byte_size = source_record.byte_size;
+            snapshot_record.entry_count = source_record.entry_count;
+            snapshot_record.token = source_record.token;
+            snap.indirect_tables.push_back(snapshot_record);
+        end
+        foreach (dma_mappings[i]) begin
+            snap.queue_dma_mappings.push_back(dma_mappings[i]);
+        end
+    endfunction
+
+    // Reattach the destination mapping GPA to the regular queue ownership
+    // records. The IOVA remains the saved source value, so ring bytes need no
+    // descriptor-format-specific rewriting.
+    protected function bit restore_migration_ownership(virtqueue_snapshot_t snap);
+        bit token_heads[int unsigned];
+        bit indirect_heads[int unsigned];
+        bit dma_iovas[bit [63:0]];
+
+        if ((snap.queue_id != queue_id) ||
+            (snap.pending_tokens.size() > queue_size) ||
+            (snap.indirect_tables.size() > snap.pending_tokens.size())) begin
+            `uvm_error("VQ_MIGRATION", $sformatf(
+                "restore ownership: invalid snapshot for queue_id=%0d", snap.queue_id))
+            return 0;
+        end
+        if ((token_map.size() != 0) || (indirect_table_records.size() != 0) ||
+            (staged_indirect_table_records.size() != 0) ||
+            (dma_mappings.size() != 0) ||
+            (staged_migration_dma_mappings.size() != 0)) begin
+            `uvm_error("VQ_MIGRATION", $sformatf(
+                "restore ownership: destination queue_id=%0d is not empty", queue_id))
+            return 0;
+        end
+
+        // Preflight the complete snapshot before mutating either ownership
+        // map. Restore orchestration commits migration DMA only after this
+        // function returns success, so a rejected queue must not retain a
+        // partial indirect-table claim alongside rollback ownership.
+        foreach (snap.pending_tokens[i]) begin
+            int unsigned head_id;
+
+            head_id = snap.pending_tokens[i].head_id;
+            if ((head_id >= queue_size) || token_heads.exists(head_id)) begin
+                `uvm_error("VQ_MIGRATION", $sformatf(
+                    "restore ownership: invalid token head=%0d queue_id=%0d",
+                    head_id, queue_id))
+                return 0;
+            end
+            token_heads[head_id] = 1;
+        end
+
+        foreach (snap.indirect_tables[i]) begin
+            virtqueue_indirect_snapshot_t snapshot_record;
+            iommu_mapping_t destination_mapping;
+
+            snapshot_record = snap.indirect_tables[i];
+            if ((snapshot_record.head_id >= queue_size) ||
+                !token_heads.exists(snapshot_record.head_id) ||
+                indirect_heads.exists(snapshot_record.head_id) ||
+                ((snapshot_record.mapping.bdf != bdf)) ||
+                (snapshot_record.byte_size == 0) ||
+                (snapshot_record.entry_count == 0) ||
+                (snapshot_record.mapping.size != snapshot_record.byte_size) ||
+                (snapshot_record.mapping.dir != DMA_TO_DEVICE) ||
+                !iommu.get_live_mapping(bdf, snapshot_record.mapping.iova,
+                                        destination_mapping) ||
+                (destination_mapping.size != snapshot_record.byte_size) ||
+                (destination_mapping.dir != DMA_TO_DEVICE)) begin
+                `uvm_error("VQ_MIGRATION", $sformatf(
+                    "restore ownership: invalid indirect table head=%0d queue_id=%0d",
+                    snapshot_record.head_id, queue_id))
+                return 0;
+            end
+            indirect_heads[snapshot_record.head_id] = 1;
+            dma_iovas[snapshot_record.mapping.iova] = 1;
+        end
+
+        foreach (snap.queue_dma_mappings[i]) begin
+            iommu_mapping_t snapshot_mapping;
+            iommu_mapping_t destination_mapping;
+
+            snapshot_mapping = snap.queue_dma_mappings[i];
+            if ((snapshot_mapping.bdf != bdf) ||
+                (snapshot_mapping.iova == 0) ||
+                (snapshot_mapping.size == 0) ||
+                (snapshot_mapping.desc_id != 0) ||
+                dma_iovas.exists(snapshot_mapping.iova) ||
+                !iommu.get_live_mapping(bdf, snapshot_mapping.iova,
+                                        destination_mapping) ||
+                (destination_mapping.size != snapshot_mapping.size) ||
+                (destination_mapping.dir != snapshot_mapping.dir)) begin
+                `uvm_error("VQ_MIGRATION", $sformatf(
+                    "restore ownership: invalid queue DMA IOVA=0x%016h queue_id=%0d",
+                    snapshot_mapping.iova, queue_id))
+                return 0;
+            end
+            dma_iovas[snapshot_mapping.iova] = 1;
+        end
+
+        foreach (snap.pending_tokens[i]) begin
+            token_map[snap.pending_tokens[i].head_id] = snap.pending_tokens[i].token;
+        end
+
+        foreach (snap.indirect_tables[i]) begin
+            virtqueue_indirect_snapshot_t snapshot_record;
+            indirect_table_record_t destination_record;
+            iommu_mapping_t destination_mapping;
+
+            snapshot_record = snap.indirect_tables[i];
+            // This mapping was preflighted above and cannot change during the
+            // single-threaded restore transaction.
+            void'(iommu.get_live_mapping(bdf, snapshot_record.mapping.iova,
+                                         destination_mapping));
+            destination_record.gpa = destination_mapping.gpa;
+            destination_record.iova = destination_mapping.iova;
+            destination_record.byte_size = snapshot_record.byte_size;
+            destination_record.entry_count = snapshot_record.entry_count;
+            destination_record.token = token_map[snapshot_record.head_id];
+            staged_indirect_table_records[snapshot_record.head_id] = destination_record;
+        end
+
+        foreach (snap.queue_dma_mappings[i]) begin
+            iommu_mapping_t destination_mapping;
+
+            // The complete snapshot was preflighted above.  Retain the
+            // recreated GPA, but do not make the queue own it until atomic
+            // ops has dropped the matching temporary migration record.
+            void'(iommu.get_live_mapping(bdf,
+                                         snap.queue_dma_mappings[i].iova,
+                                         destination_mapping));
+            staged_migration_dma_mappings.push_back(destination_mapping);
+        end
+        return 1;
+    endfunction
+
+    // This call has no failure path: restore_migration_ownership() and the
+    // atomic-ops claim preflighted the same records, and no task yield occurs
+    // between the temporary-list transfer and this queue-local commit.
+    function void commit_restored_migration_ownership();
+        foreach (staged_indirect_table_records[head_id]) begin
+            indirect_table_records[head_id] = staged_indirect_table_records[head_id];
+        end
+        staged_indirect_table_records.delete();
+        foreach (staged_migration_dma_mappings[i]) begin
+            dma_mappings.push_back(staged_migration_dma_mappings[i]);
+            migration_owned_dma_iovas[
+                staged_migration_dma_mappings[i].iova] = 1;
+        end
+        staged_migration_dma_mappings.delete();
     endfunction
 
     // ------------------------------------------------------------------
@@ -232,12 +626,23 @@ virtual class virtqueue_base extends uvm_object;
             end
         end
 
-        if (token_map.size() == 0 && dma_mappings.size() == 0) begin
+        if (indirect_table_records.size() > 0) begin
+            `uvm_warning("VQ_LEAK",
+                $sformatf("queue_id=%0d: %0d outstanding indirect table(s)",
+                          queue_id, indirect_table_records.size()))
+        end
+
+        if (token_map.size() == 0 && dma_mappings.size() == 0 &&
+            indirect_table_records.size() == 0) begin
             `uvm_info("VQ_LEAK",
-                $sformatf("queue_id=%0d: clean -- no outstanding tokens or DMA mappings",
+                $sformatf("queue_id=%0d: clean -- no outstanding tokens, DMA mappings, or indirect tables",
                           queue_id),
                 UVM_LOW)
         end
+    endfunction
+
+    function int unsigned get_indirect_table_count();
+        return indirect_table_records.size();
     endfunction
 
 endclass : virtqueue_base

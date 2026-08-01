@@ -11,14 +11,25 @@ import virtio_net_pkg::*;
 class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
     `uvm_object_utils(virtio_fabric_cfg_stub_accessor)
 
+    typedef struct {
+        bit [11:0] addr;
+        bit [31:0] data;
+        bit [3:0]  be;
+    } config_write_t;
+
     int unsigned config_write_count;
+    config_write_t config_writes[$];
+    bit discovery_started_before_bar_programming;
 
     function new(string name = "virtio_fabric_cfg_stub_accessor");
         super.new(name);
         config_write_count = 0;
+        discovery_started_before_bar_programming = 0;
     endfunction
 
     virtual task config_read(bit [11:0] addr, ref bit [31:0] data);
+        if (config_write_count != 6)
+            discovery_started_before_bar_programming = 1;
         data = '0;
         case (addr)
             12'h034: data = 32'h0000_0040;
@@ -46,9 +57,43 @@ class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
     virtual task config_write(
         bit [11:0] addr, bit [31:0] data, bit [3:0] be
     );
+        config_write_t write;
+
         config_write_count++;
+        write.addr = addr;
+        write.data = data;
+        write.be = be;
+        config_writes.push_back(write);
     endtask
 endclass : virtio_fabric_cfg_stub_accessor
+
+// This deliberately small UVM driver observes requests issued through the
+// base accessor's real config_write() path.  Unlike the config-space stub
+// above, it cannot be reached by overriding config_write(), so it catches a
+// regression that makes BAR programming in-memory-only or drops TLP payload.
+class virtio_fabric_cfg_tlp_capture_driver extends uvm_driver #(pcie_tl_tlp);
+    `uvm_component_utils(virtio_fabric_cfg_tlp_capture_driver)
+
+    pcie_tl_tlp captured_tlps[$];
+
+    function new(string name, uvm_component parent = null);
+        super.new(name, parent);
+    endfunction
+
+    function void clear();
+        captured_tlps.delete();
+    endfunction
+
+    virtual task run_phase(uvm_phase phase);
+        pcie_tl_tlp tlp;
+
+        forever begin
+            seq_item_port.get_next_item(tlp);
+            captured_tlps.push_back(tlp);
+            seq_item_port.item_done();
+        end
+    endtask
+endclass : virtio_fabric_cfg_tlp_capture_driver
 
 // Temporarily demotes only the deliberate reserved-BAR negative access.  It
 // is registered immediately around that access and then removed, so discovery
@@ -70,6 +115,38 @@ class virtio_expected_bar_reserved_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_expected_bar_reserved_catcher
 
+// Scoped negative-path catcher.  Production failures remain fatal outside
+// these narrow test calls; each helper also verifies that its expected report
+// was actually produced.
+class virtio_expected_bar_report_catcher extends uvm_report_catcher;
+    string expected_id;
+    uvm_severity expected_severity;
+    int unsigned caught_count;
+    string last_message;
+
+    function new(
+        string name,
+        string expected_report_id,
+        uvm_severity expected_report_severity
+    );
+        super.new(name);
+        expected_id = expected_report_id;
+        expected_severity = expected_report_severity;
+        caught_count = 0;
+        last_message = "";
+    endfunction
+
+    function action_e catch();
+        if ((get_id() == expected_id) &&
+            (get_severity() == expected_severity)) begin
+            caught_count++;
+            last_message = get_message();
+            set_severity(UVM_INFO);
+        end
+        return THROW;
+    endfunction
+endclass : virtio_expected_bar_report_catcher
+
 class virtio_fabric_resource_test extends uvm_test;
     `uvm_component_utils(virtio_fabric_resource_test)
 
@@ -81,6 +158,8 @@ class virtio_fabric_resource_test extends uvm_test;
     virtio_net_env_config cfg;
     virtio_net_env        env;
     virtio_vf_instance    compatibility_vf;
+    uvm_sequencer #(pcie_tl_tlp) fabric_cfg_tlp_seqr;
+    virtio_fabric_cfg_tlp_capture_driver fabric_cfg_tlp_capture;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -95,6 +174,247 @@ class virtio_fabric_resource_test extends uvm_test;
         return (lhs_base < (rhs_base + rhs_size)) &&
                (rhs_base < (lhs_base + lhs_size));
     endfunction
+
+    protected function automatic dpu_bar_pair_lease_t make_fabric_bar_pair(
+        input dpu_bar_role_e role,
+        input int unsigned even_bar_id,
+        input bit [63:0] base,
+        input bit [63:0] size
+    );
+        dpu_bar_pair_lease_t pair;
+
+        pair.role = role;
+        pair.even_bar_id = even_bar_id;
+        pair.base = base;
+        pair.size = size;
+        return pair;
+    endfunction
+
+    protected function bit string_contains(
+        input string haystack,
+        input string needle
+    );
+        if (needle.len() == 0)
+            return 1;
+        if (haystack.len() < needle.len())
+            return 0;
+        for (int offset = 0;
+             offset <= (haystack.len() - needle.len());
+             offset++) begin
+            if (haystack.substr(offset, offset + needle.len() - 1) == needle)
+                return 1;
+        end
+        return 0;
+    endfunction
+
+    // Deliberately return the valid leases out of BAR order.  The accessor
+    // must recognize the required {role, even-BAR} set rather than treating
+    // the input queue position as configuration.
+    protected function void make_valid_fabric_bar_pairs(
+        ref dpu_bar_pair_lease_t bars[$]
+    );
+        bars.delete();
+        bars.push_back(make_fabric_bar_pair(
+            DPU_BAR_MSIX, 4, 64'h0001_0000_3000_0000, 64'h0000_0000_0001_0000));
+        bars.push_back(make_fabric_bar_pair(
+            DPU_BAR_FUNCTION_DEVICE, 0, 64'h0001_0000_1000_0000,
+            64'h0000_0000_0010_0000));
+        bars.push_back(make_fabric_bar_pair(
+            DPU_BAR_RESERVED, 2, 64'h0001_0000_2000_0000,
+            64'h0000_0000_0001_0000));
+    endfunction
+
+    task assert_fabric_lease_set_rejected(
+        input string case_name,
+        input dpu_bar_pair_lease_t bars[$],
+        input string expected_context
+    );
+        virtio_bar_accessor accessor;
+        virtio_expected_bar_report_catcher expected_error;
+
+        accessor = virtio_bar_accessor::type_id::create(
+            {"invalid_fabric_bar_accessor_", case_name});
+        expected_error = new(
+            {"invalid_fabric_bar_catcher_", case_name},
+            "BAR_ACCESSOR", UVM_ERROR);
+        uvm_report_cb::add(null, expected_error);
+        accessor.configure_fabric_bar_pairs(bars);
+        uvm_report_cb::delete(null, expected_error);
+
+        if (expected_error.caught_count != 1) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s did not report one contextual Fabric BAR lease rejection (got %0d)",
+                case_name, expected_error.caught_count))
+        end
+        if (!string_contains(expected_error.last_message, expected_context)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s rejection lacked context '%s': %s",
+                case_name, expected_context, expected_error.last_message))
+        end
+        if (accessor.fabric_bar_layout_is_active()) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s activated a rejected Fabric BAR lease set", case_name))
+        end
+    endtask
+
+    task assert_fabric_bar_programming_rejected(
+        input string case_name,
+        input dpu_bar_pair_lease_t bars[$],
+        input string expected_context
+    );
+        virtio_fabric_cfg_stub_accessor config_stub;
+        virtio_expected_bar_report_catcher expected_fatal;
+
+        config_stub = virtio_fabric_cfg_stub_accessor::type_id::create(
+            {"malformed_fabric_bar_stub_", case_name});
+        config_stub.requester_id = 16'h02a8;
+        config_stub.configure_fabric_bar_pairs(bars);
+        expected_fatal = new(
+            {"malformed_fabric_bar_catcher_", case_name},
+            "BAR_FABRIC_PROGRAM", UVM_FATAL);
+        uvm_report_cb::add(null, expected_fatal);
+        config_stub.program_fabric_bar_pairs();
+        uvm_report_cb::delete(null, expected_fatal);
+
+        if (expected_fatal.caught_count != 1) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s did not report one contextual Fabric BAR programming rejection (got %0d)",
+                case_name, expected_fatal.caught_count))
+        end
+        if (!string_contains(expected_fatal.last_message, expected_context)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s rejection lacked context '%s': %s",
+                case_name, expected_context, expected_fatal.last_message))
+        end
+        if (config_stub.config_write_count != 0) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s issued %0d config write(s) before rejecting the Fabric BAR lease",
+                case_name, config_stub.config_write_count))
+        end
+    endtask
+
+    // Verify the base config_write() sequence reaches a sequencer/driver and
+    // emits complete Config Write Type-0 TLPs.  Recording a virtual override
+    // alone cannot establish this transport serialization contract.
+    task assert_fabric_bar_config_tlp_serialization();
+        dpu_bar_pair_lease_t bars[$];
+        virtio_bar_accessor accessor;
+        bit [15:0] function_bdf;
+        bit [11:0] expected_addr[6];
+        bit [31:0] expected_data[6];
+
+        make_valid_fabric_bar_pairs(bars);
+        function_bdf = 16'h02b0;
+        accessor = virtio_bar_accessor::type_id::create(
+            "fabric_bar_base_config_accessor");
+        accessor.requester_id = function_bdf;
+        accessor.pcie_rc_seqr = fabric_cfg_tlp_seqr;
+        accessor.configure_fabric_bar_pairs(bars);
+        if (!accessor.fabric_bar_layout_is_active()) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "valid Fabric BAR leases were rejected before TLP serialization")
+        end
+
+        expected_addr[0] = PCI_CFG_BAR0;
+        expected_addr[1] = PCI_CFG_BAR1;
+        expected_addr[2] = PCI_CFG_BAR2;
+        expected_addr[3] = PCI_CFG_BAR3;
+        expected_addr[4] = PCI_CFG_BAR4;
+        expected_addr[5] = PCI_CFG_BAR5;
+        foreach (bars[pair_index]) begin
+            int unsigned low_bar_id;
+            bit [63:0] base;
+
+            low_bar_id = bars[pair_index].even_bar_id;
+            base = bars[pair_index].base;
+            expected_data[low_bar_id] =
+                (base[31:0] & 32'hffff_fff0) | 32'h0000_0004;
+            expected_data[low_bar_id + 1] = base[63:32];
+        end
+
+        fabric_cfg_tlp_capture.clear();
+        accessor.program_fabric_bar_pairs();
+        if (fabric_cfg_tlp_capture.captured_tlps.size() != 6) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "base config_write path emitted %0d TLPs, expected exactly six",
+                fabric_cfg_tlp_capture.captured_tlps.size()))
+        end
+
+        foreach (expected_addr[write_index]) begin
+            pcie_tl_cfg_tlp cfg_tlp;
+            bit [31:0] payload_dword;
+
+            if (!$cast(cfg_tlp,
+                       fabric_cfg_tlp_capture.captured_tlps[write_index])) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "base config_write item %0d was not a PCIe config TLP",
+                    write_index))
+            end
+            if ((cfg_tlp.kind != TLP_CFG_WR0) ||
+                (cfg_tlp.completer_id != function_bdf) ||
+                (cfg_tlp.reg_num != expected_addr[write_index][11:2]) ||
+                (cfg_tlp.first_be != 4'hf)) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "BAR config TLP %0d header mismatch: kind=%0d target=0x%04h reg=%0d be=0x%01h expected Type0 BDF=0x%04h offset=0x%03h be=0xf",
+                    write_index, cfg_tlp.kind, cfg_tlp.completer_id,
+                    cfg_tlp.reg_num, cfg_tlp.first_be, function_bdf,
+                    expected_addr[write_index]))
+            end
+            if (cfg_tlp.payload.size() != 4) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "BAR config TLP %0d payload length is %0d, expected four bytes",
+                    write_index, cfg_tlp.payload.size()))
+            end
+            payload_dword = {cfg_tlp.payload[3], cfg_tlp.payload[2],
+                             cfg_tlp.payload[1], cfg_tlp.payload[0]};
+            if (payload_dword != expected_data[write_index]) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "BAR config TLP %0d payload mismatch: got 0x%08h expected 0x%08h",
+                    write_index, payload_dword, expected_data[write_index]))
+            end
+        end
+    endtask
+
+    task assert_fabric_bar_hardening_rejections();
+        dpu_bar_pair_lease_t bars[$];
+
+        // Exact lease-set validation rejects absence, a repeated identical
+        // pair, an extra pair, and a role/ID mismatch before state activation.
+        bars.delete();
+        assert_fabric_lease_set_rejected("zero_leases", bars, "exactly three");
+
+        make_valid_fabric_bar_pairs(bars);
+        bars[2] = bars[1];
+        assert_fabric_lease_set_rejected(
+            "duplicate_identical_lease", bars, "duplicates");
+
+        make_valid_fabric_bar_pairs(bars);
+        bars.push_back(make_fabric_bar_pair(
+            DPU_BAR_RESERVED, 6, 64'h0001_0000_4000_0000,
+            64'h0000_0000_0001_0000));
+        assert_fabric_lease_set_rejected("extra_lease", bars, "exactly three");
+
+        make_valid_fabric_bar_pairs(bars);
+        bars[1].even_bar_id = 2;
+        assert_fabric_lease_set_rejected(
+            "wrong_function_role_bar_id", bars, "invalid role");
+
+        // A sub-16-byte power-of-two lease is not representable as a BAR
+        // pair.  Its aligned base must still be rejected before config I/O.
+        make_valid_fabric_bar_pairs(bars);
+        bars[1].size = 64'h8;
+        assert_fabric_bar_programming_rejected(
+            "sub_16_byte_size", bars, "at least 0x10");
+
+        // This base is aligned to its malformed 8-byte lease, so an
+        // implementation that masks base[3:0] instead of rejecting it would
+        // silently serialize a different BAR base.
+        make_valid_fabric_bar_pairs(bars);
+        bars[1].base = 64'h0001_0000_1000_0008;
+        bars[1].size = 64'h8;
+        assert_fabric_bar_programming_rejected(
+            "low_nibble_base", bars, "low address nibble");
+    endtask
 
     task assert_bar_layout(input virtio_function_instance function_instance);
         dpu_bar_pair_lease_t bars[$];
@@ -193,6 +513,64 @@ class virtio_fabric_resource_test extends uvm_test;
         global_rx_qids.push_back(global_rx_qid);
     endtask
 
+    task assert_fabric_bar_config_writes(
+        input virtio_function_instance function_instance,
+        input virtio_fabric_cfg_stub_accessor config_stub
+    );
+        bit [11:0] expected_addr[6];
+        bit [31:0] expected_data[6];
+
+        expected_addr[0] = PCI_CFG_BAR0;
+        expected_addr[1] = PCI_CFG_BAR1;
+        expected_addr[2] = PCI_CFG_BAR2;
+        expected_addr[3] = PCI_CFG_BAR3;
+        expected_addr[4] = PCI_CFG_BAR4;
+        expected_addr[5] = PCI_CFG_BAR5;
+        foreach (function_instance.bar_pairs[pair_index]) begin
+            int unsigned low_bar_id;
+            bit [63:0] base;
+
+            low_bar_id = function_instance.bar_pairs[pair_index].even_bar_id;
+            base = function_instance.bar_pairs[pair_index].base;
+            expected_data[low_bar_id] =
+                (base[31:0] & 32'hffff_fff0) | 32'h0000_0004;
+            expected_data[low_bar_id + 1] = base[63:32];
+        end
+
+        if (config_stub.discovery_started_before_bar_programming) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "Fabric capability discovery started before all BAR slots were programmed for host %0d PF %0d kind %0d VF %0d",
+                function_instance.function_key.host_id,
+                function_instance.function_key.pf_id,
+                function_instance.function_key.kind,
+                function_instance.function_key.vf_id))
+        end
+        if (config_stub.config_write_count != 6) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "expected six Fabric BAR config writes for host %0d PF %0d kind %0d VF %0d, got %0d",
+                function_instance.function_key.host_id,
+                function_instance.function_key.pf_id,
+                function_instance.function_key.kind,
+                function_instance.function_key.vf_id,
+                config_stub.config_write_count))
+        end
+        foreach (expected_addr[write_index]) begin
+            if ((config_stub.config_writes[write_index].addr !=
+                 expected_addr[write_index]) ||
+                (config_stub.config_writes[write_index].data !=
+                 expected_data[write_index]) ||
+                (config_stub.config_writes[write_index].be != 4'hf)) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "Fabric BAR config write %0d mismatch: addr=0x%03h data=0x%08h be=0x%01h expected addr=0x%03h data=0x%08h be=0xf",
+                    write_index,
+                    config_stub.config_writes[write_index].addr,
+                    config_stub.config_writes[write_index].data,
+                    config_stub.config_writes[write_index].be,
+                    expected_addr[write_index], expected_data[write_index]))
+            end
+        end
+    endtask
+
     task discover_fabric_function(input virtio_function_instance function_instance);
         virtio_fabric_cfg_stub_accessor config_stub;
         virtio_expected_bar_reserved_catcher expected_bar_error;
@@ -212,11 +590,11 @@ class virtio_fabric_resource_test extends uvm_test;
         function_instance.transport.cap_mgr.bar_ref = config_stub;
 
         function_instance.transport.discover_fabric_preconfigured_bars();
-        if ((config_stub.config_write_count != 0) ||
-            !function_instance.transport.fabric_capability_discovered) begin
+        if (!function_instance.transport.fabric_capability_discovered) begin
             `uvm_fatal("FABRIC_RESOURCE",
-                "Fabric discovery enumerated or rewrote a Fabric BAR")
+                "Fabric capability discovery did not complete")
         end
+        assert_fabric_bar_config_writes(function_instance, config_stub);
         assert_bar_layout(function_instance);
 
         reserved_errors = config_stub.get_reserved_bar_access_error_count();
@@ -266,6 +644,17 @@ class virtio_fabric_resource_test extends uvm_test;
         compatibility_vf = virtio_vf_instance::type_id::create(
             "compatibility_vf", this
         );
+        fabric_cfg_tlp_seqr = new("fabric_cfg_tlp_seqr", this);
+        fabric_cfg_tlp_capture = virtio_fabric_cfg_tlp_capture_driver::type_id::create(
+            "fabric_cfg_tlp_capture", this
+        );
+    endfunction
+
+    virtual function void connect_phase(uvm_phase phase);
+        super.connect_phase(phase);
+        fabric_cfg_tlp_capture.seq_item_port.connect(
+            fabric_cfg_tlp_seqr.seq_item_export
+        );
     endfunction
 
     virtual task run_phase(uvm_phase phase);
@@ -281,6 +670,13 @@ class virtio_fabric_resource_test extends uvm_test;
         dpu_bar_pair_lease_t no_bars[$];
 
         phase.raise_objection(this);
+
+        // Run the BAR hardening cases before topology traffic.  The first
+        // group validates rejected Fabric input without issuing config I/O;
+        // the second proves the actual base accessor serializes all six
+        // payload-carrying Config Write Type-0 transactions.
+        assert_fabric_bar_hardening_rejections();
+        assert_fabric_bar_config_tlp_serialization();
 
         // A legacy VF wrapper must remain substitutable for a generic
         // function while retaining immutable VF identity.  The assignment is

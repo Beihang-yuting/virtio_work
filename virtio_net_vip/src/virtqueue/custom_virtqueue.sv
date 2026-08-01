@@ -48,7 +48,7 @@ virtual class virtqueue_custom_callback extends uvm_object;
 
     // Migration
     pure virtual function void cb_save_state(virtqueue_base vq, ref virtqueue_snapshot_t snap);
-    pure virtual function void cb_restore_state(virtqueue_base vq, virtqueue_snapshot_t snap);
+    pure virtual function bit cb_restore_state(virtqueue_base vq, virtqueue_snapshot_t snap);
 
 endclass : virtqueue_custom_callback
 
@@ -239,8 +239,7 @@ class custom_virtqueue extends virtqueue_base;
         end
 
         if (found_idx >= 0) begin
-            iommu.unmap(bdf, iova);
-            dma_mappings.delete(found_idx);
+            release_dma_mapping(found_idx);
             `uvm_info("CUSTOM_VQ",
                 $sformatf("dma_unmap_buf: queue_id=%0d iova=0x%016x", queue_id, iova),
                 UVM_HIGH)
@@ -269,9 +268,9 @@ class custom_virtqueue extends virtqueue_base;
         custom_cb.cb_save_state(this, snap);
     endfunction
 
-    virtual function void restore_state(virtqueue_snapshot_t snap);
-        if (!check_cb("restore_state")) return;
-        custom_cb.cb_restore_state(this, snap);
+    virtual function bit restore_state(virtqueue_snapshot_t snap);
+        if (!check_cb("restore_state")) return 0;
+        return custom_cb.cb_restore_state(this, snap);
     endfunction
 
     // =================================================================

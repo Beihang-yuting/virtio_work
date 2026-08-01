@@ -35,9 +35,22 @@ class virtio_atomic_ops extends uvm_object;
     bit [63:0]                 negotiated_features;
 
     // ===== Internal tracking =====
-    protected bit [63:0]       tx_iova_map[int unsigned][$];   // queue_id -> list of IOVAs for cleanup
-    protected bit [63:0]       rx_iova_map[int unsigned][$];   // queue_id -> list of IOVAs for cleanup
-    protected bit [63:0]       ring_iovas[int unsigned][$];    // queue_id -> ring IOVAs (desc, avail, used)
+    // Normal data DMA owns both sides of a mapping.  Retaining only the IOVA
+    // made reset/teardown able to unmap (at best) while leaking the host
+    // buffer that backs it.  Keep the ownership pair together until one
+    // completion or a verified device reset retires it.
+    typedef struct {
+        bit [15:0] bdf;
+        bit [63:0] gpa;
+        bit [63:0] iova;
+    } normal_dma_record_t;
+    protected normal_dma_record_t tx_dma_map[int unsigned][$];
+    protected normal_dma_record_t rx_dma_map[int unsigned][$];
+    // Migration payloads are recreated after reset rather than being tied to
+    // a pre-freeze queue.  They still have normal DMA ownership and must be
+    // retired by every later ordinary device reset.
+    protected normal_dma_record_t migration_restore_dma[$];
+    protected bit [63:0]         ring_iovas[int unsigned][$];  // queue_id -> ring IOVAs (desc, avail, used)
 
     // ========================================================================
     // Constructor
@@ -48,6 +61,357 @@ class virtio_atomic_ops extends uvm_object;
         negotiated_features = '0;
     endfunction
 
+    // Retire one ordinary data-DMA ownership record.  This is deliberately
+    // separate from ring/indirect-table ownership, which remains owned by
+    // the virtqueue implementation.
+    protected function void retire_normal_dma_record(
+        normal_dma_record_t record
+    );
+        iommu.unmap(record.bdf, record.iova);
+        mem.free(record.gpa);
+    endfunction
+
+    protected function void retire_normal_dma_records(
+        ref normal_dma_record_t records[$]
+    );
+        foreach (records[i]) begin
+            retire_normal_dma_record(records[i]);
+        end
+        records.delete();
+    endfunction
+
+    protected function bit has_pending_normal_dma();
+        foreach (tx_dma_map[qid]) begin
+            if (tx_dma_map[qid].size() != 0)
+                return 1;
+        end
+        foreach (rx_dma_map[qid]) begin
+            if (rx_dma_map[qid].size() != 0)
+                return 1;
+        end
+        return (migration_restore_dma.size() != 0);
+    endfunction
+
+    // Device-side writers must use this completed-write boundary instead of
+    // calling IOMMU translate() followed by host_mem.write_mem().  It commits
+    // bytes first and lets the IOMMU preserve a migration generation payload
+    // before a completion path may unmap/free this DMA allocation.
+    virtual function bit device_dma_write(bit [63:0] iova, byte data[],
+                                          ref iommu_fault_e fault);
+        if ((transport == null) || (iommu == null) || (mem == null)) begin
+            fault = IOMMU_FAULT_UNMAPPED;
+            `uvm_error("ATOMIC_OPS", "device_dma_write: incomplete DMA context")
+            return 0;
+        end
+        return iommu.write_from_device(mem, transport.bdf, iova, data, fault);
+    endfunction
+
+    // Materialize one complete saved mapping after reset.  The destination
+    // retains the original IOVA layout so saved descriptors (including raw
+    // split, packed, and indirect forms) keep resolving without rewriting.
+    // Callers that only have retired dirty-page spans assemble a zero-filled
+    // complete payload before calling this common ownership boundary.
+    virtual function bit materialize_migration_mapping(
+        iommu_mapping_t source_mapping,
+        byte source_payload[],
+        ref iommu_mapping_t destination
+    );
+        bit [63:0] destination_gpa;
+        bit [63:0] destination_iova;
+        normal_dma_record_t ownership;
+
+        destination.bdf = '0;
+        destination.gpa = '0;
+        destination.iova = '0;
+        destination.size = 0;
+        destination.dir = DMA_TO_DEVICE;
+        destination.desc_id = 0;
+        if ((transport == null) || (iommu == null) || (mem == null)) begin
+            `uvm_error("ATOMIC_OPS",
+                "materialize_migration_mapping: incomplete DMA context")
+            return 0;
+        end
+        if (source_mapping.size == 0) begin
+            `uvm_error("ATOMIC_OPS",
+                "materialize_migration_mapping: zero-size source mapping")
+            return 0;
+        end
+        if (source_payload.size() != source_mapping.size) begin
+            `uvm_error("ATOMIC_OPS",
+                "materialize_migration_mapping: source payload size mismatch")
+            return 0;
+        end
+
+        destination_gpa = mem.alloc(source_mapping.size, .align(1));
+        if (destination_gpa == '1) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "materialize_migration_mapping: allocation failed for %0d bytes",
+                source_mapping.size))
+            return 0;
+        end
+        mem.write_mem(destination_gpa, source_payload);
+        destination_iova = iommu.map_fixed(source_mapping.bdf, destination_gpa,
+                                           source_mapping.size, source_mapping.dir,
+                                           source_mapping.iova);
+        if ((destination_iova == '1) || (destination_iova == 0)) begin
+            mem.free(destination_gpa);
+            `uvm_error("ATOMIC_OPS",
+                "materialize_migration_mapping: fixed destination DMA map failed")
+            return 0;
+        end
+
+        destination.bdf = source_mapping.bdf;
+        destination.gpa = destination_gpa;
+        destination.iova = destination_iova;
+        destination.size = source_mapping.size;
+        destination.dir = source_mapping.dir;
+        destination.desc_id = source_mapping.desc_id;
+        ownership.bdf = source_mapping.bdf;
+        ownership.gpa = destination_gpa;
+        ownership.iova = destination_iova;
+        migration_restore_dma.push_back(ownership);
+        return 1;
+    endfunction
+
+    function void release_migration_restore_payloads();
+        retire_normal_dma_records(migration_restore_dma);
+    endfunction
+
+    // Snapshot normal data DMA in the exact FIFO order consumed by TX/RX
+    // completion. Raw ring bytes retain only IOVAs; they do not identify the
+    // allocation that completion must retire.
+    virtual function bit snapshot_normal_dma_ownership(
+        ref virtio_normal_dma_snapshot_t records[$]
+    );
+        records.delete();
+        if (iommu == null) begin
+            `uvm_error("ATOMIC_OPS", "snapshot normal DMA: missing IOMMU")
+            return 0;
+        end
+        foreach (tx_dma_map[queue_id]) begin
+            foreach (tx_dma_map[queue_id][i]) begin
+                iommu_mapping_t mapping;
+                virtio_normal_dma_snapshot_t snapshot_record;
+
+                if (!iommu.get_live_mapping(tx_dma_map[queue_id][i].bdf,
+                                            tx_dma_map[queue_id][i].iova,
+                                            mapping)) begin
+                    `uvm_error("ATOMIC_OPS", $sformatf(
+                        "snapshot normal DMA: TX mapping missing queue_id=%0d IOVA=0x%016h",
+                        queue_id, tx_dma_map[queue_id][i].iova))
+                    records.delete();
+                    return 0;
+                end
+                snapshot_record.queue_id = queue_id;
+                snapshot_record.is_tx = 1;
+                snapshot_record.mapping = mapping;
+                records.push_back(snapshot_record);
+            end
+        end
+        foreach (rx_dma_map[queue_id]) begin
+            foreach (rx_dma_map[queue_id][i]) begin
+                iommu_mapping_t mapping;
+                virtio_normal_dma_snapshot_t snapshot_record;
+
+                if (!iommu.get_live_mapping(rx_dma_map[queue_id][i].bdf,
+                                            rx_dma_map[queue_id][i].iova,
+                                            mapping)) begin
+                    `uvm_error("ATOMIC_OPS", $sformatf(
+                        "snapshot normal DMA: RX mapping missing queue_id=%0d IOVA=0x%016h",
+                        queue_id, rx_dma_map[queue_id][i].iova))
+                    records.delete();
+                    return 0;
+                end
+                snapshot_record.queue_id = queue_id;
+                snapshot_record.is_tx = 0;
+                snapshot_record.mapping = mapping;
+                records.push_back(snapshot_record);
+            end
+        end
+        return 1;
+    endfunction
+
+    protected function bit claim_migration_restore_dma(
+        iommu_mapping_t expected, ref normal_dma_record_t destination
+    );
+        destination = '{default: 0};
+        foreach (migration_restore_dma[i]) begin
+            iommu_mapping_t live_mapping;
+
+            if ((migration_restore_dma[i].bdf != expected.bdf) ||
+                (migration_restore_dma[i].iova != expected.iova))
+                continue;
+            if (!iommu.get_live_mapping(expected.bdf, expected.iova,
+                                        live_mapping) ||
+                (live_mapping.size != expected.size) ||
+                (live_mapping.dir != expected.dir))
+                return 0;
+            destination = migration_restore_dma[i];
+            migration_restore_dma.delete(i);
+            return 1;
+        end
+        return 0;
+    endfunction
+
+    // Move restored destination allocations from the temporary migration
+    // ownership list back into the same TX/RX queues that completion and
+    // verified reset already understand.
+    virtual function bit restore_normal_dma_ownership(
+        virtio_normal_dma_snapshot_t records[$]
+    );
+        foreach (records[i]) begin
+            normal_dma_record_t destination;
+
+            if (!claim_migration_restore_dma(records[i].mapping, destination)) begin
+                `uvm_error("ATOMIC_OPS", $sformatf(
+                    "restore normal DMA: source IOVA 0x%016h was not materialized",
+                    records[i].mapping.iova))
+                return 0;
+            end
+            if (records[i].is_tx) begin
+                if (!tx_dma_map.exists(records[i].queue_id))
+                    tx_dma_map[records[i].queue_id] = {};
+                tx_dma_map[records[i].queue_id].push_back(destination);
+            end else begin
+                if (!rx_dma_map.exists(records[i].queue_id))
+                    rx_dma_map[records[i].queue_id] = {};
+                rx_dma_map[records[i].queue_id].push_back(destination);
+            end
+        end
+        return 1;
+    endfunction
+
+    // Queue-owned migration DMA includes indirect descriptor tables and
+    // explicit dma_map_buf() mappings.  Both begin in migration_restore_dma
+    // after materialization and must be claimed as one queue transaction.
+    protected function void collect_restored_queue_mappings(
+        virtqueue_snapshot_t queue_snapshot,
+        ref iommu_mapping_t expected_mappings[$]
+    );
+        expected_mappings.delete();
+        foreach (queue_snapshot.indirect_tables[i])
+            expected_mappings.push_back(queue_snapshot.indirect_tables[i].mapping);
+        foreach (queue_snapshot.queue_dma_mappings[i])
+            expected_mappings.push_back(queue_snapshot.queue_dma_mappings[i]);
+    endfunction
+
+    // Locate every temporary record before deleting any of them.  This makes
+    // the handoff all-or-nothing: a bad queue snapshot remains entirely in
+    // migration_restore_dma for the restore rollback reset to retire.
+    protected function bit collect_migration_restore_claim_indices(
+        iommu_mapping_t expected_mappings[$],
+        ref int unsigned claim_indices[$]
+    );
+        claim_indices.delete();
+        foreach (expected_mappings[i]) begin
+            int found_index;
+            iommu_mapping_t live_mapping;
+
+            found_index = -1;
+            if ((expected_mappings[i].bdf != transport.bdf) ||
+                (expected_mappings[i].iova == 0) ||
+                (expected_mappings[i].size == 0)) begin
+                `uvm_error("ATOMIC_OPS", $sformatf(
+                    "restore queue ownership: invalid source IOVA 0x%016h",
+                    expected_mappings[i].iova))
+                return 0;
+            end
+            foreach (migration_restore_dma[m]) begin
+                bit already_claimed;
+
+                already_claimed = 0;
+                foreach (claim_indices[c]) begin
+                    if (claim_indices[c] == m) begin
+                        already_claimed = 1;
+                        break;
+                    end
+                end
+                if (already_claimed ||
+                    (migration_restore_dma[m].bdf != expected_mappings[i].bdf) ||
+                    (migration_restore_dma[m].iova != expected_mappings[i].iova))
+                    continue;
+                if (!iommu.get_live_mapping(expected_mappings[i].bdf,
+                                            expected_mappings[i].iova,
+                                            live_mapping) ||
+                    (live_mapping.size != expected_mappings[i].size) ||
+                    (live_mapping.dir != expected_mappings[i].dir)) begin
+                    `uvm_error("ATOMIC_OPS", $sformatf(
+                        "restore queue ownership: materialized IOVA 0x%016h has invalid layout",
+                        expected_mappings[i].iova))
+                    return 0;
+                end
+                found_index = m;
+                break;
+            end
+            if (found_index < 0) begin
+                `uvm_error("ATOMIC_OPS", $sformatf(
+                    "restore queue ownership: source IOVA 0x%016h was not materialized",
+                    expected_mappings[i].iova))
+                return 0;
+            end
+            claim_indices.push_back(found_index);
+        end
+        return 1;
+    endfunction
+
+    // Validate every queue-owned mapping before the first queue overlay. The
+    // temporary migration list remains the sole physical owner at this stage,
+    // so an early overlay failure is cleaned by the ordinary rollback reset.
+    virtual function bit validate_restored_queue_ownership(
+        virtio_device_snapshot_t snap
+    );
+        iommu_mapping_t expected_mappings[$];
+        int unsigned claim_indices[$];
+
+        foreach (snap.queue_snapshots[q]) begin
+            iommu_mapping_t queue_expected_mappings[$];
+
+            collect_restored_queue_mappings(snap.queue_snapshots[q],
+                                            queue_expected_mappings);
+            foreach (queue_expected_mappings[i])
+                expected_mappings.push_back(queue_expected_mappings[i]);
+        end
+        return collect_migration_restore_claim_indices(expected_mappings,
+                                                       claim_indices);
+    endfunction
+
+    // A queue takes ownership only after restore_state() has fully staged its
+    // state. All expected records are preflighted before any temporary record
+    // is removed, so later rollback has exactly one owner per mapping.
+    virtual function bit claim_restored_queue_ownership(
+        virtqueue_snapshot_t queue_snapshot
+    );
+        iommu_mapping_t expected_mappings[$];
+        int unsigned claim_indices[$];
+
+        collect_restored_queue_mappings(queue_snapshot, expected_mappings);
+        if (!collect_migration_restore_claim_indices(expected_mappings,
+                                                     claim_indices))
+            return 0;
+        // collect_restored_queue_mappings() groups indirect tables before
+        // explicit dma_map_buf() records, whereas materialization preserves
+        // source IOVA order. Remove the numeric positions from highest to
+        // lowest so deleting one temporary record cannot shift another
+        // claimed record before it is removed.
+        claim_indices.sort();
+        for (int i = claim_indices.size(); i > 0; i--)
+            migration_restore_dma.delete(claim_indices[i - 1]);
+        return 1;
+    endfunction
+
+    // Compatibility name for callers that restore only indirect tables.
+    virtual function bit validate_restored_indirect_ownership(
+        virtio_device_snapshot_t snap
+    );
+        return validate_restored_queue_ownership(snap);
+    endfunction
+
+    virtual function bit claim_restored_indirect_ownership(
+        virtqueue_snapshot_t queue_snapshot
+    );
+        return claim_restored_queue_ownership(queue_snapshot);
+    endfunction
+
     // ========================================================================
     // Device Lifecycle
     // ========================================================================
@@ -55,10 +419,23 @@ class virtio_atomic_ops extends uvm_object;
     // ------------------------------------------------------------------------
     // device_reset -- Write status=0 and clean up all queue/DMA state
     // ------------------------------------------------------------------------
-    virtual task device_reset();
+    virtual task device_reset_verified(ref bit reset_complete);
+        int unsigned tx_qids[$];
+        int unsigned rx_qids[$];
+
         `uvm_info("ATOMIC_OPS", "device_reset: starting", UVM_MEDIUM)
 
-        transport.reset_device();
+        reset_complete = 0;
+        if ((transport == null) || (vq_mgr == null) || (iommu == null) ||
+            ((mem == null) && has_pending_normal_dma())) begin
+            `uvm_error("ATOMIC_OPS", "device_reset: incomplete PF lifecycle context")
+            return;
+        end
+        transport.reset_device_verified(reset_complete);
+        if (!reset_complete) begin
+            `uvm_error("ATOMIC_OPS", "device_reset: transport reset did not complete; retaining PF DMA")
+            return;
+        end
 
         // Detach all queues if any exist
         if (vq_mgr.get_queue_count() > 0) begin
@@ -72,12 +449,36 @@ class virtio_atomic_ops extends uvm_object;
             end
         end
         ring_iovas.delete();
-        tx_iova_map.delete();
-        rx_iova_map.delete();
+        foreach (tx_dma_map[qid]) begin
+            tx_qids.push_back(qid);
+        end
+        foreach (tx_qids[i]) begin
+            retire_normal_dma_records(tx_dma_map[tx_qids[i]]);
+            tx_dma_map.delete(tx_qids[i]);
+        end
+        foreach (rx_dma_map[qid]) begin
+            rx_qids.push_back(qid);
+        end
+        foreach (rx_qids[i]) begin
+            retire_normal_dma_records(rx_dma_map[rx_qids[i]]);
+            rx_dma_map.delete(rx_qids[i]);
+        end
+        release_migration_restore_payloads();
+
+        // detach_all_queues() releases descriptor ownership only.  After a
+        // verified device reset, free every queue's rings and remove its
+        // manager entry before the PF can be reinitialized.
+        vq_mgr.destroy_all();
 
         negotiated_features = '0;
 
         `uvm_info("ATOMIC_OPS", "device_reset: complete", UVM_MEDIUM)
+    endtask
+
+    virtual task device_reset();
+        bit reset_complete;
+
+        device_reset_verified(reset_complete);
     endtask
 
     // ------------------------------------------------------------------------
@@ -197,7 +598,8 @@ class virtio_atomic_ops extends uvm_object;
     virtual task setup_queue(
         int unsigned       queue_id,
         int unsigned       queue_size,
-        virtqueue_type_e   vq_type
+        virtqueue_type_e   vq_type,
+        output bit          ok
     );
         virtqueue_base     vq;
         int unsigned       max_size;
@@ -209,6 +611,13 @@ class virtio_atomic_ops extends uvm_object;
         bit [63:0]         avail_iova;
         bit [63:0]         used_iova;
         int unsigned       msix_vector;
+
+        ok = 0;
+        if ((transport == null) || (vq_mgr == null) || (iommu == null) ||
+            (mem == null)) begin
+            `uvm_error("ATOMIC_OPS", "setup_queue: incomplete queue context")
+            return;
+        end
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("setup_queue: queue_id=%0d size=%0d type=%s",
@@ -231,6 +640,12 @@ class virtio_atomic_ops extends uvm_object;
         end else
             eff_size = queue_size;
 
+        if (eff_size == 0) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: device reported zero-sized queue %0d", queue_id))
+            return;
+        end
+
         // 4. Create queue via manager
         vq = vq_mgr.create_queue(queue_id, eff_size, vq_type);
         if (vq == null) begin
@@ -251,8 +666,12 @@ class virtio_atomic_ops extends uvm_object;
             end
             VQ_PACKED: begin
                 desc_size  = 16 * eff_size;
-                avail_size = 8;  // event suppression struct
-                used_size  = 8;  // event suppression struct
+                // Packed rings place two independent 4-byte event
+                // suppression structures after the descriptor table.  Map
+                // each structure at its own programmed GPA; mapping 8 bytes
+                // from device_event_addr would run past the contiguous ring.
+                avail_size = 4;
+                used_size  = 4;
             end
             default: begin
                 desc_size  = 16 * eff_size;
@@ -265,6 +684,20 @@ class virtio_atomic_ops extends uvm_object;
         desc_iova  = iommu.map(transport.bdf, vq.desc_table_addr,  desc_size,  DMA_BIDIRECTIONAL);
         avail_iova = iommu.map(transport.bdf, vq.driver_ring_addr, avail_size, DMA_BIDIRECTIONAL);
         used_iova  = iommu.map(transport.bdf, vq.device_ring_addr, used_size,  DMA_BIDIRECTIONAL);
+        if ((desc_iova == '1) || (desc_iova == 0) ||
+            (avail_iova == '1) || (avail_iova == 0) ||
+            (used_iova == '1) || (used_iova == 0)) begin
+            if ((desc_iova != '1) && (desc_iova != 0))
+                iommu.unmap(transport.bdf, desc_iova);
+            if ((avail_iova != '1) && (avail_iova != 0))
+                iommu.unmap(transport.bdf, avail_iova);
+            if ((used_iova != '1) && (used_iova != 0))
+                iommu.unmap(transport.bdf, used_iova);
+            vq_mgr.destroy_queue(queue_id);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: failed to map queue_id=%0d rings", queue_id))
+            return;
+        end
 
         // Track ring IOVAs for cleanup
         ring_iovas[queue_id] = '{desc_iova, avail_iova, used_iova};
@@ -287,6 +720,7 @@ class virtio_atomic_ops extends uvm_object;
         `uvm_info("ATOMIC_OPS",
             $sformatf("setup_queue: queue_id=%0d complete, desc_iova=0x%016h avail_iova=0x%016h used_iova=0x%016h",
                       queue_id, desc_iova, avail_iova, used_iova), UVM_MEDIUM)
+        ok = 1;
     endtask
 
     // ------------------------------------------------------------------------
@@ -316,11 +750,17 @@ class virtio_atomic_ops extends uvm_object;
             ring_iovas.delete(queue_id);
         end
 
-        // 4. Clean up TX/RX IOVA tracking
-        if (tx_iova_map.exists(queue_id))
-            tx_iova_map.delete(queue_id);
-        if (rx_iova_map.exists(queue_id))
-            rx_iova_map.delete(queue_id);
+        // 4. Retire every still-owned normal data-DMA pair before forgetting
+        // the queue.  Completion paths pop the same records first, so this
+        // only releases buffers that remain pending at teardown.
+        if (tx_dma_map.exists(queue_id)) begin
+            retire_normal_dma_records(tx_dma_map[queue_id]);
+            tx_dma_map.delete(queue_id);
+        end
+        if (rx_dma_map.exists(queue_id)) begin
+            retire_normal_dma_records(rx_dma_map[queue_id]);
+            rx_dma_map.delete(queue_id);
+        end
 
         // 5. Destroy queue
         vq_mgr.destroy_queue(queue_id);
@@ -350,9 +790,14 @@ class virtio_atomic_ops extends uvm_object;
     virtual task setup_all_queues(
         int unsigned     num_pairs,
         virtqueue_type_e vq_type,
-        int unsigned     queue_size
+        int unsigned     queue_size,
+        output bit        ok
     );
         int unsigned ctrl_qid;
+        int unsigned created_qids[$];
+        bit queue_ok;
+
+        ok = 0;
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("setup_all_queues: num_pairs=%0d type=%s size=%0d",
@@ -360,19 +805,37 @@ class virtio_atomic_ops extends uvm_object;
 
         // Setup receive and transmit queue pairs
         for (int unsigned i = 0; i < num_pairs; i++) begin
-            setup_queue(i * 2,     queue_size, vq_type);  // receiveq_i
-            setup_queue(i * 2 + 1, queue_size, vq_type);  // transmitq_i
+            setup_queue(i * 2, queue_size, vq_type, queue_ok);  // receiveq_i
+            if (!queue_ok) begin
+                foreach (created_qids[j])
+                    teardown_queue(created_qids[j]);
+                return;
+            end
+            created_qids.push_back(i * 2);
+            setup_queue(i * 2 + 1, queue_size, vq_type, queue_ok);  // transmitq_i
+            if (!queue_ok) begin
+                foreach (created_qids[j])
+                    teardown_queue(created_qids[j]);
+                return;
+            end
+            created_qids.push_back(i * 2 + 1);
         end
 
         // Setup control queue if CTRL_VQ negotiated
         if (negotiated_features[VIRTIO_NET_F_CTRL_VQ]) begin
             ctrl_qid = num_pairs * 2;
-            setup_queue(ctrl_qid, queue_size, vq_type);
+            setup_queue(ctrl_qid, queue_size, vq_type, queue_ok);
+            if (!queue_ok) begin
+                foreach (created_qids[j])
+                    teardown_queue(created_qids[j]);
+                return;
+            end
         end
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("setup_all_queues: complete, total queues=%0d",
                       vq_mgr.get_queue_count()), UVM_MEDIUM)
+        ok = 1;
     endtask
 
     // ========================================================================
@@ -415,6 +878,16 @@ class virtio_atomic_ops extends uvm_object;
         int unsigned     result;
         byte             hdr_data[];
         byte             pkt_data[];
+        normal_dma_record_t dma_record;
+
+        desc_id = '1;
+        if (use_indirect &&
+            !negotiated_features[VIRTIO_F_RING_INDIRECT_DESC]) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "tx_submit: queue %0d requested indirect descriptors without negotiating VIRTIO_F_RING_INDIRECT_DESC",
+                queue_id))
+            return;
+        end
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("tx_submit: queue_id=%0d", queue_id), UVM_HIGH)
@@ -445,9 +918,16 @@ class virtio_atomic_ops extends uvm_object;
 
         // 3. Allocate host_mem for hdr + data buffers
         hdr_gpa = mem.alloc(hdr_size, .align(1));
+        if (hdr_gpa == '1) begin
+            `uvm_error("ATOMIC_OPS",
+                $sformatf("tx_submit: host_mem alloc failed for queue %0d", queue_id))
+            return;
+        end
         pkt_gpa = mem.alloc(pkt_size, .align(1));
-
-        if (hdr_gpa == '1 || pkt_gpa == '1) begin
+        if (pkt_gpa == '1) begin
+            // No DMA mapping or descriptor owns the header yet, so rollback
+            // the sole successful allocation exactly once.
+            mem.free(hdr_gpa);
             `uvm_error("ATOMIC_OPS",
                 $sformatf("tx_submit: host_mem alloc failed for queue %0d", queue_id))
             return;
@@ -466,13 +946,34 @@ class virtio_atomic_ops extends uvm_object;
 
         // 5. Map through IOMMU (DMA_TO_DEVICE -- device reads these buffers)
         hdr_iova = iommu.map(transport.bdf, hdr_gpa, hdr_size, DMA_TO_DEVICE);
+        if ((hdr_iova == '1) || (hdr_iova == 0)) begin
+            mem.free(hdr_gpa);
+            mem.free(pkt_gpa);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "tx_submit: failed to map header for queue %0d", queue_id))
+            return;
+        end
         pkt_iova = iommu.map(transport.bdf, pkt_gpa, pkt_size, DMA_TO_DEVICE);
+        if ((pkt_iova == '1) || (pkt_iova == 0)) begin
+            iommu.unmap(transport.bdf, hdr_iova);
+            mem.free(hdr_gpa);
+            mem.free(pkt_gpa);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "tx_submit: failed to map payload for queue %0d", queue_id))
+            return;
+        end
 
-        // Track IOVAs for cleanup
-        if (!tx_iova_map.exists(queue_id))
-            tx_iova_map[queue_id] = {};
-        tx_iova_map[queue_id].push_back(hdr_iova);
-        tx_iova_map[queue_id].push_back(pkt_iova);
+        // Track the complete DMA ownership pairs for completion/reset.
+        if (!tx_dma_map.exists(queue_id))
+            tx_dma_map[queue_id] = {};
+        dma_record.bdf = transport.bdf;
+        dma_record.gpa = hdr_gpa;
+        dma_record.iova = hdr_iova;
+        tx_dma_map[queue_id].push_back(dma_record);
+        dma_record.bdf = transport.bdf;
+        dma_record.gpa = pkt_gpa;
+        dma_record.iova = pkt_iova;
+        tx_dma_map[queue_id].push_back(dma_record);
 
         // 6. Build scatter-gather lists: [hdr_sg(out)] [data_sg(out)]
         hdr_entry.addr = hdr_iova;
@@ -486,6 +987,21 @@ class virtio_atomic_ops extends uvm_object;
         // 7. Add buffers to virtqueue (n_out=2, n_in=0)
         result = vq.add_buf(sgs, 2, 0, pkt, use_indirect);
         desc_id = result;
+
+        // The data buffers belong to this operation, not to add_buf().  A
+        // rejected chain must not remain in the completion map or reach the
+        // notification path.
+        if (result == '1) begin
+            iommu.unmap(transport.bdf, hdr_iova);
+            iommu.unmap(transport.bdf, pkt_iova);
+            mem.free(hdr_gpa);
+            mem.free(pkt_gpa);
+            tx_dma_map[queue_id].pop_back();
+            tx_dma_map[queue_id].pop_back();
+            if (tx_dma_map[queue_id].size() == 0)
+                tx_dma_map.delete(queue_id);
+            return;
+        end
 
         // 8. Kick if device needs notification
         if (vq.needs_notification()) begin
@@ -524,12 +1040,14 @@ class virtio_atomic_ops extends uvm_object;
 
         // Clean up IOMMU mappings for completed TX buffers
         // (Each TX uses 2 IOVAs: hdr + data)
-        if (tx_iova_map.exists(queue_id)) begin
+        if (tx_dma_map.exists(queue_id)) begin
             int unsigned iovas_to_free = count * 2;
-            for (int unsigned i = 0; i < iovas_to_free && tx_iova_map[queue_id].size() > 0; i++) begin
-                bit [63:0] iova = tx_iova_map[queue_id].pop_front();
-                iommu.unmap(transport.bdf, iova);
+            for (int unsigned i = 0; i < iovas_to_free && tx_dma_map[queue_id].size() > 0; i++) begin
+                normal_dma_record_t record = tx_dma_map[queue_id].pop_front();
+                retire_normal_dma_record(record);
             end
+            if (tx_dma_map[queue_id].size() == 0)
+                tx_dma_map.delete(queue_id);
         end
 
         if (count > 0)
@@ -568,6 +1086,7 @@ class virtio_atomic_ops extends uvm_object;
             virtio_sg_list   sgs[1];
             virtio_sg_entry  buf_entry;
             int unsigned     result;
+            normal_dma_record_t dma_record;
 
             // Allocate RX buffer from host memory
             buf_gpa = mem.alloc(buf_size, .align(1));
@@ -582,11 +1101,21 @@ class virtio_atomic_ops extends uvm_object;
 
             // Map through IOMMU (DMA_FROM_DEVICE -- device writes to this buffer)
             buf_iova = iommu.map(transport.bdf, buf_gpa, buf_size, DMA_FROM_DEVICE);
+            if ((buf_iova == '1) || (buf_iova == 0)) begin
+                mem.free(buf_gpa);
+                `uvm_error("ATOMIC_OPS", $sformatf(
+                    "rx_refill: failed to map buffer %0d for queue %0d",
+                    filled, queue_id))
+                break;
+            end
 
-            // Track IOVA for cleanup
-            if (!rx_iova_map.exists(queue_id))
-                rx_iova_map[queue_id] = {};
-            rx_iova_map[queue_id].push_back(buf_iova);
+            // Track the complete DMA ownership pair for completion/reset.
+            if (!rx_dma_map.exists(queue_id))
+                rx_dma_map[queue_id] = {};
+            dma_record.bdf = transport.bdf;
+            dma_record.gpa = buf_gpa;
+            dma_record.iova = buf_iova;
+            rx_dma_map[queue_id].push_back(dma_record);
 
             // Build sg: single device-writable buffer (n_out=0, n_in=1)
             buf_entry.addr = buf_iova;
@@ -594,6 +1123,14 @@ class virtio_atomic_ops extends uvm_object;
             sgs[0].entries.push_back(buf_entry);
 
             result = vq.add_buf(sgs, 0, 1, null, 0);
+            if (result == '1) begin
+                iommu.unmap(transport.bdf, buf_iova);
+                mem.free(buf_gpa);
+                rx_dma_map[queue_id].pop_back();
+                if (rx_dma_map[queue_id].size() == 0)
+                    rx_dma_map.delete(queue_id);
+                break;
+            end
             filled++;
         end
 
@@ -646,11 +1183,13 @@ class virtio_atomic_ops extends uvm_object;
         end
 
         // Clean up IOMMU mappings for consumed RX buffers
-        if (rx_iova_map.exists(queue_id)) begin
-            for (int unsigned i = 0; i < count && rx_iova_map[queue_id].size() > 0; i++) begin
-                bit [63:0] iova = rx_iova_map[queue_id].pop_front();
-                iommu.unmap(transport.bdf, iova);
+        if (rx_dma_map.exists(queue_id)) begin
+            for (int unsigned i = 0; i < count && rx_dma_map[queue_id].size() > 0; i++) begin
+                normal_dma_record_t record = rx_dma_map[queue_id].pop_front();
+                retire_normal_dma_record(record);
             end
+            if (rx_dma_map[queue_id].size() == 0)
+                rx_dma_map.delete(queue_id);
         end
 
         if (count > 0)
@@ -661,6 +1200,276 @@ class virtio_atomic_ops extends uvm_object;
     // ========================================================================
     // Control VQ
     // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // admin_vq_submit -- Submit one PF Admin-VQ request and consume response
+    //
+    // The PF manager owns feature/lease/target validation.  This helper owns
+    // only the DMA, descriptor, notification, completion and cleanup
+    // lifecycle of a validated, independently configured Admin VQ.
+    // ------------------------------------------------------------------------
+    virtual task admin_vq_submit(
+        virtio_admin_vq_context admin_context,
+        byte unsigned           cmd_data[],
+        ref byte unsigned       result[],
+        ref bit                 ok,
+        input bit               lock_already_held = 0
+    );
+        bit [63:0]       request_gpa;
+        bit [63:0]       response_gpa;
+        bit [63:0]       request_iova;
+        bit [63:0]       response_iova;
+        bit              request_allocated;
+        bit              response_allocated;
+        bit              request_mapped;
+        bit              response_mapped;
+        bit              submitted;
+        bit              completion_seen;
+        bit              reset_required;
+        bit              reset_complete;
+        bit              release_safe;
+        int unsigned     desc_id;
+        int unsigned     used_len;
+        int unsigned     max_polls;
+        int unsigned     poll_count;
+        int unsigned     poll_interval;
+        int unsigned     effective_timeout;
+        int unsigned     response_len;
+        longint unsigned poll_quotient;
+        uvm_object       completed_token;
+        uvm_object       detached_tokens[$];
+        virtio_sg_list   sgs[];
+        virtio_sg_entry  entry;
+        byte             write_buf[];
+        byte             response_buf[];
+
+        ok = 0;
+        result = new[0];
+        request_gpa = '0;
+        response_gpa = '0;
+        request_iova = '0;
+        response_iova = '0;
+        request_allocated = 0;
+        response_allocated = 0;
+        request_mapped = 0;
+        response_mapped = 0;
+        submitted = 0;
+        completion_seen = 0;
+        reset_required = 0;
+        reset_complete = 0;
+        release_safe = 1;
+
+        if (admin_context == null) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: null Admin VQ context")
+            return;
+        end
+        if (admin_context.submit_lock == null) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: Admin VQ context has no submission lock")
+            return;
+        end
+
+        if (!lock_already_held)
+            admin_context.submit_lock.get(1);
+        begin : admin_vq_submit_locked
+        do begin
+        // The PF manager validates before calling this helper.  Repeat the
+        // context checks while holding the shared-VQ lock: a prior command
+        // may have performed recovery while this caller waited for ownership.
+        if ((admin_context.vq == null) ||
+            (admin_context.transport == null) || (admin_context.mem == null) ||
+            (admin_context.iommu == null) || (admin_context.wait_pol == null) ||
+            (admin_context.response_capacity == 0) || !admin_context.configured ||
+            !admin_context.special_vq_lease_valid || admin_context.special_vq_lease.frozen ||
+            !admin_context.negotiated_features[VIRTIO_F_ADMIN_VQ]) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: incomplete Admin VQ context")
+            break;
+        end
+        // This public helper may be called without virtio_pf_manager.  Once
+        // it owns the submission lock, confirm that descriptors, DMA, and
+        // notification still address one VQ/requester/memory/IOMMU binding.
+        // Reject before allocation or any queue/device-visible side effect.
+        if ((admin_context.queue_id != admin_context.vq.queue_id) ||
+            (admin_context.vq.bdf != admin_context.transport.bdf) ||
+            (admin_context.vq.mem != admin_context.mem) ||
+            (admin_context.vq.iommu != admin_context.iommu)) begin
+            `uvm_error("ATOMIC_OPS",
+                "admin_vq_submit: Admin VQ binding is inconsistent")
+            break;
+        end
+        if (admin_context.full_reset_owner == null) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: Admin VQ has no PF lifecycle reset owner")
+            break;
+        end
+        if (admin_context.recovery_required || admin_context.dma_quarantined) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: Admin VQ requires verified recovery")
+            break;
+        end
+        if (cmd_data.size() == 0) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: empty Admin VQ request")
+            break;
+        end
+
+        request_gpa = admin_context.mem.alloc(cmd_data.size(), .align(1));
+        if (request_gpa == '1) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: request allocation failed")
+            break;
+        end
+        request_allocated = 1;
+
+        response_gpa = admin_context.mem.alloc(admin_context.response_capacity, .align(1));
+        if (response_gpa == '1) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: response allocation failed")
+            break;
+        end
+        response_allocated = 1;
+
+        write_buf = new[cmd_data.size()];
+        foreach (cmd_data[index])
+            write_buf[index] = cmd_data[index];
+        admin_context.mem.write_mem(request_gpa, write_buf);
+        admin_context.mem.mem_set(response_gpa, 8'hFF, admin_context.response_capacity);
+
+        request_iova = admin_context.iommu.map(
+            admin_context.transport.bdf, request_gpa, cmd_data.size(), DMA_TO_DEVICE
+        );
+        if (request_iova == '1 || request_iova == 0) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: request DMA map failed")
+        end else begin
+            request_mapped = 1;
+            response_iova = admin_context.iommu.map(
+                admin_context.transport.bdf, response_gpa, admin_context.response_capacity,
+                DMA_FROM_DEVICE
+            );
+            if (response_iova == '1 || response_iova == 0) begin
+                `uvm_error("ATOMIC_OPS", "admin_vq_submit: response DMA map failed")
+            end else begin
+                response_mapped = 1;
+                sgs = new[2];
+                entry.addr = request_iova;
+                entry.len = cmd_data.size();
+                entry.is_indirect = 0;
+                sgs[0].entries.push_back(entry);
+                entry.addr = response_iova;
+                entry.len = admin_context.response_capacity;
+                entry.is_indirect = 0;
+                sgs[1].entries.push_back(entry);
+
+                desc_id = admin_context.vq.add_buf(sgs, 1, 1, null, 0);
+                if (desc_id == '1) begin
+                    `uvm_error("ATOMIC_OPS", $sformatf(
+                        "admin_vq_submit: queue %0d rejected Admin VQ descriptor chain",
+                        admin_context.queue_id))
+                end else begin
+                    submitted = 1;
+                    admin_context.transport.kick(admin_context.queue_id,
+                                                 admin_context.vq.total_add_buf_ops, 0);
+
+                    // Both timeout and interval derive from the shared wait policy;
+                    // there is no operation-specific arbitrary delay here.
+                    effective_timeout = admin_context.wait_pol.effective_timeout(
+                        admin_context.wait_pol.default_timeout_ns
+                    );
+                    poll_interval = admin_context.wait_pol.default_poll_interval_ns;
+                    if (poll_interval == 0)
+                        poll_interval = 1;
+                    // Cap the widened quotient before adding one.  A
+                    // saturated UINT_MAX timeout with interval one must not
+                    // wrap its poll count to zero.
+                    poll_quotient = effective_timeout / poll_interval;
+                    if (poll_quotient >= admin_context.wait_pol.max_poll_attempts)
+                        max_polls = admin_context.wait_pol.max_poll_attempts;
+                    else
+                        max_polls = poll_quotient + 1;
+                    poll_count = 0;
+
+                    while (poll_count < max_polls) begin
+                        if (admin_context.vq.poll_used(completed_token, used_len)) begin
+                            completion_seen = 1;
+                            break;
+                        end
+                        poll_count++;
+                        if (poll_count < max_polls)
+                            #(poll_interval * 1ns);
+                    end
+
+                    if (!completion_seen) begin
+                        `uvm_error("ATOMIC_OPS", $sformatf(
+                            "admin_vq_submit: timeout waiting for Admin VQ %0d completion after %0dns",
+                            admin_context.queue_id, effective_timeout))
+                        reset_required = 1;
+                    end else if ((used_len == 0) || (used_len > admin_context.response_capacity)) begin
+                        `uvm_error("ATOMIC_OPS", $sformatf(
+                            "admin_vq_submit: invalid Admin VQ response length %0d (capacity=%0d)",
+                            used_len, admin_context.response_capacity))
+                        reset_required = 1;
+                    end else begin
+                        response_len = used_len - 1;
+                        admin_context.mem.read_mem(response_gpa, used_len, response_buf);
+                        result = new[response_len];
+                        foreach (result[index])
+                            result[index] = response_buf[index + 1];
+                        if (response_buf[0] != VIRTIO_NET_OK) begin
+                            `uvm_error("ATOMIC_OPS", $sformatf(
+                                "admin_vq_submit: device rejected Admin VQ request with status 0x%02h",
+                                response_buf[0]))
+                        end else begin
+                            ok = 1;
+                        end
+                    end
+                end
+            end
+        end
+        end while (0);
+
+        // A rejected add_buf() owns no descriptor.  For an accepted request
+        // that timed out or returned malformed completion data, reset before
+        // releasing its software ownership or DMA buffers: a late completion
+        // must not DMA into memory we are about to free.  Q_RESET is valid
+        // only when VIRTIO_F_RING_RESET was negotiated; Admin VQ alone does
+        // not imply that feature, so otherwise reset the whole device.
+        if (submitted && reset_required) begin
+            release_safe = 0;
+            if (admin_context.negotiated_features[VIRTIO_F_RING_RESET])
+                admin_context.transport.write_queue_reset_verified(
+                    admin_context.queue_id, reset_complete
+                );
+            else
+                admin_context.full_reset_owner.reset_pf_lifecycle(reset_complete);
+            admin_context.configured = 0;
+            admin_context.recovery_required = 1;
+            if (reset_complete) begin
+                admin_context.vq.detach_all_unused(detached_tokens);
+                admin_context.vq.reset_queue();
+                admin_context.vq.alloc_rings();
+                release_safe = 1;
+            end else begin
+                admin_context.dma_quarantined = 1;
+                if (response_mapped)
+                    admin_context.quarantined_iovas.push_back(response_iova);
+                if (request_mapped)
+                    admin_context.quarantined_iovas.push_back(request_iova);
+                if (response_allocated)
+                    admin_context.quarantined_gpas.push_back(response_gpa);
+                if (request_allocated)
+                    admin_context.quarantined_gpas.push_back(request_gpa);
+                `uvm_error("ATOMIC_OPS", $sformatf(
+                    "admin_vq_submit: Admin VQ %0d reset did not complete; DMA is quarantined",
+                    admin_context.queue_id))
+            end
+        end
+
+        if (release_safe && response_mapped)
+            admin_context.iommu.unmap(admin_context.transport.bdf, response_iova);
+        if (release_safe && request_mapped)
+            admin_context.iommu.unmap(admin_context.transport.bdf, request_iova);
+        if (release_safe && response_allocated)
+            admin_context.mem.free(response_gpa);
+        if (release_safe && request_allocated)
+            admin_context.mem.free(request_gpa);
+        end : admin_vq_submit_locked
+        if (!lock_already_held)
+            admin_context.submit_lock.put(1);
+    endtask
 
     // ------------------------------------------------------------------------
     // ctrl_send -- Send a control command and wait for ACK

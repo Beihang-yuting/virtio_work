@@ -3,8 +3,8 @@
 //
 // Dual VIP peer-to-peer traffic test: two virtio-net VIP instances (A and B)
 // communicate bidirectionally through a virtual network bridge. Both VIPs
-// perform full virtio init through real PCIe TLPs using the completion bridge
-// from virtio_full_test.sv, then exchange packets simultaneously.
+// perform full virtio init through real PCIe TLPs using one reusable TLM
+// completion adapter, then exchange packets simultaneously.
 //
 // Architecture:
 //   VIP A (BDF=0x0100) <---> Virtual Network Bridge <---> VIP B (BDF=0x0200)
@@ -74,8 +74,7 @@ class virtio_dual_test extends uvm_test;
     // PCIe environment (shared)
     pcie_tl_env pcie_env;
 
-    // Completion bridge (shared)
-    virtio_cpl_bridge bridge;
+    virtio_tlm_completion_adapter tlm_adapter;
 
     // ---- VIP A components ----
     virtio_pci_transport  transport_a;
@@ -86,6 +85,8 @@ class virtio_dual_test extends uvm_test;
     virtio_memory_barrier_model barrier_a;
     virtqueue_error_injector    err_inj_a;
     virtio_atomic_ops     ops_a;
+    virtio_auto_fsm       fsm_a;
+    virtio_function_instance binding_function_a;
 
     // ---- VIP B components ----
     virtio_pci_transport  transport_b;
@@ -96,6 +97,8 @@ class virtio_dual_test extends uvm_test;
     virtio_memory_barrier_model barrier_b;
     virtqueue_error_injector    err_inj_b;
     virtio_atomic_ops     ops_b;
+    virtio_auto_fsm       fsm_b;
+    virtio_function_instance binding_function_b;
 
     // Perf monitors
     virtio_perf_monitor   perf_a, perf_b;
@@ -122,25 +125,10 @@ class virtio_dual_test extends uvm_test;
         pcie_tl_env_config pcie_cfg;
         super.build_phase(phase);
 
-        // 1. Create completion bridge
-        bridge = virtio_cpl_bridge::type_id::create("bridge");
-
-        // 2. Factory override: swap RC driver with shim
-        pcie_tl_rc_driver::type_id::set_inst_override(
-            virtio_rc_driver_shim::get_type(),
-            "pcie_env.rc_agent.driver", this);
-
-        // 3. Factory overrides for bridged sequences
-        virtio_bar_mem_rd_seq::type_id::set_type_override(
-            virtio_bar_mem_rd_seq_bridged::get_type());
-        virtio_bar_cfg_rd_seq::type_id::set_type_override(
-            virtio_bar_cfg_rd_seq_bridged::get_type());
-        virtio_bar_mem_wr_seq::type_id::set_type_override(
-            virtio_bar_mem_wr_seq_bridged::get_type());
-        virtio_bar_cfg_wr_seq::type_id::set_type_override(
-            virtio_bar_cfg_wr_seq_bridged::get_type());
-        virtio_bar_accessor::type_id::set_type_override(
-            virtio_bar_accessor_bridged::get_type());
+        // Install one reusable adapter before PCIe creates its RC driver.
+        tlm_adapter = virtio_tlm_completion_adapter::type_id::create(
+            "tlm_adapter");
+        tlm_adapter.install_factory_overrides();
 
         // 4. Create PCIe environment
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
@@ -168,6 +156,8 @@ class virtio_dual_test extends uvm_test;
         barrier_a   = virtio_memory_barrier_model::type_id::create("barrier_a");
         err_inj_a   = virtqueue_error_injector::type_id::create("err_inj_a");
         ops_a       = virtio_atomic_ops::type_id::create("ops_a");
+        binding_function_a = virtio_function_instance::type_id::create(
+            "binding_function_a", this);
 
         // 6. Create VIP B components
         transport_b = virtio_pci_transport::type_id::create("transport_b");
@@ -178,6 +168,8 @@ class virtio_dual_test extends uvm_test;
         barrier_b   = virtio_memory_barrier_model::type_id::create("barrier_b");
         err_inj_b   = virtqueue_error_injector::type_id::create("err_inj_b");
         ops_b       = virtio_atomic_ops::type_id::create("ops_b");
+        binding_function_b = virtio_function_instance::type_id::create(
+            "binding_function_b", this);
 
         // 7. Perf monitors
         perf_a = virtio_perf_monitor::type_id::create("perf_a", this);
@@ -186,36 +178,20 @@ class virtio_dual_test extends uvm_test;
         // 7b. Extended perf monitor for bandwidth control test
         bw_mon = virtio_perf_monitor_ext::type_id::create("bw_mon", this);
 
-        // 8. Set static bridge references
-        virtio_bar_mem_rd_seq_bridged::s_bridge = bridge;
-        virtio_bar_cfg_rd_seq_bridged::s_bridge = bridge;
-        virtio_bar_cfg_wr_seq_bridged::s_bridge = bridge;
     endfunction
 
     // ========================================================================
     // Connect Phase
     // ========================================================================
     virtual function void connect_phase(uvm_phase phase);
-        virtio_rc_driver_shim shim;
         super.connect_phase(phase);
 
-        // Inject bridge into RC driver shim
-        if (pcie_env.rc_agent != null && pcie_env.rc_agent.driver != null) begin
-            if ($cast(shim, pcie_env.rc_agent.driver))
-                shim.bridge = bridge;
-            else
-                `uvm_fatal("DUAL_TEST", "Failed to cast driver to virtio_rc_driver_shim")
-        end
-
         // ---- Wire VIP A ----
-        transport_a.bar.pcie_rc_seqr = pcie_env.rc_agent.sequencer;
         transport_a.bdf = 16'h0100;
-        transport_a.wait_pol = wait_pol_a;
-        ops_a.transport = transport_a;
-        ops_a.vq_mgr = vq_mgr_a;
-        ops_a.mem = mem_a;
-        ops_a.iommu = iommu_a;
-        ops_a.wait_pol = wait_pol_a;
+        binding_function_a.bind_pcie_components(
+            "dual_function_a", transport_a, vq_mgr_a, null, mem_a, iommu_a,
+            barrier_a, err_inj_a, wait_pol_a, binding_function_a.drv_cfg,
+            pcie_env.rc_agent.sequencer, ops_a, fsm_a);
 
         wait_pol_a.default_poll_interval_ns = 100;
         wait_pol_a.reset_timeout_ns = 10000;
@@ -223,14 +199,11 @@ class virtio_dual_test extends uvm_test;
         wait_pol_a.max_poll_attempts = 100;
 
         // ---- Wire VIP B ----
-        transport_b.bar.pcie_rc_seqr = pcie_env.rc_agent.sequencer;
         transport_b.bdf = 16'h0200;
-        transport_b.wait_pol = wait_pol_b;
-        ops_b.transport = transport_b;
-        ops_b.vq_mgr = vq_mgr_b;
-        ops_b.mem = mem_b;
-        ops_b.iommu = iommu_b;
-        ops_b.wait_pol = wait_pol_b;
+        binding_function_b.bind_pcie_components(
+            "dual_function_b", transport_b, vq_mgr_b, null, mem_b, iommu_b,
+            barrier_b, err_inj_b, wait_pol_b, binding_function_b.drv_cfg,
+            pcie_env.rc_agent.sequencer, ops_b, fsm_b);
 
         wait_pol_b.default_poll_interval_ns = 100;
         wait_pol_b.reset_timeout_ns = 10000;
@@ -256,31 +229,31 @@ class virtio_dual_test extends uvm_test;
 
         // Drain bridge between phases
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // Test 1: Bidirectional large traffic
         test_bidirectional_traffic(1000, 1000, 256, 256, "Test 1: Bidirectional 2000 packets");
 
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // Test 2: Asymmetric traffic
         test_bidirectional_traffic(2000, 200, 256, 256, "Test 2: Asymmetric 2200 packets");
 
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // Test 3: Variable packet sizes
         test_variable_sizes();
 
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // Test 4: Queue wrap stress
         test_queue_wrap_stress();
 
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // Test 5: Bandwidth control with 20K packets
         test_bandwidth_control();
@@ -586,7 +559,7 @@ class virtio_dual_test extends uvm_test;
         run_virtio_init(transport_a, "VIP_A");
 
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // VIP B uses same EP config space and BAR (shared device)
         `uvm_info("DUAL_TEST", "--- Initializing VIP B ---", UVM_LOW)
@@ -608,7 +581,7 @@ class virtio_dual_test extends uvm_test;
         run_virtio_init(transport_b, "VIP_B");
 
         #100ns;
-        bridge.drain();
+        tlm_adapter.drain();
 
         // Initialize host memory regions (separate for A and B)
         mem_a.init_region(64'hA000_0000, 64'hAFFF_FFFF);  // 256MB for A
@@ -1557,7 +1530,7 @@ class virtio_dual_test extends uvm_test;
                 a_tx_submitted, b_rx_received, b_tx_submitted, a_rx_received), UVM_LOW)
 
             #100ns;
-            bridge.drain();
+            tlm_adapter.drain();
         end
 
         // Verify results
@@ -1820,7 +1793,10 @@ class virtio_dual_test extends uvm_test;
     // Result Reporting
     // ========================================================================
     virtual function void report_results();
-        bridge.report();
+        `uvm_info("DUAL_TEST", $sformatf(
+            "Completion adapter stats: received=%0d consumed=%0d",
+            tlm_adapter.completions_received,
+            tlm_adapter.completions_consumed), UVM_LOW)
 
         `uvm_info("DUAL_TEST", "============================================================", UVM_LOW)
         `uvm_info("DUAL_TEST", $sformatf("Test Results: %0d/%0d passed, %0d failed",

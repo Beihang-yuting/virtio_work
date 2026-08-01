@@ -47,6 +47,7 @@ class virtio_scoreboard extends uvm_component;
 
     // ===== Statistics =====
     scoreboard_stats_t stats;
+    int unsigned monitor_event_count;
 
     // ===== Pending TX packets (for matching) =====
     protected uvm_object tx_expected[$];
@@ -64,6 +65,7 @@ class virtio_scoreboard extends uvm_component;
     function new(string name, uvm_component parent);
         super.new(name, parent);
         stats = '{default: 0};
+        monitor_event_count = 0;
     endfunction
 
     // ========================================================================
@@ -83,6 +85,23 @@ class virtio_scoreboard extends uvm_component;
     // ========================================================================
 
     virtual function void write(virtio_transaction txn);
+        if (txn.is_monitor_event) begin
+            monitor_event_count++;
+            case (txn.monitor_event)
+                VIRTIO_MON_DMA: begin
+                    if (chk_dma_compliance && !txn.monitor_error)
+                        check_dma_access(txn.monitor_addr, txn.monitor_length,
+                            txn.monitor_is_write ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+                end
+                VIRTIO_MON_INTERRUPT: begin
+                    if (chk_notification)
+                        check_notification(txn.queue_id, 0, 1);
+                end
+                default: ;
+            endcase
+            return;
+        end
+
         case (txn.txn_type)
             VIO_TXN_SEND_PKTS: begin
                 // Record expected TX packets for later matching

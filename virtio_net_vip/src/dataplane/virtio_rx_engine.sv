@@ -155,7 +155,7 @@ class virtio_rx_engine extends uvm_object;
             tracker.add(buf_gpa, buf_iova, alloc_size);
 
             // 5. Build single-entry SG list (device-writable)
-            sg.entries.push_back('{addr: buf_iova, len: alloc_size});
+            sg.entries.push_back('{addr: buf_iova, len: alloc_size, is_indirect: 0});
             sgs_arr = new[1];
             sgs_arr[0] = sg;
 

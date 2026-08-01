@@ -107,13 +107,76 @@ class virtio_function_instance extends uvm_component;
         return (bar_id == 2) || (bar_id == 3);
     endfunction
 
+    // Public binding primitive.  The environment uses it for each active
+    // PF/VF; standalone TLM tests use a compatible function instance too.
+    virtual function void bind_pcie_components(
+        input string function_name,
+        input virtio_pci_transport transport_ref,
+        input virtqueue_manager vq_mgr_ref,
+        input virtio_driver_agent driver_agent_ref,
+        input host_mem_manager hmem,
+        input virtio_iommu_model iommu_mdl,
+        input virtio_memory_barrier_model bar_mdl,
+        input virtqueue_error_injector einj,
+        input virtio_wait_policy wpol,
+        input virtio_driver_config_t driver_cfg,
+        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
+        ref virtio_atomic_ops ops,
+        ref virtio_auto_fsm fsm
+    );
+        if (pcie_rc_seqr == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s received a null PCIe RC sequencer", function_name))
+        end
+        if ((transport_ref == null) || (vq_mgr_ref == null)) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s is missing transport or virtqueue manager", function_name))
+        end
+
+        vq_mgr_ref.mem = hmem;
+        vq_mgr_ref.iommu = iommu_mdl;
+        vq_mgr_ref.barrier = bar_mdl;
+        vq_mgr_ref.err_inj = einj;
+        vq_mgr_ref.wait_pol = wpol;
+        transport_ref.wait_pol = wpol;
+        transport_ref.bar.pcie_rc_seqr = pcie_rc_seqr;
+        transport_ref.notify_mgr.bar = transport_ref.bar;
+        transport_ref.cap_mgr.bar_ref = transport_ref.bar;
+
+        if (ops == null)
+            ops = virtio_atomic_ops::type_id::create({function_name, "_ops"});
+        ops.transport = transport_ref;
+        ops.vq_mgr = vq_mgr_ref;
+        ops.mem = hmem;
+        ops.iommu = iommu_mdl;
+        ops.wait_pol = wpol;
+
+        if (fsm == null)
+            fsm = virtio_auto_fsm::type_id::create({function_name, "_fsm"});
+        fsm.ops = ops;
+        fsm.drv_cfg = driver_cfg;
+
+        if (driver_agent_ref != null) begin
+            driver_agent_ref.ops = ops;
+            driver_agent_ref.fsm = fsm;
+            if (driver_agent_ref.driver != null) begin
+                driver_agent_ref.driver.ops = ops;
+                driver_agent_ref.driver.fsm = fsm;
+            end
+            if (driver_agent_ref.monitor != null) begin
+                driver_agent_ref.monitor.transport = transport_ref;
+                driver_agent_ref.monitor.vq_mgr = vq_mgr_ref;
+            end
+        end
+    endfunction
+
     virtual function void wire_shared(
         host_mem_manager hmem,
         virtio_iommu_model iommu_mdl,
         virtio_memory_barrier_model bar_mdl,
         virtqueue_error_injector einj,
         virtio_wait_policy wpol,
-        uvm_sequencer #(uvm_sequence_item) pcie_rc_seqr
+        uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
     );
         virtio_atomic_ops ops;
         virtio_auto_fsm fsm;
@@ -123,34 +186,63 @@ class virtio_function_instance extends uvm_component;
         barrier = bar_mdl;
         err_inj = einj;
         wait_pol = wpol;
-        vq_mgr.mem = hmem;
-        vq_mgr.iommu = iommu_mdl;
-        vq_mgr.barrier = bar_mdl;
-        vq_mgr.err_inj = einj;
-        vq_mgr.wait_pol = wpol;
-        transport.wait_pol = wpol;
-        $cast(transport.bar.pcie_rc_seqr, pcie_rc_seqr);
-        transport.notify_mgr.bar = transport.bar;
-        transport.cap_mgr.bar_ref = transport.bar;
+        ops = driver_agent.ops;
+        fsm = driver_agent.fsm;
+        bind_pcie_components(
+            $sformatf("function_%0d", vf_index), transport, vq_mgr,
+            driver_agent, hmem, iommu_mdl, bar_mdl, einj, wpol, drv_cfg,
+            pcie_rc_seqr, ops, fsm);
+    endfunction
 
-        ops = virtio_atomic_ops::type_id::create(
-            $sformatf("function_%0d_ops", vf_index));
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = hmem;
-        ops.iommu = iommu_mdl;
-        ops.wait_pol = wpol;
-        fsm = virtio_auto_fsm::type_id::create(
-            $sformatf("function_%0d_fsm", vf_index));
-        fsm.ops = ops;
-        fsm.drv_cfg = drv_cfg;
-        driver_agent.ops = ops;
-        driver_agent.fsm = fsm;
+    virtual function void bind_pcie(
+        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
+    );
+        wire_shared(mem, iommu, barrier, err_inj, wait_pol, pcie_rc_seqr);
     endfunction
 
     virtual task init(virtio_driver_config_t cfg);
         drv_cfg = cfg;
         state = VF_CONFIGURED;
+    endtask
+
+    // A full reset requested through the PF Admin VQ belongs to this normal
+    // PF lifecycle owner, not to the separate Admin VQ.  Quiesce any running
+    // FSM before the verified device reset; only confirmed completion permits
+    // the function and FSM to become eligible for a fresh initialization.
+    virtual task reset_pf_lifecycle(ref bit reset_complete);
+        virtio_atomic_ops pf_ops;
+        virtio_auto_fsm   pf_fsm;
+
+        reset_complete = 0;
+        if (function_kind != DPU_FUNCTION_PF) begin
+            `uvm_error("FUNCTION_INSTANCE",
+                "reset_pf_lifecycle: only a PF may own full-device recovery")
+            return;
+        end
+        if ((driver_agent == null) || (driver_agent.ops == null) ||
+            (driver_agent.fsm == null)) begin
+            `uvm_error("FUNCTION_INSTANCE",
+                "reset_pf_lifecycle: PF driver/FSM/ops lifecycle is not bound")
+            return;
+        end
+
+        pf_ops = driver_agent.ops;
+        pf_fsm = driver_agent.fsm;
+        if (pf_fsm.state == FSM_RUNNING)
+            pf_fsm.stop_dataplane();
+
+        pf_ops.device_reset_verified(reset_complete);
+        if (!reset_complete) begin
+            // device_reset_verified() retained normal PF queue/DMA ownership;
+            // record the failed lifecycle instead of representing a usable or
+            // successfully reinitialized function.
+            state = VF_RESET_FAILED;
+            pf_fsm.state = FSM_ERROR;
+            return;
+        end
+
+        state = VF_REINIT_REQUIRED;
+        pf_fsm.state = FSM_REINIT_REQUIRED;
     endtask
 
     virtual task shutdown();
@@ -179,6 +271,13 @@ class virtio_function_instance extends uvm_component;
     endfunction
 
     virtual function void set_active();
+        if ((state == VF_REINIT_REQUIRED) || (state == VF_RESET_FAILED)) begin
+            `uvm_error("FUNCTION_INSTANCE", $sformatf(
+                "set_active: function %0d:%0d:%0d:%0d requires reinitialization before activation from state %s",
+                function_key.host_id, function_key.pf_id, function_key.kind,
+                function_key.vf_id, state.name()))
+            return;
+        end
         if (state != VF_CONFIGURED) begin
             `uvm_warning("FUNCTION_INSTANCE", $sformatf(
                 "set_active: function %0d:%0d:%0d:%0d is in state %s",
@@ -194,6 +293,7 @@ class virtio_function_instance extends uvm_component;
         if ((transport == null) || (vq_mgr == null) || (resource_client == null))
             return;
         transport.bdf = bdf;
+        transport.notify_mgr.set_function_bdf(bdf);
         transport.is_vf = (function_kind == DPU_FUNCTION_VF);
         transport.vf_index = vf_index;
         transport.bar.requester_id = bdf;

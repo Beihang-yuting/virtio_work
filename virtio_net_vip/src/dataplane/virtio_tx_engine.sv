@@ -111,6 +111,15 @@ class virtio_tx_engine extends uvm_object;
         byte unsigned    pkt_data[$];
         virtio_net_hdr_t hdr;
 
+        desc_id = '1;
+        if (use_indirect &&
+            !negotiated_features[VIRTIO_F_RING_INDIRECT_DESC]) begin
+            `uvm_error("TX_ENG", $sformatf(
+                "submit_packet: queue %0d requested indirect descriptors without negotiating VIRTIO_F_RING_INDIRECT_DESC",
+                queue_id))
+            return;
+        end
+
         // ---- 1. Extract raw packet bytes ----
         pkt_data = extract_pkt_data(pkt);
         if (pkt_data.size() == 0) begin
@@ -177,6 +186,17 @@ class virtio_tx_engine extends uvm_object;
         // All SGs are device-readable (out): n_out = sgs.size(), n_in = 0
         desc_id = vq.add_buf(sgs_arr, sgs_arr.size(), 0, token, use_indirect);
 
+        // add_buf() does not own the caller's TX buffers.  If it rejects the
+        // chain, undo this attempt's maps and allocations before any success
+        // bookkeeping makes the packet visible to completion handling.
+        if (desc_id == '1) begin
+            for (int i = 0; i < tracker.count(); i++) begin
+                iommu.unmap(bdf, tracker.iova_list[i]);
+                mem.free(tracker.gpa_list[i]);
+            end
+            return;
+        end
+
         // Store tracker for cleanup at completion time
         tx_buf_map[token] = tracker;
 
@@ -237,8 +257,8 @@ class virtio_tx_engine extends uvm_object;
         tracker.add(data_gpa, data_iova, pkt_data.size());
 
         // ---- 6. Build scatter-gather lists ----
-        hdr_sg.entries.push_back('{addr: hdr_iova,  len: hdr_bytes.size()});
-        data_sg.entries.push_back('{addr: data_iova, len: pkt_data.size()});
+        hdr_sg.entries.push_back('{addr: hdr_iova,  len: hdr_bytes.size(), is_indirect: 0});
+        data_sg.entries.push_back('{addr: data_iova, len: pkt_data.size(),  is_indirect: 0});
         sgs.push_back(hdr_sg);
         sgs.push_back(data_sg);
 

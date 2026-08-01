@@ -15,33 +15,102 @@ import virtio_net_pkg::*;
 // ensures the correct wdata reaches the EP's memory model.
 // ============================================================================
 
-class virtio_e2e_mem_wr_seq extends virtio_bar_mem_wr_seq;
+class virtio_e2e_mem_wr_seq extends virtio_tlm_bar_mem_wr_seq;
     `uvm_object_utils(virtio_e2e_mem_wr_seq)
+
+    static bit          capture_writes;
+    static bit [63:0]   expected_write_addr;
+    static bit [3:0]    expected_first_be;
+    static bit [31:0]   expected_wdata;
+    static int unsigned captured_write_count;
+    static bit          captured_writes_match;
 
     function new(string name = "virtio_e2e_mem_wr_seq");
         super.new(name);
     endfunction
 
+    static function void begin_write_capture(
+        input bit [63:0] expected_addr,
+        input bit [3:0] expected_be,
+        input bit [31:0] expected_data
+    );
+        expected_write_addr = expected_addr;
+        expected_first_be = expected_be;
+        expected_wdata = expected_data;
+        captured_write_count = 0;
+        captured_writes_match = 1;
+        capture_writes = 1;
+    endfunction
+
+    static function void end_write_capture();
+        capture_writes = 0;
+    endfunction
+
     virtual task body();
-        // Write to EP mem_space directly with the correct data at
-        // DWord-aligned address using byte enables (matches EP behavior)
-        begin
-            pcie_tl_ep_driver ep_drv;
-            uvm_object obj;
-            bit [63:0] dw_addr;
-            dw_addr = {addr[63:2], 2'b00};
-            if (uvm_config_db#(uvm_object)::get(null, "", "ep_driver_ref", obj)) begin
-                $cast(ep_drv, obj);
-                // Write bytes according to byte enables
-                if (first_be[0]) ep_drv.mem_space[dw_addr]     = wdata[7:0];
-                if (first_be[1]) ep_drv.mem_space[dw_addr + 1] = wdata[15:8];
-                if (first_be[2]) ep_drv.mem_space[dw_addr + 2] = wdata[23:16];
-                if (first_be[3]) ep_drv.mem_space[dw_addr + 3] = wdata[31:24];
-            end
+        // Keep the WIP kick check on the production adapter's real PCIe
+        // Memory Write path, including its non-randomized payload.
+        super.body();
+
+        if (capture_writes) begin
+            captured_write_count++;
+            if ((addr != expected_write_addr) ||
+                (first_be != expected_first_be) ||
+                (wdata != expected_wdata))
+                captured_writes_match = 0;
         end
     endtask
 
 endclass
+
+// ============================================================================
+// Raw two-DWord write used to exercise the real RC->EP path with independent
+// first/last byte enables.  The public BAR helper deliberately models only a
+// single DWord, so it cannot cover this PCIe packet shape.
+// ============================================================================
+class virtio_tlm_two_dw_mem_wr_seq extends uvm_sequence #(pcie_tl_tlp);
+    `uvm_object_utils(virtio_tlm_two_dw_mem_wr_seq)
+
+    bit [63:0] addr;
+    bit [3:0]  first_be;
+    bit [3:0]  last_be;
+    bit [7:0]  write_bytes[];
+
+    function new(string name = "virtio_tlm_two_dw_mem_wr_seq");
+        super.new(name);
+    endfunction
+
+    virtual task body();
+        pcie_tl_mem_tlp tlp;
+
+        if (write_bytes.size() != 8)
+            `uvm_fatal("TWO_DW_WRITE", "two-DWord write needs exactly eight payload bytes")
+        if (first_be == 0 || last_be == 0)
+            `uvm_fatal("TWO_DW_WRITE", "two-DWord write needs nonzero first/last BE")
+
+        tlp = pcie_tl_mem_tlp::type_id::create("two_dw_mem_wr_tlp");
+        start_item(tlp);
+        tlp.kind = TLP_MEM_WR;
+        tlp.addr = addr;
+        tlp.length = 10'd2;
+        tlp.first_be = first_be;
+        tlp.last_be = last_be;
+        tlp.is_64bit = (addr[63:32] != 0);
+        tlp.fmt = tlp.is_64bit ? FMT_4DW_WITH_DATA : FMT_3DW_WITH_DATA;
+        tlp.type_f = TLP_TYPE_MEM_WR;
+        tlp.tc = 0;
+        tlp.attr = 0;
+        tlp.constraint_mode_sel = CONSTRAINT_LEGAL;
+        tlp.inject_ecrc_err = 0;
+        tlp.inject_lcrc_err = 0;
+        tlp.inject_poisoned = 0;
+        tlp.violate_ordering = 0;
+        tlp.field_bitmask = 0;
+        tlp.has_prefix = 0;
+        tlp.payload = new[write_bytes.size()];
+        foreach (write_bytes[i]) tlp.payload[i] = write_bytes[i];
+        finish_item(tlp);
+    endtask
+endclass : virtio_tlm_two_dw_mem_wr_seq
 
 // ============================================================================
 // virtio_e2e_cfg_wr_seq
@@ -165,6 +234,7 @@ class virtio_e2e_test extends uvm_test;
     // ===== Environments =====
     pcie_tl_env           pcie_env;
     virtio_net_env        virtio_env;
+    virtio_tlm_completion_adapter tlm_adapter;
 
     // ===== Configs =====
     pcie_tl_env_config    pcie_cfg;
@@ -173,6 +243,9 @@ class virtio_e2e_test extends uvm_test;
     // ===== Test parameters =====
     localparam bit [63:0] BAR0_BASE       = 64'h0000_0000_C000_0000;
     localparam bit [31:0] BAR0_SIZE       = 32'h0001_0000;  // 64KB
+    localparam bit [63:0] BAR2_BASE       = 64'h0000_0000_C002_0000;
+    localparam bit [31:0] BAR2_SIZE       = 32'h0001_0000;  // 64KB
+    localparam int unsigned NOTIFY_BAR     = 2;
 
     // BAR0 region offsets for virtio capabilities
     localparam bit [31:0] COMMON_CFG_OFF  = 32'h0000_0000;
@@ -223,22 +296,13 @@ class virtio_e2e_test extends uvm_test;
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
 
-        // ----- Override bar accessor sequences -----
-        // The bar_mem_rd_seq and bar_cfg_rd_seq call get_response() which
-        // requires the driver to return a response. The base driver does not
-        // support this. We override both to read data from EP mem_space
-        // directly (semantically equivalent in TLM auto-response mode).
-        // The bar_mem_wr_seq doesn't pass wdata through the TLP payload,
-        // so we override it to write to EP mem_space directly.
-        virtio_bar_mem_rd_seq::type_id::set_type_override(
-            virtio_e2e_mem_rd_seq::get_type());
-        virtio_bar_cfg_rd_seq::type_id::set_type_override(
-            virtio_e2e_cfg_rd_seq::get_type());
+        // Install the reusable TLM completion bridge before PCIe creates its
+        // RC driver.  The local write override only adds WIP kick capture.
+        tlm_adapter = virtio_tlm_completion_adapter::type_id::create(
+            "tlm_adapter");
+        tlm_adapter.install_factory_overrides();
         virtio_bar_mem_wr_seq::type_id::set_type_override(
             virtio_e2e_mem_wr_seq::get_type());
-        // Note: Config writes (bar_cfg_wr_seq) are not overridden because
-        // we skip BAR enumeration. Config reads are the only path needed
-        // for capability discovery.
 
         // ----- PCIe TL env config -----
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
@@ -283,63 +347,16 @@ class virtio_e2e_test extends uvm_test;
     // ========================================================================
     // Connect Phase
     //
-    // Wire the PCIe RC sequencer into the virtio VF instances so TLPs
-    // generated by the virtio driver flow through the PCIe TLM loopback.
+    // Bind the PCIe RC sequencer to every active virtio function through the
+    // public environment integration API.
     // ========================================================================
 
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
 
-        // Wire shared components into VF instances manually.
-        // We cannot use wire_shared() because it takes
-        // uvm_sequencer#(uvm_sequence_item) but the PCIe RC sequencer is
-        // uvm_sequencer#(pcie_tl_tlp), and the $cast between parameterized
-        // types fails. Instead, we replicate wire_shared logic here.
-        foreach (virtio_env.vf_instances[i]) begin
-            virtio_vf_instance vfi;
-            virtio_atomic_ops ops;
-            virtio_auto_fsm   fsm;
-
-            vfi = virtio_env.vf_instances[i];
-
-            vfi.mem      = virtio_env.host_mem;
-            vfi.iommu    = virtio_env.iommu;
-            vfi.barrier  = virtio_env.barrier;
-            vfi.err_inj  = virtio_env.err_inj;
-            vfi.wait_pol = virtio_env.wait_pol;
-
-            // Wire into virtqueue manager
-            vfi.vq_mgr.mem     = virtio_env.host_mem;
-            vfi.vq_mgr.iommu   = virtio_env.iommu;
-            vfi.vq_mgr.barrier = virtio_env.barrier;
-            vfi.vq_mgr.err_inj = virtio_env.err_inj;
-            vfi.vq_mgr.wait_pol = virtio_env.wait_pol;
-
-            // Wire into transport
-            vfi.transport.wait_pol = virtio_env.wait_pol;
-            vfi.transport.bar.pcie_rc_seqr = pcie_env.rc_agent.sequencer;
-            vfi.transport.notify_mgr.bar   = vfi.transport.bar;
-            vfi.transport.cap_mgr.bar_ref  = vfi.transport.bar;
-
-            // Create and wire atomic_ops
-            ops = virtio_atomic_ops::type_id::create(
-                $sformatf("vf%0d_ops", i));
-            ops.transport = vfi.transport;
-            ops.vq_mgr    = vfi.vq_mgr;
-            ops.mem       = virtio_env.host_mem;
-            ops.iommu     = virtio_env.iommu;
-            ops.wait_pol  = virtio_env.wait_pol;
-
-            // Create and wire auto_fsm
-            fsm = virtio_auto_fsm::type_id::create(
-                $sformatf("vf%0d_fsm", i));
-            fsm.ops     = ops;
-            fsm.drv_cfg = vfi.drv_cfg;
-
-            // Wire into driver agent
-            vfi.driver_agent.ops = ops;
-            vfi.driver_agent.fsm = fsm;
-        end
+        // Public environment binding owns the completion adapter/RC-driver
+        // lifecycle; this test deliberately performs no private driver bind.
+        virtio_env.bind_pcie(pcie_env.rc_agent.sequencer, tlm_adapter);
 
     endfunction
 
@@ -402,6 +419,13 @@ class virtio_e2e_test extends uvm_test;
         cfg_mgr.cfg_space[18] = BAR0_BASE[23:16];
         cfg_mgr.cfg_space[19] = BAR0_BASE[31:24];
 
+        // BAR2 is a separate notification aperture.  Keeping it distinct
+        // from BAR0 proves kicks use the discovered notification capability.
+        cfg_mgr.cfg_space[24] = BAR2_BASE[7:0] & 8'hF0;
+        cfg_mgr.cfg_space[25] = BAR2_BASE[15:8];
+        cfg_mgr.cfg_space[26] = BAR2_BASE[23:16];
+        cfg_mgr.cfg_space[27] = BAR2_BASE[31:24];
+
         // ----- Vendor-Specific Capability 1: Common Config (cfg_type=1) -----
         // Data bytes after cap_id and cap_next (14 bytes):
         //   cap_len, cfg_type, bar, id, pad, pad, offset[3:0], length[3:0]
@@ -432,7 +456,7 @@ class virtio_e2e_test extends uvm_test;
             vs_data2 = new[18];
             vs_data2[0]  = 8'h14;               // cap_len = 20
             vs_data2[1]  = VIRTIO_PCI_CAP_NOTIFY_CFG; // cfg_type = 2
-            vs_data2[2]  = 8'h00;               // bar = 0
+            vs_data2[2]  = NOTIFY_BAR[7:0];     // notification BAR = 2
             vs_data2[3]  = 8'h00;               // id
             vs_data2[4]  = 8'h00;               // padding
             vs_data2[5]  = 8'h00;               // padding
@@ -727,6 +751,8 @@ class virtio_e2e_test extends uvm_test;
     protected task phase1_setup_transport();
         virtio_vf_instance vf;
         virtio_pci_transport xport;
+        bit [31:0] num_queues_word;
+        bit [7:0] status;
 
         `uvm_info("E2E_TEST", "----- Phase 1: Transport Setup -----", UVM_LOW)
 
@@ -737,6 +763,9 @@ class virtio_e2e_test extends uvm_test;
         xport.bar.bar_base[0] = BAR0_BASE;
         xport.bar.bar_size[0] = BAR0_SIZE;
         xport.bar.bar_type[0] = 3'b000;  // 32-bit MMIO
+        xport.bar.bar_base[NOTIFY_BAR] = BAR2_BASE;
+        xport.bar.bar_size[NOTIFY_BAR] = BAR2_SIZE;
+        xport.bar.bar_type[NOTIFY_BAR] = 3'b000;  // 32-bit MMIO
         xport.bar.requester_id = virtio_cfg.pf_bdf;
         xport.bdf = virtio_cfg.pf_bdf;
 
@@ -756,6 +785,28 @@ class virtio_e2e_test extends uvm_test;
         assert(xport.cap_mgr.msix_found)
             else `uvm_fatal("E2E_TEST", "MSI-X capability not found")
 
+        // Regression: a 16-bit common-config read at offset 0x12 issues a
+        // single-DWord request with first_be=0xc and must return the
+        // right-justified num_queues value, not bytes from offset 0x14.
+        xport.bar.read_reg(0, COMMON_CFG_OFF + 32'h12, 2, num_queues_word);
+        assert(num_queues_word == NUM_QUEUES)
+            else `uvm_error("E2E_TEST", $sformatf(
+                "unaligned num_queues read mismatch: got %0d, expected %0d",
+                num_queues_word, NUM_QUEUES))
+
+        // Regression: posted writes issued through the real TLM adapter must
+        // become visible to the immediately following non-posted read.
+        xport.write_device_status(DEV_STATUS_ACKNOWLEDGE);
+        xport.read_device_status(status);
+        assert(status == DEV_STATUS_ACKNOWLEDGE)
+            else `uvm_error("E2E_TEST", $sformatf(
+                "posted status write was not visible to immediate read: got 0x%02h",
+                status))
+
+        test_tlm_unaligned_unified_mem_writes();
+        test_tlm_sparse_mem_byte_enables();
+        test_tlm_two_dw_endpoint_byte_enables();
+
         `uvm_info("E2E_TEST",
             $sformatf("Caps found: common_cfg(bar=%0d,off=0x%08h) notify(bar=%0d,off=0x%08h,mult=%0d) msix(%0d vectors)",
                       xport.cap_mgr.get_common_cfg_bar(),
@@ -766,6 +817,198 @@ class virtio_e2e_test extends uvm_test;
                       xport.cap_mgr.msix_table_size), UVM_LOW)
 
         `uvm_info("E2E_TEST", "Phase 1 complete: transport setup done", UVM_LOW)
+    endtask
+
+    // Exercise the production TLM write adapter against the endpoint's real
+    // unified-memory backend.  Both writes are single-DWord requests whose
+    // byte enables select only a subset of the payload lanes.
+    protected task test_tlm_unaligned_unified_mem_writes();
+        host_mem_manager endpoint_mem;
+        pcie_tl_ep_driver ep_drv;
+        virtio_tlm_bar_mem_wr_seq wr_seq;
+        bit [63:0] base;
+        byte seed_bytes[];
+        byte actual[];
+
+        endpoint_mem = host_mem_manager::type_id::create("unaligned_endpoint_mem");
+        endpoint_mem.init_region(64'h0000_0000, 64'h0000_FFFF);
+        base = endpoint_mem.alloc(8, .align(4));
+        seed_bytes = '{8'h10, 8'h11, 8'h12, 8'h13,
+                       8'h14, 8'h15, 8'h16, 8'h17};
+        endpoint_mem.write_mem(base, seed_bytes);
+
+        ep_drv = pcie_env.ep_agent.ep_driver;
+        ep_drv.mem = endpoint_mem;
+        ep_drv.use_unified_mem = 1;
+
+        // offset 2, 16-bit access: first_be=C selects lanes 2 and 3.
+        // The user data are right-justified, so the adapter must move AA/BB
+        // into those payload lanes while retaining the DWord-aligned address.
+        wr_seq = virtio_tlm_bar_mem_wr_seq::type_id::create("offset2_be_c_write");
+        wr_seq.addr = base + 2;
+        wr_seq.first_be = 4'hC;
+        wr_seq.last_be = 4'h0;
+        wr_seq.wdata = 32'h0000_BBAA;
+        wr_seq.start(pcie_env.rc_agent.sequencer);
+        #20ns;
+
+        endpoint_mem.read_mem(base, 8, actual);
+        assert((actual[0] == 8'h10) && (actual[1] == 8'h11) &&
+               (actual[2] == 8'hAA) && (actual[3] == 8'hBB) &&
+               (actual[4] == 8'h14) && (actual[5] == 8'h15) &&
+               (actual[6] == 8'h16) && (actual[7] == 8'h17))
+            else `uvm_error("E2E_TEST", $sformatf(
+                "offset-2 BE=C write corrupted endpoint memory: %p", actual))
+
+        // A partial first-DWord short write at an aligned address must update
+        // exactly its two enabled lanes and preserve the following lanes.
+        wr_seq = virtio_tlm_bar_mem_wr_seq::type_id::create("short_be_3_write");
+        wr_seq.addr = base + 4;
+        wr_seq.first_be = 4'h3;
+        wr_seq.last_be = 4'h0;
+        wr_seq.wdata = 32'h0000_2211;
+        wr_seq.start(pcie_env.rc_agent.sequencer);
+        #20ns;
+
+        endpoint_mem.read_mem(base, 8, actual);
+        assert((actual[0] == 8'h10) && (actual[1] == 8'h11) &&
+               (actual[2] == 8'hAA) && (actual[3] == 8'hBB) &&
+               (actual[4] == 8'h11) && (actual[5] == 8'h22) &&
+               (actual[6] == 8'h16) && (actual[7] == 8'h17))
+            else `uvm_error("E2E_TEST", $sformatf(
+                "single-DWord short write corrupted endpoint memory: %p", actual))
+
+        ep_drv.use_unified_mem = 0;
+        ep_drv.mem = null;
+        endpoint_mem.free(base);
+        `uvm_info("E2E_TEST", "test_tlm_unaligned_unified_mem_writes PASSED", UVM_LOW)
+    endtask
+
+    // The legacy sparse endpoint backend must use the same PCIe byte-enable
+    // semantics as unified memory.  This asserts the backend itself rather
+    // than relying on the scoreboard to infer the corruption later.
+    protected task test_tlm_sparse_mem_byte_enables();
+        pcie_tl_ep_driver ep_drv;
+        virtio_tlm_bar_mem_wr_seq wr_seq;
+        bit [63:0] base;
+
+        ep_drv = pcie_env.ep_agent.ep_driver;
+        ep_drv.use_unified_mem = 0;
+        ep_drv.mem = null;
+        base = BAR0_BASE + 32'h0000_6000;
+        ep_drv.mem_space[base]     = 8'h30;
+        ep_drv.mem_space[base + 1] = 8'h31;
+        ep_drv.mem_space[base + 2] = 8'h32;
+        ep_drv.mem_space[base + 3] = 8'h33;
+        ep_drv.mem_space[base + 4] = 8'h34;
+        ep_drv.mem_space[base + 5] = 8'h35;
+        ep_drv.mem_space[base + 6] = 8'h36;
+        ep_drv.mem_space[base + 7] = 8'h37;
+
+        wr_seq = virtio_tlm_bar_mem_wr_seq::type_id::create("sparse_offset2_be_c");
+        wr_seq.addr = base + 2;
+        wr_seq.first_be = 4'hC;
+        wr_seq.last_be = 4'h0;
+        wr_seq.wdata = 32'h0000_D4C3;
+        wr_seq.start(pcie_env.rc_agent.sequencer);
+        #20ns;
+
+        assert((ep_drv.mem_space[base]     == 8'h30) &&
+               (ep_drv.mem_space[base + 1] == 8'h31) &&
+               (ep_drv.mem_space[base + 2] == 8'hC3) &&
+               (ep_drv.mem_space[base + 3] == 8'hD4) &&
+               (ep_drv.mem_space[base + 4] == 8'h34) &&
+               (ep_drv.mem_space[base + 5] == 8'h35) &&
+               (ep_drv.mem_space[base + 6] == 8'h36) &&
+               (ep_drv.mem_space[base + 7] == 8'h37))
+            else `uvm_error("E2E_TEST", "sparse endpoint ignored BE=C lanes")
+
+        wr_seq = virtio_tlm_bar_mem_wr_seq::type_id::create("sparse_short_be_3");
+        wr_seq.addr = base + 4;
+        wr_seq.first_be = 4'h3;
+        wr_seq.last_be = 4'h0;
+        wr_seq.wdata = 32'h0000_A2A1;
+        wr_seq.start(pcie_env.rc_agent.sequencer);
+        #20ns;
+
+        assert((ep_drv.mem_space[base]     == 8'h30) &&
+               (ep_drv.mem_space[base + 1] == 8'h31) &&
+               (ep_drv.mem_space[base + 2] == 8'hC3) &&
+               (ep_drv.mem_space[base + 3] == 8'hD4) &&
+               (ep_drv.mem_space[base + 4] == 8'hA1) &&
+               (ep_drv.mem_space[base + 5] == 8'hA2) &&
+               (ep_drv.mem_space[base + 6] == 8'h36) &&
+               (ep_drv.mem_space[base + 7] == 8'h37))
+            else `uvm_error("E2E_TEST", "sparse endpoint corrupted disabled short-write lanes")
+
+        `uvm_info("E2E_TEST", "test_tlm_sparse_mem_byte_enables PASSED", UVM_LOW)
+    endtask
+
+    // Exercise a genuine two-DWord PCIe Memory Write through the RC->EP TLM
+    // path. BE=5/A updates only lanes 0/2 of the first DWord and lanes 1/3
+    // of the last DWord; each disabled lane must retain its seeded value.
+    // Run the exact packet against both endpoint storage implementations.
+    protected task test_tlm_two_dw_endpoint_byte_enables();
+        host_mem_manager endpoint_mem;
+        pcie_tl_ep_driver ep_drv;
+        virtio_tlm_two_dw_mem_wr_seq wr_seq;
+        bit [63:0] unified_base;
+        bit [63:0] sparse_base;
+        byte seed[];
+        byte expected[];
+        byte actual[];
+
+        seed = '{8'h10, 8'h11, 8'h12, 8'h13,
+                 8'h14, 8'h15, 8'h16, 8'h17};
+        expected = '{8'hA0, 8'h11, 8'hA2, 8'h13,
+                     8'h14, 8'hB1, 8'h16, 8'hB3};
+
+        ep_drv = pcie_env.ep_agent.ep_driver;
+        endpoint_mem = host_mem_manager::type_id::create("two_dw_endpoint_mem");
+        endpoint_mem.init_region(64'h0000_0000, 64'h0000_FFFF);
+        unified_base = endpoint_mem.alloc(8, .align(4));
+        endpoint_mem.write_mem(unified_base, seed);
+        ep_drv.mem = endpoint_mem;
+        ep_drv.use_unified_mem = 1;
+
+        wr_seq = virtio_tlm_two_dw_mem_wr_seq::type_id::create("two_dw_unified_write");
+        wr_seq.addr = unified_base;
+        wr_seq.first_be = 4'h5;
+        wr_seq.last_be = 4'hA;
+        wr_seq.write_bytes = '{8'hA0, 8'hA1, 8'hA2, 8'hA3,
+                               8'hB0, 8'hB1, 8'hB2, 8'hB3};
+        wr_seq.start(pcie_env.rc_agent.sequencer);
+        #20ns;
+
+        endpoint_mem.read_mem(unified_base, 8, actual);
+        foreach (expected[i])
+            assert(actual[i] == expected[i])
+                else `uvm_error("E2E_TEST", $sformatf(
+                    "unified two-DWord BE=5/A lane %0d got 0x%02h expected 0x%02h",
+                    i, actual[i], expected[i]))
+
+        sparse_base = BAR0_BASE + 32'h0000_7000;
+        ep_drv.use_unified_mem = 0;
+        ep_drv.mem = null;
+        foreach (seed[i]) ep_drv.mem_space[sparse_base + i] = seed[i];
+
+        wr_seq = virtio_tlm_two_dw_mem_wr_seq::type_id::create("two_dw_sparse_write");
+        wr_seq.addr = sparse_base;
+        wr_seq.first_be = 4'h5;
+        wr_seq.last_be = 4'hA;
+        wr_seq.write_bytes = '{8'hA0, 8'hA1, 8'hA2, 8'hA3,
+                               8'hB0, 8'hB1, 8'hB2, 8'hB3};
+        wr_seq.start(pcie_env.rc_agent.sequencer);
+        #20ns;
+
+        foreach (expected[i])
+            assert(ep_drv.mem_space[sparse_base + i] == expected[i])
+                else `uvm_error("E2E_TEST", $sformatf(
+                    "sparse two-DWord BE=5/A lane %0d got 0x%02h expected 0x%02h",
+                    i, ep_drv.mem_space[sparse_base + i], expected[i]))
+
+        endpoint_mem.free(unified_base);
+        `uvm_info("E2E_TEST", "test_tlm_two_dw_endpoint_byte_enables PASSED", UVM_LOW)
     endtask
 
     // ========================================================================
@@ -912,6 +1155,7 @@ class virtio_e2e_test extends uvm_test;
         virtio_atomic_ops ops;
         int unsigned tx_qid;
         int unsigned num_tx_packets;
+        int unsigned q_noff;
         bit [63:0] bar_base_addr;
 
         `uvm_info("E2E_TEST", "----- Phase 3: Dataplane -----", UVM_LOW)
@@ -960,6 +1204,54 @@ class virtio_e2e_test extends uvm_test;
                     $sformatf("Queue %0d setup: desc=0x%016h avail=0x%016h used=0x%016h",
                               q, desc_addr, avail_addr, used_addr), UVM_LOW)
             end
+        end
+
+        // The public PCIe path must use the notification capability's BAR and
+        // per-queue offset.  NOTIFICATION_DATA was not negotiated, so each
+        // write carries the 16-bit queue number and its byte enables reflect
+        // that write's offset within the containing DWord.
+        // Re-read queue offsets after setup: the simple EP memory model shares
+        // neighboring common-config bytes, so the setup writes above may have
+        // overwritten the pre-populated queue_notify_off field.
+        for (int q = 0; q < 2; q++) begin
+            xport.select_queue(q);
+            write_ep_mem16(pcie_env.ep_agent.ep_driver,
+                bar_base_addr + COMMON_CFG_OFF + 32'h1E, q[15:0]);
+            xport.read_queue_notify_off(q_noff);
+            assert(q_noff == q)
+                else `uvm_fatal("E2E_TEST", $sformatf(
+                    "queue %0d notify_off discovery mismatch: got %0d", q, q_noff))
+            xport.queue_notify_off[q] = q_noff;
+        end
+
+        virtio_e2e_mem_wr_seq::begin_write_capture(
+            BAR2_BASE + xport.cap_mgr.get_notify_bar_offset(xport.queue_notify_off[0]),
+            4'h3, 32'h0000_0000);
+        xport.kick(0, 1, 0);
+        virtio_e2e_mem_wr_seq::end_write_capture();
+        if (virtio_e2e_mem_wr_seq::captured_write_count != 1) begin
+            `uvm_fatal("E2E_TEST", $sformatf(
+                "expected one queue-0 notify write, received %0d",
+                virtio_e2e_mem_wr_seq::captured_write_count))
+        end
+        if (!virtio_e2e_mem_wr_seq::captured_writes_match) begin
+            `uvm_fatal("E2E_TEST",
+                "queue-0 notify did not use the discovered BAR2 capability address/data")
+        end
+
+        virtio_e2e_mem_wr_seq::begin_write_capture(
+            BAR2_BASE + xport.cap_mgr.get_notify_bar_offset(xport.queue_notify_off[1]),
+            4'hC, 32'h0000_0001);
+        xport.kick(1, 1, 0);
+        virtio_e2e_mem_wr_seq::end_write_capture();
+        if (virtio_e2e_mem_wr_seq::captured_write_count != 1) begin
+            `uvm_fatal("E2E_TEST", $sformatf(
+                "expected one queue-1 notify write, received %0d",
+                virtio_e2e_mem_wr_seq::captured_write_count))
+        end
+        if (!virtio_e2e_mem_wr_seq::captured_writes_match) begin
+            `uvm_fatal("E2E_TEST",
+                "queue-1 notify did not use the discovered BAR2 capability address/data")
         end
 
         // Step 2: Read Device Config (generates PCIe Memory Read TLPs)
@@ -1025,7 +1317,7 @@ class virtio_e2e_test extends uvm_test;
             begin
                 bit [63:0] notify_addr;
                 bit [31:0] notify_data;
-                notify_addr = BAR0_BASE + NOTIFY_OFF
+                notify_addr = BAR2_BASE + NOTIFY_OFF
                             + (tx_qid * NOTIFY_OFF_MULTIPLIER);
                 notify_data = read_ep_mem32(pcie_env.ep_agent.ep_driver,
                                             notify_addr);
