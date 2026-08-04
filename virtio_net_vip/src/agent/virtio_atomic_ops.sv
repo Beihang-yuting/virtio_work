@@ -393,7 +393,8 @@ class virtio_atomic_ops extends uvm_object;
         // source IOVA order. Remove the numeric positions from highest to
         // lowest so deleting one temporary record cannot shift another
         // claimed record before it is removed.
-        claim_indices.sort();
+        if (claim_indices.size() > 1)
+            claim_indices.sort();
         for (int i = claim_indices.size(); i > 0; i--)
             migration_restore_dma.delete(claim_indices[i - 1]);
         return 1;
