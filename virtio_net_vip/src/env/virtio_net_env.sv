@@ -309,9 +309,10 @@ class virtio_net_env extends uvm_env;
 
     endfunction
 
-    // Bind one RC sequencer and one completion adapter to all live functions.
-    // Fabric topology owns independent PF and VF functions, so it must not be
-    // reduced to the compatibility vf_instances view.
+    // Bind one required RC sequencer and optional TLM completion adapter to
+    // all live functions. Fabric topology owns independent PF and VF
+    // functions, so it must not be reduced to the compatibility vf_instances
+    // view.
     virtual function void bind_pcie(
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
         input virtio_tlm_completion_adapter tlm_adapter = null,
@@ -322,8 +323,8 @@ class virtio_net_env extends uvm_env;
             `uvm_fatal("VIRTIO_ENV", "bind_pcie() received a null PCIe RC sequencer")
         end
 
-        // The adapter owns the factory-created RC shim.  Bind and validate it
-        // here so callers need only this public environment API.
+        // A non-null adapter owns the factory-created RC shim. Bind and
+        // validate that shim only when the caller supplies the adapter.
         if (tlm_adapter != null)
             tlm_adapter.bind_registered_rc_driver();
         v_seqr.pcie_rc_seqr = pcie_rc_seqr;
