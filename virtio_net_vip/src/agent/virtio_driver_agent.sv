@@ -65,31 +65,19 @@ class virtio_driver_agent extends uvm_agent;
     endfunction
 
     // ========================================================================
-    // Connect Phase
-    //
-    // Connects driver to sequencer and injects shared component references
-    // into the driver and monitor.
+    // Apply the latest shared references to the active driver and monitor.
+    // This is invoked again at start_of_simulation so parent connect_phase
+    // late bindings are propagated after child connect_phase has completed.
     // ========================================================================
 
-    virtual function void connect_phase(uvm_phase phase);
-        super.connect_phase(phase);
-
+    function void apply_component_bindings();
         if (get_is_active() == UVM_ACTIVE) begin
-            // Connect driver's seq_item_port to sequencer's export
-            driver.seq_item_port.connect(sequencer.seq_item_export);
-
-            // Inject shared component references into driver
             if (ops != null)
                 driver.ops = ops;
-
             if (fsm != null)
                 driver.fsm = fsm;
         end
 
-        // Inject transport and vq_mgr references into monitor
-        // These are typically set by the env after agent construction:
-        //   agent.monitor.transport = env.transport;
-        //   agent.monitor.vq_mgr   = env.vq_mgr;
         if (ops != null) begin
             if (monitor.transport == null && ops.transport != null)
                 monitor.transport = ops.transport;
@@ -100,13 +88,30 @@ class virtio_driver_agent extends uvm_agent;
         observer.monitor = monitor;
     endfunction
 
+    // ========================================================================
+    // Connect Phase
+    //
+    // Connects the active driver to its sequencer, then applies the shared
+    // component references available at this phase.
+    // ========================================================================
+
+    virtual function void connect_phase(uvm_phase phase);
+        super.connect_phase(phase);
+
+        if (get_is_active() == UVM_ACTIVE)
+            driver.seq_item_port.connect(sequencer.seq_item_export);
+
+        apply_component_bindings();
+    endfunction
+
     virtual function void start_of_simulation_phase(uvm_phase phase);
         super.start_of_simulation_phase(phase);
         if (get_is_active() == UVM_ACTIVE) begin
-            if (ops == null)
+            apply_component_bindings();
+            if ((driver == null) || (driver.ops == null))
                 `uvm_error("VIRTIO_AGENT",
                     "active driver has no virtio_atomic_ops binding")
-            if (fsm == null)
+            if ((driver == null) || (driver.fsm == null))
                 `uvm_error("VIRTIO_AGENT",
                     "active driver has no virtio_auto_fsm binding")
         end

@@ -120,6 +120,9 @@ class virtio_unit_test extends uvm_test;
 
     pcie_tl_scoreboard be_scb;
     virtio_tlm_rc_driver_shim completion_shim;
+    virtio_driver_agent late_binding_agent;
+    virtio_atomic_ops late_binding_ops;
+    virtio_auto_fsm late_binding_fsm;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -130,6 +133,20 @@ class virtio_unit_test extends uvm_test;
         be_scb = pcie_tl_scoreboard::type_id::create("be_scb", this);
         completion_shim = virtio_tlm_rc_driver_test_shim::type_id::create(
             "completion_shim", this);
+        late_binding_ops = virtio_atomic_ops::type_id::create(
+            "late_binding_ops");
+        late_binding_fsm = virtio_auto_fsm::type_id::create(
+            "late_binding_fsm");
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "late_binding_agent", "is_active", UVM_ACTIVE);
+        late_binding_agent = virtio_driver_agent::type_id::create(
+            "late_binding_agent", this);
+    endfunction
+
+    virtual function void connect_phase(uvm_phase phase);
+        super.connect_phase(phase);
+        late_binding_agent.ops = late_binding_ops;
+        late_binding_agent.fsm = late_binding_fsm;
     endfunction
 
     virtual task run_phase(uvm_phase phase);
@@ -144,9 +161,18 @@ class virtio_unit_test extends uvm_test;
         test_tlm_completion_matcher();
         test_tlm_config_write_completion_lifecycle();
         test_tlm_completion_factory_owner();
+        test_late_driver_agent_binding();
 
         `uvm_info("UNIT_TEST", "All unit tests PASSED", UVM_NONE)
         phase.drop_objection(this);
+    endtask
+
+    task test_late_driver_agent_binding();
+        assert(late_binding_agent.driver.ops == late_binding_ops)
+            else `uvm_error("TEST", "late-bound ops did not reach active driver")
+        assert(late_binding_agent.driver.fsm == late_binding_fsm)
+            else `uvm_error("TEST", "late-bound fsm did not reach active driver")
+        `uvm_info("UNIT_TEST", "test_late_driver_agent_binding PASSED", UVM_LOW)
     endtask
 
     // Test 1: host_mem alloc/write/read/free

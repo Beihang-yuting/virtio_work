@@ -156,6 +156,8 @@ class virtio_dual_test extends uvm_test;
         barrier_a   = virtio_memory_barrier_model::type_id::create("barrier_a");
         err_inj_a   = virtqueue_error_injector::type_id::create("err_inj_a");
         ops_a       = virtio_atomic_ops::type_id::create("ops_a");
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "binding_function_a.driver_agent", "is_active", UVM_PASSIVE);
         binding_function_a = virtio_function_instance::type_id::create(
             "binding_function_a", this);
 
@@ -168,6 +170,8 @@ class virtio_dual_test extends uvm_test;
         barrier_b   = virtio_memory_barrier_model::type_id::create("barrier_b");
         err_inj_b   = virtqueue_error_injector::type_id::create("err_inj_b");
         ops_b       = virtio_atomic_ops::type_id::create("ops_b");
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "binding_function_b.driver_agent", "is_active", UVM_PASSIVE);
         binding_function_b = virtio_function_instance::type_id::create(
             "binding_function_b", this);
 
