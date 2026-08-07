@@ -46,8 +46,12 @@ if [[ "$summary_count" -ne 1 ]]; then
 fi
 
 for severity in UVM_WARNING UVM_ERROR UVM_FATAL; do
-  count="$(awk -v key="$severity" '$1 == key && $2 == ":" {value=$3} END {print value}' <<<"$log_text")"
-  if [[ -z "$count" || "$count" != "0" ]]; then
+  read -r row_count count < <(
+    awk -v key="$severity" \
+      '$1 == key && $2 == ":" {row_count++; value=$3} END {print row_count, value}' \
+      <<<"$log_text"
+  )
+  if [[ "$row_count" != "1" || ! "$count" =~ ^0$ ]]; then
     echo "$severity count is ${count:-missing}" >&2
     exit 1
   fi
