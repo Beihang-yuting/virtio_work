@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "$script_dir/.." && pwd)"
+source "$root_dir/scripts/test_manifest.sh"
 
 if [[ -z "${VCS_HOME:-}" ]]; then
   echo "VCS_HOME is not set; source the VCS environment before running VCS" >&2
@@ -32,14 +33,10 @@ case "$#" in
 esac
 
 TEST="${TEST:-}"
-case "$TEST" in
-  virtio_unit_test|virtio_fabric_resource_test|virtio_stress_unit_test|virtio_protocol_test|virtio_indirect_desc_test|virtio_admin_vq_test|virtio_pf_lifecycle_reset_test|virtio_monitor_test|virtio_coverage_test|virtio_monitor_routing_test|virtio_migration_dirty_test|virtio_e2e_test|virtio_full_integration_test|virtio_dual_test|dpu_resource_manager_test)
-    ;;
-  *)
-    echo "unsupported TEST: $TEST" >&2
-    exit 2
-    ;;
-esac
+if ! is_virtio_maintained_test "$TEST"; then
+  echo "unsupported TEST: $TEST" >&2
+  exit 2
+fi
 
 "$root_dir/scripts/check_deps.sh"
 cd "$root_dir"
@@ -53,10 +50,6 @@ vcs_args=(
   -f "$root_dir/filelists/dpu_common.f"
   -f "$root_dir/filelists/virtio_net.f"
 )
-
-if [[ "$TEST" == "dpu_resource_manager_test" ]]; then
-  vcs_args+=(-f "$root_dir/filelists/dpu_red_tests.f")
-fi
 
 vcs_args+=(
   -f "$root_dir/filelists/tests.f"
