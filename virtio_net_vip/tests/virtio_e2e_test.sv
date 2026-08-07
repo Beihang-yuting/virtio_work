@@ -240,6 +240,8 @@ class virtio_e2e_test extends uvm_test;
     pcie_tl_env_config    pcie_cfg;
     virtio_net_env_config virtio_cfg;
 
+    protected bit [63:0] e2e_host_allocations[$];
+
     // ===== Test parameters =====
     localparam bit [63:0] BAR0_BASE       = 64'h0000_0000_C000_0000;
     localparam bit [31:0] BAR0_SIZE       = 32'h0001_0000;  // 64KB
@@ -710,6 +712,17 @@ class virtio_e2e_test extends uvm_test;
         return data;
     endfunction
 
+    protected function void track_e2e_allocation(bit [63:0] addr);
+        if (addr != '1)
+            e2e_host_allocations.push_back(addr);
+    endfunction
+
+    protected function void release_e2e_allocations();
+        for (int index = e2e_host_allocations.size(); index > 0; index--)
+            virtio_env.host_mem.free(e2e_host_allocations[index - 1]);
+        e2e_host_allocations.delete();
+    endfunction
+
     // ========================================================================
     // Run Phase -- Execute the End-to-End Test
     // ========================================================================
@@ -730,6 +743,8 @@ class virtio_e2e_test extends uvm_test;
 
         // Phase 3: Queue setup and TX packet submission
         phase3_dataplane();
+
+        release_e2e_allocations();
 
         // Phase 4: Verification
         phase4_verify();
@@ -1184,6 +1199,10 @@ class virtio_e2e_test extends uvm_test;
                         $sformatf("Failed to allocate ring memory for queue %0d", q))
                 end
 
+                track_e2e_allocation(desc_addr);
+                track_e2e_allocation(avail_addr);
+                track_e2e_allocation(used_addr);
+
                 // Initialize ring memory to zeros
                 begin
                     byte zeros[];
@@ -1300,6 +1319,8 @@ class virtio_e2e_test extends uvm_test;
                         $sformatf("Failed to allocate TX buffer for packet %0d", p))
                     continue;
                 end
+
+                track_e2e_allocation(buf_addr);
 
                 // Write packet data to host memory
                 virtio_env.host_mem.write_mem(buf_addr, pkt_data);
