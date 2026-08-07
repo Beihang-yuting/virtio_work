@@ -8,15 +8,11 @@ import virtio_net_pkg::*;
 // ============================================================================
 // virtio_smoke_test
 //
-// Smoke test: runs the virtio_smoke_vseq virtual sequence for a minimal
-// end-to-end init -> traffic -> reset flow on VF 0 (or PF in pure PF mode).
-//
-// Depends on:
-//   - virtio_base_test
-//   - virtio_smoke_vseq
+// Maintained bounded TLM/model integration smoke. This test exercises the
+// model-backed PCIe transport and does not prove behavior through a real DUT.
 // ============================================================================
 
-class virtio_smoke_test extends virtio_base_test;
+class virtio_smoke_test extends virtio_e2e_test;
     `uvm_component_utils(virtio_smoke_test)
 
     function new(string name, uvm_component parent);
@@ -24,13 +20,27 @@ class virtio_smoke_test extends virtio_base_test;
     endfunction
 
     virtual task run_phase(uvm_phase phase);
-        virtio_smoke_vseq vseq = virtio_smoke_vseq::type_id::create("vseq");
-        phase.raise_objection(this);
+        virtio_pci_transport xport;
+        bit [7:0] status;
 
-        vseq.vf_seqr = env.vf_instances[0].driver_agent.sequencer;
-        vseq.start(env.v_seqr);
+        phase.raise_objection(this, "virtio smoke running");
+        #200ns;
 
-        phase.drop_objection(this);
+        phase1_setup_transport();
+        phase2_virtio_init();
+
+        xport = virtio_env.vf_instances[0].transport;
+        xport.write_device_status(DEV_STATUS_RESET);
+        xport.read_device_status(status);
+        assert (status == DEV_STATUS_RESET)
+        else
+            `uvm_fatal("SMOKE_TEST", $sformatf(
+                "device reset did not clear status: 0x%02h", status))
+
+        release_e2e_allocations();
+        phase4_verify();
+
+        phase.drop_objection(this, "virtio smoke done");
     endtask
 
 endclass : virtio_smoke_test

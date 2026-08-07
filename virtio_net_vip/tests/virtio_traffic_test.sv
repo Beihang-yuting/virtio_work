@@ -8,9 +8,9 @@ import virtio_net_pkg::*;
 // ============================================================================
 // virtio_traffic_test
 //
-// Standalone temporary test file for large-traffic and protocol integrity
-// testing. NOT part of the main package or git. Uses direct host_mem access
-// and device simulation (no real DUT).
+// Maintained bounded direct-memory traffic regression. It uses host-memory
+// models and device simulation to exercise traffic behavior; it does not
+// represent traffic through a real DUT.
 //
 // Tests:
 //   1. test_large_traffic       — 1000 packet TX/RX loopback
