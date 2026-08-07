@@ -65,6 +65,26 @@ class virtio_monitor_routing_protocol_sva_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_monitor_routing_protocol_sva_catcher
 
+// Queue-reset negative traffic intentionally generates only the disabled
+// queue-notify SVA.  Keep that expected diagnostic scoped to this subtest.
+class virtio_monitor_routing_disabled_notify_sva_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "virtio_monitor_routing_disabled_notify_sva_catcher");
+        super.new(name);
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) &&
+            (get_id() == "VIRTIO_PROTOCOL_SVA") &&
+            (get_message() == "notify observed for a disabled queue")) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_monitor_routing_disabled_notify_sva_catcher
+
 // Exercises the public virtio_net_env PCIe binding with two Fabric functions.
 // A TLP emitted on the external endpoint monitor is addressed only by the PF
 // BAR range; the VF must neither observe it nor classify it as DMA.
@@ -321,15 +341,10 @@ class virtio_monitor_routing_test extends uvm_test;
         pf.driver_agent.monitor.reset_protocol_state();
         vf.driver_agent.monitor.reset_protocol_state();
 
-        // The routed PF reset and two MSI-X events above remain staged until
-        // a negedge release.  reset_protocol_state() adds one reset pulse per
-        // function, so four release/sample pairs drain every known PF pulse
-        // before this test establishes its local checker baseline.
-        repeat (4) begin
-            @(negedge virtio_tb_top.clk);
-            @(posedge virtio_tb_top.clk);
-            #1step;
-        end
+        // The routed PF reset and reset_protocol_state() pulses are staged.
+        // MSI-X observations only add a pulse for queue completions, so drain
+        // the actual PF/VF queue contents rather than assuming a fixed depth.
+        drain_staged_protocol_pulses(pf_protocol_vif, vf_protocol_vif);
         pf_protocol_vif.protocol_error_count = 0;
         vf_protocol_vif.protocol_error_count = 0;
         pf_protocol_vif.assertions_enable = 1;
@@ -378,13 +393,23 @@ class virtio_monitor_routing_test extends uvm_test;
         input virtio_function_instance pf
     );
         virtio_monitor_routing_error_catcher error_catcher;
+        virtio_monitor_routing_disabled_notify_sva_catcher sva_catcher;
+        virtual virtio_protocol_event_if protocol_vif;
+        int unsigned protocol_errors_before;
 
         // Do not let an uninstantiated functional virtqueue reject the notify
         // for us; this test isolates observer/monitor reset state.
         pf.driver_agent.monitor.vq_mgr = null;
-        pf.driver_agent.monitor.protocol_vif.assertions_enable = 0;
+        protocol_vif = pf.driver_agent.monitor.protocol_vif;
+        assert(protocol_vif != null)
+            else `uvm_fatal("ROUTING_TEST",
+                "queue-reset test requires a protocol event interface")
+        protocol_vif.assertions_enable = 1;
         error_catcher = new();
+        sva_catcher = new();
+        protocol_errors_before = protocol_vif.protocol_error_count;
         uvm_report_cb::add(null, error_catcher);
+        uvm_report_cb::add(null, sva_catcher);
 
         configure_and_enable_queue(pf, 3);
         emit_common_write(pf, VIRTIO_PCI_COMMON_Q_RESET, 32'h1);
@@ -408,7 +433,45 @@ class virtio_monitor_routing_test extends uvm_test;
             else `uvm_fatal("ROUTING_TEST",
                 "adapter kept queue configuration after device reset")
 
+        drain_staged_protocol_pulses(protocol_vif, null);
+        assert(sva_catcher.caught_count == 2)
+            else `uvm_fatal("ROUTING_TEST", $sformatf(
+                "expected two scoped disabled-notify SVA reports, saw %0d",
+                sva_catcher.caught_count))
+        assert(protocol_vif.protocol_error_count == (protocol_errors_before + 2))
+            else `uvm_fatal("ROUTING_TEST", $sformatf(
+                "expected two disabled-notify protocol errors, saw %0d -> %0d",
+                protocol_errors_before, protocol_vif.protocol_error_count))
+
+        uvm_report_cb::delete(null, sva_catcher);
         uvm_report_cb::delete(null, error_catcher);
+    endtask
+
+    // Each interface releases at most one staged pulse on a negedge.  Capture
+    // the exact pending depth first, then fail rather than spinning if a new
+    // callback prevents these known pre-baseline events from draining.
+    protected task drain_staged_protocol_pulses(
+        input virtual virtio_protocol_event_if pf_protocol_vif,
+        input virtual virtio_protocol_event_if vf_protocol_vif
+    );
+        int unsigned pending_pulses;
+        int unsigned release_count;
+
+        pending_pulses = pf_protocol_vif.staged_pulses.size();
+        if (vf_protocol_vif != null)
+            pending_pulses += vf_protocol_vif.staged_pulses.size();
+        while ((pf_protocol_vif.staged_pulses.size() != 0) ||
+               ((vf_protocol_vif != null) &&
+                (vf_protocol_vif.staged_pulses.size() != 0))) begin
+            assert(release_count < pending_pulses)
+                else `uvm_fatal("ROUTING_TEST", $sformatf(
+                    "staged protocol pulses grew while draining (%0d releases, %0d initial)",
+                    release_count, pending_pulses))
+            @(negedge virtio_tb_top.clk);
+            @(posedge virtio_tb_top.clk);
+            #1step;
+            release_count++;
+        end
     endtask
 
     protected task configure_and_enable_queue(
