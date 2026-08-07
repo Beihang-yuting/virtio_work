@@ -61,7 +61,8 @@ class virtio_concurrency_controller extends uvm_object;
         ref bit results[]
     );
         int unsigned num_vfs = vf_ids.size();
-        results = new[num_vfs];
+        bit worker_results[];
+        worker_results = new[num_vfs];
 
         `uvm_info("CONC_CTRL",
             $sformatf("parallel_vf_op: op=%s, num_vfs=%0d, timeout=%0dns",
@@ -78,29 +79,29 @@ class virtio_concurrency_controller extends uvm_object;
                         case (op)
                             VIO_TXN_INIT: begin
                                 vf_instances[vf_id].init(vf_instances[vf_id].drv_cfg);
-                                results[idx] = 1;
+                                worker_results[idx] = 1;
                             end
                             VIO_TXN_SHUTDOWN: begin
                                 vf_instances[vf_id].shutdown();
-                                results[idx] = 1;
+                                worker_results[idx] = 1;
                             end
                             VIO_TXN_RESET: begin
                                 if (vf_instances[vf_id].driver_agent.ops != null) begin
                                     vf_instances[vf_id].driver_agent.ops.device_reset();
-                                    results[idx] = 1;
+                                    worker_results[idx] = 1;
                                 end
                             end
                             default: begin
                                 `uvm_warning("CONC_CTRL",
                                     $sformatf("parallel_vf_op: unsupported op=%s for VF%0d",
                                               op.name(), vf_id))
-                                results[idx] = 0;
+                                worker_results[idx] = 0;
                             end
                         endcase
                     end else begin
                         `uvm_warning("CONC_CTRL",
                             $sformatf("parallel_vf_op: VF%0d not available", vf_id))
-                        results[idx] = 0;
+                        worker_results[idx] = 0;
                     end
                 end
             join_none
@@ -118,6 +119,7 @@ class virtio_concurrency_controller extends uvm_object;
             end
         join_any
         disable parallel_vf_op_wait;
+        results = worker_results;
 
         `uvm_info("CONC_CTRL",
             $sformatf("parallel_vf_op: complete, op=%s", op.name()),
@@ -143,7 +145,8 @@ class virtio_concurrency_controller extends uvm_object;
     );
         int unsigned num_vfs = vf_ids.size();
         int unsigned timeout_ns;
-        actual_sent = new[num_vfs];
+        int unsigned worker_actual_sent[];
+        worker_actual_sent = new[num_vfs];
 
         if (wait_pol != null)
             timeout_ns = wait_pol.effective_timeout(wait_pol.default_timeout_ns) * pkts_per_vf;
@@ -161,7 +164,7 @@ class virtio_concurrency_controller extends uvm_object;
 
             fork : parallel_traffic_block
                 begin
-                    actual_sent[idx] = 0;
+                    worker_actual_sent[idx] = 0;
 
                     if (vf_id < vf_instances.size() && vf_instances[vf_id] != null) begin
                         // Traffic generation is done via sequences in Phase 9.
@@ -172,7 +175,7 @@ class virtio_concurrency_controller extends uvm_object;
                                       vf_id, target_pkts),
                             UVM_HIGH)
                         // Placeholder: actual traffic driven by sequences
-                        actual_sent[idx] = target_pkts;
+                        worker_actual_sent[idx] = target_pkts;
                     end
                 end
             join_none
@@ -189,6 +192,7 @@ class virtio_concurrency_controller extends uvm_object;
             end
         join_any
         disable parallel_traffic_wait;
+        actual_sent = worker_actual_sent;
 
         `uvm_info("CONC_CTRL", "parallel_traffic: complete", UVM_LOW)
     endtask

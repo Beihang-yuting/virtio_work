@@ -82,7 +82,7 @@ class virtio_dynamic_reconfig extends uvm_object;
         // Send control command via atomic ops
         if (vf.driver_agent.ops != null) begin
             vf.driver_agent.ops.ctrl_send(
-                VIRTIO_NET_CTRL_MQ,
+                VIRTIO_NET_CTRL_CLS_MQ,
                 VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
                 ctrl_data,
                 result
@@ -275,7 +275,7 @@ class virtio_dynamic_reconfig extends uvm_object;
 
         if (vf.driver_agent.ops != null) begin
             vf.driver_agent.ops.ctrl_send(
-                VIRTIO_NET_CTRL_MAC,
+                VIRTIO_NET_CTRL_CLS_MAC,
                 VIRTIO_NET_CTRL_MAC_ADDR_SET,
                 ctrl_data,
                 result
@@ -330,7 +330,7 @@ class virtio_dynamic_reconfig extends uvm_object;
 
         if (vf.driver_agent.ops != null) begin
             vf.driver_agent.ops.ctrl_send(
-                VIRTIO_NET_CTRL_VLAN,
+                VIRTIO_NET_CTRL_CLS_VLAN,
                 cmd,
                 ctrl_data,
                 result

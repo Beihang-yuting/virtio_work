@@ -249,11 +249,20 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
 
         mem.init_region(64'h6100_0000, 64'h6100_FFFF);
         wait_pol.default_poll_interval_ns = 10;
-        cfg = '{default: 0};
         cfg.num_queue_pairs = 1;
         cfg.queue_size = 8;
+        cfg.vq_type = VQ_SPLIT;
+        cfg.driver_features = '0;
+        cfg.rx_buf_mode = RX_MODE_MERGEABLE;
+        cfg.rx_buf_size = 0;
         cfg.rx_refill_threshold = 1;
         cfg.irq_mode = IRQ_MSIX_PER_QUEUE;
+        cfg.napi_budget = 0;
+        cfg.coal_max_packets = 0;
+        cfg.coal_max_usecs = 0;
+        cfg.bw_limit_enable = 0;
+        cfg.bw_limit_mbps = 0;
+        cfg.mode = DRV_MODE_AUTO;
 
         pf_function.function_kind = DPU_FUNCTION_PF;
         pf_function.state = VF_ACTIVE;

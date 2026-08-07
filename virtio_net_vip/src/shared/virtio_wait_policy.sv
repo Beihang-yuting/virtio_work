@@ -147,19 +147,21 @@ class virtio_wait_policy extends uvm_object;
         ref bit      triggered
     );
         int unsigned eff_timeout;
+        bit          event_triggered;
         eff_timeout = effective_timeout(timeout_ns);
-        triggered   = 0;
+        event_triggered = 0;
 
         fork : wait_evt_blk
             begin : evt_arm
                 evt.wait_trigger();
-                triggered = 1;
+                event_triggered = 1;
             end
             begin : timeout_arm
                 #(eff_timeout * 1ns);
             end
         join_any
         disable wait_evt_blk;
+        triggered = event_triggered;
 
         if (!triggered) begin
             `uvm_error("WAIT_POLICY",
