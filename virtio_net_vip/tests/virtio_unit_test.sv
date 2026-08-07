@@ -31,6 +31,18 @@ class virtio_tlm_rc_driver_test_shim extends virtio_tlm_rc_driver_shim;
     endfunction
 endclass : virtio_tlm_rc_driver_test_shim
 
+class virtio_completion_ep_driver_test_shim extends pcie_tl_ep_driver;
+    `uvm_component_utils(virtio_completion_ep_driver_test_shim)
+
+    function new(string name = "virtio_completion_ep_driver_test_shim",
+                 uvm_component parent = null);
+        super.new(name, parent);
+    endfunction
+
+    virtual task run_phase(uvm_phase phase);
+    endtask
+endclass : virtio_completion_ep_driver_test_shim
+
 class virtio_tlm_adapter_owner_catcher extends uvm_report_catcher;
     bit caught;
 
@@ -119,6 +131,7 @@ class virtio_unit_test extends uvm_test;
     `uvm_component_utils(virtio_unit_test)
 
     pcie_tl_scoreboard be_scb;
+    virtio_completion_ep_driver_test_shim completion_ep_driver;
     virtio_tlm_rc_driver_shim completion_shim;
     virtio_driver_agent late_binding_agent;
     virtio_atomic_ops late_binding_ops;
@@ -131,6 +144,8 @@ class virtio_unit_test extends uvm_test;
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
         be_scb = pcie_tl_scoreboard::type_id::create("be_scb", this);
+        completion_ep_driver = virtio_completion_ep_driver_test_shim::type_id::create(
+            "completion_ep_driver", this);
         completion_shim = virtio_tlm_rc_driver_test_shim::type_id::create(
             "completion_shim", this);
         late_binding_ops = virtio_atomic_ops::type_id::create(
@@ -157,6 +172,7 @@ class virtio_unit_test extends uvm_test;
         test_split_virtqueue();
         test_wait_policy();
         test_pcie_scoreboard_byte_enables();
+        test_ep_config_read_completion_metadata();
         test_tlm_completion_reject_filter();
         test_tlm_completion_matcher();
         test_tlm_config_write_completion_lifecycle();
@@ -426,6 +442,29 @@ class virtio_unit_test extends uvm_test;
                 scb.matched))
 
         `uvm_info("UNIT_TEST", "test_pcie_scoreboard_byte_enables PASSED", UVM_LOW)
+    endtask
+
+    task test_ep_config_read_completion_metadata();
+        pcie_tl_cfg_tlp req;
+        pcie_tl_cpl_tlp cpl;
+
+        req = pcie_tl_cfg_tlp::type_id::create("config_read_req");
+        req.kind = TLP_CFG_RD0;
+        req.fmt = FMT_3DW_NO_DATA;
+        req.type_f = TLP_TYPE_CFG_RD0;
+        req.length = 10'd1;
+        req.requester_id = 16'h0100;
+        req.tag = 10'h055;
+        req.first_be = 4'hF;
+
+        cpl = completion_ep_driver.generate_completion(req, CPL_STATUS_SC);
+
+        assert(cpl.byte_count == 12'd4)
+            else `uvm_error("TEST", $sformatf(
+                "config-read completion byte_count expected 4 got %0d",
+                cpl.byte_count))
+
+        `uvm_info("UNIT_TEST", "test_ep_config_read_completion_metadata PASSED", UVM_LOW)
     endtask
 
     // The TLM shim must preserve the RC driver's authoritative completion

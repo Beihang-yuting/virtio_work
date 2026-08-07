@@ -10,7 +10,7 @@ submodules=(
   "virtio_net_vip/ext/net_packet"
 )
 expected_revisions=(
-  "7fb5d13931fd53c994fdda6575230a8697bc18ba"
+  "f65eec85ecbb10819dab9b2fbc6d50df37094878"
   "3b9e000d5df4d10efbb3029f43605e0362e0caca"
   "e2af70204f53ede65e366c7a65f695c59acdbbc5"
 )
