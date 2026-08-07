@@ -179,10 +179,52 @@ class virtio_pf_lifecycle_tx_alloc_error_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_pf_lifecycle_tx_alloc_error_catcher
 
+class virtio_pf_lifecycle_blocking_vf extends virtio_vf_instance;
+    `uvm_component_utils(virtio_pf_lifecycle_blocking_vf)
+
+    uvm_event release_init;
+    bit       init_entered;
+    bit       init_completed;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+        release_init = new("release_init");
+        init_entered = 0;
+        init_completed = 0;
+    endfunction
+
+    virtual task init(virtio_driver_config_t cfg);
+        init_entered = 1;
+        release_init.wait_trigger();
+        init_completed = 1;
+        super.init(cfg);
+    endtask
+endclass : virtio_pf_lifecycle_blocking_vf
+
+class virtio_pf_lifecycle_conc_timeout_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "virtio_pf_lifecycle_conc_timeout_catcher");
+        super.new(name);
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_WARNING) && (get_id() == "CONC_CTRL") &&
+            uvm_is_match("*parallel_vf_op: timeout after 20ns*", get_message())) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_pf_lifecycle_conc_timeout_catcher
+
 class virtio_pf_lifecycle_reset_test extends uvm_test;
     `uvm_component_utils(virtio_pf_lifecycle_reset_test)
 
     virtio_function_instance          pf_function;
+    virtio_pf_lifecycle_blocking_vf   concurrency_normal_vf;
+    virtio_pf_lifecycle_blocking_vf   concurrency_timeout_vf;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -193,8 +235,20 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         uvm_config_db#(uvm_active_passive_enum)::set(
             this, "pf_function.driver_agent", "is_active", UVM_PASSIVE
         );
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "concurrency_normal_vf.driver_agent", "is_active", UVM_PASSIVE
+        );
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "concurrency_timeout_vf.driver_agent", "is_active", UVM_PASSIVE
+        );
         pf_function = virtio_function_instance::type_id::create(
             "pf_function", this
+        );
+        concurrency_normal_vf = virtio_pf_lifecycle_blocking_vf::type_id::create(
+            "concurrency_normal_vf", this
+        );
+        concurrency_timeout_vf = virtio_pf_lifecycle_blocking_vf::type_id::create(
+            "concurrency_timeout_vf", this
         );
     endfunction
 
@@ -205,12 +259,108 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         test_verified_reset_retires_pending_normal_dma();
         test_tx_second_allocation_failure_releases_header();
         test_pf_reset_waits_for_real_dataplane_worker();
+        test_parallel_vf_op_waits_and_cancels_workers();
         test_failed_reset_retains_pf_runtime();
         test_set_active_rejects_reinit_required();
         test_set_active_rejects_reset_failed();
 
         `uvm_info("PF_LIFECYCLE", "PF lifecycle reset tests PASSED", UVM_NONE)
         phase.drop_objection(this);
+    endtask
+
+    task test_parallel_vf_op_waits_and_cancels_workers();
+        virtio_concurrency_controller                 controller;
+        virtio_pf_lifecycle_conc_timeout_catcher      catcher;
+        virtio_driver_config_t                         cfg;
+        int unsigned                                   vf_ids[$];
+        int unsigned                                   no_vf_ids[$];
+        bit                                            results[];
+        int unsigned                                   actual_sent[];
+        bit                                            normal_returned;
+        bit                                            timeout_returned;
+
+        controller = virtio_concurrency_controller::type_id::create(
+            "pf_lifecycle_concurrency_controller");
+        controller.vf_instances = new[1];
+        controller.vf_instances[0] = concurrency_normal_vf;
+        vf_ids.push_back(0);
+        cfg.num_queue_pairs = 0;
+        cfg.queue_size = 0;
+        cfg.vq_type = VQ_SPLIT;
+        cfg.driver_features = '0;
+        cfg.rx_buf_mode = RX_MODE_MERGEABLE;
+        cfg.rx_buf_size = 0;
+        cfg.rx_refill_threshold = 0;
+        cfg.irq_mode = IRQ_MSIX_PER_QUEUE;
+        cfg.napi_budget = 0;
+        cfg.coal_max_packets = 0;
+        cfg.coal_max_usecs = 0;
+        cfg.bw_limit_enable = 0;
+        cfg.bw_limit_mbps = 0;
+        cfg.mode = DRV_MODE_AUTO;
+        concurrency_normal_vf.drv_cfg = cfg;
+        concurrency_timeout_vf.drv_cfg = cfg;
+        normal_returned = 0;
+
+        fork
+            begin
+                controller.parallel_vf_op(vf_ids, VIO_TXN_INIT, 100, results);
+                normal_returned = 1;
+            end
+        join_none
+
+        wait (concurrency_normal_vf.init_entered);
+        #(1ns);
+        assert(!normal_returned)
+            else `uvm_fatal("PF_LIFECYCLE",
+                "parallel_vf_op returned before its blocking worker completed")
+        concurrency_normal_vf.release_init.trigger();
+        wait (normal_returned);
+        assert((results.size() == 1) && results[0] && concurrency_normal_vf.init_completed)
+            else `uvm_fatal("PF_LIFECYCLE",
+                "parallel_vf_op did not await and return the completed worker result")
+
+        controller.vf_instances[0] = concurrency_timeout_vf;
+        catcher = new("parallel_vf_op_timeout_catcher");
+        uvm_report_cb::add(null, catcher);
+        timeout_returned = 0;
+
+        fork
+            begin
+                controller.parallel_vf_op(vf_ids, VIO_TXN_INIT, 20, results);
+                timeout_returned = 1;
+            end
+        join_none
+
+        wait (concurrency_timeout_vf.init_entered);
+        #(1ns);
+        assert(!timeout_returned)
+            else `uvm_fatal("PF_LIFECYCLE",
+                "parallel_vf_op returned before its configured timeout")
+        wait (timeout_returned);
+        assert((results.size() == 1) && !results[0] && !concurrency_timeout_vf.init_completed &&
+               catcher.caught_count == 1)
+            else `uvm_fatal("PF_LIFECYCLE",
+                "parallel_vf_op timeout did not preserve an incomplete worker result")
+        concurrency_timeout_vf.release_init.trigger();
+        #(1ns);
+        uvm_report_cb::delete(null, catcher);
+        assert(!concurrency_timeout_vf.init_completed)
+            else `uvm_fatal("PF_LIFECYCLE",
+                "parallel_vf_op timeout left its worker alive after return")
+
+        controller.parallel_vf_op(no_vf_ids, VIO_TXN_INIT, 20, results);
+        assert(results.size() == 0)
+            else `uvm_fatal("PF_LIFECYCLE",
+                "parallel_vf_op did not return an empty result for zero workers")
+        controller.parallel_traffic(vf_ids, 2, actual_sent);
+        assert((actual_sent.size() == 1) && (actual_sent[0] == 2))
+            else `uvm_fatal("PF_LIFECYCLE",
+                "parallel_traffic did not await and return the worker count")
+        controller.parallel_traffic(no_vf_ids, 2, actual_sent);
+        assert(actual_sent.size() == 0)
+            else `uvm_fatal("PF_LIFECYCLE",
+                "parallel_traffic did not return an empty result for zero workers")
     endtask
 
     // This deliberately uses the production FSM's start/stop implementation,
