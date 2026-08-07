@@ -81,15 +81,9 @@ class virtio_driver_agent extends uvm_agent;
             // Inject shared component references into driver
             if (ops != null)
                 driver.ops = ops;
-            else
-                `uvm_warning("VIRTIO_AGENT",
-                    "ops handle is null -- driver will not function correctly")
 
             if (fsm != null)
                 driver.fsm = fsm;
-            else
-                `uvm_warning("VIRTIO_AGENT",
-                    "fsm handle is null -- driver AUTO-mode transactions will fail")
         end
 
         // Inject transport and vq_mgr references into monitor
@@ -104,6 +98,18 @@ class virtio_driver_agent extends uvm_agent;
             monitor.negotiated_features = ops.negotiated_features;
         end
         observer.monitor = monitor;
+    endfunction
+
+    virtual function void start_of_simulation_phase(uvm_phase phase);
+        super.start_of_simulation_phase(phase);
+        if (get_is_active() == UVM_ACTIVE) begin
+            if (ops == null)
+                `uvm_error("VIRTIO_AGENT",
+                    "active driver has no virtio_atomic_ops binding")
+            if (fsm == null)
+                `uvm_error("VIRTIO_AGENT",
+                    "active driver has no virtio_auto_fsm binding")
+        end
     endfunction
 
 endclass : virtio_driver_agent

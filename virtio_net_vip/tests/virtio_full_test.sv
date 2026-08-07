@@ -85,6 +85,8 @@ class virtio_full_integration_test extends uvm_test;
         err_inj = virtqueue_error_injector::type_id::create("err_inj");
         ops = virtio_atomic_ops::type_id::create("ops");
         perf_mon = virtio_perf_monitor::type_id::create("perf_mon", this);
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "binding_function.driver_agent", "is_active", UVM_PASSIVE);
         binding_function = virtio_function_instance::type_id::create(
             "binding_function", this);
     endfunction

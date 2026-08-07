@@ -640,6 +640,10 @@ class virtio_fabric_resource_test extends uvm_test;
         cfg.num_vfs_per_pf[1][1] = 1;
 
         uvm_config_db#(virtio_net_env_config)::set(this, "env", "cfg", cfg);
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "env.*.driver_agent", "is_active", UVM_PASSIVE);
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "compatibility_vf.driver_agent", "is_active", UVM_PASSIVE);
         env = virtio_net_env::type_id::create("env", this);
         compatibility_vf = virtio_vf_instance::type_id::create(
             "compatibility_vf", this

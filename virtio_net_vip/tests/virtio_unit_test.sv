@@ -87,6 +87,23 @@ class virtio_wait_policy_poll_timeout_probe_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_wait_policy_poll_timeout_probe_catcher
 
+class virtio_expected_rc_completion_warning_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+    function new(string name = "virtio_expected_rc_completion_warning_catcher");
+        super.new(name);
+        caught_count = 0;
+    endfunction
+    virtual function action_e catch();
+        if ((get_severity() == UVM_WARNING) &&
+            (get_id() == "RC_DRV") &&
+            uvm_is_match("Unexpected Completion:*", get_message())) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_expected_rc_completion_warning_catcher
+
 // ============================================================================
 // virtio_unit_test
 //
@@ -391,6 +408,7 @@ class virtio_unit_test extends uvm_test;
     task test_tlm_completion_reject_filter();
         virtio_tlm_completion_adapter adapter;
         virtio_tlm_rc_driver_shim shim;
+        virtio_expected_rc_completion_warning_catcher catcher;
         pcie_tl_mem_tlp req;
         pcie_tl_cpl_tlp rejected_cpl;
         pcie_tl_cpl_tlp matched_cpl;
@@ -420,7 +438,12 @@ class virtio_unit_test extends uvm_test;
         rejected_cpl.cpl_status = CPL_STATUS_SC;
         rejected_cpl.payload = new[4];
 
+        catcher = new();
+        uvm_report_cb::add(null, catcher);
         accepted = shim.handle_completion(rejected_cpl);
+        uvm_report_cb::delete(null, catcher);
+        assert(catcher.caught_count == 1)
+            else `uvm_error("TEST", "expected exactly one rejected completion warning")
         assert(!accepted)
             else `uvm_error("TEST", "RC shim accepted a mismatched completion")
         assert(adapter.completions_received == 0)
