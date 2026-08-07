@@ -44,6 +44,27 @@ class virtio_monitor_routing_error_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_monitor_routing_error_catcher
 
+// The PF/VF isolation trace deliberately violates only the VF DRIVER_OK
+// dependency.  Keep that expected SVA diagnostic scoped to the injection so
+// any other protocol error remains visible to the global report server.
+class virtio_monitor_routing_protocol_sva_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "virtio_monitor_routing_protocol_sva_catcher");
+        super.new(name);
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) &&
+            (get_id() == "VIRTIO_PROTOCOL_SVA") &&
+            (get_message() == "DRIVER_OK observed before FEATURES_OK")) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_monitor_routing_protocol_sva_catcher
+
 // Exercises the public virtio_net_env PCIe binding with two Fabric functions.
 // A TLP emitted on the external endpoint monitor is addressed only by the PF
 // BAR range; the VF must neither observe it nor classify it as DMA.
@@ -52,7 +73,6 @@ class virtio_monitor_routing_test extends uvm_test;
 
     pcie_tl_env                    pcie_env;
     virtio_net_env                 virtio_env;
-    virtio_tlm_completion_adapter  tlm_adapter;
     pcie_tl_env_config             pcie_cfg;
     virtio_net_env_config          virtio_cfg;
     virtio_monitor_routing_collector pf_collector;
@@ -74,12 +94,6 @@ class virtio_monitor_routing_test extends uvm_test;
 
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
-
-        // The environment public API owns the completion adapter binding.
-        // Install it before pcie_tl_env creates the RC driver shim.
-        tlm_adapter = virtio_tlm_completion_adapter::type_id::create(
-            "tlm_adapter");
-        tlm_adapter.install_factory_overrides();
 
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
         pcie_cfg.if_mode = TLM_MODE;
@@ -119,8 +133,7 @@ class virtio_monitor_routing_test extends uvm_test;
 
         // Public binding is responsible for configuring every PF/VF observer
         // and wiring both directions of the external PCIe monitor stream.
-        virtio_env.bind_pcie(
-            pcie_env.rc_agent.sequencer, tlm_adapter,
+        virtio_env.bind_pcie(pcie_env.rc_agent.sequencer, null,
             pcie_env.rc_agent.monitor, pcie_env.ep_agent.monitor);
 
         virtio_env.pf_instances[0].pf_function.driver_agent.monitor.txn_ap.connect(
@@ -140,6 +153,16 @@ class virtio_monitor_routing_test extends uvm_test;
 
         pf = virtio_env.pf_instances[0].pf_function;
         vf = virtio_env.pf_instances[0].vf_functions[0];
+        if ($test$plusargs("ROUTING_BIND_ONLY")) begin
+            assert((pf.driver_agent.ops != null) &&
+                   (pf.driver_agent.fsm != null) &&
+                   (vf.driver_agent.ops != null) &&
+                   (vf.driver_agent.fsm != null))
+                else `uvm_fatal("ROUTING_TEST",
+                    "no-adapter binding left an active function unbound")
+            phase.drop_objection(this);
+            return;
+        end
         configure_function_ranges(pf, PF_BAR0_BASE);
         configure_function_ranges(vf, VF_BAR0_BASE);
         virtio_env.cov.enable_all();
@@ -280,6 +303,7 @@ class virtio_monitor_routing_test extends uvm_test;
     );
         virtual virtio_protocol_event_if pf_protocol_vif;
         virtual virtio_protocol_event_if vf_protocol_vif;
+        virtio_monitor_routing_protocol_sva_catcher sva_catcher;
 
         pf_protocol_vif = pf.driver_agent.monitor.protocol_vif;
         vf_protocol_vif = vf.driver_agent.monitor.protocol_vif;
@@ -292,17 +316,33 @@ class virtio_monitor_routing_test extends uvm_test;
 
         pf.driver_agent.monitor.chk_status_transition = 0;
         vf.driver_agent.monitor.chk_status_transition = 0;
+        pf_protocol_vif.assertions_enable = 0;
+        vf_protocol_vif.assertions_enable = 0;
         pf.driver_agent.monitor.reset_protocol_state();
         vf.driver_agent.monitor.reset_protocol_state();
+
+        // The routed PF reset and two MSI-X events above remain staged until
+        // a negedge release.  reset_protocol_state() adds one reset pulse per
+        // function, so four release/sample pairs drain every known PF pulse
+        // before this test establishes its local checker baseline.
+        repeat (4) begin
+            @(negedge virtio_tb_top.clk);
+            @(posedge virtio_tb_top.clk);
+            #1step;
+        end
         pf_protocol_vif.protocol_error_count = 0;
         vf_protocol_vif.protocol_error_count = 0;
         pf_protocol_vif.assertions_enable = 1;
         vf_protocol_vif.assertions_enable = 1;
 
-        // PF establishes FEATURES_OK.  The VF's DRIVER_OK is intentionally
-        // illegal and must trip only the VF assertion state.
+        // PF establishes DRIVER before FEATURES_OK.  The VF's DRIVER_OK is
+        // intentionally illegal and must trip only the VF assertion state.
+        emit_status_and_advance(pf,
+            DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER);
         emit_status_and_advance(pf,
             DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER | DEV_STATUS_FEATURES_OK);
+        sva_catcher = new();
+        uvm_report_cb::add(null, sva_catcher);
         emit_status_and_advance(vf,
             DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER | DEV_STATUS_DRIVER_OK);
         assert(pf_protocol_vif.protocol_error_count == 0)
@@ -311,6 +351,11 @@ class virtio_monitor_routing_test extends uvm_test;
         assert(vf_protocol_vif.protocol_error_count == 1)
             else `uvm_fatal("ROUTING_TEST",
                 "VF DRIVER_OK without VF FEATURES_OK did not trip its SVA")
+        assert(sva_catcher.caught_count == 1)
+            else `uvm_fatal("ROUTING_TEST", $sformatf(
+                "expected one scoped VF DRIVER_OK SVA report, saw %0d",
+                sva_catcher.caught_count))
+        uvm_report_cb::delete(null, sva_catcher);
 
         // Reset both checker histories, then prove that independent legal
         // traces pass without cross-function contamination.
@@ -393,11 +438,13 @@ class virtio_monitor_routing_test extends uvm_test;
         input bit [7:0] status
     );
         emit_common_write(function_instance, VIRTIO_PCI_COMMON_STATUS, status);
-        // The concurrent assertion action executes after the test process
-        // wakes on this edge.  Cross the following half-cycle before reading
-        // protocol_error_count so the observed-region update is visible.
+        // The callback can enqueue on the same negedge at which the interface
+        // drains its queue.  Cross the next release edge and then the following
+        // SVA sample; #1step leaves the observed/reactive regions before checking.
         @(posedge virtio_tb_top.clk);
         @(negedge virtio_tb_top.clk);
+        @(posedge virtio_tb_top.clk);
+        #1step;
     endtask
 
     protected task emit_common_write(

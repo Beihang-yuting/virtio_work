@@ -314,20 +314,18 @@ class virtio_net_env extends uvm_env;
     // reduced to the compatibility vf_instances view.
     virtual function void bind_pcie(
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
-        input virtio_tlm_completion_adapter tlm_adapter,
+        input virtio_tlm_completion_adapter tlm_adapter = null,
         input pcie_tl_base_monitor pcie_rc_monitor = null,
         input pcie_tl_base_monitor pcie_ep_monitor = null
     );
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("VIRTIO_ENV", "bind_pcie() received a null PCIe RC sequencer")
         end
-        if (tlm_adapter == null) begin
-            `uvm_fatal("VIRTIO_ENV", "bind_pcie() received a null TLM completion adapter")
-        end
 
         // The adapter owns the factory-created RC shim.  Bind and validate it
         // here so callers need only this public environment API.
-        tlm_adapter.bind_registered_rc_driver();
+        if (tlm_adapter != null)
+            tlm_adapter.bind_registered_rc_driver();
         v_seqr.pcie_rc_seqr = pcie_rc_seqr;
         protocol_event_vif_index = 0;
         if (fabric_topology) begin
