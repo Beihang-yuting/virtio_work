@@ -153,6 +153,52 @@ class virtio_dual_test extends uvm_test;
         tests_run = 0;
     endfunction
 
+    protected function bit parse_dual_bw_pkts_per_dir(
+        string raw_value,
+        output int signed parsed_value
+    );
+        int unsigned index;
+        int unsigned raw_len;
+        int unsigned magnitude;
+        int unsigned digit;
+        byte unsigned ch;
+        bit negative;
+
+        parsed_value = 0;
+        magnitude = 0;
+        negative = 0;
+        raw_len = raw_value.len();
+        if (raw_len == 0)
+            return 0;
+
+        index = 0;
+        ch = raw_value.getc(index);
+        if (ch == 8'h2b || ch == 8'h2d) begin
+            negative = (ch == 8'h2d);
+            index++;
+        end
+        if (index >= raw_len)
+            return 0;
+
+        while (index < raw_len) begin
+            ch = raw_value.getc(index);
+            if (ch < 8'h30 || ch > 8'h39)
+                return 0;
+            digit = ch - 8'h30;
+            if (magnitude <= DUAL_BW_MAX_PKTS_PER_DIR) begin
+                if (magnitude >
+                    ((DUAL_BW_MAX_PKTS_PER_DIR - digit) / 10))
+                    magnitude = DUAL_BW_MAX_PKTS_PER_DIR + 1;
+                else
+                    magnitude = (magnitude * 10) + digit;
+            end
+            index++;
+        end
+
+        parsed_value = negative ? -int'(magnitude) : int'(magnitude);
+        return 1;
+    endfunction
+
     // ========================================================================
     // Build Phase
     // ========================================================================
@@ -1369,19 +1415,18 @@ class virtio_dual_test extends uvm_test;
         int unsigned pkts_per_dir = 1000;
         int unsigned pkt_size     = 1500;
         int unsigned queue_size   = 256;
-        longint signed parsed_pkts_per_dir;
+        int signed parsed_pkts_per_dir;
         string pkts_per_dir_text;
-        string trailing_text;
 
         // Phase configs: {mbps}  0 = unlimited
         int unsigned phase_mbps[3] = '{0, 10000, 1000};
+        string bare_pkts_per_dir_args[$];
 
         tests_run++;
-        if ($test$plusargs("DUAL_BW_PKTS_PER_DIR")) begin
-            if (!$value$plusargs(
-                    "DUAL_BW_PKTS_PER_DIR=%s", pkts_per_dir_text) ||
-                ($sscanf(pkts_per_dir_text, "%d%s",
-                    parsed_pkts_per_dir, trailing_text) != 1))
+        if ($value$plusargs(
+                "DUAL_BW_PKTS_PER_DIR=%s", pkts_per_dir_text)) begin
+            if (!parse_dual_bw_pkts_per_dir(
+                    pkts_per_dir_text, parsed_pkts_per_dir))
                 `uvm_fatal("DUAL_TEST",
                     "DUAL_BW_PKTS_PER_DIR must be an integer")
             if (parsed_pkts_per_dir < 256)
@@ -1391,6 +1436,13 @@ class virtio_dual_test extends uvm_test;
                 `uvm_fatal("DUAL_TEST",
                     "DUAL_BW_PKTS_PER_DIR must not exceed 10000")
             pkts_per_dir = int'(parsed_pkts_per_dir);
+        end else if (
+            uvm_cmdline_processor::get_inst().get_arg_matches(
+                "/^[+]DUAL_BW_PKTS_PER_DIR$/",
+                bare_pkts_per_dir_args) != 0 ||
+            $test$plusargs("DUAL_BW_PKTS_PER_DIR=")) begin
+            `uvm_fatal("DUAL_TEST",
+                "DUAL_BW_PKTS_PER_DIR must be an integer")
         end
 
         `uvm_info("DUAL_TEST", $sformatf(
