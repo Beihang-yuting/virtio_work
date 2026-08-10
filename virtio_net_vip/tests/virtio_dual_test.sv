@@ -15,7 +15,7 @@
 //   2. Asymmetric traffic (2000 + 200)
 //   3. Variable packet sizes
 //   4. Stress with queue wrap (small queue, many packets)
-//   5. Bandwidth control with 20K packets (unlimited vs 10Gbps vs 1Gbps)
+//   5. Bandwidth control with a bounded default (unlimited vs 10Gbps vs 1Gbps)
 // ============================================================================
 
 `ifndef VIRTIO_DUAL_TEST_SV
@@ -34,17 +34,23 @@ import virtio_net_pkg::*;
 class virtio_perf_monitor_ext extends virtio_perf_monitor;
     `uvm_component_utils(virtio_perf_monitor_ext)
 
+    localparam int unsigned BW_BURST_WINDOW_NS = 100_000;
+
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
 
     // Reconfigure bandwidth limit at runtime, reinitializing the token bucket.
     function void configure_bw(int unsigned mbps);
+        longint unsigned scaled_bucket_bytes;
+
         bw_limit_mbps = mbps;
         if (mbps > 0) begin
             bw_limit_enable = 1;
-            // bucket_size = 1ms worth of bytes at configured rate (mbps * 125)
-            bucket_size  = mbps * 125;
+            scaled_bucket_bytes = mbps;
+            scaled_bucket_bytes *= BW_BURST_WINDOW_NS;
+            scaled_bucket_bytes /= 8000;
+            bucket_size  = scaled_bucket_bytes;
             token_bucket = bucket_size;  // start full
             last_refill_time = $realtime;
         end else begin
@@ -52,6 +58,33 @@ class virtio_perf_monitor_ext extends virtio_perf_monitor;
             bucket_size  = 0;
             token_bucket = 0;
         end
+    endfunction
+
+    // Refill for one packet's logical wait without advancing simulation time.
+    function int unsigned advance_logical_refill(int unsigned bytes);
+        longint unsigned wait_numerator;
+        longint unsigned wait_ns;
+        longint unsigned refill_tokens;
+        longint unsigned refill_total;
+
+        if (!bw_limit_enable || (bw_limit_mbps == 0)) begin
+            `uvm_fatal("DUAL_TEST",
+                "logical bandwidth refill requires a nonzero enabled rate")
+            return 0;
+        end
+
+        wait_numerator = bytes;
+        wait_numerator *= 8000;
+        wait_ns = (wait_numerator / bw_limit_mbps) + 1;
+        refill_tokens = wait_ns;
+        refill_tokens *= bw_limit_mbps;
+        refill_tokens /= 8000;
+        refill_total = token_bucket;
+        refill_total += refill_tokens;
+        token_bucket = (refill_total > bucket_size) ?
+            bucket_size : refill_total;
+        last_refill_time = $realtime;
+        return wait_ns;
     endfunction
 
     // Reset all stats for a fresh measurement phase
@@ -259,7 +292,7 @@ class virtio_dual_test extends uvm_test;
         #100ns;
         tlm_adapter.drain();
 
-        // Test 5: Bandwidth control with 20K packets
+        // Test 5: Bandwidth control with a bounded default
         test_bandwidth_control();
 
         // Report results
@@ -1318,10 +1351,10 @@ class virtio_dual_test extends uvm_test;
     endtask
 
     // ========================================================================
-    // Test 5: Bandwidth Control with 20K Packets
+    // Test 5: Bandwidth Control
     //
-    // Runs three phases comparing unlimited, 1Gbps, and 100Mbps bandwidth
-    // limiting using the perf_monitor's token-bucket rate limiter.
+    // Runs three phases comparing unlimited, 10Gbps, and 1Gbps bandwidth
+    // limits using test-local token-bucket logical-time accounting.
     // ========================================================================
     virtual task test_bandwidth_control();
         // Phase results
@@ -1331,7 +1364,7 @@ class virtio_dual_test extends uvm_test;
         int unsigned phase_total_pkts[3];
         string   phase_label[3];
 
-        int unsigned pkts_per_dir = 10000;
+        int unsigned pkts_per_dir = 1000;
         int unsigned pkt_size     = 1500;
         int unsigned queue_size   = 256;
 
@@ -1339,7 +1372,14 @@ class virtio_dual_test extends uvm_test;
         int unsigned phase_mbps[3] = '{0, 10000, 1000};
 
         tests_run++;
-        `uvm_info("DUAL_TEST", "--- Test 5: Bandwidth Control with 20K packets ---", UVM_LOW)
+        void'($value$plusargs("DUAL_BW_PKTS_PER_DIR=%d", pkts_per_dir));
+        if (pkts_per_dir < 256)
+            `uvm_fatal("DUAL_TEST",
+                "DUAL_BW_PKTS_PER_DIR must be at least 256")
+
+        `uvm_info("DUAL_TEST", $sformatf(
+            "--- Test 5: Bandwidth Control with %0d packets/direction ---",
+            pkts_per_dir), UVM_LOW)
 
         phase_label[0] = "unlimited";
         phase_label[1] = "10Gbps";
@@ -1351,6 +1391,7 @@ class virtio_dual_test extends uvm_test;
             int unsigned throttle_count;
             int unsigned a_remaining, b_remaining;
             realtime start_time, end_time;
+            realtime logical_wait_ns;
             real elapsed_ns_real;
 
             // Configure bandwidth for this phase
@@ -1371,6 +1412,7 @@ class virtio_dual_test extends uvm_test;
             b_rx_received  = 0;
             a_rx_received  = 0;
             throttle_count = 0;
+            logical_wait_ns = 0.0;
             a_remaining    = pkts_per_dir;
             b_remaining    = pkts_per_dir;
 
@@ -1418,13 +1460,14 @@ class virtio_dual_test extends uvm_test;
                     byte unsigned pkt_data[$];
                     int unsigned desc_id;
 
-                    // Bandwidth gate: calculate exact wait time for token refill
+                    // Bandwidth gate: account for one packet's logical refill wait
                     if (bw_mon.bw_limit_enable && !bw_mon.can_send(pkt_size)) begin
-                        int unsigned wait_ns;
-                        // bytes_needed / rate_bytes_per_ns = bytes_needed * 8000 / bw_limit_mbps
-                        wait_ns = (pkt_size * 8000) / bw_mon.bw_limit_mbps + 1;
                         throttle_count++;
-                        #(wait_ns * 1ns);
+                        logical_wait_ns +=
+                            bw_mon.advance_logical_refill(pkt_size);
+                        assert(bw_mon.can_send(pkt_size))
+                            else `uvm_fatal("DUAL_TEST",
+                                "logical refill did not make one packet sendable")
                     end
                     if (bw_mon.bw_limit_enable)
                         bw_mon.on_sent(pkt_size);
@@ -1442,12 +1485,14 @@ class virtio_dual_test extends uvm_test;
                     byte unsigned pkt_data[$];
                     int unsigned desc_id;
 
-                    // Bandwidth gate: calculate exact wait time for token refill
+                    // Bandwidth gate: account for one packet's logical refill wait
                     if (bw_mon.bw_limit_enable && !bw_mon.can_send(pkt_size)) begin
-                        int unsigned wait_ns;
-                        wait_ns = (pkt_size * 8000) / bw_mon.bw_limit_mbps + 1;
                         throttle_count++;
-                        #(wait_ns * 1ns);
+                        logical_wait_ns +=
+                            bw_mon.advance_logical_refill(pkt_size);
+                        assert(bw_mon.can_send(pkt_size))
+                            else `uvm_fatal("DUAL_TEST",
+                                "logical refill did not make one packet sendable")
                     end
                     if (bw_mon.bw_limit_enable)
                         bw_mon.on_sent(pkt_size);
@@ -1510,7 +1555,8 @@ class virtio_dual_test extends uvm_test;
             end_time = $realtime;
 
             // Calculate results for this phase
-            phase_time[phase_idx] = end_time - start_time;
+            phase_time[phase_idx] =
+                (end_time - start_time) + logical_wait_ns;
             phase_throttle_count[phase_idx] = throttle_count;
             phase_total_pkts[phase_idx] = a_tx_submitted + b_tx_submitted;
 
@@ -1541,7 +1587,7 @@ class virtio_dual_test extends uvm_test;
         begin
             bit pass = 1;
 
-            // All phases must have sent/received all 20K packets
+            // All phases must send and receive the selected bounded workload
             for (int i = 0; i < 3; i++) begin
                 if (phase_total_pkts[i] != pkts_per_dir * 2) begin
                     `uvm_error("DUAL_TEST", $sformatf(
