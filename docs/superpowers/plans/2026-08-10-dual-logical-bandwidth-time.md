@@ -192,7 +192,7 @@ Run:
 
 ```bash
 git diff --check
-git diff --stat 93da00b6a29d049e07352cff16cf2873a9cc9f18..HEAD
+git diff --stat 7ec9280..HEAD
 git status --short
 ```
 
