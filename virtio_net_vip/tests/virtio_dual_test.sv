@@ -104,6 +104,8 @@ endclass : virtio_perf_monitor_ext
 class virtio_dual_test extends uvm_test;
     `uvm_component_utils(virtio_dual_test)
 
+    localparam int unsigned DUAL_BW_MAX_PKTS_PER_DIR = 10_000;
+
     // PCIe environment (shared)
     pcie_tl_env pcie_env;
 
@@ -1367,15 +1369,29 @@ class virtio_dual_test extends uvm_test;
         int unsigned pkts_per_dir = 1000;
         int unsigned pkt_size     = 1500;
         int unsigned queue_size   = 256;
+        longint signed parsed_pkts_per_dir;
+        string pkts_per_dir_text;
+        string trailing_text;
 
         // Phase configs: {mbps}  0 = unlimited
         int unsigned phase_mbps[3] = '{0, 10000, 1000};
 
         tests_run++;
-        void'($value$plusargs("DUAL_BW_PKTS_PER_DIR=%d", pkts_per_dir));
-        if (pkts_per_dir < 256)
-            `uvm_fatal("DUAL_TEST",
-                "DUAL_BW_PKTS_PER_DIR must be at least 256")
+        if ($test$plusargs("DUAL_BW_PKTS_PER_DIR")) begin
+            if (!$value$plusargs(
+                    "DUAL_BW_PKTS_PER_DIR=%s", pkts_per_dir_text) ||
+                ($sscanf(pkts_per_dir_text, "%d%s",
+                    parsed_pkts_per_dir, trailing_text) != 1))
+                `uvm_fatal("DUAL_TEST",
+                    "DUAL_BW_PKTS_PER_DIR must be an integer")
+            if (parsed_pkts_per_dir < 256)
+                `uvm_fatal("DUAL_TEST",
+                    "DUAL_BW_PKTS_PER_DIR must be at least 256")
+            if (parsed_pkts_per_dir > DUAL_BW_MAX_PKTS_PER_DIR)
+                `uvm_fatal("DUAL_TEST",
+                    "DUAL_BW_PKTS_PER_DIR must not exceed 10000")
+            pkts_per_dir = int'(parsed_pkts_per_dir);
+        end
 
         `uvm_info("DUAL_TEST", $sformatf(
             "--- Test 5: Bandwidth Control with %0d packets/direction ---",
@@ -1587,7 +1603,7 @@ class virtio_dual_test extends uvm_test;
         begin
             bit pass = 1;
 
-            // All phases must send and receive the selected bounded workload
+            // All phases must submit the selected bounded workload
             for (int i = 0; i < 3; i++) begin
                 if (phase_total_pkts[i] != pkts_per_dir * 2) begin
                     `uvm_error("DUAL_TEST", $sformatf(
