@@ -301,6 +301,10 @@ class dpu_resource_manager_test extends uvm_test;
         end
         fabric_cfg.mmio_aperture_base = 64'h0001_0000_0000_0000;
         fabric_cfg.mmio_aperture_limit = 64'h0001_0010_0000_0000;
+        fabric_cfg.dut_caps.max_hosts = DPU_MAX_HOSTS;
+        fabric_cfg.dut_caps.max_pfs_per_host = DPU_MAX_PFS_PER_HOST;
+        fabric_cfg.dut_caps.max_vfs_per_pf = DPU_MAX_VFS_PER_PF;
+        fabric_cfg.dut_caps.max_functions = DPU_MAX_FUNCTIONS;
         fabric_cfg.resource_profiles.push_back(qpair_profile);
         if (!fabric.apply_resource_profiles(fabric_cfg, why)) begin
             `uvm_fatal("DPU_RESOURCE", $sformatf(

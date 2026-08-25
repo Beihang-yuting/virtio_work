@@ -49,6 +49,7 @@ class dpu_resource_manager extends uvm_object;
     protected bit                     resource_classes_sealed;
     protected dpu_resource_fabric_authority fabric_registry_authority;
     protected bit                           fabric_registry_authority_claimed;
+    protected dpu_dut_caps                  dut_caps;
 
     protected bit        aperture_configured;
     protected bit [63:0] aperture_base;
@@ -57,6 +58,7 @@ class dpu_resource_manager extends uvm_object;
 
     function new(string name = "dpu_resource_manager");
         super.new(name);
+        dut_caps = dpu_dut_caps::type_id::create("dut_caps");
         next_resource_class_id = 0;
         activated_function_count = 0;
         resource_classes_sealed = 0;
@@ -81,12 +83,14 @@ class dpu_resource_manager extends uvm_object;
     );
         why = "";
 
-        if (key.host_id >= DPU_MAX_HOSTS) begin
-            why = $sformatf("host_id %0d exceeds DPU_MAX_HOSTS", key.host_id);
+        if (key.host_id >= dut_caps.max_hosts) begin
+            why = $sformatf("host_id %0d exceeds DUT max_hosts %0d",
+                            key.host_id, dut_caps.max_hosts);
             return 0;
         end
-        if (key.pf_id >= DPU_MAX_PFS_PER_HOST) begin
-            why = $sformatf("pf_id %0d exceeds DPU_MAX_PFS_PER_HOST", key.pf_id);
+        if (key.pf_id >= dut_caps.max_pfs_per_host) begin
+            why = $sformatf("pf_id %0d exceeds DUT max_pfs_per_host %0d",
+                            key.pf_id, dut_caps.max_pfs_per_host);
             return 0;
         end
 
@@ -98,9 +102,9 @@ class dpu_resource_manager extends uvm_object;
                 end
             end
             DPU_FUNCTION_VF: begin
-                if (key.vf_id >= DPU_MAX_VFS_PER_PF) begin
-                    why = $sformatf("vf_id %0d exceeds DPU_MAX_VFS_PER_PF",
-                                    key.vf_id);
+                if (key.vf_id >= dut_caps.max_vfs_per_pf) begin
+                    why = $sformatf("vf_id %0d exceeds DUT max_vfs_per_pf %0d",
+                                    key.vf_id, dut_caps.max_vfs_per_pf);
                     return 0;
                 end
             end
@@ -270,8 +274,8 @@ class dpu_resource_manager extends uvm_object;
                 return 0;
             end
         end
-        if (function_states.num() >= DPU_MAX_FUNCTIONS) begin
-            why = "DPU_MAX_FUNCTIONS registrations have already been consumed";
+        if (function_states.num() >= dut_caps.max_functions) begin
+            why = "DUT function registrations have been exhausted";
             return 0;
         end
 
@@ -325,6 +329,38 @@ class dpu_resource_manager extends uvm_object;
             return null;
         fabric_registry_authority_claimed = 1;
         return fabric_registry_authority;
+    endfunction
+
+    function bit fabric_configure_dut_caps(
+        input dpu_resource_fabric_authority authority,
+        input dpu_dut_caps cfg,
+        output string why
+    );
+        if (!fabric_registry_authority_claimed || (authority == null) ||
+            (authority != fabric_registry_authority)) begin
+            why = "DUT capability configuration requires the Fabric authority";
+            return 0;
+        end
+        if (cfg == null) begin
+            why = "DUT capability configuration is null";
+            return 0;
+        end
+        if (function_states.num() != 0) begin
+            why = "DUT capabilities cannot change after function registration";
+            return 0;
+        end
+        if (!cfg.validate(why))
+            return 0;
+        dut_caps.copy_from(cfg);
+        why = "";
+        return 1;
+    endfunction
+
+    function dpu_dut_caps snapshot_dut_caps();
+        dpu_dut_caps snapshot;
+        snapshot = dpu_dut_caps::type_id::create("dut_caps_snapshot");
+        snapshot.copy_from(dut_caps);
+        return snapshot;
     endfunction
 
     function bit fabric_configure_mmio_aperture(

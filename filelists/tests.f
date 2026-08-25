@@ -18,4 +18,5 @@ virtio_net_vip/tests/virtio_dual_test.sv
 virtio_net_vip/tests/virtio_base_test.sv
 virtio_net_vip/tests/virtio_smoke_test.sv
 virtio_net_vip/tests/virtio_traffic_test.sv
+virtio_net_vip/tests/virtio_dut_caps_test.sv
 virtio_net_vip/tests/virtio_tb_top.sv

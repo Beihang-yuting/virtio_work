@@ -2,6 +2,7 @@
 
 VIRTIO_MAINTAINED_TESTS=(
   dpu_resource_manager_test
+  virtio_dut_caps_test
   virtio_fabric_resource_test
   virtio_unit_test
   virtio_stress_unit_test

@@ -15,9 +15,11 @@ class dpu_fabric_env_config extends uvm_object;
     bit [63:0] mmio_aperture_base;
     bit [63:0] mmio_aperture_limit;
     dpu_resource_pool_config_t resource_profiles[$];
+    dpu_dut_caps dut_caps;
 
     function new(string name = "dpu_fabric_env_config");
         super.new(name);
+        dut_caps = dpu_dut_caps::type_id::create("dut_caps");
     endfunction
 endclass : dpu_fabric_env_config
 
@@ -73,6 +75,10 @@ class dpu_fabric_env extends uvm_env;
             why = "DPU Fabric resource profiles cannot be applied after activation";
             return 0;
         end
+        if (!resource_manager.fabric_configure_dut_caps(
+            registry_authority, cfg.dut_caps, why
+        ))
+            return 0;
         if (cfg.mmio_aperture_base >= cfg.mmio_aperture_limit) begin
             why = "DPU Fabric MMIO aperture base must be below its limit";
             return 0;

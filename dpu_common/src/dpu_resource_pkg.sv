@@ -11,6 +11,7 @@ package dpu_resource_pkg;
   `include "uvm_macros.svh"
 
   `include "dpu_resource_types.sv"
+  `include "dpu_dut_caps.sv"
   `include "dpu_resource_manager.sv"
   `include "dpu_fabric_env.sv"
 

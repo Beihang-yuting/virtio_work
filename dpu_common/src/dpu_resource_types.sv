@@ -9,6 +9,12 @@ localparam int unsigned DPU_MAX_HOSTS = 4;
 localparam int unsigned DPU_MAX_PFS_PER_HOST = 16;
 localparam int unsigned DPU_MAX_VFS_PER_PF = 16;
 localparam int unsigned DPU_MAX_FUNCTIONS = 1024;
+localparam int unsigned DPU_VIO_GLOBAL_QPAIR_ID_WIDTH = 11;
+localparam int unsigned DPU_MAX_VIO_GLOBAL_QPAIRS =
+    (1 << DPU_VIO_GLOBAL_QPAIR_ID_WIDTH);
+localparam int unsigned DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE = 32;
+localparam int unsigned DPU_MAX_GLOBAL_MSIX_VECTORS = 256;
+localparam int unsigned DPU_MAX_VIO_NOTIFY_ENTRIES_PER_BANK = 1024;
 
 typedef enum int unsigned {
   DPU_FUNCTION_PF,
