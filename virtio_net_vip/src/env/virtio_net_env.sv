@@ -236,6 +236,8 @@ class virtio_net_env extends uvm_env;
         // Create concurrency/dynamic reconfig
         conc_ctrl    = virtio_concurrency_controller::type_id::create("conc_ctrl");
         dyn_reconfig = virtio_dynamic_reconfig::type_id::create("dyn_reconfig");
+        dyn_reconfig.max_vio_net_qpairs_per_device =
+            cfg.dut_caps.max_vio_net_qpairs_per_device;
 
         // Virtual sequencer
         v_seqr = virtio_virtual_sequencer::type_id::create("v_seqr", this);

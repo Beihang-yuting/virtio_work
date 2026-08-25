@@ -28,12 +28,20 @@
 class virtio_dynamic_reconfig extends uvm_object;
     `uvm_object_utils(virtio_dynamic_reconfig)
 
+    int unsigned max_vio_net_qpairs_per_device;
+
     // ========================================================================
     // Constructor
     // ========================================================================
 
     function new(string name = "virtio_dynamic_reconfig");
         super.new(name);
+        max_vio_net_qpairs_per_device = DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
+    endfunction
+
+    function bit qpair_count_supported(input int unsigned count);
+        return (count != 0) &&
+               (count <= max_vio_net_qpairs_per_device);
     endfunction
 
     // ========================================================================
@@ -63,6 +71,13 @@ class virtio_dynamic_reconfig extends uvm_object;
     );
         byte unsigned ctrl_data[];
         virtio_ctrl_ack_e result;
+
+        if (!qpair_count_supported(new_pairs)) begin
+            `uvm_error("DYN_RECONFIG", $sformatf(
+                "live_mq_resize: %0d pairs exceeds device limit %0d",
+                new_pairs, max_vio_net_qpairs_per_device))
+            return;
+        end
 
         `uvm_info("DYN_RECONFIG",
             $sformatf("live_mq_resize: VF%0d, %0d -> %0d pairs, traffic_active=%0b",

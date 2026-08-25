@@ -102,6 +102,30 @@ class virtio_dut_caps_expected_bind_fatal extends uvm_report_catcher;
     endfunction
 endclass
 
+class virtio_dut_caps_expected_resize_error extends uvm_report_catcher;
+    string expected_message;
+    int unsigned caught_count;
+
+    function new(
+        string name,
+        string configured_expected_message
+    );
+        super.new(name);
+        expected_message = configured_expected_message;
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) &&
+            (get_id() == "DYN_RECONFIG") &&
+            (get_message() == expected_message)) begin
+            caught_count++;
+            set_severity(UVM_INFO);
+        end
+        return THROW;
+    endfunction
+endclass
+
 class virtio_dut_caps_test extends uvm_test;
     `uvm_component_utils(virtio_dut_caps_test)
 
@@ -443,6 +467,51 @@ class virtio_dut_caps_test extends uvm_test;
                 "global qpair rejection used wrong reason: %s", why))
     endtask
 
+    task assert_dynamic_resize_limit();
+        virtio_dynamic_reconfig reconfig;
+        virtio_dut_caps_expected_resize_error default_catcher;
+        virtio_dut_caps_expected_resize_error propagated_catcher;
+
+        reconfig = virtio_dynamic_reconfig::type_id::create("reconfig");
+        if (!reconfig.qpair_count_supported(32))
+            `uvm_fatal("DUT_CAPS", "dynamic resize rejected 32 qpairs")
+        if (reconfig.qpair_count_supported(33))
+            `uvm_fatal("DUT_CAPS", "dynamic resize accepted 33 qpairs")
+        if (reconfig.qpair_count_supported(0))
+            `uvm_fatal("DUT_CAPS", "dynamic resize accepted zero qpairs")
+
+        default_catcher = new("default_resize_catcher",
+            "live_mq_resize: 33 pairs exceeds device limit 32");
+        uvm_report_cb::add(null, default_catcher);
+        reconfig.live_mq_resize(null, 1, 33, 0);
+        uvm_report_cb::delete(null, default_catcher);
+        if (default_catcher.caught_count != 1)
+            `uvm_fatal("DUT_CAPS",
+                "invalid default-cap resize did not return before VF access")
+
+        if (propagated_caps_env.dyn_reconfig == null)
+            `uvm_fatal("DUT_CAPS",
+                "capability-driven virtio env did not build dynamic reconfig")
+        if (propagated_caps_env.dyn_reconfig.
+            max_vio_net_qpairs_per_device != 1) begin
+            `uvm_fatal("DUT_CAPS",
+                "dynamic reconfig did not receive the non-default device limit")
+        end
+        if (!propagated_caps_env.dyn_reconfig.qpair_count_supported(1))
+            `uvm_fatal("DUT_CAPS", "dynamic resize rejected custom-cap qpair 1")
+        if (propagated_caps_env.dyn_reconfig.qpair_count_supported(2))
+            `uvm_fatal("DUT_CAPS", "dynamic resize accepted custom-cap qpair 2")
+
+        propagated_catcher = new("propagated_resize_catcher",
+            "live_mq_resize: 2 pairs exceeds device limit 1");
+        uvm_report_cb::add(null, propagated_catcher);
+        propagated_caps_env.dyn_reconfig.live_mq_resize(null, 1, 2, 0);
+        uvm_report_cb::delete(null, propagated_catcher);
+        if (propagated_catcher.caught_count != 1)
+            `uvm_fatal("DUT_CAPS",
+                "invalid custom-cap resize did not return before VF access")
+    endtask
+
     task configure_fabric();
         dpu_resource_pool_config_t unused_profile;
         dpu_resource_pool_config_t qpair_profile;
@@ -617,6 +686,7 @@ class virtio_dut_caps_test extends uvm_test;
         assert_real_dut_capability_defaults();
         assert_virtio_config_uses_dut_caps();
         assert_env_propagates_caps_to_fabric();
+        assert_dynamic_resize_limit();
         configure_fabric();
         assert_manager_topology_limits();
         assert_vio_local_qpair_limit();
