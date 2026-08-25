@@ -346,6 +346,13 @@ class virtio_migration_dirty_test_fsm extends virtio_auto_fsm;
         snap.integrity_checksum = migration_snapshot_checksum(snap);
     endfunction
 
+    task restore_topology_free_mapping_body(
+        virtio_device_snapshot_t snap,
+        output bit ok
+    );
+        do_restore_from_migration(snap, ok);
+    endtask
+
     virtual task stop_dataplane();
         iommu_fault_e fault;
         byte write_data[];
@@ -901,7 +908,10 @@ class virtio_migration_dirty_test extends uvm_test;
                 "ordinary reset retained a retired source DMA resource")
 
         fsm.inject_write_on_stop = 0;
-        fsm.restore_from_migration(snapshot, restore_ok);
+        // This unit case intentionally has no queue topology and isolates the
+        // fallback materialization body.  A zero-pair snapshot is not a legal
+        // public migration request, so invoke the protected test hook directly.
+        fsm.restore_topology_free_mapping_body(snapshot, restore_ok);
         assert(restore_ok && (fsm.start_count == 1) &&
                (iommu.active_mapping_count() == 1) &&
                (mem.outstanding_allocations() == 1) &&

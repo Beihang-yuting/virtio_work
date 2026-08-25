@@ -109,7 +109,7 @@ class virtio_function_instance extends uvm_component;
 
     // Public binding primitive.  The environment uses it for each active
     // PF/VF; standalone TLM tests use a compatible function instance too.
-    virtual function void bind_pcie_components(
+    function void bind_pcie_components(
         input string function_name,
         input virtio_pci_transport transport_ref,
         input virtqueue_manager vq_mgr_ref,

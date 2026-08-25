@@ -235,6 +235,124 @@ class virtio_dut_caps_mq_fsm_probe extends virtio_auto_fsm;
     endfunction
 endclass
 
+// These subclasses deliberately redeclare the public capability-sensitive
+// entry points.  Calls in the tests below are made through base-class handles,
+// matching the production driver/helper dispatch paths.  The public methods
+// must therefore remain unreachable while the protected do_* hooks stay
+// available for legal factory customization.
+class virtio_dut_caps_malicious_fsm extends virtio_dut_caps_mq_fsm_probe;
+    `uvm_object_utils(virtio_dut_caps_malicious_fsm)
+
+    int unsigned public_configure_count;
+    int unsigned public_full_init_count;
+    int unsigned public_restore_count;
+    int unsigned do_configure_count;
+    int unsigned do_full_init_count;
+    int unsigned do_restore_count;
+
+    function new(string name = "virtio_dut_caps_malicious_fsm");
+        super.new(name);
+        public_configure_count = 0;
+        public_full_init_count = 0;
+        public_restore_count = 0;
+        do_configure_count = 0;
+        do_full_init_count = 0;
+        do_restore_count = 0;
+    endfunction
+
+    virtual task configure_mq(int unsigned num_pairs);
+        public_configure_count++;
+    endtask
+
+    virtual task full_init();
+        public_full_init_count++;
+    endtask
+
+    virtual task restore_from_migration(
+        virtio_device_snapshot_t snap,
+        output bit ok
+    );
+        public_restore_count++;
+        ok = 1;
+    endtask
+
+    protected virtual task do_configure_mq(int unsigned num_pairs);
+        do_configure_count++;
+    endtask
+
+    protected virtual task do_full_init();
+        do_full_init_count++;
+    endtask
+
+    protected virtual task do_restore_from_migration(
+        virtio_device_snapshot_t snap,
+        output bit ok
+    );
+        do_restore_count++;
+        ok = 1;
+    endtask
+endclass
+
+class virtio_dut_caps_malicious_reconfig extends virtio_dynamic_reconfig;
+    `uvm_object_utils(virtio_dut_caps_malicious_reconfig)
+
+    int unsigned public_resize_count;
+    int unsigned do_resize_count;
+
+    function new(string name = "virtio_dut_caps_malicious_reconfig");
+        super.new(name);
+        public_resize_count = 0;
+        do_resize_count = 0;
+    endfunction
+
+    virtual task live_mq_resize(
+        virtio_vf_instance vf,
+        int unsigned old_pairs,
+        int unsigned new_pairs,
+        bit traffic_active
+    );
+        public_resize_count++;
+    endtask
+
+    protected virtual task do_live_mq_resize(
+        virtio_vf_instance vf,
+        int unsigned old_pairs,
+        int unsigned new_pairs,
+        bit traffic_active
+    );
+        do_resize_count++;
+    endtask
+endclass
+
+class virtio_dut_caps_malicious_function extends virtio_function_instance;
+    `uvm_component_utils(virtio_dut_caps_malicious_function)
+
+    int unsigned public_bind_count;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+        public_bind_count = 0;
+    endfunction
+
+    virtual function void bind_pcie_components(
+        input string function_name,
+        input virtio_pci_transport transport_ref,
+        input virtqueue_manager vq_mgr_ref,
+        input virtio_driver_agent driver_agent_ref,
+        input host_mem_manager hmem,
+        input virtio_iommu_model iommu_mdl,
+        input virtio_memory_barrier_model bar_mdl,
+        input virtqueue_error_injector einj,
+        input virtio_wait_policy wpol,
+        input virtio_driver_config_t driver_cfg,
+        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
+        ref virtio_atomic_ops ops,
+        ref virtio_auto_fsm fsm
+    );
+        public_bind_count++;
+    endfunction
+endclass
+
 class virtio_dut_caps_driver_probe extends virtio_driver;
     `uvm_component_utils(virtio_dut_caps_driver_probe)
 
@@ -296,6 +414,7 @@ class virtio_dut_caps_test extends uvm_test;
     virtio_net_env propagated_caps_env;
     virtio_net_env_config propagated_caps_cfg;
     virtio_function_instance mq_binding_function;
+    virtio_dut_caps_malicious_function malicious_binding_function;
     virtio_dut_caps_driver_probe mq_driver;
     uvm_sequencer #(pcie_tl_tlp) mq_pcie_seqr;
 
@@ -355,8 +474,14 @@ class virtio_dut_caps_test extends uvm_test;
 
         uvm_config_db#(uvm_active_passive_enum)::set(
             this, "mq_binding_function.driver_agent", "is_active", UVM_PASSIVE);
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "malicious_binding_function.driver_agent", "is_active",
+            UVM_PASSIVE);
         mq_binding_function = virtio_function_instance::type_id::create(
             "mq_binding_function", this);
+        malicious_binding_function =
+            virtio_dut_caps_malicious_function::type_id::create(
+                "malicious_binding_function", this);
         mq_driver = virtio_dut_caps_driver_probe::type_id::create(
             "mq_driver", this);
         mq_pcie_seqr = new("mq_pcie_seqr", this);
@@ -973,6 +1098,292 @@ class virtio_dut_caps_test extends uvm_test;
         end
     endtask
 
+    task assert_mandatory_fsm_guards_cannot_be_overridden();
+        virtio_dut_caps_malicious_fsm malicious_fsm;
+        virtio_dut_caps_mq_ops_spy ops_spy;
+        virtio_auto_fsm base_fsm;
+        virtio_transaction req;
+        virtio_dut_caps_expected_fsm_mq_error set_mq_over_catcher;
+        virtio_dut_caps_expected_fsm_mq_error set_mq_unknown_catcher;
+        virtio_dut_caps_expected_fsm_mq_error full_over_catcher;
+        virtio_dut_caps_expected_fsm_mq_error full_zero_catcher;
+        virtio_dut_caps_expected_fsm_mq_error full_unknown_catcher;
+        virtio_dut_caps_expected_fsm_mq_error restore_over_catcher;
+        virtio_dut_caps_expected_fsm_mq_error restore_zero_catcher;
+        virtio_dut_caps_expected_fsm_mq_error restore_unknown_catcher;
+        bit restore_over_success;
+        bit restore_zero_success;
+        bit restore_unknown_success;
+        string why;
+
+        malicious_fsm = virtio_dut_caps_malicious_fsm::type_id::create(
+            "malicious_fsm");
+        ops_spy = virtio_dut_caps_mq_ops_spy::type_id::create(
+            "malicious_fsm_ops_spy");
+        base_fsm = malicious_fsm;
+        base_fsm.ops = ops_spy;
+        base_fsm.state = FSM_RUNNING;
+        if (!base_fsm.bind_mq_pair_limit(1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "malicious FSM limit bind failed: %s", why))
+        mq_driver.fsm = base_fsm;
+
+        req = virtio_transaction::type_id::create("malicious_set_mq_over_req");
+        req.txn_type = VIO_TXN_SET_MQ;
+        req.num_pairs = 2;
+        set_mq_over_catcher = new(
+            "malicious_set_mq_over_catcher",
+            "configure_mq: requested 2 pairs is outside supported range 1..1");
+        uvm_report_cb::add(null, set_mq_over_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, set_mq_over_catcher);
+
+        // These public counts are int unsigned; VCS normalizes injected X to
+        // zero at this boundary.  Keep the separate stimulus to lock down the
+        // normalization plus the same pre-side-effect rejection behavior.
+        req.num_pairs = 'x;
+        set_mq_unknown_catcher = new(
+            "malicious_set_mq_unknown_catcher",
+            "configure_mq: requested 0 pairs is outside supported range 1..1");
+        uvm_report_cb::add(null, set_mq_unknown_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, set_mq_unknown_catcher);
+
+        req = virtio_transaction::type_id::create("malicious_full_over_req");
+        req.txn_type = VIO_TXN_INIT;
+        malicious_fsm.drv_cfg.num_queue_pairs = 2;
+        full_over_catcher = new(
+            "malicious_full_over_catcher",
+            {"full_init: configured queue-pair count 2 is outside supported ",
+             "range 1..1"});
+        uvm_report_cb::add(null, full_over_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, full_over_catcher);
+
+        malicious_fsm.drv_cfg.num_queue_pairs = 0;
+        full_zero_catcher = new(
+            "malicious_full_zero_catcher",
+            {"full_init: configured queue-pair count 0 is outside supported ",
+             "range 1..1"});
+        uvm_report_cb::add(null, full_zero_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, full_zero_catcher);
+
+        malicious_fsm.drv_cfg.num_queue_pairs = 'x;
+        full_unknown_catcher = new(
+            "malicious_full_unknown_catcher",
+            {"full_init: configured queue-pair count 0 is outside supported ",
+             "range 1..1"});
+        uvm_report_cb::add(null, full_unknown_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, full_unknown_catcher);
+
+        req = virtio_transaction::type_id::create("malicious_restore_over_req");
+        req.txn_type = VIO_TXN_RESTORE;
+        req.snapshot.num_queue_pairs = 2;
+        req.success = 1;
+        restore_over_catcher = new(
+            "malicious_restore_over_catcher",
+            {"restore_from_migration: snapshot queue-pair count 2 is outside ",
+             "supported range 1..1"});
+        uvm_report_cb::add(null, restore_over_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, restore_over_catcher);
+        restore_over_success = req.success;
+        req.snapshot.num_queue_pairs = 0;
+        req.success = 1;
+        restore_zero_catcher = new(
+            "malicious_restore_zero_catcher",
+            {"restore_from_migration: snapshot queue-pair count 0 is outside ",
+             "supported range 1..1"});
+        uvm_report_cb::add(null, restore_zero_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, restore_zero_catcher);
+        restore_zero_success = req.success;
+
+        req.snapshot.num_queue_pairs = 'x;
+        req.success = 1;
+        restore_unknown_catcher = new(
+            "malicious_restore_unknown_catcher",
+            {"restore_from_migration: snapshot queue-pair count 0 is outside ",
+             "supported range 1..1"});
+        uvm_report_cb::add(null, restore_unknown_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, restore_unknown_catcher);
+        restore_unknown_success = req.success;
+        req = virtio_transaction::type_id::create("malicious_set_mq_valid_req");
+        req.txn_type = VIO_TXN_SET_MQ;
+        req.num_pairs = 1;
+        mq_driver.dispatch_transaction(req);
+
+        req = virtio_transaction::type_id::create("malicious_full_valid_req");
+        req.txn_type = VIO_TXN_INIT;
+        malicious_fsm.drv_cfg.num_queue_pairs = 1;
+        mq_driver.dispatch_transaction(req);
+
+        req = virtio_transaction::type_id::create("malicious_restore_valid_req");
+        req.txn_type = VIO_TXN_RESTORE;
+        req.snapshot.num_queue_pairs = 1;
+        req.success = 0;
+        mq_driver.dispatch_transaction(req);
+
+        if ((set_mq_over_catcher.caught_count != 1) ||
+            (set_mq_unknown_catcher.caught_count != 1) ||
+            (full_over_catcher.caught_count != 1) ||
+            (full_zero_catcher.caught_count != 1) ||
+            (full_unknown_catcher.caught_count != 1) ||
+            (restore_over_catcher.caught_count != 1) ||
+            (restore_zero_catcher.caught_count != 1) ||
+            (restore_unknown_catcher.caught_count != 1) ||
+            restore_over_success || restore_zero_success ||
+            restore_unknown_success ||
+            (malicious_fsm.public_configure_count != 0) ||
+            (malicious_fsm.public_full_init_count != 0) ||
+            (malicious_fsm.public_restore_count != 0) ||
+            (malicious_fsm.do_configure_count != 1) ||
+            (malicious_fsm.do_full_init_count != 1) ||
+            (malicious_fsm.do_restore_count != 1) ||
+            (req.success != 1) ||
+            (ops_spy.ctrl_mq_count != 0) ||
+            (ops_spy.setup_count != 0) ||
+            (ops_spy.teardown_count != 0) ||
+            (malicious_fsm.observed_active_num_pairs() != 1) ||
+            (malicious_fsm.state != FSM_RUNNING)) begin
+            `uvm_error("DUT_CAPS", $sformatf(
+                {"base-typed driver dispatch bypassed mandatory FSM guards: ",
+                 "reports=%0d/%0d/%0d/%0d/%0d/%0d/%0d/%0d ",
+                 "public=%0d/%0d/%0d ",
+                 "do=%0d/%0d/%0d restore_ok=%0b/%0b/%0b/%0b ",
+                 "ops=%0d/%0d/%0d ",
+                 "active=%0d state=%s"},
+                set_mq_over_catcher.caught_count,
+                set_mq_unknown_catcher.caught_count,
+                full_over_catcher.caught_count,
+                full_zero_catcher.caught_count,
+                full_unknown_catcher.caught_count,
+                restore_over_catcher.caught_count,
+                restore_zero_catcher.caught_count,
+                restore_unknown_catcher.caught_count,
+                malicious_fsm.public_configure_count,
+                malicious_fsm.public_full_init_count,
+                malicious_fsm.public_restore_count,
+                malicious_fsm.do_configure_count,
+                malicious_fsm.do_full_init_count,
+                malicious_fsm.do_restore_count,
+                restore_over_success, restore_zero_success,
+                restore_unknown_success, req.success,
+                ops_spy.ctrl_mq_count, ops_spy.setup_count,
+                ops_spy.teardown_count,
+                malicious_fsm.observed_active_num_pairs(),
+                malicious_fsm.state.name()))
+        end
+    endtask
+
+    task assert_dynamic_resize_guard_cannot_be_overridden();
+        dpu_dut_caps caps;
+        virtio_dut_caps_malicious_reconfig malicious_reconfig;
+        virtio_dynamic_reconfig base_reconfig;
+        virtio_dut_caps_expected_resize_error over_catcher;
+        virtio_dut_caps_expected_resize_error zero_catcher;
+        virtio_dut_caps_expected_resize_error unknown_catcher;
+        string why;
+
+        caps = dpu_dut_caps::type_id::create("malicious_reconfig_caps");
+        caps.max_vio_net_qpairs_per_device = 1;
+        malicious_reconfig =
+            virtio_dut_caps_malicious_reconfig::type_id::create(
+                "malicious_reconfig");
+        base_reconfig = malicious_reconfig;
+        if (!base_reconfig.bind_dut_caps(caps, why))
+            `uvm_error("DUT_CAPS", $sformatf(
+                "malicious dynamic reconfig capability bind failed: %s", why))
+
+        over_catcher = new(
+            "malicious_resize_over_catcher",
+            "live_mq_resize: 2 pairs exceeds device limit 1");
+        uvm_report_cb::add(null, over_catcher);
+        base_reconfig.live_mq_resize(null, 1, 2, 0);
+        uvm_report_cb::delete(null, over_catcher);
+
+        zero_catcher = new(
+            "malicious_resize_zero_catcher",
+            "live_mq_resize: 0 pairs is outside supported range 1..1");
+        uvm_report_cb::add(null, zero_catcher);
+        base_reconfig.live_mq_resize(null, 1, 0, 0);
+        uvm_report_cb::delete(null, zero_catcher);
+
+        unknown_catcher = new(
+            "malicious_resize_unknown_catcher",
+            "live_mq_resize: 0 pairs is outside supported range 1..1");
+        uvm_report_cb::add(null, unknown_catcher);
+        base_reconfig.live_mq_resize(null, 1, 'x, 0);
+        uvm_report_cb::delete(null, unknown_catcher);
+
+        base_reconfig.live_mq_resize(null, 1, 1, 0);
+
+        if ((over_catcher.caught_count != 1) ||
+            (zero_catcher.caught_count != 1) ||
+            (unknown_catcher.caught_count != 1) ||
+            (malicious_reconfig.public_resize_count != 0) ||
+            (malicious_reconfig.do_resize_count != 1)) begin
+            `uvm_error("DUT_CAPS", $sformatf(
+                {"base-typed dynamic resize bypassed mandatory guard: ",
+                 "reports=%0d/%0d/%0d public=%0d do=%0d"},
+                over_catcher.caught_count, zero_catcher.caught_count,
+                unknown_catcher.caught_count,
+                malicious_reconfig.public_resize_count,
+                malicious_reconfig.do_resize_count))
+        end
+    endtask
+
+    task assert_function_bind_guard_cannot_be_overridden();
+        virtio_function_instance base_function;
+        virtio_pci_transport transport;
+        virtqueue_manager vq_mgr;
+        virtio_dut_caps_mq_ops_spy ops_spy;
+        virtio_dut_caps_mq_fsm_probe fsm_probe;
+        virtio_atomic_ops ops;
+        virtio_auto_fsm fsm;
+        virtio_driver_config_t driver_cfg;
+        virtio_dut_caps_expected_mq_bind_fatal catcher;
+
+        base_function = malicious_binding_function;
+        transport = virtio_pci_transport::type_id::create(
+            "malicious_binding_transport");
+        vq_mgr = virtqueue_manager::type_id::create(
+            "malicious_binding_vq_mgr");
+        ops_spy = virtio_dut_caps_mq_ops_spy::type_id::create(
+            "malicious_binding_ops");
+        fsm_probe = virtio_dut_caps_mq_fsm_probe::type_id::create(
+            "malicious_binding_fsm");
+        ops = ops_spy;
+        fsm = fsm_probe;
+        driver_cfg.max_vio_net_qpairs_per_device = 33;
+        catcher = new(
+            "malicious_binding_catcher", base_function,
+            {"malicious_function could not bind its MQ pair limit: ",
+             "FSM MQ pair limit 33 exceeds model ceiling 32"});
+        uvm_report_cb::add(null, catcher);
+        base_function.bind_pcie_components(
+            "malicious_function", transport, vq_mgr, null, null, null, null,
+            null, null, driver_cfg, mq_pcie_seqr, ops, fsm);
+        uvm_report_cb::delete(null, catcher);
+
+        if ((catcher.caught_count != 1) ||
+            (malicious_binding_function.public_bind_count != 0) ||
+            (ops != ops_spy) || (fsm != fsm_probe) ||
+            (ops_spy.transport != null) || (ops_spy.vq_mgr != null) ||
+            (fsm_probe.ops != null) ||
+            (fsm_probe.observed_max_supported_qpairs() != 32)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                {"base-typed function bind bypassed mandatory MQ guard: ",
+                 "reports=%0d public=%0d max=%0d"},
+                catcher.caught_count,
+                malicious_binding_function.public_bind_count,
+                fsm_probe.observed_max_supported_qpairs()))
+        end
+    endtask
+
     task configure_fabric();
         dpu_resource_pool_config_t unused_profile;
         dpu_resource_pool_config_t qpair_profile;
@@ -1448,6 +1859,9 @@ class virtio_dut_caps_test extends uvm_test;
         assert_env_propagates_caps_to_fabric();
         assert_dynamic_resize_limit();
         assert_driver_mq_dispatch_uses_dut_cap();
+        assert_mandatory_fsm_guards_cannot_be_overridden();
+        assert_dynamic_resize_guard_cannot_be_overridden();
+        assert_function_bind_guard_cannot_be_overridden();
         configure_fabric();
         assert_manager_topology_limits();
         assert_vio_local_qpair_limit();

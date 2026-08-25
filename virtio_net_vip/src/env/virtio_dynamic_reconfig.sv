@@ -105,18 +105,16 @@ class virtio_dynamic_reconfig extends uvm_object;
     //   traffic_active -- if 1, traffic may be flowing during resize
     // ========================================================================
 
-    virtual task live_mq_resize(
+    task live_mq_resize(
         virtio_vf_instance vf,
         int unsigned old_pairs,
         int unsigned new_pairs,
         bit traffic_active
     );
-        byte unsigned ctrl_data[];
-        virtio_ctrl_ack_e result;
-
-        if (new_pairs == 0) begin
+        if ($isunknown(new_pairs) || (new_pairs == 0)) begin
             `uvm_error("DYN_RECONFIG", $sformatf(
-                "live_mq_resize: 0 pairs is outside supported range 1..%0d",
+                "live_mq_resize: %0d pairs is outside supported range 1..%0d",
+                new_pairs,
                 enforced_max_vio_net_qpairs_per_device))
             return;
         end
@@ -126,6 +124,17 @@ class virtio_dynamic_reconfig extends uvm_object;
                 new_pairs, enforced_max_vio_net_qpairs_per_device))
             return;
         end
+        do_live_mq_resize(vf, old_pairs, new_pairs, traffic_active);
+    endtask
+
+    protected virtual task do_live_mq_resize(
+        virtio_vf_instance vf,
+        int unsigned old_pairs,
+        int unsigned new_pairs,
+        bit traffic_active
+    );
+        byte unsigned ctrl_data[];
+        virtio_ctrl_ack_e result;
 
         `uvm_info("DYN_RECONFIG",
             $sformatf("live_mq_resize: VF%0d, %0d -> %0d pairs, traffic_active=%0b",

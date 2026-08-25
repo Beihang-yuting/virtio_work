@@ -687,7 +687,21 @@ class virtio_auto_fsm extends uvm_object;
     //          -> FSM_MSIX_SETUP -> FSM_READY
     // ========================================================================
 
-    virtual task full_init();
+    task full_init();
+        if ($isunknown(drv_cfg.num_queue_pairs) ||
+            (drv_cfg.num_queue_pairs == 0) ||
+            (drv_cfg.num_queue_pairs > max_vio_net_qpairs_per_device)) begin
+            `uvm_error("AUTO_FSM", $sformatf(
+                {"full_init: configured queue-pair count %0d is outside ",
+                 "supported range 1..%0d"},
+                drv_cfg.num_queue_pairs,
+                max_vio_net_qpairs_per_device))
+            return;
+        end
+        do_full_init();
+    endtask
+
+    protected virtual task do_full_init();
         bit [63:0] negotiated;
         bit        feat_ok;
         bit        setup_ok;
@@ -1015,17 +1029,20 @@ class virtio_auto_fsm extends uvm_object;
     // ------------------------------------------------------------------------
     // configure_mq -- Change the number of active queue pairs
     // ------------------------------------------------------------------------
-    virtual task configure_mq(int unsigned num_pairs);
-        bit success;
-        bit setup_ok;
-
-        if ((num_pairs == 0) ||
+    task configure_mq(int unsigned num_pairs);
+        if ($isunknown(num_pairs) || (num_pairs == 0) ||
             (num_pairs > max_vio_net_qpairs_per_device)) begin
             `uvm_error("AUTO_FSM", $sformatf(
                 "configure_mq: requested %0d pairs is outside supported range 1..%0d",
                 num_pairs, max_vio_net_qpairs_per_device))
             return;
         end
+        do_configure_mq(num_pairs);
+    endtask
+
+    protected virtual task do_configure_mq(int unsigned num_pairs);
+        bit success;
+        bit setup_ok;
 
         `uvm_info("AUTO_FSM",
             $sformatf("configure_mq: changing from %0d to %0d pairs",
@@ -1239,8 +1256,26 @@ class virtio_auto_fsm extends uvm_object;
     //
     // Restores device state from a snapshot and restarts data plane.
     // ------------------------------------------------------------------------
-    virtual task restore_from_migration(virtio_device_snapshot_t snap,
-                                        output bit ok);
+    task restore_from_migration(virtio_device_snapshot_t snap,
+                                output bit ok);
+        ok = 0;
+        if ($isunknown(snap.num_queue_pairs) ||
+            (snap.num_queue_pairs == 0) ||
+            (snap.num_queue_pairs > max_vio_net_qpairs_per_device)) begin
+            `uvm_error("AUTO_FSM", $sformatf(
+                {"restore_from_migration: snapshot queue-pair count %0d is ",
+                 "outside supported range 1..%0d"},
+                snap.num_queue_pairs,
+                max_vio_net_qpairs_per_device))
+            return;
+        end
+        do_restore_from_migration(snap, ok);
+    endtask
+
+    protected virtual task do_restore_from_migration(
+        virtio_device_snapshot_t snap,
+        output bit ok
+    );
         bit feat_ok;
         bit reset_complete;
         bit setup_ok;
