@@ -163,8 +163,12 @@ class virtio_net_env extends uvm_env;
                 end
             end
         end
-        foreach (pf_instances[index])
-            pf_instances[index].configure_fabric_resources(resource_manager);
+        foreach (pf_instances[index]) begin
+            if (!pf_instances[index].configure_fabric_resources(
+                resource_manager)) begin
+                return 0;
+            end
+        end
         return 1;
     endfunction
 

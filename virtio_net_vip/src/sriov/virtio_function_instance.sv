@@ -56,7 +56,7 @@ class virtio_function_instance extends uvm_component;
     // Fabric topology supplies all identity and BAR leases before transport
     // discovery.  BAR0/1 is the virtio function window, BAR2/3 is a consumed
     // reservation, and BAR4/5 is MSI-X only; the BAR accessor enforces roles.
-    virtual function void configure_function(
+    virtual function bit configure_function(
         input dpu_function_kind_e kind,
         input dpu_function_key_t key,
         input bit [15:0] device_bdf,
@@ -70,14 +70,23 @@ class virtio_function_instance extends uvm_component;
             `uvm_error("FUNCTION_INSTANCE", $sformatf(
                 "transport kind %0d disagrees with Fabric function key kind %0d",
                 kind, key.kind))
-            return;
+            return 0;
+        end
+        if ((resource_client != null) &&
+            resource_client.is_bound_to_fabric() && (manager == null)) begin
+            why =
+                "virtio resource client binding ownership cannot be cleared";
+            `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
+                key.host_id, key.pf_id, key.kind, key.vf_id, why))
+            return 0;
         end
         if ((manager != null) && (resource_client != null) &&
             !resource_client.bind_to_fabric(manager, key, why)) begin
             `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                 "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
                 key.host_id, key.pf_id, key.kind, key.vf_id, why))
-            return;
+            return 0;
         end
         function_kind = kind;
         function_key = key;
@@ -87,6 +96,7 @@ class virtio_function_instance extends uvm_component;
         resource_manager = manager;
         pcie_ctx_ref = pcie_ctx;
         apply_function_configuration();
+        return 1;
     endfunction
 
     // Legacy flat-VF callers configure a local BAR0 rather than Fabric BAR
@@ -343,7 +353,7 @@ class virtio_function_instance extends uvm_component;
     protected function void release_fabric_qpairs(input string lifecycle);
         string why;
 
-        if ((resource_manager == null) || (resource_client == null) ||
+        if ((resource_client == null) ||
             !resource_client.has_pending_qpair_cleanup()) begin
             return;
         end

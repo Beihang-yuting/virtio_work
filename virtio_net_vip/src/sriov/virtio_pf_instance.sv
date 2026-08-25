@@ -40,9 +40,11 @@ class virtio_pf_instance extends uvm_component;
     virtio_vf_instance          vf_functions[];
     virtio_pf_manager           pf_manager;
     virtio_pf_lifecycle_reset_owner lifecycle_reset_owner;
+    protected bit               configuration_valid;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
+        configuration_valid = 0;
     endfunction
 
     function void configure_topology(
@@ -77,25 +79,32 @@ class virtio_pf_instance extends uvm_component;
         pf_function = virtio_function_instance::type_id::create(
             "pf_function", this
         );
-        pf_function.configure_function(
+        if (!pf_function.configure_function(
             DPU_FUNCTION_PF, pf_key, pf_bdf, no_bars
-        );
+        )) begin
+            return;
+        end
 
         vf_functions = new[num_vfs];
         foreach (vf_functions[vf_id]) begin
             vf_functions[vf_id] = virtio_vf_instance::type_id::create(
                 $sformatf("vf_function_%0d", vf_id), this
             );
-            vf_functions[vf_id].configure_function(
+            if (!vf_functions[vf_id].configure_function(
                 DPU_FUNCTION_VF, vf_keys[vf_id], vf_bdfs[vf_id], no_bars
-            );
+            )) begin
+                return;
+            end
         end
         pf_manager = virtio_pf_manager::type_id::create("pf_manager");
         pf_manager.pf_index = pf_id;
+        configuration_valid = 1;
     endfunction
 
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
+        if (!configuration_valid)
+            return;
         pf_manager.vf_instances = new[vf_functions.size()];
         foreach (vf_functions[vf_id])
             pf_manager.vf_instances[vf_id] = vf_functions[vf_id];
@@ -107,31 +116,41 @@ class virtio_pf_instance extends uvm_component;
         pf_manager.configure_pf_lifecycle_reset_owner(lifecycle_reset_owner);
     endfunction
 
-    function void configure_fabric_resources(
+    function bit configure_fabric_resources(
         input dpu_resource_manager manager
     );
         dpu_bar_pair_lease_t bars[$];
         string why;
 
+        if (!configuration_valid)
+            return 0;
+
         if (!manager.activate_function(pf_key, bars, why)) begin
             `uvm_fatal("PF_INSTANCE", $sformatf(
                 "PF activation failed for host %0d PF %0d: %s",
                 host_id, pf_id, why))
+            return 0;
         end
-        pf_function.configure_function(
+        if (!pf_function.configure_function(
             DPU_FUNCTION_PF, pf_key, pf_bdf, bars, manager
-        );
+        )) begin
+            return 0;
+        end
 
         foreach (vf_functions[vf_id]) begin
             if (!manager.activate_function(vf_keys[vf_id], bars, why)) begin
                 `uvm_fatal("PF_INSTANCE", $sformatf(
                     "VF activation failed for host %0d PF %0d VF %0d: %s",
                     host_id, pf_id, vf_id, why))
+                return 0;
             end
-            vf_functions[vf_id].configure_function(
+            if (!vf_functions[vf_id].configure_function(
                 DPU_FUNCTION_VF, vf_keys[vf_id], vf_bdfs[vf_id], bars, manager
-            );
+            )) begin
+                return 0;
+            end
         end
+        return 1;
     endfunction
 endclass : virtio_pf_instance
 

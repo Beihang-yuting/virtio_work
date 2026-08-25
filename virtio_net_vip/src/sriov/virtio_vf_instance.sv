@@ -12,7 +12,7 @@ class virtio_vf_instance extends virtio_function_instance;
         function_kind = DPU_FUNCTION_VF;
     endfunction
 
-    virtual function void configure_function(
+    virtual function bit configure_function(
         input dpu_function_kind_e kind,
         input dpu_function_key_t key,
         input bit [15:0] device_bdf,
@@ -23,17 +23,18 @@ class virtio_vf_instance extends virtio_function_instance;
         if ((kind != DPU_FUNCTION_VF) || (key.kind != DPU_FUNCTION_VF)) begin
             `uvm_fatal("VF_INSTANCE",
                 "compatibility virtio_vf_instance requires a VF function key")
-            return;
+            return 0;
         end
-        super.configure_function(kind, key, device_bdf, bars, manager, pcie_ctx);
+        return super.configure_function(
+            kind, key, device_bdf, bars, manager, pcie_ctx);
     endfunction
 
-    virtual function void configure_fabric_function(
+    virtual function bit configure_fabric_function(
         input dpu_function_key_t key,
         input dpu_bar_pair_lease_t bars[$],
         input dpu_resource_manager manager
     );
-        configure_function(
+        return configure_function(
             DPU_FUNCTION_VF, key, bdf, bars, manager, pcie_ctx_ref
         );
     endfunction

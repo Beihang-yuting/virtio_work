@@ -86,6 +86,10 @@ class virtio_resource_client extends uvm_object;
         return 1;
     endfunction
 
+    function bit is_bound_to_fabric();
+        return binding_owned;
+    endfunction
+
     function dpu_dut_caps snapshot_bound_dut_caps();
         dpu_dut_caps snapshot;
 

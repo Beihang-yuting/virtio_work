@@ -672,6 +672,7 @@ class virtio_fabric_resource_test extends uvm_test;
         dpu_function_key_t compatibility_vf_key;
         dpu_function_key_t invalid_pf_key;
         dpu_bar_pair_lease_t no_bars[$];
+        bit function_configuration_succeeded;
 
         phase.raise_objection(this);
 
@@ -697,19 +698,23 @@ class virtio_fabric_resource_test extends uvm_test;
         compatibility_vf_key.pf_id = 0;
         compatibility_vf_key.kind = DPU_FUNCTION_VF;
         compatibility_vf_key.vf_id = 0;
-        compatibility_vf.configure_function(
+        function_configuration_succeeded = compatibility_vf.configure_function(
             DPU_FUNCTION_VF, compatibility_vf_key, 16'h0400, no_bars
         );
+        if (!function_configuration_succeeded)
+            `uvm_fatal("FABRIC_RESOURCE",
+                "compatibility VF rejected a valid VF configuration")
         invalid_pf_key = compatibility_vf_key;
         invalid_pf_key.kind = DPU_FUNCTION_PF;
         invalid_pf_key.vf_id = 0;
         compatibility_vf.set_report_severity_id_override(
             UVM_FATAL, "VF_INSTANCE", UVM_INFO
         );
-        compatibility_vf.configure_function(
+        function_configuration_succeeded = compatibility_vf.configure_function(
             DPU_FUNCTION_PF, invalid_pf_key, 16'h0401, no_bars
         );
-        if ((compatibility_vf.function_kind != DPU_FUNCTION_VF) ||
+        if (function_configuration_succeeded ||
+            (compatibility_vf.function_kind != DPU_FUNCTION_VF) ||
             !compatibility_vf.transport.is_vf ||
             (compatibility_vf.function_key.kind != DPU_FUNCTION_VF)) begin
             `uvm_fatal("FABRIC_RESOURCE",
@@ -737,11 +742,12 @@ class virtio_fabric_resource_test extends uvm_test;
         function_view.set_report_severity_id_override(
             UVM_ERROR, "FUNCTION_INSTANCE", UVM_INFO
         );
-        function_view.configure_function(
+        function_configuration_succeeded = function_view.configure_function(
             DPU_FUNCTION_VF, function_view.function_key, function_view.bdf,
             function_view.bar_pairs, function_view.resource_manager
         );
-        if ((function_view.function_kind != DPU_FUNCTION_PF) ||
+        if (function_configuration_succeeded ||
+            (function_view.function_kind != DPU_FUNCTION_PF) ||
             function_view.transport.is_vf ||
             (function_view.function_key.kind != DPU_FUNCTION_PF)) begin
             `uvm_fatal("FABRIC_RESOURCE",
