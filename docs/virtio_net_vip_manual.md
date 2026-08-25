@@ -1500,13 +1500,22 @@ pairs，local pair ID 为 `0..31`。例如，两个不同 device 都可以使用
 ID 0，因为 Fabric 会结合各自的 function/device context 解析 global qpair
 lease；解析后的 global qpair lease 仍是全局排他的，不能同时租给另一个 device。
 
-限制在以下三层执行：
+限制由同一个 `dut_caps.max_vio_net_qpairs_per_device` 在以下边界执行：
 
-1. 初始 `virtio_net_env_config` 拒绝 33 个 queue pairs 的默认或 per-VF 配置；
-2. dynamic resize 拒绝将 pair 数改为 33（也拒绝 0）；
-3. 最终 Fabric lease acquisition 拒绝第 33 个 local pair，以及任何包含
-   `local_pair_id > 31` 的范围；`virtio.qpair` profile 的 per-function quota
-   也保持为 32。
+1. 初始 `virtio_net_env_config` 拒绝超过 capability 的默认或 per-VF pair 数；
+2. dynamic resize 拒绝超过 capability 的 pair 数（也拒绝 0）；
+3. VIO client 在最终 Fabric lease acquisition 时拒绝越过 capability 的 local
+   pair range；
+4. `virtio.qpair` profile 的 per-function quota 取同一个 capability 值。
+
+默认 capability/quota 是 32，所以默认配置拒绝第 33 个 pair，local pair ID
+必须在 `0..31`。如果 `dut_caps` 合法配置为 16，以上四处边界会同步降为 16，
+local pair ID 范围相应变为 `0..15`。32 是每设备的默认 capability 和
+device/model ceiling，并非所有参数化场景中固定不变的 quota。
+
+Fabric 拥有 `virtio.qpair` 的不透明 resource-class ID；它不是 core enum 常量。
+所有 resource profiles 必须在任何 function activation 前完成 register，并在
+注册完成后 seal registry。
 
 当前 verification/Fabric model 的 BAR 布局仍是三组 64-bit pair lease。
 PF 的 BAR0/1、BAR2/3、BAR4/5 分别建模为 32 MiB function-device、64 KiB

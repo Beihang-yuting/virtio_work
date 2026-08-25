@@ -298,10 +298,17 @@ VIO global qpair ID 是 11 bits，编码域为 `0..2047`，因此默认 profile
 Fabric 通过该设备的 function/device 上下文解析 global qpair lease，解析后的
 global qpair lease 在整个 Fabric 中仍保持排他。
 
-边界校验分为三层：初始 `virtio_net_env_config` 和 dynamic resize 均拒绝第 33
-个 pair，最终 Fabric lease acquisition 还拒绝任何越过 32-pair 范围的申请，
-包括 local pair ID 超出 `0..31`。`virtio.qpair` profile 的每 function quota
-同样保持 32，作为最终防线。
+`dut_caps.max_vio_net_qpairs_per_device` 同时驱动初始
+`virtio_net_env_config`、dynamic resize、VIO local lease range 和
+`virtio.qpair` profile 的 per-function quota。默认 capability/quota 为 32，
+因此默认配置拒绝第 33 个 pair，Fabric lease acquisition 也拒绝 local pair ID
+超出 `0..31`。如果参数化场景把该 capability 合法缩小为 16，这四处边界会同步
+缩小为 16，local pair ID 范围也变为 `0..15`；32 是设备/model ceiling，
+不是不可缩小的常量 quota。
+
+`virtio.qpair` resource-class ID 由 Fabric 持有，是不透明值而非 core enum
+常量；所有 resource profiles 都必须在 function activation 前完成 register，
+随后 seal registry。
 
 当前 verification/Fabric model 还定义三组 64-bit BAR pair lease：PF 的
 BAR0/1、BAR2/3、BAR4/5 分别为 32 MiB function-device、64 KiB reserved、
