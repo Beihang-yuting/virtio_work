@@ -72,6 +72,12 @@ class virtio_dynamic_reconfig extends uvm_object;
         byte unsigned ctrl_data[];
         virtio_ctrl_ack_e result;
 
+        if (new_pairs == 0) begin
+            `uvm_error("DYN_RECONFIG", $sformatf(
+                "live_mq_resize: 0 pairs is outside supported range 1..%0d",
+                max_vio_net_qpairs_per_device))
+            return;
+        end
         if (!qpair_count_supported(new_pairs)) begin
             `uvm_error("DYN_RECONFIG", $sformatf(
                 "live_mq_resize: %0d pairs exceeds device limit %0d",

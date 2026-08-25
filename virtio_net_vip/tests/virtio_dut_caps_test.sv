@@ -126,6 +126,19 @@ class virtio_dut_caps_expected_resize_error extends uvm_report_catcher;
     endfunction
 endclass
 
+class virtio_dut_caps_snapshot_mutator extends virtio_resource_client;
+    `uvm_object_utils(virtio_dut_caps_snapshot_mutator)
+
+    function new(string name = "virtio_dut_caps_snapshot_mutator");
+        super.new(name);
+    endfunction
+
+    function void mutate_snapshot_qpair_limit(input int unsigned limit);
+        if (dut_caps != null)
+            dut_caps.max_vio_net_qpairs_per_device = limit;
+    endfunction
+endclass
+
 class virtio_dut_caps_test extends uvm_test;
     `uvm_component_utils(virtio_dut_caps_test)
 
@@ -389,6 +402,18 @@ class virtio_dut_caps_test extends uvm_test;
             "invalid DUT capabilities: null capability object",
             "null DUT capabilities were accepted", total_caught);
 
+        cfg = virtio_net_env_config::type_id::create("invalid_caps_root_cfg");
+        cfg.dut_caps.max_hosts = 0;
+        cfg.num_hosts = 1;
+        cfg.num_pfs_per_host = new[1];
+        cfg.num_pfs_per_host[0] = 1;
+        cfg.num_vfs_per_pf = new[1];
+        cfg.num_vfs_per_pf[0] = new[1];
+        cfg.num_vfs_per_pf[0][0] = 0;
+        assert_config_rejected_once(cfg,
+            "invalid DUT capabilities: DUT host capability must be nonzero",
+            "invalid DUT capabilities were accepted", total_caught);
+
         cfg = virtio_net_env_config::type_id::create(
             "invalid_function_count_cfg");
         cfg.dut_caps.max_functions = 1;
@@ -402,9 +427,9 @@ class virtio_dut_caps_test extends uvm_test;
             "requested 2 functions exceeds DUT limit 1",
             "DUT function-count limit was not enforced", total_caught);
 
-        if (total_caught != 11)
+        if (total_caught != 12)
             `uvm_fatal("DUT_CAPS", $sformatf(
-                "caught %0d expected invalid configurations; expected exactly 11",
+                "caught %0d expected invalid configurations; expected exactly 12",
                 total_caught))
     endtask
 
@@ -465,12 +490,25 @@ class virtio_dut_caps_test extends uvm_test;
         if (why != "resource-class capacity would be exceeded")
             `uvm_fatal("DUT_CAPS", $sformatf(
                 "global qpair rejection used wrong reason: %s", why))
+        if (!clients[0].release_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "first PF could not release its propagated qpair: %s", why))
+        if (!clients[1].release_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "second PF could not release its propagated qpair: %s", why))
+        if (!clients[2].reserve_qpairs(0, 1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "third PF could not reserve after capacity recovery: %s", why))
+        if (!clients[2].release_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "third PF could not release its recovered qpair: %s", why))
     endtask
 
     task assert_dynamic_resize_limit();
         virtio_dynamic_reconfig reconfig;
         virtio_dut_caps_expected_resize_error default_catcher;
         virtio_dut_caps_expected_resize_error propagated_catcher;
+        virtio_dut_caps_expected_resize_error zero_catcher;
 
         reconfig = virtio_dynamic_reconfig::type_id::create("reconfig");
         if (!reconfig.qpair_count_supported(32))
@@ -479,6 +517,15 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS", "dynamic resize accepted 33 qpairs")
         if (reconfig.qpair_count_supported(0))
             `uvm_fatal("DUT_CAPS", "dynamic resize accepted zero qpairs")
+
+        zero_catcher = new("zero_resize_catcher",
+            "live_mq_resize: 0 pairs is outside supported range 1..32");
+        uvm_report_cb::add(null, zero_catcher);
+        reconfig.live_mq_resize(null, 1, 0, 0);
+        uvm_report_cb::delete(null, zero_catcher);
+        if (zero_catcher.caught_count != 1)
+            `uvm_fatal("DUT_CAPS",
+                "zero resize did not use the supported-range diagnostic")
 
         default_catcher = new("default_resize_catcher",
             "live_mq_resize: 33 pairs exceeds device limit 32");
@@ -573,8 +620,10 @@ class virtio_dut_caps_test extends uvm_test;
         dpu_function_key_t failed_rebind_key;
         dpu_resource_class_id_t original_class_id;
         dpu_dut_caps original_caps;
+        dpu_dut_caps observed_caps;
         virtio_resource_client pf_client;
         virtio_resource_client vf_client;
+        virtio_dut_caps_snapshot_mutator mutable_vf_client;
         string why;
 
         if (!manager.activate_function(valid_pf, bars, why))
@@ -583,7 +632,12 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS", $sformatf("valid VF activation failed: %s", why))
 
         pf_client = virtio_resource_client::type_id::create("pf_client");
-        vf_client = virtio_resource_client::type_id::create("vf_client");
+        mutable_vf_client = virtio_dut_caps_snapshot_mutator::type_id::create(
+            "vf_client");
+        vf_client = mutable_vf_client;
+        if (vf_client.snapshot_bound_dut_caps() != null)
+            `uvm_fatal("DUT_CAPS",
+                "unbound VF client exposed a DUT capability snapshot")
         if (!pf_client.bind_to_fabric(manager, valid_pf, why))
             `uvm_fatal("DUT_CAPS", $sformatf("PF client bind failed: %s", why))
         if (!vf_client.bind_to_fabric(manager, valid_vf, why))
@@ -593,10 +647,38 @@ class virtio_dut_caps_test extends uvm_test;
         if (!vf_client.mark_device_ready(why))
             `uvm_fatal("DUT_CAPS", $sformatf("VF client ready failed: %s", why))
 
+        observed_caps = vf_client.snapshot_bound_dut_caps();
+        if ((observed_caps == null) ||
+            (observed_caps.max_vio_net_qpairs_per_device != 32)) begin
+            `uvm_fatal("DUT_CAPS",
+                "VF client did not expose its bound DUT capability snapshot")
+        end
+        observed_caps.max_vio_net_qpairs_per_device = 33;
+        observed_caps = vf_client.snapshot_bound_dut_caps();
+        if ((observed_caps == null) ||
+            (observed_caps.max_vio_net_qpairs_per_device != 32)) begin
+            `uvm_fatal("DUT_CAPS",
+                "mutating the observed VF caps changed the bound snapshot")
+        end
+        if (vf_client.reserve_qpairs(32, 1, why))
+            `uvm_fatal("DUT_CAPS",
+                "mutated observed VF caps allowed local pair 32")
+        if (why != "VIO-net local qpair range exceeds device limit 0..31")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "observed caps mutation rejection used wrong reason: %s", why))
+
+        mutable_vf_client.mutate_snapshot_qpair_limit(33);
+        if (vf_client.reserve_qpairs(32, 1, why))
+            `uvm_fatal("DUT_CAPS",
+                "mutable VF client snapshot allowed local pair 32")
+        if (why != "VIO-net local qpair range exceeds device limit 0..31")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "mutated snapshot rejection used wrong reason: %s", why))
+
         original_manager = vf_client.resource_manager;
         original_key = vf_client.function_key;
         original_class_id = vf_client.qpair_class_id;
-        original_caps = vf_client.dut_caps;
+        original_caps = vf_client.snapshot_bound_dut_caps();
         if (original_class_id == '0)
             `uvm_fatal("DUT_CAPS",
                 "failed rebind guard requires a nonzero virtio.qpair class ID")
@@ -617,10 +699,27 @@ class virtio_dut_caps_test extends uvm_test;
             (vf_client.function_key.pf_id != original_key.pf_id) ||
             (vf_client.function_key.kind != original_key.kind) ||
             (vf_client.function_key.vf_id != original_key.vf_id) ||
-            (vf_client.qpair_class_id != original_class_id) ||
-            (vf_client.dut_caps != original_caps)) begin
+            (vf_client.qpair_class_id != original_class_id)) begin
             `uvm_fatal("DUT_CAPS",
                 "failed rebind partially replaced the old VF binding")
+        end
+        observed_caps = vf_client.snapshot_bound_dut_caps();
+        if ((observed_caps == null) || (original_caps == null) ||
+            (observed_caps.max_hosts != original_caps.max_hosts) ||
+            (observed_caps.max_pfs_per_host !=
+             original_caps.max_pfs_per_host) ||
+            (observed_caps.max_vfs_per_pf != original_caps.max_vfs_per_pf) ||
+            (observed_caps.max_functions != original_caps.max_functions) ||
+            (observed_caps.global_msix_vector_count !=
+             original_caps.global_msix_vector_count) ||
+            (observed_caps.vio_global_qpair_count !=
+             original_caps.vio_global_qpair_count) ||
+            (observed_caps.max_vio_net_qpairs_per_device !=
+             original_caps.max_vio_net_qpairs_per_device) ||
+            (observed_caps.vio_notify_entries_per_bank !=
+             original_caps.vio_notify_entries_per_bank)) begin
+            `uvm_fatal("DUT_CAPS",
+                "failed rebind replaced the bound VF capability snapshot")
         end
         if (!vf_client.reserve_qpairs(1, 1, why))
             `uvm_fatal("DUT_CAPS", $sformatf(

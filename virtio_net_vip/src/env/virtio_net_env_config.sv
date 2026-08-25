@@ -146,6 +146,7 @@ class virtio_net_env_config extends uvm_object;
 
     function bit validate();
         bit ok = 1;
+        bit caps_valid = 0;
         string caps_why;
 
         if (dut_caps == null) begin
@@ -160,6 +161,7 @@ class virtio_net_env_config extends uvm_object;
             ok = 0;
         end
         else begin
+            caps_valid = 1;
             if (default_num_pairs == 0) begin
                 `uvm_error("ENV_CFG",
                     "default_num_pairs=0 must be nonzero")
@@ -196,7 +198,7 @@ class virtio_net_env_config extends uvm_object;
             ok = 0;
         end
 
-        if (uses_fabric_topology() && (dut_caps != null)) begin
+        if (uses_fabric_topology() && caps_valid) begin
             int unsigned total_functions;
 
             if (num_hosts == 0) begin

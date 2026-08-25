@@ -7,17 +7,19 @@ class virtio_resource_client extends uvm_object;
     `uvm_object_utils(virtio_resource_client)
 
     dpu_resource_manager    resource_manager;
-    dpu_dut_caps            dut_caps;
+    protected dpu_dut_caps  dut_caps;
     dpu_function_key_t      function_key;
     dpu_resource_class_id_t qpair_class_id;
     dpu_resource_lease_t    qpair_leases[$];
     virtio_qpair_mapping_t  qpair_mappings[$];
+    local int unsigned      bound_local_qpair_limit;
     protected bit           device_ready;
     protected bit           qpairs_frozen;
 
     function new(string name = "virtio_resource_client");
         super.new(name);
         qpair_class_id = '0;
+        bound_local_qpair_limit = 0;
         device_ready = 0;
         qpairs_frozen = 0;
     endfunction
@@ -29,6 +31,7 @@ class virtio_resource_client extends uvm_object;
     );
         dpu_resource_class_id_t bound_qpair_class_id;
         dpu_dut_caps bound_dut_caps;
+        int unsigned bound_qpair_limit;
 
         if (manager == null) begin
             why = "virtio resource client requires a Fabric resource manager";
@@ -44,15 +47,29 @@ class virtio_resource_client extends uvm_object;
             why = "virtio resource client requires DUT capabilities";
             return 0;
         end
+        bound_qpair_limit =
+            bound_dut_caps.max_vio_net_qpairs_per_device;
 
         resource_manager = manager;
         function_key = key;
         qpair_class_id = bound_qpair_class_id;
         dut_caps = bound_dut_caps;
+        bound_local_qpair_limit = bound_qpair_limit;
         device_ready = 0;
         qpairs_frozen = 0;
         why = "";
         return 1;
+    endfunction
+
+    function dpu_dut_caps snapshot_bound_dut_caps();
+        dpu_dut_caps snapshot;
+
+        if (dut_caps == null)
+            return null;
+        snapshot = dpu_dut_caps::type_id::create(
+            "virtio_client_bound_dut_caps_snapshot");
+        snapshot.copy_from(dut_caps);
+        return snapshot;
     endfunction
 
     // The caller invokes this only after it programmed the Fabric BAR
@@ -76,7 +93,6 @@ class virtio_resource_client extends uvm_object;
     );
         dpu_resource_lease_t leases[$];
         virtio_qpair_mapping_t mapping;
-        int unsigned local_qpair_limit;
 
         if ((resource_manager == null) || !device_ready) begin
             why = "virtio resource client function is not device-ready";
@@ -90,18 +106,17 @@ class virtio_resource_client extends uvm_object;
             why = "virtio resource client requires DUT capabilities";
             return 0;
         end
-        local_qpair_limit = dut_caps.max_vio_net_qpairs_per_device;
-        if (first_local_pair >= local_qpair_limit) begin
+        if (first_local_pair >= bound_local_qpair_limit) begin
             why = $sformatf(
                 "VIO-net local qpair range exceeds device limit 0..%0d",
-                local_qpair_limit - 1
+                bound_local_qpair_limit - 1
             );
             return 0;
         end
-        if (count > (local_qpair_limit - first_local_pair)) begin
+        if (count > (bound_local_qpair_limit - first_local_pair)) begin
             why = $sformatf(
                 "VIO-net local qpair range exceeds device limit 0..%0d",
-                local_qpair_limit - 1
+                bound_local_qpair_limit - 1
             );
             return 0;
         end
