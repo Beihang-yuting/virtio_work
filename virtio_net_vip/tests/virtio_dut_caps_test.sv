@@ -444,11 +444,17 @@ class virtio_dut_caps_test extends uvm_test;
     endtask
 
     task configure_fabric();
+        dpu_resource_pool_config_t unused_profile;
         dpu_resource_pool_config_t qpair_profile;
         string why;
 
         fabric_cfg.mmio_aperture_base = 64'h0001_0000_0000_0000;
         fabric_cfg.mmio_aperture_limit = 64'h0001_0100_0000_0000;
+        unused_profile.name = "test.unused";
+        unused_profile.kind = DPU_RESOURCE_KIND_QUEUE;
+        unused_profile.capacity = 1;
+        unused_profile.max_per_function = 1;
+        fabric_cfg.resource_profiles.push_back(unused_profile);
         qpair_profile.name = "virtio.qpair";
         qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
         qpair_profile.capacity = fabric_cfg.dut_caps.vio_global_qpair_count;
@@ -522,6 +528,9 @@ class virtio_dut_caps_test extends uvm_test;
         original_key = vf_client.function_key;
         original_class_id = vf_client.qpair_class_id;
         original_caps = vf_client.dut_caps;
+        if (original_class_id == '0)
+            `uvm_fatal("DUT_CAPS",
+                "failed rebind guard requires a nonzero virtio.qpair class ID")
         failed_rebind_key = make_key(1, 3, DPU_FUNCTION_VF, 14);
         missing_class_manager = dpu_resource_manager::type_id::create(
             "missing_class_manager");
