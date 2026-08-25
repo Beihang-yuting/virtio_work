@@ -199,15 +199,19 @@ class virtio_net_env_config extends uvm_object;
         if (uses_fabric_topology() && (dut_caps != null)) begin
             int unsigned total_functions;
 
-            if ((num_hosts == 0) ||
-                (num_hosts > dut_caps.max_hosts)) begin
+            if (num_hosts == 0) begin
+                `uvm_error("ENV_CFG", "num_hosts=0 must be nonzero")
+                ok = 0;
+            end
+            else if (num_hosts > dut_caps.max_hosts) begin
                 `uvm_error("ENV_CFG", $sformatf(
                     "num_hosts=%0d exceeds DUT limit %0d",
                     num_hosts, dut_caps.max_hosts))
                 ok = 0;
             end
-            if (num_pfs_per_host.size() != num_hosts ||
-                num_vfs_per_pf.size() != num_hosts) begin
+            if ((num_hosts != 0) &&
+                ((num_pfs_per_host.size() != num_hosts) ||
+                 (num_vfs_per_pf.size() != num_hosts))) begin
                 `uvm_error("ENV_CFG", "topology arrays must contain one entry per host")
                 ok = 0;
             end
@@ -218,9 +222,13 @@ class virtio_net_env_config extends uvm_object;
                 if ((host_id >= num_pfs_per_host.size()) ||
                     (host_id >= num_vfs_per_pf.size()))
                     continue;
-                if ((num_pfs_per_host[host_id] == 0) ||
-                    (num_pfs_per_host[host_id] >
-                     dut_caps.max_pfs_per_host)) begin
+                if (num_pfs_per_host[host_id] == 0) begin
+                    `uvm_error("ENV_CFG", $sformatf(
+                        "host %0d PF count 0 must be nonzero", host_id))
+                    ok = 0;
+                end
+                else if (num_pfs_per_host[host_id] >
+                         dut_caps.max_pfs_per_host) begin
                     `uvm_error("ENV_CFG", $sformatf(
                         "host %0d PF count %0d exceeds DUT limit %0d",
                         host_id, num_pfs_per_host[host_id],

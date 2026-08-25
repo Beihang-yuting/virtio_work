@@ -76,6 +76,32 @@ class virtio_dut_caps_expected_cfg_error extends uvm_report_catcher;
     endfunction
 endclass
 
+class virtio_dut_caps_expected_bind_fatal extends uvm_report_catcher;
+    uvm_report_object expected_env_client;
+    int unsigned caught_count;
+
+    function new(
+        string name,
+        uvm_report_object configured_env_client
+    );
+        super.new(name);
+        expected_env_client = configured_env_client;
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_FATAL) &&
+            (get_id() == "VIRTIO_ENV") &&
+            (get_client() == expected_env_client) &&
+            (get_message() ==
+             "bind_pcie() received a null PCIe RC sequencer")) begin
+            caught_count++;
+            set_severity(UVM_INFO);
+        end
+        return THROW;
+    endfunction
+endclass
+
 class virtio_dut_caps_test extends uvm_test;
     `uvm_component_utils(virtio_dut_caps_test)
 
@@ -146,6 +172,8 @@ class virtio_dut_caps_test extends uvm_test;
     endfunction
 
     task assert_invalid_legacy_config_hard_fails();
+        virtio_dut_caps_expected_bind_fatal bind_catcher;
+
         uvm_report_cb::delete(null, expected_build_failure);
         if ((expected_build_failure.cfg_error_count != 1) ||
             (expected_build_failure.env_fatal_count != 1)) begin
@@ -164,6 +192,18 @@ class virtio_dut_caps_test extends uvm_test;
         if (invalid_legacy_env.host_mem != null) begin
             `uvm_fatal("DUT_CAPS",
                 "invalid legacy configuration continued normal environment construction")
+        end
+
+        bind_catcher = new("invalid_legacy_bind_catcher", invalid_legacy_env);
+        invalid_legacy_env.v_seqr = propagated_caps_env.v_seqr;
+        uvm_report_cb::add(null, bind_catcher);
+        invalid_legacy_env.bind_pcie(null);
+        uvm_report_cb::delete(null, bind_catcher);
+        invalid_legacy_env.v_seqr = null;
+        if (bind_catcher.caught_count != 0) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "invalid legacy bind reported %0d null-sequencer fatal(s); expected silent return",
+                bind_catcher.caught_count))
         end
     endtask
 
@@ -253,6 +293,15 @@ class virtio_dut_caps_test extends uvm_test;
             "VF0 num_queue_pairs=33 exceeds VIO-net device limit 32",
             "VF configuration accepted 33 qpairs", total_caught);
 
+        cfg = virtio_net_env_config::type_id::create("invalid_zero_host_cfg");
+        cfg.num_hosts = 0;
+        cfg.num_pfs_per_host = new[1];
+        cfg.num_vfs_per_pf = new[1];
+        cfg.num_vfs_per_pf[0] = new[0];
+        assert_config_rejected_once(cfg,
+            "num_hosts=0 must be nonzero",
+            "zero-host topology was accepted", total_caught);
+
         cfg = virtio_net_env_config::type_id::create("invalid_host_cfg");
         cfg.num_hosts = 3;
         cfg.num_pfs_per_host = new[3];
@@ -264,6 +313,16 @@ class virtio_dut_caps_test extends uvm_test;
         assert_config_rejected_once(cfg,
             "num_hosts=3 exceeds DUT limit 2",
             "three-host topology exceeded real-DUT caps", total_caught);
+
+        cfg = virtio_net_env_config::type_id::create("invalid_zero_pf_cfg");
+        cfg.num_hosts = 1;
+        cfg.num_pfs_per_host = new[1];
+        cfg.num_pfs_per_host[0] = 0;
+        cfg.num_vfs_per_pf = new[1];
+        cfg.num_vfs_per_pf[0] = new[0];
+        assert_config_rejected_once(cfg,
+            "host 0 PF count 0 must be nonzero",
+            "zero-PF topology was accepted", total_caught);
 
         cfg = virtio_net_env_config::type_id::create("invalid_pf_cfg");
         cfg.num_hosts = 1;
@@ -319,9 +378,9 @@ class virtio_dut_caps_test extends uvm_test;
             "requested 2 functions exceeds DUT limit 1",
             "DUT function-count limit was not enforced", total_caught);
 
-        if (total_caught != 9)
+        if (total_caught != 11)
             `uvm_fatal("DUT_CAPS", $sformatf(
-                "caught %0d expected invalid configurations; expected exactly 9",
+                "caught %0d expected invalid configurations; expected exactly 11",
                 total_caught))
     endtask
 

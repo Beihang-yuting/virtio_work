@@ -326,6 +326,8 @@ class virtio_net_env extends uvm_env;
         input pcie_tl_base_monitor pcie_rc_monitor = null,
         input pcie_tl_base_monitor pcie_ep_monitor = null
     );
+        if (!configuration_valid)
+            return;
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("VIRTIO_ENV", "bind_pcie() received a null PCIe RC sequencer")
         end
