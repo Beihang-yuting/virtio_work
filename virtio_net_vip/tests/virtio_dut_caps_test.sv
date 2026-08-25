@@ -492,6 +492,12 @@ class virtio_dut_caps_test extends uvm_test;
 
     task assert_vio_local_qpair_limit();
         dpu_bar_pair_lease_t bars[$];
+        dpu_resource_manager original_manager;
+        dpu_resource_manager missing_class_manager;
+        dpu_function_key_t original_key;
+        dpu_function_key_t failed_rebind_key;
+        dpu_resource_class_id_t original_class_id;
+        dpu_dut_caps original_caps;
         virtio_resource_client pf_client;
         virtio_resource_client vf_client;
         string why;
@@ -512,9 +518,60 @@ class virtio_dut_caps_test extends uvm_test;
         if (!vf_client.mark_device_ready(why))
             `uvm_fatal("DUT_CAPS", $sformatf("VF client ready failed: %s", why))
 
+        original_manager = vf_client.resource_manager;
+        original_key = vf_client.function_key;
+        original_class_id = vf_client.qpair_class_id;
+        original_caps = vf_client.dut_caps;
+        failed_rebind_key = make_key(1, 3, DPU_FUNCTION_VF, 14);
+        missing_class_manager = dpu_resource_manager::type_id::create(
+            "missing_class_manager");
+        if (vf_client.bind_to_fabric(
+            missing_class_manager, failed_rebind_key, why
+        )) begin
+            `uvm_fatal("DUT_CAPS",
+                "VF client rebound to a manager without virtio.qpair")
+        end
+        if (why != "resource-class name is not registered")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "failed rebind used wrong reason: %s", why))
+        if ((vf_client.resource_manager != original_manager) ||
+            (vf_client.function_key.host_id != original_key.host_id) ||
+            (vf_client.function_key.pf_id != original_key.pf_id) ||
+            (vf_client.function_key.kind != original_key.kind) ||
+            (vf_client.function_key.vf_id != original_key.vf_id) ||
+            (vf_client.qpair_class_id != original_class_id) ||
+            (vf_client.dut_caps != original_caps)) begin
+            `uvm_fatal("DUT_CAPS",
+                "failed rebind partially replaced the old VF binding")
+        end
+        if (!vf_client.reserve_qpairs(1, 1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "old VF binding was unusable after failed rebind: %s", why))
+        if (!vf_client.release_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "old VF binding could not release its rebind probe: %s", why))
+
         if (!pf_client.reserve_qpairs(0, 32, why))
             `uvm_fatal("DUT_CAPS", $sformatf(
                 "PF rejected valid local pairs 0..31: %s", why))
+
+        if (vf_client.reserve_qpairs(0, 0, why))
+            `uvm_fatal("DUT_CAPS", "VF accepted zero local pairs")
+        if (why != "lease count must be nonzero")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "zero-count rejection used wrong reason: %s", why))
+
+        if (vf_client.reserve_qpairs(32, 0, why))
+            `uvm_fatal("DUT_CAPS", "VF accepted out-of-range zero-count request")
+        if (why != "VIO-net local qpair range exceeds device limit 0..31")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "out-of-range zero-count rejection used wrong reason: %s", why))
+
+        if (vf_client.reserve_qpairs(0, 32'hffff_ffff, why))
+            `uvm_fatal("DUT_CAPS", "VF accepted oversized local pair count")
+        if (why != "VIO-net local qpair range exceeds device limit 0..31")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "oversized local pair count rejection used wrong reason: %s", why))
 
         if (vf_client.reserve_qpairs(32, 1, why))
             `uvm_fatal("DUT_CAPS", "VF accepted local pair 32")
@@ -537,6 +594,12 @@ class virtio_dut_caps_test extends uvm_test;
         if (!vf_client.reserve_qpairs(0, 1, why))
             `uvm_fatal("DUT_CAPS", $sformatf(
                 "VF could not independently reserve local pair 0: %s", why))
+        if (!vf_client.release_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "VF could not release its local qpair lease: %s", why))
+        if (!pf_client.release_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "PF could not release its local qpair leases: %s", why))
     endtask
 
     virtual task run_phase(uvm_phase phase);
