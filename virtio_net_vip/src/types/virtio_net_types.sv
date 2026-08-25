@@ -313,6 +313,7 @@ typedef struct {
 
 typedef struct {
     int unsigned num_queue_pairs, queue_size;
+    int unsigned max_vio_net_qpairs_per_device;
     virtqueue_type_e vq_type; bit [63:0] driver_features;
     rx_buf_mode_e rx_buf_mode; int unsigned rx_buf_size, rx_refill_threshold;
     interrupt_mode_e irq_mode; int unsigned napi_budget, coal_max_packets, coal_max_usecs;

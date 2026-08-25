@@ -54,6 +54,8 @@ class virtio_auto_fsm extends uvm_object;
     // ===== Internal state =====
     protected int unsigned  num_total_queues;
     protected int unsigned  active_num_pairs;
+    local int unsigned      max_vio_net_qpairs_per_device;
+    local bit               mq_pair_limit_bound;
 
     // ========================================================================
     // Constructor
@@ -67,6 +69,48 @@ class virtio_auto_fsm extends uvm_object;
         interrupt_event         = new("interrupt_event");
         num_total_queues        = 0;
         active_num_pairs        = 1;
+        max_vio_net_qpairs_per_device = DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
+        mq_pair_limit_bound = 0;
+    endfunction
+
+    // Snapshot the function's effective MQ limit.  Zero is the compatibility
+    // encoding used by standalone/legacy driver configs created before this
+    // field existed.  Repeated binds are idempotent, but a different value is
+    // rejected so a live FSM cannot diverge from its configured queue state.
+    function bit bind_mq_pair_limit(
+        input int unsigned configured_limit,
+        output string why
+    );
+        int unsigned effective_limit;
+
+        if ($isunknown(configured_limit) || (configured_limit == 0))
+            effective_limit = DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
+        else
+            effective_limit = configured_limit;
+        if (effective_limit > DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE) begin
+            why = $sformatf(
+                "FSM MQ pair limit %0d exceeds model ceiling %0d",
+                effective_limit, DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE);
+            return 0;
+        end
+        if (!mq_pair_limit_bound) begin
+            max_vio_net_qpairs_per_device = effective_limit;
+            mq_pair_limit_bound = 1;
+            why = "";
+            return 1;
+        end
+        if (effective_limit == max_vio_net_qpairs_per_device) begin
+            why = "";
+            return 1;
+        end
+        why = $sformatf(
+            "FSM MQ pair limit is already bound to %0d; cannot rebind to %0d",
+            max_vio_net_qpairs_per_device, effective_limit);
+        return 0;
+    endfunction
+
+    function int unsigned max_supported_mq_pairs();
+        return max_vio_net_qpairs_per_device;
     endfunction
 
     // The checksum is calculated over one migration-owned mapping span.  It
@@ -974,6 +1018,14 @@ class virtio_auto_fsm extends uvm_object;
     virtual task configure_mq(int unsigned num_pairs);
         bit success;
         bit setup_ok;
+
+        if ((num_pairs == 0) ||
+            (num_pairs > max_vio_net_qpairs_per_device)) begin
+            `uvm_error("AUTO_FSM", $sformatf(
+                "configure_mq: requested %0d pairs is outside supported range 1..%0d",
+                num_pairs, max_vio_net_qpairs_per_device))
+            return;
+        end
 
         `uvm_info("AUTO_FSM",
             $sformatf("configure_mq: changing from %0d to %0d pairs",

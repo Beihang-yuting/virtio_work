@@ -124,14 +124,32 @@ class virtio_function_instance extends uvm_component;
         ref virtio_atomic_ops ops,
         ref virtio_auto_fsm fsm
     );
+        string why;
+        virtio_auto_fsm candidate_fsm;
+
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("FUNCTION_BIND", $sformatf(
                 "%s received a null PCIe RC sequencer", function_name))
+            return;
         end
         if ((transport_ref == null) || (vq_mgr_ref == null)) begin
             `uvm_fatal("FUNCTION_BIND", $sformatf(
                 "%s is missing transport or virtqueue manager", function_name))
+            return;
         end
+
+        candidate_fsm = fsm;
+        if (candidate_fsm == null)
+            candidate_fsm = virtio_auto_fsm::type_id::create(
+                {function_name, "_fsm"});
+        if (!candidate_fsm.bind_mq_pair_limit(
+            driver_cfg.max_vio_net_qpairs_per_device, why
+        )) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s could not bind its MQ pair limit: %s", function_name, why))
+            return;
+        end
+        fsm = candidate_fsm;
 
         vq_mgr_ref.mem = hmem;
         vq_mgr_ref.iommu = iommu_mdl;
@@ -151,8 +169,6 @@ class virtio_function_instance extends uvm_component;
         ops.iommu = iommu_mdl;
         ops.wait_pol = wpol;
 
-        if (fsm == null)
-            fsm = virtio_auto_fsm::type_id::create({function_name, "_fsm"});
         fsm.ops = ops;
         fsm.drv_cfg = driver_cfg;
 

@@ -126,6 +126,130 @@ class virtio_dut_caps_expected_resize_error extends uvm_report_catcher;
     endfunction
 endclass
 
+class virtio_dut_caps_expected_fsm_mq_error extends uvm_report_catcher;
+    string expected_message;
+    int unsigned caught_count;
+
+    function new(
+        string name,
+        string configured_expected_message
+    );
+        super.new(name);
+        expected_message = configured_expected_message;
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) &&
+            (get_id() == "AUTO_FSM") &&
+            (get_message() == expected_message)) begin
+            caught_count++;
+            set_severity(UVM_INFO);
+        end
+        return THROW;
+    endfunction
+endclass
+
+class virtio_dut_caps_expected_mq_bind_fatal extends uvm_report_catcher;
+    uvm_report_object expected_client;
+    string expected_message;
+    int unsigned caught_count;
+
+    function new(
+        string name,
+        uvm_report_object configured_expected_client,
+        string configured_expected_message
+    );
+        super.new(name);
+        expected_client = configured_expected_client;
+        expected_message = configured_expected_message;
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_FATAL) &&
+            (get_id() == "FUNCTION_BIND") &&
+            (get_client() == expected_client) &&
+            (get_message() == expected_message)) begin
+            caught_count++;
+            set_severity(UVM_INFO);
+        end
+        return THROW;
+    endfunction
+endclass
+
+class virtio_dut_caps_mq_ops_spy extends virtio_atomic_ops;
+    `uvm_object_utils(virtio_dut_caps_mq_ops_spy)
+
+    int unsigned ctrl_mq_count;
+    int unsigned setup_count;
+    int unsigned teardown_count;
+
+    function new(string name = "virtio_dut_caps_mq_ops_spy");
+        super.new(name);
+        reset_counts();
+    endfunction
+
+    function void reset_counts();
+        ctrl_mq_count = 0;
+        setup_count = 0;
+        teardown_count = 0;
+    endfunction
+
+    virtual task ctrl_set_mq_pairs(
+        int unsigned num_pairs,
+        ref bit success
+    );
+        ctrl_mq_count++;
+        success = 1;
+    endtask
+
+    virtual task setup_queue(
+        int unsigned queue_id,
+        int unsigned queue_size,
+        virtqueue_type_e vq_type,
+        output bit ok
+    );
+        setup_count++;
+        ok = 1;
+    endtask
+
+    virtual task teardown_queue(int unsigned queue_id);
+        teardown_count++;
+    endtask
+endclass
+
+class virtio_dut_caps_mq_fsm_probe extends virtio_auto_fsm;
+    `uvm_object_utils(virtio_dut_caps_mq_fsm_probe)
+
+    function new(string name = "virtio_dut_caps_mq_fsm_probe");
+        super.new(name);
+    endfunction
+
+    function int unsigned observed_active_num_pairs();
+        return active_num_pairs;
+    endfunction
+
+    function int unsigned observed_max_supported_qpairs();
+        return max_supported_mq_pairs();
+    endfunction
+endclass
+
+class virtio_dut_caps_driver_probe extends virtio_driver;
+    `uvm_component_utils(virtio_dut_caps_driver_probe)
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    virtual task run_phase(uvm_phase phase);
+    endtask
+
+    task dispatch_transaction(virtio_transaction req);
+        process_transaction(req);
+    endtask
+endclass
+
 class virtio_dut_caps_snapshot_mutator extends virtio_resource_client;
     `uvm_object_utils(virtio_dut_caps_snapshot_mutator)
 
@@ -171,6 +295,9 @@ class virtio_dut_caps_test extends uvm_test;
     virtio_dut_caps_expected_build_failure expected_build_failure;
     virtio_net_env propagated_caps_env;
     virtio_net_env_config propagated_caps_cfg;
+    virtio_function_instance mq_binding_function;
+    virtio_dut_caps_driver_probe mq_driver;
+    uvm_sequencer #(pcie_tl_tlp) mq_pcie_seqr;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -225,6 +352,14 @@ class virtio_dut_caps_test extends uvm_test;
             "propagated_caps_env", this);
         uvm_config_db#(virtio_net_env_config)::set(
             this, "propagated_caps_env", "cfg", propagated_caps_cfg);
+
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "mq_binding_function.driver_agent", "is_active", UVM_PASSIVE);
+        mq_binding_function = virtio_function_instance::type_id::create(
+            "mq_binding_function", this);
+        mq_driver = virtio_dut_caps_driver_probe::type_id::create(
+            "mq_driver", this);
+        mq_pcie_seqr = new("mq_pcie_seqr", this);
     endfunction
 
     task assert_invalid_legacy_config_hard_fails();
@@ -668,6 +803,176 @@ class virtio_dut_caps_test extends uvm_test;
                 "invalid custom-cap resize did not return before VF access")
     endtask
 
+    task assert_driver_mq_dispatch_uses_dut_cap();
+        virtio_net_env_config custom_cfg;
+        virtio_driver_config_t driver_cfg;
+        virtio_pci_transport transport;
+        virtio_pci_transport rebind_transport;
+        virtqueue_manager vq_mgr;
+        virtqueue_manager rebind_vq_mgr;
+        virtio_dut_caps_mq_ops_spy ops_spy;
+        virtio_dut_caps_mq_fsm_probe fsm_probe;
+        virtio_dut_caps_mq_fsm_probe standalone_fsm_probe;
+        virtio_atomic_ops ops;
+        virtio_auto_fsm fsm;
+        virtio_transaction req;
+        virtio_dut_caps_expected_fsm_mq_error over_cap_catcher;
+        virtio_dut_caps_expected_fsm_mq_error zero_catcher;
+        virtio_dut_caps_expected_mq_bind_fatal rebind_catcher;
+        string why;
+
+        standalone_fsm_probe = virtio_dut_caps_mq_fsm_probe::type_id::create(
+            "standalone_mq_fsm_probe");
+        if (standalone_fsm_probe.observed_max_supported_qpairs() != 32)
+            `uvm_fatal("DUT_CAPS",
+                "standalone FSM did not retain the compatibility limit 32")
+        if (!standalone_fsm_probe.bind_mq_pair_limit(0, why) ||
+            (standalone_fsm_probe.observed_max_supported_qpairs() != 32)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "legacy zero-valued qpair-limit bind was not compatible: %s",
+                why))
+        end
+
+        custom_cfg = virtio_net_env_config::type_id::create(
+            "mq_custom_cap_cfg");
+        custom_cfg.dut_caps.max_vio_net_qpairs_per_device = 1;
+        custom_cfg.default_num_pairs = 1;
+        driver_cfg = custom_cfg.get_default_driver_config();
+        if (driver_cfg.max_vio_net_qpairs_per_device != 1)
+            `uvm_fatal("DUT_CAPS",
+                "default PF driver config did not receive the env DUT capability")
+        custom_cfg.vf_configs = new[1];
+        custom_cfg.vf_configs[0] = driver_cfg;
+        custom_cfg.vf_configs[0].max_vio_net_qpairs_per_device = 32;
+        driver_cfg = custom_cfg.get_vf_config(0);
+        if (driver_cfg.max_vio_net_qpairs_per_device != 1)
+            `uvm_fatal("DUT_CAPS",
+                "explicit VF driver config bypassed the env DUT capability")
+
+        transport = virtio_pci_transport::type_id::create("mq_transport");
+        vq_mgr = virtqueue_manager::type_id::create("mq_vq_mgr");
+        ops_spy = virtio_dut_caps_mq_ops_spy::type_id::create("mq_ops_spy");
+        fsm_probe = virtio_dut_caps_mq_fsm_probe::type_id::create(
+            "mq_fsm_probe");
+        ops = ops_spy;
+        fsm = fsm_probe;
+        mq_binding_function.bind_pcie_components(
+            "mq_cap_function", transport, vq_mgr, null, null, null, null,
+            null, null, driver_cfg, mq_pcie_seqr, ops, fsm);
+        mq_driver.ops = ops;
+        mq_driver.fsm = fsm;
+        fsm_probe.state = FSM_RUNNING;
+        if (fsm_probe.observed_max_supported_qpairs() != 1)
+            `uvm_fatal("DUT_CAPS",
+                "FSM did not snapshot the custom per-function qpair limit")
+        if (!fsm_probe.bind_mq_pair_limit(1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "idempotent FSM qpair-limit bind failed: %s", why))
+        if (fsm_probe.bind_mq_pair_limit(2, why))
+            `uvm_fatal("DUT_CAPS",
+                "FSM qpair-limit rebind relaxed custom limit 1")
+        if (why !=
+            "FSM MQ pair limit is already bound to 1; cannot rebind to 2") begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "FSM qpair-limit rebind used wrong reason: %s", why))
+        end
+        rebind_transport = virtio_pci_transport::type_id::create(
+            "mq_rebind_transport");
+        rebind_vq_mgr = virtqueue_manager::type_id::create(
+            "mq_rebind_vq_mgr");
+        driver_cfg.max_vio_net_qpairs_per_device = 2;
+        rebind_catcher = new(
+            "mq_bind_rebind_catcher", mq_binding_function,
+            {"mq_cap_function_rebind could not bind its MQ pair limit: ",
+             "FSM MQ pair limit is already bound to 1; cannot rebind to 2"});
+        uvm_report_cb::add(null, rebind_catcher);
+        mq_binding_function.bind_pcie_components(
+            "mq_cap_function_rebind", rebind_transport, rebind_vq_mgr, null,
+            null, null, null, null, null, driver_cfg, mq_pcie_seqr, ops, fsm);
+        uvm_report_cb::delete(null, rebind_catcher);
+        if ((rebind_catcher.caught_count != 1) ||
+            (ops != ops_spy) || (fsm != fsm_probe) ||
+            (ops_spy.transport != transport) || (ops_spy.vq_mgr != vq_mgr)) begin
+            `uvm_fatal("DUT_CAPS",
+                "failed MQ-limit rebind partially replaced function bindings")
+        end
+        custom_cfg.dut_caps.max_vio_net_qpairs_per_device = 2;
+        if (fsm_probe.observed_max_supported_qpairs() != 1)
+            `uvm_fatal("DUT_CAPS",
+                "source DUT capability mutation relaxed the FSM qpair limit")
+        driver_cfg.max_vio_net_qpairs_per_device = 32;
+        if (fsm_probe.observed_max_supported_qpairs() != 1)
+            `uvm_fatal("DUT_CAPS",
+                "source driver config mutation relaxed the FSM qpair limit")
+        fsm_probe.drv_cfg.max_vio_net_qpairs_per_device = 2;
+        if (fsm_probe.observed_max_supported_qpairs() != 1)
+            `uvm_fatal("DUT_CAPS",
+                "public driver config mutation relaxed the FSM qpair limit")
+
+        req = virtio_transaction::type_id::create("mq_over_cap_req");
+        req.txn_type = VIO_TXN_SET_MQ;
+        req.num_pairs = 2;
+        over_cap_catcher = new(
+            "mq_over_cap_catcher",
+            "configure_mq: requested 2 pairs is outside supported range 1..1");
+        uvm_report_cb::add(null, over_cap_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, over_cap_catcher);
+        if ((over_cap_catcher.caught_count != 1) ||
+            (ops_spy.ctrl_mq_count != 0) ||
+            (ops_spy.setup_count != 0) ||
+            (ops_spy.teardown_count != 0) ||
+            (fsm_probe.observed_active_num_pairs() != 1) ||
+            (fsm_probe.state != FSM_RUNNING)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                {"custom-cap VIO_TXN_SET_MQ dispatch escaped its pre-side-effect guard: ",
+                 "caught=%0d ctrl_mq=%0d setup=%0d teardown=%0d active=%0d state=%s"},
+                over_cap_catcher.caught_count, ops_spy.ctrl_mq_count,
+                ops_spy.setup_count, ops_spy.teardown_count,
+                fsm_probe.observed_active_num_pairs(), fsm_probe.state.name()))
+        end
+
+        req = virtio_transaction::type_id::create("mq_zero_req");
+        req.txn_type = VIO_TXN_SET_MQ;
+        req.num_pairs = 0;
+        zero_catcher = new(
+            "mq_zero_catcher",
+            "configure_mq: requested 0 pairs is outside supported range 1..1");
+        uvm_report_cb::add(null, zero_catcher);
+        mq_driver.dispatch_transaction(req);
+        uvm_report_cb::delete(null, zero_catcher);
+        if ((zero_catcher.caught_count != 1) ||
+            (ops_spy.ctrl_mq_count != 0) ||
+            (ops_spy.setup_count != 0) ||
+            (ops_spy.teardown_count != 0) ||
+            (fsm_probe.observed_active_num_pairs() != 1) ||
+            (fsm_probe.state != FSM_RUNNING)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                {"zero-pair VIO_TXN_SET_MQ dispatch escaped its pre-side-effect guard: ",
+                 "caught=%0d ctrl_mq=%0d setup=%0d teardown=%0d active=%0d state=%s"},
+                zero_catcher.caught_count, ops_spy.ctrl_mq_count,
+                ops_spy.setup_count, ops_spy.teardown_count,
+                fsm_probe.observed_active_num_pairs(), fsm_probe.state.name()))
+        end
+
+        req = virtio_transaction::type_id::create("mq_valid_req");
+        req.txn_type = VIO_TXN_SET_MQ;
+        req.num_pairs = 1;
+        mq_driver.dispatch_transaction(req);
+        if ((ops_spy.ctrl_mq_count != 1) ||
+            (ops_spy.setup_count != 0) ||
+            (ops_spy.teardown_count != 0) ||
+            (fsm_probe.observed_active_num_pairs() != 1) ||
+            (fsm_probe.state != FSM_RUNNING)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                {"valid custom-cap VIO_TXN_SET_MQ dispatch was not preserved: ",
+                 "ctrl_mq=%0d setup=%0d teardown=%0d active=%0d state=%s"},
+                ops_spy.ctrl_mq_count, ops_spy.setup_count,
+                ops_spy.teardown_count,
+                fsm_probe.observed_active_num_pairs(), fsm_probe.state.name()))
+        end
+    endtask
+
     task configure_fabric();
         dpu_resource_pool_config_t unused_profile;
         dpu_resource_pool_config_t qpair_profile;
@@ -895,6 +1200,7 @@ class virtio_dut_caps_test extends uvm_test;
         assert_virtio_config_uses_dut_caps();
         assert_env_propagates_caps_to_fabric();
         assert_dynamic_resize_limit();
+        assert_driver_mq_dispatch_uses_dut_cap();
         configure_fabric();
         assert_manager_topology_limits();
         assert_vio_local_qpair_limit();

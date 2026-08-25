@@ -110,6 +110,9 @@ class virtio_net_env_config extends uvm_object;
         virtio_driver_config_t cfg;
         cfg.num_queue_pairs     = default_num_pairs;
         cfg.queue_size          = default_queue_size;
+        cfg.max_vio_net_qpairs_per_device =
+            (dut_caps == null) ? DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE :
+                                 dut_caps.max_vio_net_qpairs_per_device;
         cfg.vq_type             = default_vq_type;
         cfg.driver_features     = default_driver_features;
         cfg.rx_buf_mode         = default_rx_mode;
@@ -133,9 +136,16 @@ class virtio_net_env_config extends uvm_object;
     // ========================================================================
 
     function virtio_driver_config_t get_vf_config(int unsigned vf_idx);
+        virtio_driver_config_t cfg;
+
         if (vf_configs.size() > vf_idx)
-            return vf_configs[vf_idx];
-        return get_default_driver_config();
+            cfg = vf_configs[vf_idx];
+        else
+            cfg = get_default_driver_config();
+        cfg.max_vio_net_qpairs_per_device =
+            (dut_caps == null) ? DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE :
+                                 dut_caps.max_vio_net_qpairs_per_device;
+        return cfg;
     endfunction
 
     // ========================================================================
