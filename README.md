@@ -284,11 +284,40 @@ make test TEST=virtio_unit_test
 
 ## DPU Fabric 部署边界
 
-Fabric 最多管理 4 个 host、每 host 16 个 PF、每 PF 16 个本地 VF，以及全局 1024 个 function。完整启用 64 个 PF 后，仍可激活 960 个 VF function。它预注册并封存 Fabric 所有的 `virtio.qpair` 通用资源 profile：全局 2048 个 QP、每 function 32 个 QP；该 class ID 是 Fabric 内部不透明值，而非 core enum 常量，function 激活前必须完成预注册和 seal。特殊 VQ 使用独立的 Fabric profile，不消耗该普通 QP 配额。这个通用 resource-pool/lease API 是后续 RDMA 和 virtio-blk 复用的集成点。
+`dpu_dut_caps` 是 real-DUT 能力的单一来源。默认拓扑能力是
+`2 hosts × 4 PFs/host × 16 VFs/PF`。`DPU_MAX_HOSTS`、
+`DPU_MAX_PFS_PER_HOST`、`DPU_MAX_VFS_PER_PF`、`DPU_MAX_FUNCTIONS` 等
+compile-time `DPU_MAX_*` 常量仅是 model/encoding ceiling，不是 real-DUT
+default。参数化场景可在 `dut_caps` 中使用更小的非零合法能力，但不能超过相应
+compile-time ceiling。
 
-PF BAR 映射固定为：BAR0/1 是 32 MiB function-device，BAR2/3 是 64 KiB 保留空间，BAR4/5 是 64 KiB MSI-X table/PBA。VF 的对应大小为 16 KiB、16 KiB、32 KiB。当前 virtio capability 发现仅在 BAR0/1；BAR2/3 虽占地址空间但没有功能绑定，任何功能访问均为违规；BAR4/5 仅承载 MSI-X table/PBA。
+VIO global qpair ID 是 11 bits，编码域为 `0..2047`，因此默认 profile
+共有 2048 个全局 pair 资源。当前 DUT profile 中，每个 PF 或 VF 的 VIO-net
+设备各自拥有一个单一 notify address 和独立的 local-qpair domain；每设备最多
+32 个 local queue pairs，编号 `0..31`。不同设备可以复用同一个 local pair ID；
+Fabric 通过该设备的 function/device 上下文解析 global qpair lease，解析后的
+global qpair lease 在整个 Fabric 中仍保持排他。
 
-Fabric 先配置 64-bit MMIO aperture，并验证对齐和地址无重叠；function 先完成 BAR0/1 capability discovery，之后才获取动态资源 lease。不要在 capability discovery 前分配 queue 资源，也不要把保留 BAR 或 MSI-X aperture 当作 virtio 寄存器窗口。
+边界校验分为三层：初始 `virtio_net_env_config` 和 dynamic resize 均拒绝第 33
+个 pair，最终 Fabric lease acquisition 还拒绝任何越过 32-pair 范围的申请，
+包括 local pair ID 超出 `0..31`。`virtio.qpair` profile 的每 function quota
+同样保持 32，作为最终防线。
+
+当前 verification/Fabric model 还定义三组 64-bit BAR pair lease：PF 的
+BAR0/1、BAR2/3、BAR4/5 分别为 32 MiB function-device、64 KiB reserved、
+64 KiB MSI-X table/PBA；VF 分别为 16 KiB、16 KiB、32 KiB。模型只允许在
+BAR0/1 发现 virtio functional capabilities，将 BAR2/3 视为不可功能访问的
+保留 aperture，并将 BAR4/5 限于 MSI-X table/PBA。模型先分配、验证对齐且互不
+重叠的 MMIO aperture 和 BAR role，再执行 capability discovery；只有 discovery
+完成后才能获取 queue lease。
+
+本阶段只实现 capability/topology 校验、初始配置与动态 resize 的 pair 数限制，
+以及 Fabric 中的 local/global qpair lease 边界。它尚未实现 `PINNED`/
+`PREFERRED` 指定 global ID、DUT register table programming、notify/BAR/MSI-X
+真实硬件下发、PCIe payload propagation 或 `cosim_control`。这些是
+[real-DUT service configuration design](docs/superpowers/specs/2026-08-25-real-dut-service-configuration-design.md)
+中的后续子项目；上述 verification/Fabric BAR model 也不代表这些 real-DUT
+hardware programming 路径已经实现。
 
 ---
 

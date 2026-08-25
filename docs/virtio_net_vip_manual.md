@@ -1485,11 +1485,45 @@ vcs -full64 -sverilog -ntb_opts uvm \
 
 #### 6.1.4 DPU Fabric 部署范围与回归入口
 
-Fabric 的固定上限为 4 个 host、每 host 16 个 PF、每 PF 16 个本地 VF，且全局最多 1024 个 function。若完整启用 64 个 PF，则剩余的有效 VF 槽位为 960。Fabric 在 function 激活前预注册并 seal Fabric 所有的 `virtio.qpair` 不透明 class ID；它不是 core enum 常量，该通用 profile 提供 2048 个全局 QP、每 function 32 个 QP。特殊 VQ 使用独立 profile，不占用普通 virtio QP 配额。通用 resource-pool/lease API 是 RDMA 与 virtio-blk 后续接入时应复用的边界。
+`dpu_dut_caps` 是 topology、resource manager、VIO client 和动态重配置共同使用的
+real-DUT capability source。其默认 topology capability 为
+`2 hosts × 4 PFs/host × 16 VFs/PF`。compile-time `DPU_MAX_*`（例如
+`DPU_MAX_HOSTS`、`DPU_MAX_PFS_PER_HOST`、`DPU_MAX_VFS_PER_PF` 和
+`DPU_MAX_FUNCTIONS`）是验证 model/encoding ceiling，不是 real-DUT default。
+参数化测试可以在 `dut_caps` 中声明更小的非零合法 capability；校验会拒绝任何
+超过相应 compile-time ceiling 的值。
 
-BAR 布局先于 capability discovery：PF 的 BAR0/1、BAR2/3、BAR4/5 分别为 32 MiB function-device、64 KiB reserved、64 KiB MSI-X table/PBA；VF 分别为 16 KiB、16 KiB、32 KiB。当前 virtio capability 仅在 BAR0/1 发现；BAR2/3 虽保留 aperture 但没有功能绑定，所有功能访问均为违规；BAR4/5 只绑定 MSI-X table/PBA。
+VIO global qpair ID 域固定为 11 bits，即 `0..2047`，完整编码域提供 2048 个
+global pair 资源。每个 PF 或 VF VIO-net device 有自己的单一 notify address，
+也因此有独立的 local-qpair domain；一个 device 最多拥有 32 个 local queue
+pairs，local pair ID 为 `0..31`。例如，两个不同 device 都可以使用 local pair
+ID 0，因为 Fabric 会结合各自的 function/device context 解析 global qpair
+lease；解析后的 global qpair lease 仍是全局排他的，不能同时租给另一个 device。
 
-配置时 Fabric 必须先建立 64-bit MMIO aperture，并检查对齐和无重叠。正确顺序是 BAR0/1 capability discovery，随后才申请动态 queue lease；不要在发现之前获取资源，也不要把保留 BAR 或 MSI-X aperture 作为 virtio 寄存器窗口。
+限制在以下三层执行：
+
+1. 初始 `virtio_net_env_config` 拒绝 33 个 queue pairs 的默认或 per-VF 配置；
+2. dynamic resize 拒绝将 pair 数改为 33（也拒绝 0）；
+3. 最终 Fabric lease acquisition 拒绝第 33 个 local pair，以及任何包含
+   `local_pair_id > 31` 的范围；`virtio.qpair` profile 的 per-function quota
+   也保持为 32。
+
+当前 verification/Fabric model 的 BAR 布局仍是三组 64-bit pair lease。
+PF 的 BAR0/1、BAR2/3、BAR4/5 分别建模为 32 MiB function-device、64 KiB
+reserved、64 KiB MSI-X table/PBA；VF 的对应大小为 16 KiB、16 KiB、32 KiB。
+模型将 virtio functional capability 限制在 BAR0/1，阻止 BAR2/3 的功能访问，
+并将 BAR4/5 限于 MSI-X table/PBA。Fabric model 先建立 64-bit MMIO aperture，
+检查 BAR 对齐和地址无重叠，再完成 BAR role 配置与 capability discovery；
+resource client 只有在 discovery 后标记 device-ready，随后才能申请 queue lease。
+
+当前 first stage 的实现到 capability/topology validation、初始配置和 dynamic
+resize 校验以及 Fabric local/global qpair lease 为止。`PINNED`/`PREFERRED`
+指定 global ID、DUT register table programming、notify/BAR/MSI-X 真实硬件下发、
+PCIe payload propagation 和 `cosim_control` 均未在本阶段实现。这些内容属于
+[real-DUT service configuration design](superpowers/specs/2026-08-25-real-dut-service-configuration-design.md)
+定义的后续子项目，不能按当前已实现能力使用；上述 BAR layout/discovery
+ordering 仅描述已验证的 verification/Fabric model contract，不代表 real-DUT
+hardware programming 已经完成。
 
 完整回归使用：
 
