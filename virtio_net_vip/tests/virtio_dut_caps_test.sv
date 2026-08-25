@@ -1193,6 +1193,253 @@ class virtio_dut_caps_test extends uvm_test;
                 "PF could not release its local qpair leases: %s", why))
     endtask
 
+    task assert_vio_binding_ownership();
+        dpu_resource_manager secondary_manager;
+        dpu_resource_fabric_authority secondary_authority;
+        dpu_dut_caps secondary_caps;
+        dpu_bar_pair_lease_t bars[$];
+        dpu_function_key_t secondary_key;
+        dpu_resource_class_id_t unused_class_id;
+        dpu_resource_class_id_t secondary_qpair_class_id;
+        virtio_resource_client owner_client;
+        virtio_resource_client secondary_client;
+        virtio_resource_client limit_identity_client;
+        dpu_resource_manager original_manager_view;
+        dpu_function_key_t original_key_view;
+        dpu_resource_class_id_t original_class_view;
+        int unsigned original_global_qid;
+        int unsigned observed_global_qid;
+        dpu_dut_caps observed_caps;
+        string why;
+
+        secondary_manager = dpu_resource_manager::type_id::create(
+            "secondary_binding_manager");
+        secondary_authority =
+            secondary_manager.claim_fabric_registry_authority();
+        if (secondary_authority == null)
+            `uvm_fatal("DUT_CAPS",
+                "secondary manager did not provide Fabric authority")
+        secondary_caps = dpu_dut_caps::type_id::create(
+            "secondary_binding_caps");
+        if (!secondary_manager.fabric_configure_dut_caps(
+            secondary_authority, secondary_caps, why
+        )) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary manager DUT caps failed: %s", why))
+        end
+        if (!secondary_manager.fabric_configure_mmio_aperture(
+            secondary_authority,
+            64'h0002_0000_0000_0000,
+            64'h0002_0100_0000_0000,
+            why
+        )) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary manager MMIO aperture failed: %s", why))
+        end
+        if (!secondary_manager.fabric_register_resource_class(
+            secondary_authority, "test.unused", DPU_RESOURCE_KIND_QUEUE,
+            1, 1, unused_class_id, why
+        )) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary manager unused profile failed: %s", why))
+        end
+        if (!secondary_manager.fabric_register_resource_class(
+            secondary_authority, "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
+            1, 1, secondary_qpair_class_id, why
+        )) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary manager qpair profile failed: %s", why))
+        end
+        if (!secondary_manager.fabric_seal_resource_classes(
+            secondary_authority, why
+        )) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary manager profile sealing failed: %s", why))
+        end
+
+        secondary_key = make_key(1, 1, DPU_FUNCTION_PF, 0);
+        limit_identity_client = virtio_resource_client::type_id::create(
+            "limit_identity_client");
+        if (!limit_identity_client.bind_to_fabric(
+            secondary_manager, secondary_key, why
+        )) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "limit identity client bind failed: %s", why))
+        end
+        secondary_caps.max_vio_net_qpairs_per_device = 31;
+        if (!secondary_manager.fabric_configure_dut_caps(
+            secondary_authority, secondary_caps, why
+        )) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary manager limit change failed: %s", why))
+        end
+        if (limit_identity_client.bind_to_fabric(
+            secondary_manager, secondary_key, why
+        )) begin
+            `uvm_fatal("DUT_CAPS",
+                "effective-limit rebind escaped binding ownership")
+        end
+        if (why !=
+            "virtio resource client binding ownership cannot be reassigned") begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "effective-limit rebind used wrong reason: %s", why))
+        end
+        observed_caps = limit_identity_client.snapshot_bound_dut_caps();
+        if ((observed_caps == null) ||
+            (observed_caps.max_vio_net_qpairs_per_device != 32)) begin
+            `uvm_fatal("DUT_CAPS",
+                "effective-limit rejection changed the bound snapshot")
+        end
+        secondary_caps.max_vio_net_qpairs_per_device = 32;
+        if (!secondary_manager.fabric_configure_dut_caps(
+            secondary_authority, secondary_caps, why
+        )) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary manager limit restore failed: %s", why))
+        end
+        if (!secondary_manager.register_function(secondary_key, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary Fabric PF registration failed: %s", why))
+        if (!secondary_manager.activate_function(secondary_key, bars, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary Fabric PF activation failed: %s", why))
+        if (!secondary_manager.mark_function_device_ready(secondary_key, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary Fabric PF readiness failed: %s", why))
+        owner_client = virtio_resource_client::type_id::create(
+            "binding_owner_client");
+        if (!owner_client.bind_to_fabric(manager, valid_vf, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "binding owner client bind failed: %s", why))
+        original_manager_view = owner_client.resource_manager;
+        original_key_view = owner_client.function_key;
+        original_class_view = owner_client.qpair_class_id;
+        if (!owner_client.mark_device_ready(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "binding owner client readiness failed: %s", why))
+        if (!owner_client.reserve_qpairs(0, 1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "binding owner client reserve failed: %s", why))
+        if (!owner_client.local_qid_to_global_qid(0, original_global_qid))
+            `uvm_fatal("DUT_CAPS",
+                "binding owner client did not publish its qpair mapping")
+        if (!owner_client.freeze_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "binding owner client freeze failed: %s", why))
+
+        if (owner_client.bind_to_fabric(
+            secondary_manager, secondary_key, why
+        )) begin
+            `uvm_fatal("DUT_CAPS",
+                {"valid cross-manager rebind escaped virtio client ",
+                 "binding ownership"})
+        end
+        if (why !=
+            "virtio resource client binding ownership cannot be reassigned") begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "cross-manager rebind rejection used wrong reason: %s", why))
+        end
+        if ((owner_client.resource_manager != manager) ||
+            (owner_client.function_key.host_id != valid_vf.host_id) ||
+            (owner_client.function_key.pf_id != valid_vf.pf_id) ||
+            (owner_client.function_key.kind != valid_vf.kind) ||
+            (owner_client.function_key.vf_id != valid_vf.vf_id)) begin
+            `uvm_fatal("DUT_CAPS",
+                "rejected cross-manager rebind replaced the old binding")
+        end
+        if ((owner_client.qpair_leases.size() != 1) ||
+            (owner_client.qpair_mappings.size() != 1) ||
+            !owner_client.local_qid_to_global_qid(0, observed_global_qid) ||
+            (observed_global_qid != original_global_qid)) begin
+            `uvm_fatal("DUT_CAPS",
+                "rejected cross-manager rebind changed the old lease mapping")
+        end
+        if (owner_client.reserve_qpairs(1, 1, why))
+            `uvm_fatal("DUT_CAPS",
+                "rejected cross-manager rebind cleared the frozen state")
+        if (why != "frozen virtio resource client cannot reserve QP leases")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "post-rebind frozen rejection used wrong reason: %s", why))
+        if (secondary_manager.local_to_global(
+            secondary_key, secondary_qpair_class_id, 0, observed_global_qid
+        )) begin
+            `uvm_fatal("DUT_CAPS",
+                "rejected cross-manager rebind polluted the new manager")
+        end
+
+        if (!owner_client.bind_to_fabric(manager, valid_vf, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "same-target idempotent bind failed: %s", why))
+        if ((owner_client.qpair_leases.size() != 1) ||
+            (owner_client.qpair_mappings.size() != 1) ||
+            !owner_client.local_qid_to_global_qid(0, observed_global_qid) ||
+            (observed_global_qid != original_global_qid)) begin
+            `uvm_fatal("DUT_CAPS",
+                "same-target idempotent bind changed the old lease mapping")
+        end
+        if (owner_client.reserve_qpairs(1, 1, why))
+            `uvm_fatal("DUT_CAPS",
+                "same-target idempotent bind cleared the frozen state")
+        if (why != "frozen virtio resource client cannot reserve QP leases")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "post-idempotent frozen rejection used wrong reason: %s", why))
+
+        owner_client.resource_manager = secondary_manager;
+        owner_client.function_key = secondary_key;
+        owner_client.qpair_class_id = unused_class_id;
+        if (owner_client.reserve_qpairs(1, 1, why))
+            `uvm_fatal("DUT_CAPS",
+                "public binding mirrors bypassed the private frozen state")
+        if (why != "frozen virtio resource client cannot reserve QP leases")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "mirror-tamper frozen rejection used wrong reason: %s", why))
+        if (!owner_client.restore_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "private binding could not restore its frozen lease: %s", why))
+        if (!owner_client.release_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "private binding could not release its restored lease: %s", why))
+        owner_client.resource_manager = original_manager_view;
+        owner_client.function_key = original_key_view;
+        owner_client.qpair_class_id = original_class_view;
+        if (manager.local_to_global(
+            valid_vf, original_class_view, 0, observed_global_qid
+        )) begin
+            `uvm_fatal("DUT_CAPS",
+                "public binding mirrors redirected old-manager cleanup")
+        end
+        if (secondary_manager.local_to_global(
+            secondary_key, secondary_qpair_class_id, 0, observed_global_qid
+        )) begin
+            `uvm_fatal("DUT_CAPS",
+                "public binding mirrors polluted new-manager cleanup")
+        end
+        if (!owner_client.reserve_qpairs(0, 1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "old manager capacity was not reusable after release: %s", why))
+        if (!owner_client.release_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "old manager could not release its reused capacity: %s", why))
+
+        secondary_client = virtio_resource_client::type_id::create(
+            "secondary_binding_client");
+        if (!secondary_client.bind_to_fabric(
+            secondary_manager, secondary_key, why
+        )) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary client bind failed: %s", why))
+        end
+        if (!secondary_client.mark_device_ready(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary client readiness failed: %s", why))
+        if (!secondary_client.reserve_qpairs(0, 1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary manager capacity was polluted: %s", why))
+        if (!secondary_client.release_qpairs(why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "secondary manager capacity could not be released: %s", why))
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         assert_invalid_legacy_config_hard_fails();
@@ -1204,6 +1451,7 @@ class virtio_dut_caps_test extends uvm_test;
         configure_fabric();
         assert_manager_topology_limits();
         assert_vio_local_qpair_limit();
+        assert_vio_binding_ownership();
         phase.drop_objection(this);
     endtask
 endclass : virtio_dut_caps_test

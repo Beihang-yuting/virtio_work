@@ -12,6 +12,10 @@ class virtio_resource_client extends uvm_object;
     dpu_resource_class_id_t qpair_class_id;
     dpu_resource_lease_t    qpair_leases[$];
     virtio_qpair_mapping_t  qpair_mappings[$];
+    local bit               binding_owned;
+    local dpu_resource_manager    bound_resource_manager;
+    local dpu_function_key_t      bound_function_key;
+    local dpu_resource_class_id_t bound_qpair_class_id;
     local int unsigned      bound_local_qpair_limit;
     protected bit           device_ready;
     protected bit           qpairs_frozen;
@@ -19,6 +23,7 @@ class virtio_resource_client extends uvm_object;
     function new(string name = "virtio_resource_client");
         super.new(name);
         qpair_class_id = '0;
+        binding_owned = 0;
         bound_local_qpair_limit = 0;
         device_ready = 0;
         qpairs_frozen = 0;
@@ -29,7 +34,7 @@ class virtio_resource_client extends uvm_object;
         input dpu_function_key_t key,
         output string why
     );
-        dpu_resource_class_id_t bound_qpair_class_id;
+        dpu_resource_class_id_t candidate_qpair_class_id;
         dpu_dut_caps bound_dut_caps;
         int unsigned bound_qpair_limit;
 
@@ -38,7 +43,7 @@ class virtio_resource_client extends uvm_object;
             return 0;
         end
         if (!manager.lookup_resource_class(
-            "virtio.qpair", bound_qpair_class_id, why
+            "virtio.qpair", candidate_qpair_class_id, why
         )) begin
             return 0;
         end
@@ -50,11 +55,31 @@ class virtio_resource_client extends uvm_object;
         bound_qpair_limit =
             bound_dut_caps.max_vio_net_qpairs_per_device;
 
+        if (binding_owned) begin
+            if ((manager == bound_resource_manager) &&
+                (key.host_id == bound_function_key.host_id) &&
+                (key.pf_id == bound_function_key.pf_id) &&
+                (key.kind == bound_function_key.kind) &&
+                (key.vf_id == bound_function_key.vf_id) &&
+                (candidate_qpair_class_id == bound_qpair_class_id) &&
+                (bound_qpair_limit == bound_local_qpair_limit)) begin
+                why = "";
+                return 1;
+            end
+            why =
+                "virtio resource client binding ownership cannot be reassigned";
+            return 0;
+        end
+
         resource_manager = manager;
         function_key = key;
-        qpair_class_id = bound_qpair_class_id;
+        qpair_class_id = candidate_qpair_class_id;
         dut_caps = bound_dut_caps;
+        bound_resource_manager = manager;
+        bound_function_key = key;
+        bound_qpair_class_id = candidate_qpair_class_id;
         bound_local_qpair_limit = bound_qpair_limit;
+        binding_owned = 1;
         device_ready = 0;
         qpairs_frozen = 0;
         why = "";
@@ -75,12 +100,15 @@ class virtio_resource_client extends uvm_object;
     // The caller invokes this only after it programmed the Fabric BAR
     // triplet and completed its transport-visible discovery setup.
     function bit mark_device_ready(output string why);
-        if (resource_manager == null) begin
+        if (bound_resource_manager == null) begin
             why = "virtio resource client has not been bound to Fabric";
             return 0;
         end
-        if (!resource_manager.mark_function_device_ready(function_key, why))
+        if (!bound_resource_manager.mark_function_device_ready(
+            bound_function_key, why
+        )) begin
             return 0;
+        end
         device_ready = 1;
         why = "";
         return 1;
@@ -94,7 +122,7 @@ class virtio_resource_client extends uvm_object;
         dpu_resource_lease_t leases[$];
         virtio_qpair_mapping_t mapping;
 
-        if ((resource_manager == null) || !device_ready) begin
+        if ((bound_resource_manager == null) || !device_ready) begin
             why = "virtio resource client function is not device-ready";
             return 0;
         end
@@ -120,8 +148,9 @@ class virtio_resource_client extends uvm_object;
             );
             return 0;
         end
-        if (!resource_manager.acquire_leases(
-            function_key, qpair_class_id, first_local_pair, count, leases, why
+        if (!bound_resource_manager.acquire_leases(
+            bound_function_key, bound_qpair_class_id,
+            first_local_pair, count, leases, why
         )) begin
             return 0;
         end
@@ -137,7 +166,7 @@ class virtio_resource_client extends uvm_object;
     endfunction
 
     function bit release_qpairs(output string why);
-        if ((resource_manager == null) || !device_ready) begin
+        if ((bound_resource_manager == null) || !device_ready) begin
             why = "virtio resource client function is not device-ready";
             return 0;
         end
@@ -146,8 +175,11 @@ class virtio_resource_client extends uvm_object;
         // releasable; it neither assigns a new global ID nor changes mappings.
         if (qpairs_frozen && !restore_qpairs(why))
             return 0;
-        if (!resource_manager.release_leases(function_key, qpair_class_id, why))
+        if (!bound_resource_manager.release_leases(
+            bound_function_key, bound_qpair_class_id, why
+        )) begin
             return 0;
+        end
         qpair_leases.delete();
         qpair_mappings.delete();
         why = "";
@@ -165,11 +197,11 @@ class virtio_resource_client extends uvm_object;
     // Freezing preserves the generic leases and their virtio pair mapping;
     // restore simply makes that saved class lease set usable again.
     function bit freeze_qpairs(output string why);
-        if ((resource_manager == null) || !device_ready) begin
+        if ((bound_resource_manager == null) || !device_ready) begin
             why = "virtio resource client function is not device-ready";
             return 0;
         end
-        if (!resource_manager.freeze_function(function_key, why))
+        if (!bound_resource_manager.freeze_function(bound_function_key, why))
             return 0;
         qpairs_frozen = 1;
         why = "";
@@ -177,11 +209,11 @@ class virtio_resource_client extends uvm_object;
     endfunction
 
     function bit restore_qpairs(output string why);
-        if ((resource_manager == null) || !device_ready) begin
+        if ((bound_resource_manager == null) || !device_ready) begin
             why = "virtio resource client function is not device-ready";
             return 0;
         end
-        if (!resource_manager.restore_function(function_key, why))
+        if (!bound_resource_manager.restore_function(bound_function_key, why))
             return 0;
         qpairs_frozen = 0;
         why = "";
