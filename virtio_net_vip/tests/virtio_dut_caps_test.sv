@@ -41,6 +41,7 @@ class virtio_dut_caps_test extends uvm_test;
 
     task assert_real_dut_capability_defaults();
         dpu_dut_caps invalid_caps;
+        dpu_dut_caps zero_caps;
         string why;
 
         if ((fabric_cfg.dut_caps.max_hosts != 2) ||
@@ -55,6 +56,16 @@ class virtio_dut_caps_test extends uvm_test;
         invalid_caps.max_vio_net_qpairs_per_device = 33;
         if (invalid_caps.validate(why)) begin
             `uvm_fatal("DUT_CAPS", "capability profile accepted 33 VIO qpairs/device")
+        end
+
+        zero_caps = dpu_dut_caps::type_id::create("zero_caps");
+        zero_caps.max_hosts = 0;
+        if (zero_caps.validate(why)) begin
+            `uvm_fatal("DUT_CAPS", "capability profile accepted zero hosts")
+        end
+        if (why != "DUT host capability must be nonzero") begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "zero host capability returned an inaccurate reason: %s", why))
         end
     endtask
 

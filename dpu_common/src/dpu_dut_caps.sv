@@ -38,43 +38,69 @@ class dpu_dut_caps extends uvm_object;
 
     function bit validate(output string why);
         why = "";
-        if ((max_hosts == 0) || (max_hosts > DPU_MAX_HOSTS)) begin
+        if (max_hosts == 0) begin
+            why = "DUT host capability must be nonzero";
+            return 0;
+        end
+        if (max_hosts > DPU_MAX_HOSTS) begin
             why = "DUT host capability exceeds the model ceiling";
             return 0;
         end
-        if ((max_pfs_per_host == 0) ||
-            (max_pfs_per_host > DPU_MAX_PFS_PER_HOST)) begin
+        if (max_pfs_per_host == 0) begin
+            why = "DUT PF capability must be nonzero";
+            return 0;
+        end
+        if (max_pfs_per_host > DPU_MAX_PFS_PER_HOST) begin
             why = "DUT PF capability exceeds the model ceiling";
             return 0;
         end
-        if ((max_vfs_per_pf == 0) ||
-            (max_vfs_per_pf > DPU_MAX_VFS_PER_PF)) begin
+        if (max_vfs_per_pf == 0) begin
+            why = "DUT VF capability must be nonzero";
+            return 0;
+        end
+        if (max_vfs_per_pf > DPU_MAX_VFS_PER_PF) begin
             why = "DUT VF capability exceeds the model ceiling";
             return 0;
         end
-        if ((max_functions == 0) || (max_functions > DPU_MAX_FUNCTIONS)) begin
+        if (max_functions == 0) begin
+            why = "DUT function capability must be nonzero";
+            return 0;
+        end
+        if (max_functions > DPU_MAX_FUNCTIONS) begin
             why = "DUT function capability exceeds the model ceiling";
             return 0;
         end
-        if ((global_msix_vector_count == 0) ||
-            (global_msix_vector_count > DPU_MAX_GLOBAL_MSIX_VECTORS)) begin
+        if (global_msix_vector_count == 0) begin
+            why = "DUT global MSI-X capability must be nonzero";
+            return 0;
+        end
+        if (global_msix_vector_count > DPU_MAX_GLOBAL_MSIX_VECTORS) begin
             why = "DUT global MSI-X capability exceeds the model ceiling";
             return 0;
         end
-        if ((vio_global_qpair_count == 0) ||
-            (vio_global_qpair_count > DPU_MAX_VIO_GLOBAL_QPAIRS)) begin
+        if (vio_global_qpair_count == 0) begin
+            why = "DUT VIO global qpair capability must be nonzero";
+            return 0;
+        end
+        if (vio_global_qpair_count > DPU_MAX_VIO_GLOBAL_QPAIRS) begin
             why = "DUT VIO global qpair capability exceeds the 11-bit ID domain";
             return 0;
         end
-        if ((max_vio_net_qpairs_per_device == 0) ||
-            (max_vio_net_qpairs_per_device >
-             DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE)) begin
+        if (max_vio_net_qpairs_per_device == 0) begin
+            why = "DUT VIO-net device capability must be nonzero";
+            return 0;
+        end
+        if (max_vio_net_qpairs_per_device >
+            DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE) begin
             why = "DUT VIO-net device capability exceeds 32 qpairs";
             return 0;
         end
-        if ((vio_notify_entries_per_bank == 0) ||
-            (vio_notify_entries_per_bank >
-             DPU_MAX_VIO_NOTIFY_ENTRIES_PER_BANK)) begin
+        if (vio_notify_entries_per_bank == 0) begin
+            why = "DUT VIO notify capability must be nonzero";
+            return 0;
+        end
+        if (vio_notify_entries_per_bank >
+            DPU_MAX_VIO_NOTIFY_ENTRIES_PER_BANK) begin
             why = "DUT VIO notify capability exceeds the model ceiling";
             return 0;
         end
