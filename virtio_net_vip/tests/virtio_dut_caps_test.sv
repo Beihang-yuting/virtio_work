@@ -6,17 +6,70 @@ import uvm_pkg::*;
 import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
 
-class virtio_dut_caps_expected_cfg_error extends uvm_report_catcher;
-    int unsigned caught_count;
+class virtio_dut_caps_expected_build_failure extends uvm_report_catcher;
+    uvm_report_object expected_env_client;
+    int unsigned cfg_error_count;
+    int unsigned env_fatal_count;
+    string last_cfg_message;
+    string last_env_message;
 
-    function new(string name = "virtio_dut_caps_expected_cfg_error");
+    function new(
+        string name,
+        uvm_report_object configured_env_client
+    );
         super.new(name);
-        caught_count = 0;
+        expected_env_client = configured_env_client;
+        cfg_error_count = 0;
+        env_fatal_count = 0;
+        last_cfg_message = "";
+        last_env_message = "";
     endfunction
 
     virtual function action_e catch();
-        if ((get_severity() == UVM_ERROR) && (get_id() == "ENV_CFG")) begin
+        if ((get_severity() == UVM_ERROR) &&
+            (get_id() == "ENV_CFG") &&
+            (get_client() == uvm_top) &&
+            (get_message() ==
+             "default_num_pairs=33 exceeds VIO-net device limit 32")) begin
+            cfg_error_count++;
+            last_cfg_message = get_message();
+            set_severity(UVM_INFO);
+        end
+        else if ((get_severity() == UVM_FATAL) &&
+                 (get_id() == "VIRTIO_ENV") &&
+                 (get_client() == expected_env_client) &&
+                 (get_message() ==
+                  "Invalid virtio-net configuration; refusing to build environment")) begin
+            env_fatal_count++;
+            last_env_message = get_message();
+            set_severity(UVM_INFO);
+        end
+        return THROW;
+    endfunction
+endclass
+
+class virtio_dut_caps_expected_cfg_error extends uvm_report_catcher;
+    string expected_message;
+    int unsigned caught_count;
+    string last_message;
+
+    function new(
+        string name,
+        string configured_expected_message
+    );
+        super.new(name);
+        expected_message = configured_expected_message;
+        caught_count = 0;
+        last_message = "";
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) &&
+            (get_id() == "ENV_CFG") &&
+            (get_client() == uvm_top) &&
+            (get_message() == expected_message)) begin
             caught_count++;
+            last_message = get_message();
             set_severity(UVM_INFO);
         end
         return THROW;
@@ -31,6 +84,11 @@ class virtio_dut_caps_test extends uvm_test;
     dpu_resource_manager manager;
     dpu_function_key_t valid_pf;
     dpu_function_key_t valid_vf;
+    virtio_net_env invalid_legacy_env;
+    virtio_net_env_config invalid_legacy_cfg;
+    virtio_dut_caps_expected_build_failure expected_build_failure;
+    virtio_net_env propagated_caps_env;
+    virtio_net_env_config propagated_caps_cfg;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -54,7 +112,60 @@ class virtio_dut_caps_test extends uvm_test;
         super.build_phase(phase);
         fabric_cfg = dpu_fabric_env_config::type_id::create("fabric_cfg");
         fabric = dpu_fabric_env::type_id::create("fabric", this);
+
+        invalid_legacy_cfg = virtio_net_env_config::type_id::create(
+            "invalid_legacy_cfg");
+        invalid_legacy_cfg.default_num_pairs = 33;
+        invalid_legacy_env = virtio_net_env::type_id::create(
+            "invalid_legacy_env", this);
+        uvm_config_db#(virtio_net_env_config)::set(
+            this, "invalid_legacy_env", "cfg", invalid_legacy_cfg);
+        expected_build_failure = new(
+            "expected_build_failure", invalid_legacy_env);
+        uvm_report_cb::add(null, expected_build_failure);
+
+        propagated_caps_cfg = virtio_net_env_config::type_id::create(
+            "propagated_caps_cfg");
+        propagated_caps_cfg.dut_caps.max_hosts = 1;
+        propagated_caps_cfg.dut_caps.max_pfs_per_host = 3;
+        propagated_caps_cfg.dut_caps.max_functions = 3;
+        propagated_caps_cfg.dut_caps.vio_global_qpair_count = 2;
+        propagated_caps_cfg.dut_caps.max_vio_net_qpairs_per_device = 1;
+        propagated_caps_cfg.num_hosts = 1;
+        propagated_caps_cfg.num_pfs_per_host = new[1];
+        propagated_caps_cfg.num_pfs_per_host[0] = 3;
+        propagated_caps_cfg.num_vfs_per_pf = new[1];
+        propagated_caps_cfg.num_vfs_per_pf[0] = new[3];
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this, "propagated_caps_env.*.driver_agent", "is_active",
+            UVM_PASSIVE);
+        propagated_caps_env = virtio_net_env::type_id::create(
+            "propagated_caps_env", this);
+        uvm_config_db#(virtio_net_env_config)::set(
+            this, "propagated_caps_env", "cfg", propagated_caps_cfg);
     endfunction
+
+    task assert_invalid_legacy_config_hard_fails();
+        uvm_report_cb::delete(null, expected_build_failure);
+        if ((expected_build_failure.cfg_error_count != 1) ||
+            (expected_build_failure.env_fatal_count != 1)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "invalid legacy build reported ENV_CFG=%0d VIRTIO_ENV_FATAL=%0d; expected 1/1",
+                expected_build_failure.cfg_error_count,
+                expected_build_failure.env_fatal_count))
+        end
+        if ((expected_build_failure.last_cfg_message !=
+             "default_num_pairs=33 exceeds VIO-net device limit 32") ||
+            (expected_build_failure.last_env_message !=
+             "Invalid virtio-net configuration; refusing to build environment")) begin
+            `uvm_fatal("DUT_CAPS",
+                "invalid legacy build reports did not preserve exact context")
+        end
+        if (invalid_legacy_env.host_mem != null) begin
+            `uvm_fatal("DUT_CAPS",
+                "invalid legacy configuration continued normal environment construction")
+        end
+    endtask
 
     task assert_real_dut_capability_defaults();
         dpu_dut_caps invalid_caps;
@@ -86,29 +197,61 @@ class virtio_dut_caps_test extends uvm_test;
         end
     endtask
 
+    task assert_config_rejected_once(
+        input virtio_net_env_config cfg,
+        input string expected_message,
+        input string accepted_fatal_message,
+        ref int unsigned total_caught
+    );
+        virtio_dut_caps_expected_cfg_error catcher;
+
+        catcher = new({cfg.get_name(), "_catcher"}, expected_message);
+        uvm_report_cb::add(null, catcher);
+        if (cfg.validate())
+            `uvm_fatal("DUT_CAPS", accepted_fatal_message)
+        uvm_report_cb::delete(null, catcher);
+
+        if ((catcher.caught_count != 1) ||
+            (catcher.last_message != expected_message)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "%s produced %0d matching ENV_CFG reports; expected exactly one: %s",
+                cfg.get_name(), catcher.caught_count, expected_message))
+        end
+        total_caught += catcher.caught_count;
+    endtask
+
     task assert_virtio_config_uses_dut_caps();
         virtio_net_env_config cfg;
         virtio_dut_caps_expected_cfg_error catcher;
+        int unsigned total_caught;
 
-        catcher = new();
+        total_caught = 0;
+
+        catcher = new("valid_32_qpair_catcher",
+            "default_num_pairs=33 exceeds VIO-net device limit 32");
         uvm_report_cb::add(null, catcher);
 
         cfg = virtio_net_env_config::type_id::create("valid_32_qpair_cfg");
         cfg.default_num_pairs = 32;
         if (!cfg.validate())
             `uvm_fatal("DUT_CAPS", "32-qpair default configuration was rejected")
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught_count != 0)
+            `uvm_fatal("DUT_CAPS", "valid 32-qpair configuration reported ENV_CFG")
 
         cfg = virtio_net_env_config::type_id::create("invalid_33_qpair_cfg");
         cfg.default_num_pairs = 33;
-        if (cfg.validate())
-            `uvm_fatal("DUT_CAPS", "33-qpair default configuration was accepted")
+        assert_config_rejected_once(cfg,
+            "default_num_pairs=33 exceeds VIO-net device limit 32",
+            "33-qpair default configuration was accepted", total_caught);
 
         cfg = virtio_net_env_config::type_id::create("invalid_vf_qpair_cfg");
         cfg.vf_configs = new[1];
         cfg.vf_configs[0] = cfg.get_default_driver_config();
         cfg.vf_configs[0].num_queue_pairs = 33;
-        if (cfg.validate())
-            `uvm_fatal("DUT_CAPS", "VF configuration accepted 33 qpairs")
+        assert_config_rejected_once(cfg,
+            "VF0 num_queue_pairs=33 exceeds VIO-net device limit 32",
+            "VF configuration accepted 33 qpairs", total_caught);
 
         cfg = virtio_net_env_config::type_id::create("invalid_host_cfg");
         cfg.num_hosts = 3;
@@ -118,8 +261,9 @@ class virtio_dut_caps_test extends uvm_test;
             cfg.num_pfs_per_host[host_id] = 1;
             cfg.num_vfs_per_pf[host_id] = new[1];
         end
-        if (cfg.validate())
-            `uvm_fatal("DUT_CAPS", "three-host topology exceeded real-DUT caps")
+        assert_config_rejected_once(cfg,
+            "num_hosts=3 exceeds DUT limit 2",
+            "three-host topology exceeded real-DUT caps", total_caught);
 
         cfg = virtio_net_env_config::type_id::create("invalid_pf_cfg");
         cfg.num_hosts = 1;
@@ -127,8 +271,9 @@ class virtio_dut_caps_test extends uvm_test;
         cfg.num_pfs_per_host[0] = 5;
         cfg.num_vfs_per_pf = new[1];
         cfg.num_vfs_per_pf[0] = new[5];
-        if (cfg.validate())
-            `uvm_fatal("DUT_CAPS", "five-PF topology exceeded real-DUT caps")
+        assert_config_rejected_once(cfg,
+            "host 0 PF count 5 exceeds DUT limit 4",
+            "five-PF topology exceeded real-DUT caps", total_caught);
 
         cfg = virtio_net_env_config::type_id::create("invalid_vf_cfg");
         cfg.num_hosts = 1;
@@ -137,12 +282,106 @@ class virtio_dut_caps_test extends uvm_test;
         cfg.num_vfs_per_pf = new[1];
         cfg.num_vfs_per_pf[0] = new[1];
         cfg.num_vfs_per_pf[0][0] = 17;
-        if (cfg.validate())
-            `uvm_fatal("DUT_CAPS", "17-VF topology exceeded real-DUT caps")
+        assert_config_rejected_once(cfg,
+            "host 0 PF 0 VF count 17 exceeds DUT limit 16",
+            "17-VF topology exceeded real-DUT caps", total_caught);
 
-        uvm_report_cb::delete(null, catcher);
-        if (catcher.caught_count < 5)
-            `uvm_fatal("DUT_CAPS", "expected invalid configurations were not reported")
+        cfg = virtio_net_env_config::type_id::create("invalid_zero_default_cfg");
+        cfg.default_num_pairs = 0;
+        assert_config_rejected_once(cfg,
+            "default_num_pairs=0 must be nonzero",
+            "zero-qpair default configuration was accepted", total_caught);
+
+        cfg = virtio_net_env_config::type_id::create("invalid_zero_vf_cfg");
+        cfg.vf_configs = new[1];
+        cfg.vf_configs[0] = cfg.get_default_driver_config();
+        cfg.vf_configs[0].num_queue_pairs = 0;
+        assert_config_rejected_once(cfg,
+            "VF0 num_queue_pairs=0 must be nonzero",
+            "VF configuration accepted zero qpairs", total_caught);
+
+        cfg = virtio_net_env_config::type_id::create("invalid_null_caps_cfg");
+        cfg.dut_caps = null;
+        assert_config_rejected_once(cfg,
+            "invalid DUT capabilities: null capability object",
+            "null DUT capabilities were accepted", total_caught);
+
+        cfg = virtio_net_env_config::type_id::create(
+            "invalid_function_count_cfg");
+        cfg.dut_caps.max_functions = 1;
+        cfg.num_hosts = 1;
+        cfg.num_pfs_per_host = new[1];
+        cfg.num_pfs_per_host[0] = 1;
+        cfg.num_vfs_per_pf = new[1];
+        cfg.num_vfs_per_pf[0] = new[1];
+        cfg.num_vfs_per_pf[0][0] = 1;
+        assert_config_rejected_once(cfg,
+            "requested 2 functions exceeds DUT limit 1",
+            "DUT function-count limit was not enforced", total_caught);
+
+        if (total_caught != 9)
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "caught %0d expected invalid configurations; expected exactly 9",
+                total_caught))
+    endtask
+
+    task assert_env_propagates_caps_to_fabric();
+        dpu_resource_manager propagated_manager;
+        dpu_dut_caps snapshot;
+        virtio_resource_client clients[3];
+        string why;
+
+        if (!uvm_config_db#(dpu_resource_manager)::get(
+            this, "propagated_caps_env.fabric", "dpu_resource_manager",
+            propagated_manager
+        )) begin
+            `uvm_fatal("DUT_CAPS",
+                "capability-driven virtio env did not publish its Fabric manager")
+        end
+
+        snapshot = propagated_manager.snapshot_dut_caps();
+        if ((snapshot.max_hosts != 1) ||
+            (snapshot.max_pfs_per_host != 3) ||
+            (snapshot.max_functions != 3) ||
+            (snapshot.vio_global_qpair_count != 2) ||
+            (snapshot.max_vio_net_qpairs_per_device != 1)) begin
+            `uvm_fatal("DUT_CAPS",
+                "virtio env did not copy its non-default DUT caps into Fabric")
+        end
+
+        if (propagated_caps_env.pf_instances.size() != 3)
+            `uvm_fatal("DUT_CAPS", "capability test env did not build three PFs")
+
+        foreach (clients[index]) begin
+            clients[index] = propagated_caps_env.pf_instances[index].
+                pf_function.resource_client;
+            if (clients[index] == null)
+                `uvm_fatal("DUT_CAPS", $sformatf(
+                    "PF%0d did not receive a Fabric resource client", index))
+            if (!clients[index].mark_device_ready(why))
+                `uvm_fatal("DUT_CAPS", $sformatf(
+                    "PF%0d could not become device-ready: %s", index, why))
+        end
+
+        if (clients[0].reserve_qpairs(0, 2, why))
+            `uvm_fatal("DUT_CAPS",
+                "single PF exceeded the propagated one-qpair quota")
+        if (why != "resource-class per-function quota would be exceeded")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "per-function qpair rejection used wrong reason: %s", why))
+
+        if (!clients[0].reserve_qpairs(0, 1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "first PF could not reserve one qpair: %s", why))
+        if (!clients[1].reserve_qpairs(0, 1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "second PF could not reserve one qpair: %s", why))
+        if (clients[2].reserve_qpairs(0, 1, why))
+            `uvm_fatal("DUT_CAPS",
+                "third PF exceeded the propagated global qpair capacity")
+        if (why != "resource-class capacity would be exceeded")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "global qpair rejection used wrong reason: %s", why))
     endtask
 
     task configure_fabric();
@@ -194,8 +433,10 @@ class virtio_dut_caps_test extends uvm_test;
 
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
+        assert_invalid_legacy_config_hard_fails();
         assert_real_dut_capability_defaults();
         assert_virtio_config_uses_dut_caps();
+        assert_env_propagates_caps_to_fabric();
         configure_fabric();
         assert_manager_topology_limits();
         phase.drop_objection(this);

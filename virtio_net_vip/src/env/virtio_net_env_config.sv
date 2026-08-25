@@ -160,9 +160,13 @@ class virtio_net_env_config extends uvm_object;
             ok = 0;
         end
         else begin
-            if ((default_num_pairs == 0) ||
-                (default_num_pairs >
-                 dut_caps.max_vio_net_qpairs_per_device)) begin
+            if (default_num_pairs == 0) begin
+                `uvm_error("ENV_CFG",
+                    "default_num_pairs=0 must be nonzero")
+                ok = 0;
+            end
+            else if (default_num_pairs >
+                     dut_caps.max_vio_net_qpairs_per_device) begin
                 `uvm_error("ENV_CFG", $sformatf(
                     "default_num_pairs=%0d exceeds VIO-net device limit %0d",
                     default_num_pairs,
@@ -170,9 +174,13 @@ class virtio_net_env_config extends uvm_object;
                 ok = 0;
             end
             foreach (vf_configs[vf_id]) begin
-                if ((vf_configs[vf_id].num_queue_pairs == 0) ||
-                    (vf_configs[vf_id].num_queue_pairs >
-                     dut_caps.max_vio_net_qpairs_per_device)) begin
+                if (vf_configs[vf_id].num_queue_pairs == 0) begin
+                    `uvm_error("ENV_CFG", $sformatf(
+                        "VF%0d num_queue_pairs=0 must be nonzero", vf_id))
+                    ok = 0;
+                end
+                else if (vf_configs[vf_id].num_queue_pairs >
+                         dut_caps.max_vio_net_qpairs_per_device) begin
                     `uvm_error("ENV_CFG", $sformatf(
                         "VF%0d num_queue_pairs=%0d exceeds VIO-net device limit %0d",
                         vf_id, vf_configs[vf_id].num_queue_pairs,

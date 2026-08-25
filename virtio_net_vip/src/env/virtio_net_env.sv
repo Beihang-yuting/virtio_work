@@ -40,6 +40,7 @@ class virtio_net_env extends uvm_env;
     dpu_fabric_env             fabric;
     virtio_pf_instance         pf_instances[];
     protected bit              fabric_topology;
+    protected bit              configuration_valid;
 
     // ===== VF instances (dynamic array based on num_vfs) =====
     virtio_vf_instance vf_instances[];
@@ -72,6 +73,7 @@ class virtio_net_env extends uvm_env;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
+        configuration_valid = 0;
     endfunction
 
     protected function bit [15:0] fabric_pf_bdf(
@@ -175,17 +177,18 @@ class virtio_net_env extends uvm_env;
         super.build_phase(phase);
 
         // Get config from config_db
-        if (!uvm_config_db #(virtio_net_env_config)::get(this, "", "cfg", cfg))
+        if (!uvm_config_db #(virtio_net_env_config)::get(this, "", "cfg", cfg)) begin
             `uvm_fatal("VIRTIO_ENV", "No virtio_net_env_config found in config_db")
+            return;
+        end
 
         // Validate config
         if (!cfg.validate()) begin
-            if (cfg.uses_fabric_topology()) begin
-                `uvm_fatal("VIRTIO_ENV",
-                    "Invalid Fabric topology; refusing to index or build it")
-            end
-            `uvm_warning("VIRTIO_ENV", "Config validation reported issues -- continuing")
+            `uvm_fatal("VIRTIO_ENV",
+                "Invalid virtio-net configuration; refusing to build environment")
+            return;
         end
+        configuration_valid = 1;
 
         `uvm_info("VIRTIO_ENV",
             $sformatf("build_phase: %s", cfg.convert2string()),
@@ -252,6 +255,8 @@ class virtio_net_env extends uvm_env;
 
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
+        if (!configuration_valid)
+            return;
 
         if (fabric_topology) begin
             configure_fabric_resources();
@@ -403,6 +408,8 @@ class virtio_net_env extends uvm_env;
 
     virtual function void report_phase(uvm_phase phase);
         super.report_phase(phase);
+        if (!configuration_valid)
+            return;
 
         `uvm_info("VIRTIO_ENV", "========== Environment Report ==========", UVM_LOW)
 
