@@ -28,7 +28,9 @@
 class virtio_dynamic_reconfig extends uvm_object;
     `uvm_object_utils(virtio_dynamic_reconfig)
 
-    int unsigned max_vio_net_qpairs_per_device;
+    protected dpu_dut_caps dut_caps;
+    local int unsigned     enforced_max_vio_net_qpairs_per_device;
+    local bit              dut_caps_bound;
 
     // ========================================================================
     // Constructor
@@ -36,12 +38,52 @@ class virtio_dynamic_reconfig extends uvm_object;
 
     function new(string name = "virtio_dynamic_reconfig");
         super.new(name);
-        max_vio_net_qpairs_per_device = DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
+        dut_caps = null;
+        enforced_max_vio_net_qpairs_per_device =
+            DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
+        dut_caps_bound = 0;
+    endfunction
+
+    function bit bind_dut_caps(
+        input dpu_dut_caps caps,
+        output string why
+    );
+        dpu_dut_caps bound_dut_caps;
+        int unsigned bound_qpair_limit;
+        string caps_why;
+
+        if (dut_caps_bound) begin
+            why = "dynamic reconfig DUT capabilities are already bound";
+            return 0;
+        end
+        if (caps == null) begin
+            why = "dynamic reconfig DUT capabilities are null";
+            return 0;
+        end
+        if (!caps.validate(caps_why)) begin
+            why = $sformatf("invalid DUT capabilities: %s", caps_why);
+            return 0;
+        end
+        bound_dut_caps = dpu_dut_caps::type_id::create(
+            "dynamic_reconfig_bound_dut_caps");
+        bound_dut_caps.copy_from(caps);
+        bound_qpair_limit =
+            bound_dut_caps.max_vio_net_qpairs_per_device;
+
+        dut_caps = bound_dut_caps;
+        enforced_max_vio_net_qpairs_per_device = bound_qpair_limit;
+        dut_caps_bound = 1;
+        why = "";
+        return 1;
+    endfunction
+
+    function int unsigned max_supported_qpairs();
+        return enforced_max_vio_net_qpairs_per_device;
     endfunction
 
     function bit qpair_count_supported(input int unsigned count);
         return (count != 0) &&
-               (count <= max_vio_net_qpairs_per_device);
+               (count <= enforced_max_vio_net_qpairs_per_device);
     endfunction
 
     // ========================================================================
@@ -75,13 +117,13 @@ class virtio_dynamic_reconfig extends uvm_object;
         if (new_pairs == 0) begin
             `uvm_error("DYN_RECONFIG", $sformatf(
                 "live_mq_resize: 0 pairs is outside supported range 1..%0d",
-                max_vio_net_qpairs_per_device))
+                enforced_max_vio_net_qpairs_per_device))
             return;
         end
         if (!qpair_count_supported(new_pairs)) begin
             `uvm_error("DYN_RECONFIG", $sformatf(
                 "live_mq_resize: %0d pairs exceeds device limit %0d",
-                new_pairs, max_vio_net_qpairs_per_device))
+                new_pairs, enforced_max_vio_net_qpairs_per_device))
             return;
         end
 

@@ -173,6 +173,7 @@ class virtio_net_env extends uvm_env;
 
     virtual function void build_phase(uvm_phase phase);
         int unsigned num_instances;
+        string why;
 
         super.build_phase(phase);
 
@@ -236,8 +237,12 @@ class virtio_net_env extends uvm_env;
         // Create concurrency/dynamic reconfig
         conc_ctrl    = virtio_concurrency_controller::type_id::create("conc_ctrl");
         dyn_reconfig = virtio_dynamic_reconfig::type_id::create("dyn_reconfig");
-        dyn_reconfig.max_vio_net_qpairs_per_device =
-            cfg.dut_caps.max_vio_net_qpairs_per_device;
+        if (!dyn_reconfig.bind_dut_caps(cfg.dut_caps, why)) begin
+            configuration_valid = 0;
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "Dynamic reconfiguration capability bind failed: %s", why))
+            return;
+        end
 
         // Virtual sequencer
         v_seqr = virtio_virtual_sequencer::type_id::create("v_seqr", this);

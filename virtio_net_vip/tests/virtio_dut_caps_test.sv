@@ -139,6 +139,25 @@ class virtio_dut_caps_snapshot_mutator extends virtio_resource_client;
     endfunction
 endclass
 
+class virtio_dut_caps_reconfig_snapshot_mutator extends virtio_dynamic_reconfig;
+    `uvm_object_utils(virtio_dut_caps_reconfig_snapshot_mutator)
+
+    function new(string name = "virtio_dut_caps_reconfig_snapshot_mutator");
+        super.new(name);
+    endfunction
+
+    function void mutate_snapshot_qpair_limit(input int unsigned limit);
+        if (dut_caps != null)
+            dut_caps.max_vio_net_qpairs_per_device = limit;
+    endfunction
+
+    function int unsigned snapshot_qpair_limit();
+        if (dut_caps == null)
+            return 0;
+        return dut_caps.max_vio_net_qpairs_per_device;
+    endfunction
+endclass
+
 class virtio_dut_caps_test extends uvm_test;
     `uvm_component_utils(virtio_dut_caps_test)
 
@@ -505,12 +524,20 @@ class virtio_dut_caps_test extends uvm_test;
     endtask
 
     task assert_dynamic_resize_limit();
-        virtio_dynamic_reconfig reconfig;
+        virtio_dut_caps_reconfig_snapshot_mutator reconfig;
         virtio_dut_caps_expected_resize_error default_catcher;
         virtio_dut_caps_expected_resize_error propagated_catcher;
         virtio_dut_caps_expected_resize_error zero_catcher;
+        dpu_dut_caps custom_caps;
+        dpu_dut_caps invalid_caps;
+        dpu_dut_caps rebind_caps;
+        string why;
 
-        reconfig = virtio_dynamic_reconfig::type_id::create("reconfig");
+        reconfig = virtio_dut_caps_reconfig_snapshot_mutator::type_id::create(
+            "reconfig");
+        if (reconfig.max_supported_qpairs() != 32)
+            `uvm_fatal("DUT_CAPS",
+                "standalone dynamic reconfig did not default to 32 qpairs")
         if (!reconfig.qpair_count_supported(32))
             `uvm_fatal("DUT_CAPS", "dynamic resize rejected 32 qpairs")
         if (reconfig.qpair_count_supported(33))
@@ -536,11 +563,85 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS",
                 "invalid default-cap resize did not return before VF access")
 
+        if (reconfig.bind_dut_caps(null, why))
+            `uvm_fatal("DUT_CAPS",
+                "standalone dynamic reconfig accepted null DUT capabilities")
+        if (why != "dynamic reconfig DUT capabilities are null")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "null dynamic capability bind used wrong reason: %s", why))
+        if ((reconfig.max_supported_qpairs() != 32) ||
+            !reconfig.qpair_count_supported(32) ||
+            reconfig.qpair_count_supported(33)) begin
+            `uvm_fatal("DUT_CAPS",
+                "null dynamic capability bind changed standalone enforcement")
+        end
+
+        invalid_caps = dpu_dut_caps::type_id::create(
+            "invalid_dynamic_reconfig_caps");
+        invalid_caps.max_hosts = 0;
+        if (reconfig.bind_dut_caps(invalid_caps, why))
+            `uvm_fatal("DUT_CAPS",
+                "standalone dynamic reconfig accepted invalid DUT capabilities")
+        if (why !=
+            "invalid DUT capabilities: DUT host capability must be nonzero") begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "invalid dynamic capability bind used wrong reason: %s", why))
+        end
+        if ((reconfig.max_supported_qpairs() != 32) ||
+            (reconfig.snapshot_qpair_limit() != 0)) begin
+            `uvm_fatal("DUT_CAPS",
+                "invalid dynamic capability bind changed standalone state")
+        end
+
+        custom_caps = dpu_dut_caps::type_id::create(
+            "custom_dynamic_reconfig_caps");
+        custom_caps.max_vio_net_qpairs_per_device = 1;
+        if (!reconfig.bind_dut_caps(custom_caps, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "valid dynamic capability bind failed: %s", why))
+        if ((reconfig.max_supported_qpairs() != 1) ||
+            (reconfig.snapshot_qpair_limit() != 1) ||
+            !reconfig.qpair_count_supported(1) ||
+            reconfig.qpair_count_supported(2)) begin
+            `uvm_fatal("DUT_CAPS",
+                "valid dynamic capability bind did not enforce custom limit 1")
+        end
+
+        custom_caps.max_vio_net_qpairs_per_device = 2;
+        if ((reconfig.max_supported_qpairs() != 1) ||
+            (reconfig.snapshot_qpair_limit() != 1) ||
+            reconfig.qpair_count_supported(2)) begin
+            `uvm_fatal("DUT_CAPS",
+                "source DUT capability mutation relaxed dynamic enforcement")
+        end
+
+        rebind_caps = dpu_dut_caps::type_id::create(
+            "dynamic_reconfig_rebind_caps");
+        rebind_caps.max_vio_net_qpairs_per_device = 2;
+        if (reconfig.bind_dut_caps(rebind_caps, why))
+            `uvm_fatal("DUT_CAPS",
+                "dynamic reconfig accepted a second DUT capability bind")
+        if (why != "dynamic reconfig DUT capabilities are already bound")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "dynamic capability rebind used wrong reason: %s", why))
+        if ((reconfig.max_supported_qpairs() != 1) ||
+            (reconfig.snapshot_qpair_limit() != 1) ||
+            reconfig.qpair_count_supported(2)) begin
+            `uvm_fatal("DUT_CAPS",
+                "failed dynamic capability rebind relaxed custom limit 1")
+        end
+
+        reconfig.mutate_snapshot_qpair_limit(2);
+        if ((reconfig.max_supported_qpairs() != 1) ||
+            reconfig.qpair_count_supported(2)) begin
+            `uvm_fatal("DUT_CAPS",
+                "protected dynamic capability mutation relaxed custom limit 1")
+        end
+
         if (propagated_caps_env.dyn_reconfig == null)
             `uvm_fatal("DUT_CAPS",
                 "capability-driven virtio env did not build dynamic reconfig")
-        if (propagated_caps_env.dyn_reconfig.
-            max_vio_net_qpairs_per_device != 1) begin
+        if (propagated_caps_env.dyn_reconfig.max_supported_qpairs() != 1) begin
             `uvm_fatal("DUT_CAPS",
                 "dynamic reconfig did not receive the non-default device limit")
         end
@@ -548,6 +649,14 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS", "dynamic resize rejected custom-cap qpair 1")
         if (propagated_caps_env.dyn_reconfig.qpair_count_supported(2))
             `uvm_fatal("DUT_CAPS", "dynamic resize accepted custom-cap qpair 2")
+
+        propagated_caps_cfg.dut_caps.max_vio_net_qpairs_per_device = 2;
+        if ((propagated_caps_env.dyn_reconfig.max_supported_qpairs() != 1) ||
+            propagated_caps_env.dyn_reconfig.qpair_count_supported(2)) begin
+            `uvm_fatal("DUT_CAPS",
+                "env source capability mutation relaxed custom qpair limit 1")
+        end
+        propagated_caps_cfg.dut_caps.max_vio_net_qpairs_per_device = 1;
 
         propagated_catcher = new("propagated_resize_catcher",
             "live_mq_resize: 2 pairs exceeds device limit 1");
