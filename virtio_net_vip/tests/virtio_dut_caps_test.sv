@@ -103,14 +103,17 @@ class virtio_dut_caps_expected_bind_fatal extends uvm_report_catcher;
 endclass
 
 class virtio_dut_caps_expected_resize_error extends uvm_report_catcher;
+    uvm_report_object expected_client;
     string expected_message;
     int unsigned caught_count;
 
     function new(
         string name,
+        uvm_report_object configured_expected_client,
         string configured_expected_message
     );
         super.new(name);
+        expected_client = configured_expected_client;
         expected_message = configured_expected_message;
         caught_count = 0;
     endfunction
@@ -118,6 +121,7 @@ class virtio_dut_caps_expected_resize_error extends uvm_report_catcher;
     virtual function action_e catch();
         if ((get_severity() == UVM_ERROR) &&
             (get_id() == "DYN_RECONFIG") &&
+            (get_client() == expected_client) &&
             (get_message() == expected_message)) begin
             caught_count++;
             set_severity(UVM_INFO);
@@ -127,14 +131,17 @@ class virtio_dut_caps_expected_resize_error extends uvm_report_catcher;
 endclass
 
 class virtio_dut_caps_expected_fsm_mq_error extends uvm_report_catcher;
+    uvm_report_object expected_client;
     string expected_message;
     int unsigned caught_count;
 
     function new(
         string name,
+        uvm_report_object configured_expected_client,
         string configured_expected_message
     );
         super.new(name);
+        expected_client = configured_expected_client;
         expected_message = configured_expected_message;
         caught_count = 0;
     endfunction
@@ -142,6 +149,38 @@ class virtio_dut_caps_expected_fsm_mq_error extends uvm_report_catcher;
     virtual function action_e catch();
         if ((get_severity() == UVM_ERROR) &&
             (get_id() == "AUTO_FSM") &&
+            (get_client() == expected_client) &&
+            (get_message() == expected_message)) begin
+            caught_count++;
+            set_severity(UVM_INFO);
+        end
+        return THROW;
+    endfunction
+endclass
+
+class virtio_dut_caps_expected_exact_error extends uvm_report_catcher;
+    uvm_report_object expected_client;
+    string expected_id;
+    string expected_message;
+    int unsigned caught_count;
+
+    function new(
+        string name,
+        uvm_report_object configured_client,
+        string configured_id,
+        string configured_message
+    );
+        super.new(name);
+        expected_client = configured_client;
+        expected_id = configured_id;
+        expected_message = configured_message;
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) &&
+            (get_client() == expected_client) &&
+            (get_id() == expected_id) &&
             (get_message() == expected_message)) begin
             caught_count++;
             set_severity(UVM_INFO);
@@ -1333,6 +1372,69 @@ class virtio_dut_caps_test extends uvm_test;
                 "third PF could not release its recovered qpair: %s", why))
     endtask
 
+    task assert_expected_error_catchers_match_client();
+        virtio_dynamic_reconfig target_reconfig;
+        virtio_dynamic_reconfig other_reconfig;
+        virtio_dut_caps_mq_fsm_probe target_fsm;
+        virtio_dut_caps_mq_fsm_probe other_fsm;
+        virtio_dut_caps_expected_resize_error resize_catcher;
+        virtio_dut_caps_expected_fsm_mq_error fsm_catcher;
+        virtio_dut_caps_expected_exact_error other_resize_catcher;
+        virtio_dut_caps_expected_exact_error other_fsm_catcher;
+        string resize_message;
+        string fsm_message;
+
+        target_reconfig = virtio_dynamic_reconfig::type_id::create(
+            "catcher_target_reconfig");
+        other_reconfig = virtio_dynamic_reconfig::type_id::create(
+            "catcher_other_reconfig");
+        resize_message =
+            "live_mq_resize: 0 pairs is outside supported range 1..32";
+        resize_catcher = new(
+            "client_exact_resize_catcher", target_reconfig, resize_message);
+        other_resize_catcher = new(
+            "other_exact_resize_catcher", other_reconfig,
+            "DYN_RECONFIG", resize_message);
+        uvm_report_cb::add(null, resize_catcher, UVM_APPEND);
+        uvm_report_cb::add(null, other_resize_catcher, UVM_APPEND);
+        target_reconfig.live_mq_resize(null, 1, 0, 0);
+        other_reconfig.live_mq_resize(null, 1, 0, 0);
+        uvm_report_cb::delete(null, other_resize_catcher);
+        uvm_report_cb::delete(null, resize_catcher);
+        if ((resize_catcher.caught_count != 1) ||
+            (other_resize_catcher.caught_count != 1)) begin
+            `uvm_error("DUT_CAPS", $sformatf(
+                {"resize catcher did not isolate identical reports by client: ",
+                 "target=%0d other=%0d"},
+                resize_catcher.caught_count,
+                other_resize_catcher.caught_count))
+        end
+
+        target_fsm = virtio_dut_caps_mq_fsm_probe::type_id::create(
+            "catcher_target_fsm");
+        other_fsm = virtio_dut_caps_mq_fsm_probe::type_id::create(
+            "catcher_other_fsm");
+        fsm_message =
+            "configure_mq: requested 0 pairs is outside supported range 1..32";
+        fsm_catcher = new(
+            "client_exact_fsm_catcher", target_fsm, fsm_message);
+        other_fsm_catcher = new(
+            "other_exact_fsm_catcher", other_fsm, "AUTO_FSM", fsm_message);
+        uvm_report_cb::add(null, fsm_catcher, UVM_APPEND);
+        uvm_report_cb::add(null, other_fsm_catcher, UVM_APPEND);
+        target_fsm.configure_mq(0);
+        other_fsm.configure_mq(0);
+        uvm_report_cb::delete(null, other_fsm_catcher);
+        uvm_report_cb::delete(null, fsm_catcher);
+        if ((fsm_catcher.caught_count != 1) ||
+            (other_fsm_catcher.caught_count != 1)) begin
+            `uvm_error("DUT_CAPS", $sformatf(
+                {"FSM catcher did not isolate identical reports by client: ",
+                 "target=%0d other=%0d"},
+                fsm_catcher.caught_count, other_fsm_catcher.caught_count))
+        end
+    endtask
+
     task assert_dynamic_resize_limit();
         virtio_dut_caps_reconfig_snapshot_mutator reconfig;
         virtio_dut_caps_expected_resize_error default_catcher;
@@ -1355,7 +1457,7 @@ class virtio_dut_caps_test extends uvm_test;
         if (reconfig.qpair_count_supported(0))
             `uvm_fatal("DUT_CAPS", "dynamic resize accepted zero qpairs")
 
-        zero_catcher = new("zero_resize_catcher",
+        zero_catcher = new("zero_resize_catcher", reconfig,
             "live_mq_resize: 0 pairs is outside supported range 1..32");
         uvm_report_cb::add(null, zero_catcher);
         reconfig.live_mq_resize(null, 1, 0, 0);
@@ -1364,7 +1466,7 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS",
                 "zero resize did not use the supported-range diagnostic")
 
-        default_catcher = new("default_resize_catcher",
+        default_catcher = new("default_resize_catcher", reconfig,
             "live_mq_resize: 33 pairs exceeds device limit 32");
         uvm_report_cb::add(null, default_catcher);
         reconfig.live_mq_resize(null, 1, 33, 0);
@@ -1468,7 +1570,8 @@ class virtio_dut_caps_test extends uvm_test;
         end
         propagated_caps_cfg.dut_caps.max_vio_net_qpairs_per_device = 1;
 
-        propagated_catcher = new("propagated_resize_catcher",
+        propagated_catcher = new(
+            "propagated_resize_catcher", propagated_caps_env.dyn_reconfig,
             "live_mq_resize: 2 pairs exceeds device limit 1");
         uvm_report_cb::add(null, propagated_catcher);
         propagated_caps_env.dyn_reconfig.live_mq_resize(null, 1, 2, 0);
@@ -1588,7 +1691,7 @@ class virtio_dut_caps_test extends uvm_test;
         req.txn_type = VIO_TXN_SET_MQ;
         req.num_pairs = 2;
         over_cap_catcher = new(
-            "mq_over_cap_catcher",
+            "mq_over_cap_catcher", fsm_probe,
             "configure_mq: requested 2 pairs is outside supported range 1..1");
         uvm_report_cb::add(null, over_cap_catcher);
         mq_driver.dispatch_transaction(req);
@@ -1611,7 +1714,7 @@ class virtio_dut_caps_test extends uvm_test;
         req.txn_type = VIO_TXN_SET_MQ;
         req.num_pairs = 0;
         zero_catcher = new(
-            "mq_zero_catcher",
+            "mq_zero_catcher", fsm_probe,
             "configure_mq: requested 0 pairs is outside supported range 1..1");
         uvm_report_cb::add(null, zero_catcher);
         mq_driver.dispatch_transaction(req);
@@ -1682,7 +1785,7 @@ class virtio_dut_caps_test extends uvm_test;
         req.txn_type = VIO_TXN_SET_MQ;
         req.num_pairs = 2;
         set_mq_over_catcher = new(
-            "malicious_set_mq_over_catcher",
+            "malicious_set_mq_over_catcher", malicious_fsm,
             "configure_mq: requested 2 pairs is outside supported range 1..1");
         uvm_report_cb::add(null, set_mq_over_catcher);
         mq_driver.dispatch_transaction(req);
@@ -1693,7 +1796,7 @@ class virtio_dut_caps_test extends uvm_test;
         // normalization plus the same pre-side-effect rejection behavior.
         req.num_pairs = 'x;
         set_mq_unknown_catcher = new(
-            "malicious_set_mq_unknown_catcher",
+            "malicious_set_mq_unknown_catcher", malicious_fsm,
             "configure_mq: requested 0 pairs is outside supported range 1..1");
         uvm_report_cb::add(null, set_mq_unknown_catcher);
         mq_driver.dispatch_transaction(req);
@@ -1703,7 +1806,7 @@ class virtio_dut_caps_test extends uvm_test;
         req.txn_type = VIO_TXN_INIT;
         malicious_fsm.drv_cfg.num_queue_pairs = 2;
         full_over_catcher = new(
-            "malicious_full_over_catcher",
+            "malicious_full_over_catcher", malicious_fsm,
             {"full_init: configured queue-pair count 2 is outside supported ",
              "range 1..1"});
         uvm_report_cb::add(null, full_over_catcher);
@@ -1712,7 +1815,7 @@ class virtio_dut_caps_test extends uvm_test;
 
         malicious_fsm.drv_cfg.num_queue_pairs = 0;
         full_zero_catcher = new(
-            "malicious_full_zero_catcher",
+            "malicious_full_zero_catcher", malicious_fsm,
             {"full_init: configured queue-pair count 0 is outside supported ",
              "range 1..1"});
         uvm_report_cb::add(null, full_zero_catcher);
@@ -1721,7 +1824,7 @@ class virtio_dut_caps_test extends uvm_test;
 
         malicious_fsm.drv_cfg.num_queue_pairs = 'x;
         full_unknown_catcher = new(
-            "malicious_full_unknown_catcher",
+            "malicious_full_unknown_catcher", malicious_fsm,
             {"full_init: configured queue-pair count 0 is outside supported ",
              "range 1..1"});
         uvm_report_cb::add(null, full_unknown_catcher);
@@ -1733,7 +1836,7 @@ class virtio_dut_caps_test extends uvm_test;
         req.snapshot.num_queue_pairs = 2;
         req.success = 1;
         restore_over_catcher = new(
-            "malicious_restore_over_catcher",
+            "malicious_restore_over_catcher", malicious_fsm,
             {"restore_from_migration: snapshot queue-pair count 2 is outside ",
              "supported range 1..1"});
         uvm_report_cb::add(null, restore_over_catcher);
@@ -1743,7 +1846,7 @@ class virtio_dut_caps_test extends uvm_test;
         req.snapshot.num_queue_pairs = 0;
         req.success = 1;
         restore_zero_catcher = new(
-            "malicious_restore_zero_catcher",
+            "malicious_restore_zero_catcher", malicious_fsm,
             {"restore_from_migration: snapshot queue-pair count 0 is outside ",
              "supported range 1..1"});
         uvm_report_cb::add(null, restore_zero_catcher);
@@ -1754,7 +1857,7 @@ class virtio_dut_caps_test extends uvm_test;
         req.snapshot.num_queue_pairs = 'x;
         req.success = 1;
         restore_unknown_catcher = new(
-            "malicious_restore_unknown_catcher",
+            "malicious_restore_unknown_catcher", malicious_fsm,
             {"restore_from_migration: snapshot queue-pair count 0 is outside ",
              "supported range 1..1"});
         uvm_report_cb::add(null, restore_unknown_catcher);
@@ -1849,21 +1952,21 @@ class virtio_dut_caps_test extends uvm_test;
                 "malicious dynamic reconfig capability bind failed: %s", why))
 
         over_catcher = new(
-            "malicious_resize_over_catcher",
+            "malicious_resize_over_catcher", malicious_reconfig,
             "live_mq_resize: 2 pairs exceeds device limit 1");
         uvm_report_cb::add(null, over_catcher);
         base_reconfig.live_mq_resize(null, 1, 2, 0);
         uvm_report_cb::delete(null, over_catcher);
 
         zero_catcher = new(
-            "malicious_resize_zero_catcher",
+            "malicious_resize_zero_catcher", malicious_reconfig,
             "live_mq_resize: 0 pairs is outside supported range 1..1");
         uvm_report_cb::add(null, zero_catcher);
         base_reconfig.live_mq_resize(null, 1, 0, 0);
         uvm_report_cb::delete(null, zero_catcher);
 
         unknown_catcher = new(
-            "malicious_resize_unknown_catcher",
+            "malicious_resize_unknown_catcher", malicious_reconfig,
             "live_mq_resize: 0 pairs is outside supported range 1..1");
         uvm_report_cb::add(null, unknown_catcher);
         base_reconfig.live_mq_resize(null, 1, 'x, 0);
@@ -2435,6 +2538,7 @@ class virtio_dut_caps_test extends uvm_test;
         assert_real_dut_capability_defaults();
         assert_virtio_config_uses_dut_caps();
         assert_env_propagates_caps_to_fabric();
+        assert_expected_error_catchers_match_client();
         assert_dynamic_resize_limit();
         assert_driver_mq_dispatch_uses_dut_cap();
         assert_mandatory_fsm_guards_cannot_be_overridden();

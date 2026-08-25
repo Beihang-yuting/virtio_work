@@ -266,11 +266,15 @@ make compile TEST=virtio_unit_test
 make test TEST=virtio_unit_test
 ```
 
-`make compile` 仅编译；`make test` 编译后运行指定测试。`make regression` 固定顺序运行
-`dpu_resource_manager_test`、`virtio_fabric_resource_test`、`virtio_unit_test`、
-`virtio_stress_unit_test`、`virtio_protocol_test`、`virtio_indirect_desc_test`、
-`virtio_admin_vq_test`、`virtio_migration_dirty_test`、`virtio_monitor_test`、
-`virtio_coverage_test`、`virtio_e2e_test` 和 `virtio_full_integration_test`。
+`make compile` 仅编译；`make test` 编译后运行指定测试。`scripts/test_manifest.sh`
+中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的单一事实源；`make regression`
+按该顺序运行 `dpu_resource_manager_test`、`virtio_dut_caps_test`、
+`virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、
+`virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、
+`virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、
+`virtio_e2e_test`、`virtio_full_integration_test`、`virtio_pf_lifecycle_reset_test`、
+`virtio_monitor_routing_test`、`virtio_dual_test`、`virtio_smoke_test` 和
+`virtio_traffic_test`。
 `make check-deps` 会验证 submodule 固定 SHA、VCS 环境以及外部源码完整性。
 
 `pcie_tl_vip@3e2d8c972f1baa78e073f98e8a38ad2f04db6e1a` 和

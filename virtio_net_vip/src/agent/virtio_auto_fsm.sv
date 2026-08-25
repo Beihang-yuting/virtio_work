@@ -22,7 +22,7 @@
 //   - virtio_wait_policy (timeout/polling)
 // ============================================================================
 
-class virtio_auto_fsm extends uvm_object;
+class virtio_auto_fsm extends uvm_report_object;
     `uvm_object_utils(virtio_auto_fsm)
 
     localparam int unsigned MIGRATION_PAGE_SIZE = 4096;

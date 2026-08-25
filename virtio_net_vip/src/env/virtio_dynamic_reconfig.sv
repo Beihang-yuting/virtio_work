@@ -25,7 +25,7 @@
 //   - virtio_net_types.sv (interrupt_mode_e, virtio_rss_config_t, etc.)
 // ============================================================================
 
-class virtio_dynamic_reconfig extends uvm_object;
+class virtio_dynamic_reconfig extends uvm_report_object;
     `uvm_object_utils(virtio_dynamic_reconfig)
 
     protected dpu_dut_caps dut_caps;
