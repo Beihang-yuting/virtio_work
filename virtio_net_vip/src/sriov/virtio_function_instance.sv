@@ -64,10 +64,19 @@ class virtio_function_instance extends uvm_component;
         input dpu_resource_manager manager = null,
         input uvm_object pcie_ctx = null
     );
+        string why;
+
         if (kind != key.kind) begin
             `uvm_error("FUNCTION_INSTANCE", $sformatf(
                 "transport kind %0d disagrees with Fabric function key kind %0d",
                 kind, key.kind))
+            return;
+        end
+        if ((manager != null) && (resource_client != null) &&
+            !resource_client.bind_to_fabric(manager, key, why)) begin
+            `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
+                key.host_id, key.pf_id, key.kind, key.vf_id, why))
             return;
         end
         function_kind = kind;
@@ -326,6 +335,7 @@ class virtio_function_instance extends uvm_component;
                 "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
                 function_key.host_id, function_key.pf_id, function_key.kind,
                 function_key.vf_id, why))
+            return;
         end
         transport.configure_fabric_managed(resource_client);
     endfunction

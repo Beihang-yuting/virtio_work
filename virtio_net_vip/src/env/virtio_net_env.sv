@@ -41,6 +41,7 @@ class virtio_net_env extends uvm_env;
     virtio_pf_instance         pf_instances[];
     protected bit              fabric_topology;
     protected bit              configuration_valid;
+    local dpu_dut_caps         effective_dut_caps;
 
     // ===== VF instances (dynamic array based on num_vfs) =====
     virtio_vf_instance vf_instances[];
@@ -74,6 +75,18 @@ class virtio_net_env extends uvm_env;
     function new(string name, uvm_component parent);
         super.new(name, parent);
         configuration_valid = 0;
+        effective_dut_caps = null;
+    endfunction
+
+    function dpu_dut_caps snapshot_effective_dut_caps();
+        dpu_dut_caps snapshot;
+
+        if (effective_dut_caps == null)
+            return null;
+        snapshot = dpu_dut_caps::type_id::create(
+            "virtio_env_effective_dut_caps_snapshot");
+        snapshot.copy_from(effective_dut_caps);
+        return snapshot;
     endfunction
 
     protected function bit [15:0] fabric_pf_bdf(
@@ -106,7 +119,7 @@ class virtio_net_env extends uvm_env;
         end
     endfunction
 
-    protected function void configure_fabric_resources();
+    protected function bit configure_fabric_resources();
         dpu_fabric_env_config fabric_cfg;
         dpu_resource_pool_config_t qpair_profile;
         dpu_resource_manager resource_manager;
@@ -115,26 +128,29 @@ class virtio_net_env extends uvm_env;
         fabric_cfg = dpu_fabric_env_config::type_id::create("fabric_cfg");
         fabric_cfg.mmio_aperture_base = 64'h0001_0000_0000_0000;
         fabric_cfg.mmio_aperture_limit = 64'h0001_0100_0000_0000;
-        fabric_cfg.dut_caps.copy_from(cfg.dut_caps);
+        fabric_cfg.dut_caps.copy_from(effective_dut_caps);
         qpair_profile.name = "virtio.qpair";
         qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
-        qpair_profile.capacity = cfg.dut_caps.vio_global_qpair_count;
+        qpair_profile.capacity = effective_dut_caps.vio_global_qpair_count;
         qpair_profile.max_per_function =
-            cfg.dut_caps.max_vio_net_qpairs_per_device;
+            effective_dut_caps.max_vio_net_qpairs_per_device;
         fabric_cfg.resource_profiles.push_back(qpair_profile);
         if (!fabric.apply_resource_profiles(fabric_cfg, why)) begin
             `uvm_fatal("VIRTIO_ENV", $sformatf(
                 "Fabric QP profile registration failed: %s", why))
+            return 0;
         end
         if (!uvm_config_db#(dpu_resource_manager)::get(
             this, "fabric", "dpu_resource_manager", resource_manager
         )) begin
             `uvm_fatal("VIRTIO_ENV", "Fabric did not publish a resource manager")
+            return 0;
         end
         foreach (pf_instances[index]) begin
             if (!resource_manager.register_function(pf_instances[index].pf_key, why)) begin
                 `uvm_fatal("VIRTIO_ENV", $sformatf(
                     "PF registration failed for topology entry %0d: %s", index, why))
+                return 0;
             end
             foreach (pf_instances[index].vf_keys[vf_id]) begin
                 if (!resource_manager.register_function(
@@ -143,11 +159,13 @@ class virtio_net_env extends uvm_env;
                     `uvm_fatal("VIRTIO_ENV", $sformatf(
                         "VF registration failed for topology entry %0d VF %0d: %s",
                         index, vf_id, why))
+                    return 0;
                 end
             end
         end
         foreach (pf_instances[index])
             pf_instances[index].configure_fabric_resources(resource_manager);
+        return 1;
     endfunction
 
     protected function void flatten_fabric_vfs();
@@ -189,6 +207,9 @@ class virtio_net_env extends uvm_env;
                 "Invalid virtio-net configuration; refusing to build environment")
             return;
         end
+        effective_dut_caps = dpu_dut_caps::type_id::create(
+            "effective_dut_caps");
+        effective_dut_caps.copy_from(cfg.dut_caps);
         configuration_valid = 1;
 
         `uvm_info("VIRTIO_ENV",
@@ -237,7 +258,7 @@ class virtio_net_env extends uvm_env;
         // Create concurrency/dynamic reconfig
         conc_ctrl    = virtio_concurrency_controller::type_id::create("conc_ctrl");
         dyn_reconfig = virtio_dynamic_reconfig::type_id::create("dyn_reconfig");
-        if (!dyn_reconfig.bind_dut_caps(cfg.dut_caps, why)) begin
+        if (!dyn_reconfig.bind_dut_caps(effective_dut_caps, why)) begin
             configuration_valid = 0;
             `uvm_fatal("VIRTIO_ENV", $sformatf(
                 "Dynamic reconfiguration capability bind failed: %s", why))
@@ -261,18 +282,25 @@ class virtio_net_env extends uvm_env;
     // ========================================================================
 
     virtual function void connect_phase(uvm_phase phase);
+        virtio_driver_config_t driver_cfg;
+
         super.connect_phase(phase);
         if (!configuration_valid)
             return;
 
         if (fabric_topology) begin
-            configure_fabric_resources();
+            if (!configure_fabric_resources()) begin
+                configuration_valid = 0;
+                return;
+            end
             flatten_fabric_vfs();
             pf_mgr = pf_instances[0].pf_manager;
             pf_mgr.wait_pol = wait_pol;
             foreach (pf_instances[pf_index]) begin
-                pf_instances[pf_index].pf_function.drv_cfg =
-                    cfg.get_default_driver_config();
+                driver_cfg = cfg.get_default_driver_config();
+                driver_cfg.max_vio_net_qpairs_per_device =
+                    effective_dut_caps.max_vio_net_qpairs_per_device;
+                pf_instances[pf_index].pf_function.drv_cfg = driver_cfg;
                 if (scb != null) begin
                     pf_instances[pf_index].pf_function.driver_agent.monitor.txn_ap.connect(
                         scb.txn_imp
@@ -289,7 +317,10 @@ class virtio_net_env extends uvm_env;
         // Wire shared components into the compatibility VF view.
         foreach (vf_instances[i]) begin
             // Set VF config from env config
-            vf_instances[i].drv_cfg = cfg.get_vf_config(i);
+            driver_cfg = cfg.get_vf_config(i);
+            driver_cfg.max_vio_net_qpairs_per_device =
+                effective_dut_caps.max_vio_net_qpairs_per_device;
+            vf_instances[i].drv_cfg = driver_cfg;
 
             // Note: wire_shared() needs pcie_rc_seqr which comes from
             // the PCIe TL env. This connection happens in the test's
