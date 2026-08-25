@@ -273,10 +273,13 @@ class virtio_dual_test extends uvm_test;
 
         // ---- Wire VIP A ----
         transport_a.bdf = 16'h0100;
-        binding_function_a.bind_pcie_components(
+        if (!binding_function_a.bind_pcie_components(
             "dual_function_a", transport_a, vq_mgr_a, null, mem_a, iommu_a,
             barrier_a, err_inj_a, wait_pol_a, binding_function_a.drv_cfg,
-            pcie_env.rc_agent.sequencer, ops_a, fsm_a);
+            pcie_env.rc_agent.sequencer, ops_a, fsm_a)) begin
+            `uvm_fatal("DUAL_TEST", "failed to bind function A to PCIe")
+            return;
+        end
 
         wait_pol_a.default_poll_interval_ns = 100;
         wait_pol_a.reset_timeout_ns = 10000;
@@ -285,10 +288,13 @@ class virtio_dual_test extends uvm_test;
 
         // ---- Wire VIP B ----
         transport_b.bdf = 16'h0200;
-        binding_function_b.bind_pcie_components(
+        if (!binding_function_b.bind_pcie_components(
             "dual_function_b", transport_b, vq_mgr_b, null, mem_b, iommu_b,
             barrier_b, err_inj_b, wait_pol_b, binding_function_b.drv_cfg,
-            pcie_env.rc_agent.sequencer, ops_b, fsm_b);
+            pcie_env.rc_agent.sequencer, ops_b, fsm_b)) begin
+            `uvm_fatal("DUAL_TEST", "failed to bind function B to PCIe")
+            return;
+        end
 
         wait_pol_b.default_poll_interval_ns = 100;
         wait_pol_b.reset_timeout_ns = 10000;

@@ -76,6 +76,7 @@ class virtio_net_env extends uvm_env;
         super.new(name, parent);
         configuration_valid = 0;
         effective_dut_caps = null;
+        protocol_event_vif_index = 0;
     endfunction
 
     function dpu_dut_caps snapshot_effective_dut_caps();
@@ -362,84 +363,261 @@ class virtio_net_env extends uvm_env;
     // all live functions. Fabric topology owns independent PF and VF
     // functions, so it must not be reduced to the compatibility vf_instances
     // view.
-    virtual function void bind_pcie(
+    function bit bind_pcie(
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
         input virtio_tlm_completion_adapter tlm_adapter = null,
         input pcie_tl_base_monitor pcie_rc_monitor = null,
         input pcie_tl_base_monitor pcie_ep_monitor = null
     );
+        int unsigned next_protocol_event_vif_index;
+        virtio_function_instance active_functions[$];
+        virtual virtio_protocol_event_if candidate_protocol_vif;
+        virtual virtio_protocol_event_if staged_protocol_vifs[DPU_MAX_FUNCTIONS];
+        virtio_auto_fsm staged_pcie_fsms[DPU_MAX_FUNCTIONS];
+        virtio_atomic_ops staged_pcie_ops[DPU_MAX_FUNCTIONS];
+
         if (!configuration_valid)
-            return;
+            return 0;
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("VIRTIO_ENV", "bind_pcie() received a null PCIe RC sequencer")
+            configuration_valid = 0;
+            return 0;
+        end
+        if (v_seqr == null) begin
+            `uvm_fatal("VIRTIO_ENV",
+                "bind_pcie() received a null virtual sequencer")
+            configuration_valid = 0;
+            return 0;
         end
 
-        // A non-null adapter owns the factory-created RC shim. Bind and
-        // validate that shim only when the caller supplies the adapter.
-        if (tlm_adapter != null)
-            tlm_adapter.bind_registered_rc_driver();
-        v_seqr.pcie_rc_seqr = pcie_rc_seqr;
-        protocol_event_vif_index = 0;
         if (fabric_topology) begin
             foreach (pf_instances[pf_index]) begin
-                bind_function_pcie(
-                    pf_instances[pf_index].pf_function, pcie_rc_seqr,
-                    pcie_rc_monitor, pcie_ep_monitor);
+                active_functions.push_back(
+                    pf_instances[pf_index].pf_function);
                 foreach (pf_instances[pf_index].vf_functions[vf_index])
-                    bind_function_pcie(
-                        pf_instances[pf_index].vf_functions[vf_index],
-                        pcie_rc_seqr, pcie_rc_monitor, pcie_ep_monitor);
+                    active_functions.push_back(
+                        pf_instances[pf_index].vf_functions[vf_index]);
             end
         end
         else begin
             foreach (vf_instances[vf_index])
-                bind_function_pcie(vf_instances[vf_index], pcie_rc_seqr,
-                    pcie_rc_monitor, pcie_ep_monitor);
+                active_functions.push_back(vf_instances[vf_index]);
         end
+
+        // Analysis connections are part of the atomic bind commit.  Validate
+        // every supplied source port before function preflight allocates
+        // candidates and before either the optional adapter or any function
+        // can commit state.
+        if ((pcie_rc_monitor != null) &&
+            (pcie_rc_monitor.tlp_ap == null)) begin
+            `uvm_fatal("VIRTIO_ENV",
+                "bind_pcie() received a PCIe RC monitor with a null tlp_ap")
+            foreach (active_functions[cancel_index])
+                active_functions[cancel_index].cancel_preflight_bind_pcie();
+            configuration_valid = 0;
+            return 0;
+        end
+        if ((pcie_ep_monitor != null) &&
+            (pcie_ep_monitor.tlp_ap == null)) begin
+            `uvm_fatal("VIRTIO_ENV",
+                "bind_pcie() received a PCIe EP monitor with a null tlp_ap")
+            foreach (active_functions[cancel_index])
+                active_functions[cancel_index].cancel_preflight_bind_pcie();
+            configuration_valid = 0;
+            return 0;
+        end
+
+        next_protocol_event_vif_index = 0;
+        foreach (active_functions[function_index]) begin
+            if (!preflight_function_pcie(
+                active_functions[function_index], pcie_rc_seqr,
+                next_protocol_event_vif_index,
+                candidate_protocol_vif)) begin
+                foreach (active_functions[cancel_index])
+                    active_functions[cancel_index].cancel_preflight_bind_pcie();
+                configuration_valid = 0;
+                return 0;
+            end
+            staged_protocol_vifs[function_index] = candidate_protocol_vif;
+            staged_pcie_fsms[function_index] =
+                active_functions[function_index].pending_pcie_fsm_candidate();
+            staged_pcie_ops[function_index] =
+                active_functions[function_index].pending_pcie_ops_candidate();
+            for (int unsigned prior_index = 0;
+                 prior_index < function_index; prior_index++) begin
+                if (staged_protocol_vifs[function_index] ==
+                    staged_protocol_vifs[prior_index]) begin
+                    `uvm_fatal("VIRTIO_ENV", $sformatf(
+                        {"Active function indices %0d and %0d staged the ",
+                         "same protocol event interface"},
+                        prior_index, function_index))
+                    foreach (active_functions[cancel_index])
+                        active_functions[cancel_index].
+                            cancel_preflight_bind_pcie();
+                    configuration_valid = 0;
+                    return 0;
+                end
+                if (staged_pcie_fsms[function_index] ==
+                    staged_pcie_fsms[prior_index]) begin
+                    `uvm_fatal("VIRTIO_ENV", $sformatf(
+                        {"Active function indices %0d and %0d staged the ",
+                         "same PCIe FSM candidate"},
+                        prior_index, function_index))
+                    foreach (active_functions[cancel_index])
+                        active_functions[cancel_index].
+                            cancel_preflight_bind_pcie();
+                    configuration_valid = 0;
+                    return 0;
+                end
+                if (staged_pcie_ops[function_index] ==
+                    staged_pcie_ops[prior_index]) begin
+                    `uvm_fatal("VIRTIO_ENV", $sformatf(
+                        {"Active function indices %0d and %0d staged the ",
+                         "same PCIe ops candidate"},
+                        prior_index, function_index))
+                    foreach (active_functions[cancel_index])
+                        active_functions[cancel_index].
+                            cancel_preflight_bind_pcie();
+                    configuration_valid = 0;
+                    return 0;
+                end
+            end
+        end
+
+        // Bind the optional completion adapter only after every function has
+        // passed side-effect-free preflight and before any function commit.
+        if ((tlm_adapter != null) &&
+            !tlm_adapter.bind_registered_rc_driver()) begin
+            foreach (active_functions[cancel_index])
+                active_functions[cancel_index].cancel_preflight_bind_pcie();
+            configuration_valid = 0;
+            return 0;
+        end
+
+        next_protocol_event_vif_index = 0;
+        foreach (active_functions[function_index]) begin
+            if (!bind_function_pcie(
+                active_functions[function_index], pcie_rc_seqr,
+                pcie_rc_monitor, pcie_ep_monitor,
+                next_protocol_event_vif_index,
+                staged_protocol_vifs[function_index])) begin
+                foreach (active_functions[cancel_index])
+                    active_functions[cancel_index].cancel_preflight_bind_pcie();
+                configuration_valid = 0;
+                return 0;
+            end
+        end
+        v_seqr.pcie_rc_seqr = pcie_rc_seqr;
+        protocol_event_vif_index = next_protocol_event_vif_index;
+        return 1;
     endfunction
 
-    protected virtual function void bind_function_pcie(
+    protected function bit preflight_function_pcie(
+        input virtio_function_instance function_instance,
+        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
+        inout int unsigned next_protocol_event_vif_index,
+        output virtual virtio_protocol_event_if protocol_vif
+    );
+        string protocol_vif_key;
+        string observer_why;
+
+        if (function_instance == null) begin
+            `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
+            return 0;
+        end
+        if ((function_instance.driver_agent == null) ||
+            (function_instance.driver_agent.monitor == null) ||
+            (function_instance.driver_agent.observer == null)) begin
+            `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
+            return 0;
+        end
+        if (!function_instance.driver_agent.observer.
+            preflight_mandatory_function_binding(
+                function_instance.transport, observer_why)) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                {"Observer mandatory bind preflight failed for function ",
+                 "BDF 0x%04h: %s"},
+                function_instance.bdf, observer_why))
+            return 0;
+        end
+        if (next_protocol_event_vif_index >= DPU_MAX_FUNCTIONS) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "Protocol event interface pool exhausted at function BDF 0x%04h",
+                function_instance.bdf))
+            return 0;
+        end
+        protocol_vif_key = $sformatf("protocol_event_vif_%0d",
+            next_protocol_event_vif_index);
+        if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
+                null, "uvm_test_top", protocol_vif_key, protocol_vif) ||
+            (protocol_vif == null)) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "No protocol event interface configured for active function %0d",
+                next_protocol_event_vif_index))
+            return 0;
+        end
+        if (!function_instance.preflight_bind_pcie(pcie_rc_seqr))
+            return 0;
+        next_protocol_event_vif_index++;
+        return 1;
+    endfunction
+
+    protected function bit bind_function_pcie(
         input virtio_function_instance function_instance,
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
         input pcie_tl_base_monitor pcie_rc_monitor,
-        input pcie_tl_base_monitor pcie_ep_monitor
+        input pcie_tl_base_monitor pcie_ep_monitor,
+        inout int unsigned next_protocol_event_vif_index,
+        input virtual virtio_protocol_event_if staged_protocol_vif = null
     );
         virtual virtio_protocol_event_if protocol_vif;
         string protocol_vif_key;
 
-        function_instance.mem = host_mem;
-        function_instance.iommu = iommu;
-        function_instance.barrier = barrier;
-        function_instance.err_inj = err_inj;
-        function_instance.wait_pol = wait_pol;
-        function_instance.bind_pcie(pcie_rc_seqr);
+        if (function_instance == null) begin
+            `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
+            return 0;
+        end
         if ((function_instance.driver_agent == null) ||
+            (function_instance.driver_agent.monitor == null) ||
             (function_instance.driver_agent.observer == null)) begin
             `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
+            return 0;
         end
-        function_instance.driver_agent.observer.configure_function(
-            function_instance.bdf, function_instance.transport);
-        if (protocol_event_vif_index >= DPU_MAX_FUNCTIONS) begin
+        if (next_protocol_event_vif_index >= DPU_MAX_FUNCTIONS) begin
             `uvm_fatal("VIRTIO_ENV", $sformatf(
                 "Protocol event interface pool exhausted at function BDF 0x%04h",
                 function_instance.bdf))
+            return 0;
         end
-        protocol_vif_key = $sformatf("protocol_event_vif_%0d",
-            protocol_event_vif_index);
-        if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
-                null, "uvm_test_top", protocol_vif_key, protocol_vif)) begin
-            `uvm_fatal("VIRTIO_ENV", $sformatf(
-                "No protocol event interface configured for active function %0d",
-                protocol_event_vif_index))
+        protocol_vif = staged_protocol_vif;
+        if (protocol_vif == null) begin
+            protocol_vif_key = $sformatf("protocol_event_vif_%0d",
+                next_protocol_event_vif_index);
+            if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
+                    null, "uvm_test_top", protocol_vif_key, protocol_vif) ||
+                (protocol_vif == null)) begin
+                `uvm_fatal("VIRTIO_ENV", $sformatf(
+                    "No protocol event interface configured for active function %0d",
+                    next_protocol_event_vif_index))
+                return 0;
+            end
         end
+        if (!function_instance.commit_preflight_bind_pcie(
+            host_mem, iommu, barrier, err_inj, wait_pol, pcie_rc_seqr)) begin
+            return 0;
+        end
+        function_instance.driver_agent.observer.
+            commit_mandatory_function_binding(
+            function_instance.bdf, function_instance.transport);
         function_instance.driver_agent.monitor.protocol_vif = protocol_vif;
-        protocol_event_vif_index++;
+        next_protocol_event_vif_index++;
         if (pcie_rc_monitor != null)
             pcie_rc_monitor.tlp_ap.connect(
                 function_instance.driver_agent.observer.analysis_export);
         if ((pcie_ep_monitor != null) && (pcie_ep_monitor != pcie_rc_monitor))
             pcie_ep_monitor.tlp_ap.connect(
                 function_instance.driver_agent.observer.analysis_export);
+        return 1;
     endfunction
 
     // ========================================================================

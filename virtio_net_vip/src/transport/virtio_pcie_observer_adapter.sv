@@ -37,16 +37,56 @@ class virtio_pcie_observer_adapter extends uvm_subscriber #(pcie_tl_tlp);
         notify_cfg_limit = '0;
     endfunction
 
-    // Called by virtio_net_env while binding each active PF/VF to PCIe.  BAR
-    // placement and capability discovery may complete after this call, so
-    // write() refreshes the derived ranges before it makes any routing choice.
-    virtual function void configure_function(
+    // Side-effect-free validation for the environment's mandatory function
+    // bind.  Keeping this nonvirtual prevents a factory subtype from bypassing
+    // the base adapter endpoints that the mandatory commit relies on.
+    function bit preflight_mandatory_function_binding(
+        input virtio_pci_transport transport_ref,
+        output string why
+    );
+        why = "";
+        if (transport_ref == null) begin
+            why = "transport_ref is null";
+            return 0;
+        end
+        if (monitor == null) begin
+            why = "observer monitor is null";
+            return 0;
+        end
+        if (analysis_export == null) begin
+            why = "observer analysis_export is null";
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    // Commit only the validated base-class binding state.  The environment
+    // calls this nonvirtual mandatory path after every fallible preflight has
+    // passed.  Capability discovery remains lazy in write(), so this commit
+    // invokes no virtual hook and performs no fallible object dereference.
+    function void commit_mandatory_function_binding(
         input bit [15:0] device_bdf,
         input virtio_pci_transport transport_ref
     );
         function_bdf = device_bdf;
         transport = transport_ref;
         function_bound = (transport_ref != null);
+        common_cfg_base = '1;
+        common_cfg_limit = '0;
+        notify_cfg_base = '1;
+        notify_cfg_limit = '0;
+    endfunction
+
+    // Compatibility entry point for callers outside virtio_net_env.  It
+    // remains virtual, while mandatory environment binding uses the
+    // nonvirtual preflight/commit pair above.  BAR placement and capability
+    // discovery may complete after this call, so write() also refreshes the
+    // derived ranges before it makes any routing choice.
+    virtual function void configure_function(
+        input bit [15:0] device_bdf,
+        input virtio_pci_transport transport_ref
+    );
+        commit_mandatory_function_binding(device_bdf, transport_ref);
         refresh_capability_ranges();
     endfunction
 

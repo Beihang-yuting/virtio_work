@@ -15,21 +15,23 @@ class virtio_tlm_completion_adapter extends uvm_object;
     protected uvm_event cpl_available;
     protected static virtio_tlm_completion_adapter factory_owner;
     protected pcie_tl_base_driver registered_rc_driver;
+    local bit rc_driver_registration_failed;
     int unsigned completions_received;
     int unsigned completions_consumed;
 
     function new(string name = "virtio_tlm_completion_adapter");
         super.new(name);
         cpl_available = new("tlm_completion_available");
+        rc_driver_registration_failed = 0;
     endfunction
 
     extern virtual function void install_factory_overrides();
 
-    extern virtual function void register_rc_driver(pcie_tl_base_driver rc_driver);
+    extern function bit register_rc_driver(pcie_tl_base_driver rc_driver);
 
-    extern virtual function void bind_registered_rc_driver();
+    extern function bit bind_registered_rc_driver();
 
-    extern virtual function void bind_rc_driver(pcie_tl_base_driver rc_driver);
+    extern function bit bind_rc_driver(pcie_tl_base_driver rc_driver);
 
     static function virtio_tlm_completion_adapter get_factory_owner();
         return factory_owner;
@@ -94,7 +96,7 @@ class virtio_tlm_rc_driver_shim extends pcie_tl_rc_driver;
         super.new(name, parent);
         owner = virtio_tlm_completion_adapter::get_factory_owner();
         if (owner != null)
-            owner.register_rc_driver(this);
+            void'(owner.register_rc_driver(this));
     endfunction
 
     virtual function bit handle_completion(pcie_tl_cpl_tlp cpl);
@@ -344,44 +346,70 @@ function void virtio_tlm_completion_adapter::install_factory_overrides();
     virtio_tlm_bar_cfg_wr_seq::adapter = this;
 endfunction
 
-function void virtio_tlm_completion_adapter::bind_rc_driver(
+function bit virtio_tlm_completion_adapter::bind_rc_driver(
     pcie_tl_base_driver rc_driver
 );
     virtio_tlm_rc_driver_shim shim;
+    if (rc_driver_registration_failed) begin
+        `uvm_fatal("TLM_COMPLETION",
+                   "Completion adapter RC driver registration previously failed")
+        return 0;
+    end
     if (rc_driver == null) begin
+        rc_driver_registration_failed = 1;
         `uvm_fatal("TLM_COMPLETION", "RC driver is null")
+        return 0;
     end
     if (!$cast(shim, rc_driver)) begin
+        rc_driver_registration_failed = 1;
         `uvm_fatal("TLM_COMPLETION",
                    "RC driver was not created as virtio_tlm_rc_driver_shim")
+        return 0;
     end
     if (shim.adapter != null && shim.adapter != this) begin
+        rc_driver_registration_failed = 1;
         `uvm_fatal("TLM_COMPLETION",
                    "RC driver is already bound to a distinct completion adapter")
-        return;
+        return 0;
     end
     if (registered_rc_driver != null && registered_rc_driver != rc_driver) begin
+        rc_driver_registration_failed = 1;
         `uvm_fatal("TLM_COMPLETION",
                    "A distinct RC driver is already registered with this completion adapter")
-        return;
+        return 0;
     end
     registered_rc_driver = rc_driver;
     shim.adapter = this;
+    return 1;
 endfunction
 
-function void virtio_tlm_completion_adapter::register_rc_driver(
+function bit virtio_tlm_completion_adapter::register_rc_driver(
     pcie_tl_base_driver rc_driver
 );
-    bind_rc_driver(rc_driver);
+    if (rc_driver_registration_failed) begin
+        `uvm_fatal("TLM_COMPLETION",
+                   "Completion adapter RC driver registration previously failed")
+        return 0;
+    end
+    if (!bind_rc_driver(rc_driver)) begin
+        rc_driver_registration_failed = 1;
+        return 0;
+    end
+    return 1;
 endfunction
 
-function void virtio_tlm_completion_adapter::bind_registered_rc_driver();
+function bit virtio_tlm_completion_adapter::bind_registered_rc_driver();
+    if (rc_driver_registration_failed) begin
+        `uvm_fatal("TLM_COMPLETION",
+                   "Completion adapter RC driver registration previously failed")
+        return 0;
+    end
     if (registered_rc_driver == null) begin
         `uvm_fatal("TLM_COMPLETION",
                    "No factory-created RC driver registered with completion adapter")
-        return;
+        return 0;
     end
-    bind_rc_driver(registered_rc_driver);
+    return bind_rc_driver(registered_rc_driver);
 endfunction
 
 `endif // VIRTIO_TLM_COMPLETION_ADAPTER_SV

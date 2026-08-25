@@ -98,10 +98,13 @@ class virtio_full_integration_test extends uvm_test;
         super.connect_phase(phase);
 
         transport.bdf = 16'h0100;  // Bus=1, Dev=0, Func=0
-        binding_function.bind_pcie_components(
+        if (!binding_function.bind_pcie_components(
             "full_function", transport, vq_mgr, null, host_mem, iommu,
             barrier, err_inj, wait_pol, binding_function.drv_cfg,
-            pcie_env.rc_agent.sequencer, ops, fsm);
+            pcie_env.rc_agent.sequencer, ops, fsm)) begin
+            `uvm_fatal("FULL_TEST", "failed to bind function to PCIe")
+            return;
+        end
 
         // 4. Configure wait policy for fast simulation
         wait_pol.default_poll_interval_ns = 100;

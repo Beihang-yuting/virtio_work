@@ -358,7 +358,11 @@ class virtio_e2e_test extends uvm_test;
 
         // Public environment binding owns the completion adapter/RC-driver
         // lifecycle; this test deliberately performs no private driver bind.
-        virtio_env.bind_pcie(pcie_env.rc_agent.sequencer, tlm_adapter);
+        if (!virtio_env.bind_pcie(
+            pcie_env.rc_agent.sequencer, tlm_adapter)) begin
+            `uvm_fatal("E2E_TEST", "failed to bind virtio environment to PCIe")
+            return;
+        end
 
     endfunction
 

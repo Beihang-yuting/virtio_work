@@ -36,11 +36,17 @@ class virtio_function_instance extends uvm_component;
     virtio_driver_config_t drv_cfg;
     protected bit [63:0]   legacy_bar_base;
     protected bit          legacy_bar_base_valid;
+    local virtio_auto_fsm  pending_pcie_fsm;
+    local virtio_atomic_ops pending_pcie_ops;
+    local bit              pcie_bind_prepared;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
         function_kind = DPU_FUNCTION_PF;
         legacy_bar_base_valid = 0;
+        pending_pcie_fsm = null;
+        pending_pcie_ops = null;
+        pcie_bind_prepared = 0;
     endfunction
 
     virtual function void build_phase(uvm_phase phase);
@@ -126,9 +132,125 @@ class virtio_function_instance extends uvm_component;
         return (bar_id == 2) || (bar_id == 3);
     endfunction
 
-    // Public binding primitive.  The environment uses it for each active
-    // PF/VF; standalone TLM tests use a compatible function instance too.
-    function void bind_pcie_components(
+    // Side-effect-free half of PCIe binding.  The environment preflights all
+    // active functions before any one-shot FSM, observer, or monitor state is
+    // committed, so a later function cannot leave earlier functions bound.
+    function bit preflight_bind_pcie(
+        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
+    );
+        string function_name;
+        string why;
+        virtio_auto_fsm candidate_fsm;
+        virtio_atomic_ops candidate_ops;
+
+        cancel_preflight_bind_pcie();
+        function_name = $sformatf("function_%0d", vf_index);
+        if (pcie_rc_seqr == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s received a null PCIe RC sequencer", function_name))
+            return 0;
+        end
+        if (driver_agent == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s is missing driver agent", function_name))
+            return 0;
+        end
+        if ((transport == null) || (vq_mgr == null)) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s is missing transport or virtqueue manager", function_name))
+            return 0;
+        end
+        if ((transport.bar == null) || (transport.notify_mgr == null) ||
+            (transport.cap_mgr == null)) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                {"%s is missing transport BAR, notify manager, or ",
+                 "capability manager"}, function_name))
+            return 0;
+        end
+        candidate_fsm = driver_agent.fsm;
+        if (candidate_fsm == null)
+            candidate_fsm = virtio_auto_fsm::type_id::create(
+                {function_name, "_fsm"}, this);
+        if (candidate_fsm == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s factory returned a null PCIe FSM", function_name))
+            return 0;
+        end
+        candidate_ops = driver_agent.ops;
+        if (candidate_ops == null)
+            candidate_ops = virtio_atomic_ops::type_id::create(
+                {function_name, "_ops"}, this);
+        if (candidate_ops == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s factory returned null PCIe atomic ops", function_name))
+            return 0;
+        end
+        if (!candidate_fsm.mq_pair_limit_binding_supported(
+            drv_cfg.max_vio_net_qpairs_per_device, why
+        )) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s could not bind its MQ pair limit: %s", function_name, why))
+            return 0;
+        end
+        pending_pcie_fsm = candidate_fsm;
+        pending_pcie_ops = candidate_ops;
+        pcie_bind_prepared = 1;
+        return 1;
+    endfunction
+
+    function virtio_auto_fsm pending_pcie_fsm_candidate();
+        return pending_pcie_fsm;
+    endfunction
+
+    function virtio_atomic_ops pending_pcie_ops_candidate();
+        return pending_pcie_ops;
+    endfunction
+
+    function void cancel_preflight_bind_pcie();
+        pending_pcie_fsm = null;
+        pending_pcie_ops = null;
+        pcie_bind_prepared = 0;
+    endfunction
+
+    function bit commit_preflight_bind_pcie(
+        input host_mem_manager hmem,
+        input virtio_iommu_model iommu_mdl,
+        input virtio_memory_barrier_model bar_mdl,
+        input virtqueue_error_injector einj,
+        input virtio_wait_policy wpol,
+        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
+    );
+        virtio_atomic_ops ops;
+        virtio_auto_fsm fsm;
+
+        if (!pcie_bind_prepared || (pending_pcie_fsm == null) ||
+            (pending_pcie_ops == null)) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "function_%0d PCIe bind commit requires successful preflight",
+                vf_index))
+            return 0;
+        end
+        ops = pending_pcie_ops;
+        fsm = pending_pcie_fsm;
+        if (!commit_validated_pcie_components(
+            $sformatf("function_%0d", vf_index), transport, vq_mgr,
+            driver_agent, hmem, iommu_mdl, bar_mdl, einj, wpol, drv_cfg,
+            pcie_rc_seqr, ops, fsm)) begin
+            return 0;
+        end
+        mem = hmem;
+        iommu = iommu_mdl;
+        barrier = bar_mdl;
+        err_inj = einj;
+        wait_pol = wpol;
+        cancel_preflight_bind_pcie();
+        return 1;
+    endfunction
+
+    // Commit only handles that have passed all null/factory/MQ checks.  The
+    // environment reaches this helper through preflight; the standalone API
+    // below performs the same checks before calling it.
+    local function bit commit_validated_pcie_components(
         input string function_name,
         input virtio_pci_transport transport_ref,
         input virtqueue_manager vq_mgr_ref,
@@ -140,35 +262,18 @@ class virtio_function_instance extends uvm_component;
         input virtio_wait_policy wpol,
         input virtio_driver_config_t driver_cfg,
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
-        ref virtio_atomic_ops ops,
-        ref virtio_auto_fsm fsm
+        input virtio_atomic_ops ops,
+        input virtio_auto_fsm fsm
     );
         string why;
-        virtio_auto_fsm candidate_fsm;
 
-        if (pcie_rc_seqr == null) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "%s received a null PCIe RC sequencer", function_name))
-            return;
-        end
-        if ((transport_ref == null) || (vq_mgr_ref == null)) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "%s is missing transport or virtqueue manager", function_name))
-            return;
-        end
-
-        candidate_fsm = fsm;
-        if (candidate_fsm == null)
-            candidate_fsm = virtio_auto_fsm::type_id::create(
-                {function_name, "_fsm"});
-        if (!candidate_fsm.bind_mq_pair_limit(
+        if (!fsm.bind_mq_pair_limit(
             driver_cfg.max_vio_net_qpairs_per_device, why
         )) begin
             `uvm_fatal("FUNCTION_BIND", $sformatf(
                 "%s could not bind its MQ pair limit: %s", function_name, why))
-            return;
+            return 0;
         end
-        fsm = candidate_fsm;
 
         vq_mgr_ref.mem = hmem;
         vq_mgr_ref.iommu = iommu_mdl;
@@ -180,8 +285,6 @@ class virtio_function_instance extends uvm_component;
         transport_ref.notify_mgr.bar = transport_ref.bar;
         transport_ref.cap_mgr.bar_ref = transport_ref.bar;
 
-        if (ops == null)
-            ops = virtio_atomic_ops::type_id::create({function_name, "_ops"});
         ops.transport = transport_ref;
         ops.vq_mgr = vq_mgr_ref;
         ops.mem = hmem;
@@ -203,9 +306,86 @@ class virtio_function_instance extends uvm_component;
                 driver_agent_ref.monitor.vq_mgr = vq_mgr_ref;
             end
         end
+        return 1;
     endfunction
 
-    virtual function void wire_shared(
+    // Public binding primitive.  The environment uses it for each active
+    // PF/VF; standalone TLM tests use a compatible function instance too.
+    function bit bind_pcie_components(
+        input string function_name,
+        input virtio_pci_transport transport_ref,
+        input virtqueue_manager vq_mgr_ref,
+        input virtio_driver_agent driver_agent_ref,
+        input host_mem_manager hmem,
+        input virtio_iommu_model iommu_mdl,
+        input virtio_memory_barrier_model bar_mdl,
+        input virtqueue_error_injector einj,
+        input virtio_wait_policy wpol,
+        input virtio_driver_config_t driver_cfg,
+        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
+        ref virtio_atomic_ops ops,
+        ref virtio_auto_fsm fsm
+    );
+        string why;
+        virtio_auto_fsm candidate_fsm;
+        virtio_atomic_ops candidate_ops;
+
+        if (pcie_rc_seqr == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s received a null PCIe RC sequencer", function_name))
+            return 0;
+        end
+        if ((transport_ref == null) || (vq_mgr_ref == null)) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s is missing transport or virtqueue manager", function_name))
+            return 0;
+        end
+        if ((transport_ref.bar == null) ||
+            (transport_ref.notify_mgr == null) ||
+            (transport_ref.cap_mgr == null)) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                {"%s is missing transport BAR, notify manager, or ",
+                 "capability manager"}, function_name))
+            return 0;
+        end
+
+        candidate_fsm = fsm;
+        if (candidate_fsm == null)
+            candidate_fsm = virtio_auto_fsm::type_id::create(
+                {function_name, "_fsm"});
+        if (candidate_fsm == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s factory returned a null PCIe FSM", function_name))
+            return 0;
+        end
+        candidate_ops = ops;
+        if (candidate_ops == null)
+            candidate_ops = virtio_atomic_ops::type_id::create(
+                {function_name, "_ops"});
+        if (candidate_ops == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s factory returned null PCIe atomic ops", function_name))
+            return 0;
+        end
+        if (!candidate_fsm.mq_pair_limit_binding_supported(
+            driver_cfg.max_vio_net_qpairs_per_device, why
+        )) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s could not bind its MQ pair limit: %s", function_name, why))
+            return 0;
+        end
+        if (!commit_validated_pcie_components(
+            function_name, transport_ref, vq_mgr_ref, driver_agent_ref,
+            hmem, iommu_mdl, bar_mdl, einj, wpol, driver_cfg, pcie_rc_seqr,
+            candidate_ops, candidate_fsm)) begin
+            return 0;
+        end
+        ops = candidate_ops;
+        fsm = candidate_fsm;
+        return 1;
+    endfunction
+
+    function bit wire_shared(
         host_mem_manager hmem,
         virtio_iommu_model iommu_mdl,
         virtio_memory_barrier_model bar_mdl,
@@ -216,23 +396,32 @@ class virtio_function_instance extends uvm_component;
         virtio_atomic_ops ops;
         virtio_auto_fsm fsm;
 
+        if (driver_agent == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "function_%0d is missing driver agent", vf_index))
+            return 0;
+        end
+        ops = driver_agent.ops;
+        fsm = driver_agent.fsm;
+        if (!bind_pcie_components(
+            $sformatf("function_%0d", vf_index), transport, vq_mgr,
+            driver_agent, hmem, iommu_mdl, bar_mdl, einj, wpol, drv_cfg,
+            pcie_rc_seqr, ops, fsm)) begin
+            return 0;
+        end
         mem = hmem;
         iommu = iommu_mdl;
         barrier = bar_mdl;
         err_inj = einj;
         wait_pol = wpol;
-        ops = driver_agent.ops;
-        fsm = driver_agent.fsm;
-        bind_pcie_components(
-            $sformatf("function_%0d", vf_index), transport, vq_mgr,
-            driver_agent, hmem, iommu_mdl, bar_mdl, einj, wpol, drv_cfg,
-            pcie_rc_seqr, ops, fsm);
+        return 1;
     endfunction
 
-    virtual function void bind_pcie(
+    function bit bind_pcie(
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
     );
-        wire_shared(mem, iommu, barrier, err_inj, wait_pol, pcie_rc_seqr);
+        return wire_shared(
+            mem, iommu, barrier, err_inj, wait_pol, pcie_rc_seqr);
     endfunction
 
     virtual task init(virtio_driver_config_t cfg);

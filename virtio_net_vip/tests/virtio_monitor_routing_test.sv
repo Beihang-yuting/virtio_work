@@ -153,8 +153,11 @@ class virtio_monitor_routing_test extends uvm_test;
 
         // Public binding is responsible for configuring every PF/VF observer
         // and wiring both directions of the external PCIe monitor stream.
-        virtio_env.bind_pcie(pcie_env.rc_agent.sequencer, null,
-            pcie_env.rc_agent.monitor, pcie_env.ep_agent.monitor);
+        if (!virtio_env.bind_pcie(pcie_env.rc_agent.sequencer, null,
+            pcie_env.rc_agent.monitor, pcie_env.ep_agent.monitor)) begin
+            `uvm_fatal("MON_ROUTE", "failed to bind virtio environment to PCIe")
+            return;
+        end
 
         virtio_env.pf_instances[0].pf_function.driver_agent.monitor.txn_ap.connect(
             pf_collector.analysis_export);

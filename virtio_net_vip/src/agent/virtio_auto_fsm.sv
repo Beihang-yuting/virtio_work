@@ -77,7 +77,7 @@ class virtio_auto_fsm extends uvm_report_object;
     // encoding used by standalone/legacy driver configs created before this
     // field existed.  Repeated binds are idempotent, but a different value is
     // rejected so a live FSM cannot diverge from its configured queue state.
-    function bit bind_mq_pair_limit(
+    function bit mq_pair_limit_binding_supported(
         input int unsigned configured_limit,
         output string why
     );
@@ -93,13 +93,8 @@ class virtio_auto_fsm extends uvm_report_object;
                 effective_limit, DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE);
             return 0;
         end
-        if (!mq_pair_limit_bound) begin
-            max_vio_net_qpairs_per_device = effective_limit;
-            mq_pair_limit_bound = 1;
-            why = "";
-            return 1;
-        end
-        if (effective_limit == max_vio_net_qpairs_per_device) begin
+        if (!mq_pair_limit_bound ||
+            (effective_limit == max_vio_net_qpairs_per_device)) begin
             why = "";
             return 1;
         end
@@ -107,6 +102,26 @@ class virtio_auto_fsm extends uvm_report_object;
             "FSM MQ pair limit is already bound to %0d; cannot rebind to %0d",
             max_vio_net_qpairs_per_device, effective_limit);
         return 0;
+    endfunction
+
+    function bit bind_mq_pair_limit(
+        input int unsigned configured_limit,
+        output string why
+    );
+        int unsigned effective_limit;
+
+        if (!mq_pair_limit_binding_supported(configured_limit, why))
+            return 0;
+        if ($isunknown(configured_limit) || (configured_limit == 0))
+            effective_limit = DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
+        else
+            effective_limit = configured_limit;
+        if (!mq_pair_limit_bound) begin
+            max_vio_net_qpairs_per_device = effective_limit;
+            mq_pair_limit_bound = 1;
+        end
+        why = "";
+        return 1;
     endfunction
 
     function int unsigned max_supported_mq_pairs();

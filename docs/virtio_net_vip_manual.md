@@ -1233,7 +1233,7 @@ typedef struct {
 
 #### 4.9.3 VF Instance
 
-`virtio_vf_instance` 封装单个 VF 的所有组件：`virtio_driver_agent`、`virtqueue_manager`、`virtio_pci_transport`、`virtio_net_dataplane`。提供 `wire_shared()` 方法注入共享组件引用。
+`virtio_vf_instance` 封装单个 VF 的所有组件：`virtio_driver_agent`、`virtqueue_manager`、`virtio_pci_transport`、`virtio_net_dataplane`。底层 nonvirtual `wire_shared()` 返回 `bit`，只有 MQ capability guard 和全部组件接线成功才返回 1；环境集成应统一调用 `virtio_net_env::bind_pcie()`，不直接逐 VF 接线。
 
 #### 4.9.4 VF FLR 流程
 
@@ -1664,18 +1664,16 @@ class my_dut_test extends virtio_base_test;
 
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
-        // 将 PCIe RC sequencer 注入每个 VF 实例
-        foreach (env.vf_instances[i]) begin
-            env.vf_instances[i].wire_shared(
-                env.host_mem, env.iommu, env.barrier, env.err_inj,
-                env.wait_pol, pcie_env.rc_agent.sequencer,
-                cfg.pf_bdf
-            );
+        // nonvirtual bind_pcie() 统一绑定所有 PF/VF，并逐层传播失败。
+        if (!env.bind_pcie(pcie_env.rc_agent.sequencer)) begin
+            `uvm_fatal("DUT_BIND", "virtio environment PCIe bind failed")
+            return;
         end
-        env.v_seqr.pcie_rc_seqr = pcie_env.rc_agent.sequencer;
     endfunction
 endclass
 ```
+
+`bind_pcie()` 返回 1 前会验证每个 function 的 driver/monitor/observer、独立 protocol-event VIF 和 MQ capability；任一项失败都会返回 0，并且不会提交环境级 RC sequencer 或 protocol-VIF 计数。调用方必须检查返回值。
 
 #### 6.3.2 BAR 地址配置
 
