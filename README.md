@@ -331,8 +331,8 @@ alignment、aperture overflow 和 overlap。随后才执行 capability discovery
 generic Fabric BAR lease 能力。本阶段新增范围只到 capability/topology、pair
 limit 和 Fabric lease 边界；real-DUT AF/service-configuration 的 register
 lowering/execution、BDF/BAR/MSI-X/notify mapping tables、`PINNED`/`PREFERRED`
-global-ID binding 及可信 production write-payload fix 尚未实现，分别由后续
-subprojects 2/3/4 承接。`cosim_control` 和 BAR2 mailbox delivery 则是
+global-ID binding 及可信 production write-payload fix 尚未实现；上述工作由后续
+subprojects 2–4 分阶段承接。`cosim_control` 和 BAR2 mailbox delivery 则是
 [real-DUT service configuration design](docs/superpowers/specs/2026-08-25-real-dut-service-configuration-design.md)
 明确排除的范围，不属于这些后续 subprojects；这不否定上述通用 VIP 功能。
 
