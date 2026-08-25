@@ -1494,11 +1494,31 @@ real-DUT capability source。其默认 topology capability 为
 超过相应 compile-time ceiling 的值。
 
 VIO global qpair ID 域固定为 11 bits，即 `0..2047`，完整编码域提供 2048 个
-global pair 资源。每个 PF 或 VF VIO-net device 有自己的单一 notify address，
-也因此有独立的 local-qpair domain；一个 device 最多拥有 32 个 local queue
-pairs，local pair ID 为 `0..31`。例如，两个不同 device 都可以使用 local pair
-ID 0，因为 Fabric 会结合各自的 function/device context 解析 global qpair
-lease；解析后的 global qpair lease 仍是全局排他的，不能同时租给另一个 device。
+global pair 资源。一份 Fabric lease `g` 是一个 qpair 的单一 global pair
+allocation，同时代表该 pair 的 RX 和 TX，不会为两个方向各申请一份 11-bit
+global lease。当前 `virtio_resource_client` 虽保存一份 `g`，但其兼容 mapping
+仍设置 `rx_global_qid=2*g`、`tx_global_qid=2*g+1`，并通过方向选择返回其中一个
+字段；这些 directional fields 不能直接解释为 Fabric 的两份 global lease ID。
+real-DUT 目标是让 VTX 和 VRX 两个硬件 block 以方向选择共享同一个 `g`。替换
+当前 `2*g` derivation、完成 one-ID-per-qpair semantics 属于 subproject 2，
+不在本 first stage 中。
+
+每个 PF 或 VF VIO-net device 有自己的 real-DUT notify-address matching
+domain/base 和独立的 local-qpair domain；一个 device 最多拥有 32 个 local
+queue pairs，local pair ID 为 `0..31`。两个不同 device 可以使用相同的 local
+pair ID，因为 Fabric 会结合各自 function/device context 解析排他的 global
+qpair lease。这里的 matching domain/base 与标准 virtio PCI Notification
+capability 不同：后者提供 notification region 与 `notify_off_multiplier`，每个
+queue 的 `notify_off` 用来计算通用 VIP 的 kick address。
+
+real-DUT AF notify table 的 logical match 是：
+
+```text
+{host_id, notify_addr[60:7], local_pair_id} -> global_qpair_id
+```
+
+本阶段只建立 function/local-pair ownership 与 limit，不生成或编程该 AF table；
+notify mapping、scheduler、route 和 VTX/VRX lowering 属于 subproject 4。
 
 限制由同一个 `dut_caps.max_vio_net_qpairs_per_device` 在以下边界执行：
 
@@ -1521,18 +1541,25 @@ Fabric 拥有 `virtio.qpair` 的不透明 resource-class ID；它不是 core enu
 PF 的 BAR0/1、BAR2/3、BAR4/5 分别建模为 32 MiB function-device、64 KiB
 reserved、64 KiB MSI-X table/PBA；VF 的对应大小为 16 KiB、16 KiB、32 KiB。
 模型将 virtio functional capability 限制在 BAR0/1，阻止 BAR2/3 的功能访问，
-并将 BAR4/5 限于 MSI-X table/PBA。Fabric model 先建立 64-bit MMIO aperture，
-检查 BAR 对齐和地址无重叠，再完成 BAR role 配置与 capability discovery；
-resource client 只有在 discovery 后标记 device-ready，随后才能申请 queue lease。
+并将 BAR4/5 限于 MSI-X table/PBA。Fabric 先配置 64-bit MMIO aperture；每个
+function activation 在该 aperture 中分配 BAR pairs 并赋予 role，同时检查 size、
+alignment、64-bit aperture overflow 和地址 overlap。完成 BAR role 配置与
+capability discovery 后，resource client 才标记 device-ready 并允许 queue lease。
 
-当前 first stage 的实现到 capability/topology validation、初始配置和 dynamic
-resize 校验以及 Fabric local/global qpair lease 为止。`PINNED`/`PREFERRED`
-指定 global ID、DUT register table programming、notify/BAR/MSI-X 真实硬件下发、
-PCIe payload propagation 和 `cosim_control` 均未在本阶段实现。这些内容属于
+仓库现有通用能力包括 VIP BAR discovery、标准 per-queue kick、MSI-X、PCIe
+sequences，以及 generic Fabric BAR leases；这些能力不应与 real-DUT AF/service
+configuration 混为一谈。当前 first stage 新增的是 capability/topology
+validation、初始配置和 dynamic resize 限制，以及 Fabric local/global qpair
+lease 边界。它没有实现 real-DUT AF register lowering/execution、BDF/BAR/MSI-X/
+notify mapping tables、`PINNED`/`PREFERRED` global-ID binding，也没有修复基础
+production `virtio_bar_mem_wr_seq` 到下层 PCIe TLP 的可信 payload propagation。
+one-ID-per-qpair、common AF mappings/payload、VIO notify/data-plane 分别属于后续
+subprojects 2、3、4。
+
+`cosim_control` 与 BAR2 mailbox command delivery 是
 [real-DUT service configuration design](superpowers/specs/2026-08-25-real-dut-service-configuration-design.md)
-定义的后续子项目，不能按当前已实现能力使用；上述 BAR layout/discovery
-ordering 仅描述已验证的 verification/Fabric model contract，不代表 real-DUT
-hardware programming 已经完成。
+明确列出的 out-of-scope 项，不属于这些后续 subprojects。上述边界既不把
+real-DUT AF hardware programming 写成已实现，也不否定仓库已有的通用 VIP 功能。
 
 完整回归使用：
 

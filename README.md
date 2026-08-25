@@ -292,11 +292,19 @@ default。参数化场景可在 `dut_caps` 中使用更小的非零合法能力�
 compile-time ceiling。
 
 VIO global qpair ID 是 11 bits，编码域为 `0..2047`，因此默认 profile
-共有 2048 个全局 pair 资源。当前 DUT profile 中，每个 PF 或 VF 的 VIO-net
-设备各自拥有一个单一 notify address 和独立的 local-qpair domain；每设备最多
-32 个 local queue pairs，编号 `0..31`。不同设备可以复用同一个 local pair ID；
-Fabric 通过该设备的 function/device 上下文解析 global qpair lease，解析后的
-global qpair lease 在整个 Fabric 中仍保持排他。
+共有 2048 个全局 pair 资源。一份 Fabric global qpair lease `g` 表示 RX/TX
+queue pair 的一次全局 pair allocation，不是 RX、TX 两份 lease；当前
+`virtio_resource_client` 仍暴露 `rx_global_qid=2*g` 和 `tx_global_qid=2*g+1`
+方向字段，不能把它们直接当作两份 11-bit lease ID，而 real-DUT VTX/VRX 共享
+同一个 `g` 的纠正属于后续 subproject 2，本阶段未改。
+
+当前 DUT profile 中，每个 PF 或 VF 的 VIO-net 设备各自拥有一个 real-DUT
+notify-address matching domain/base 和独立的 local-qpair domain；每设备最多 32
+个 local queue pairs，编号 `0..31`。该 matching domain 不等同于标准 virtio PCI
+Notification capability 的 per-queue `notify_off` 和据此计算的 kick address。
+不同设备可以复用同一个 local pair ID；Fabric 通过 function/device 上下文解析的
+global qpair lease 在整个 Fabric 中仍保持排他。本阶段只建立 function/local-pair
+ownership 和 limit，不编程 AF VIO notify mapping table；该表属于 subproject 4。
 
 `dut_caps.max_vio_net_qpairs_per_device` 同时驱动初始
 `virtio_net_env_config`、dynamic resize、VIO local lease range 和
@@ -314,17 +322,19 @@ global qpair lease 在整个 Fabric 中仍保持排他。
 BAR0/1、BAR2/3、BAR4/5 分别为 32 MiB function-device、64 KiB reserved、
 64 KiB MSI-X table/PBA；VF 分别为 16 KiB、16 KiB、32 KiB。模型只允许在
 BAR0/1 发现 virtio functional capabilities，将 BAR2/3 视为不可功能访问的
-保留 aperture，并将 BAR4/5 限于 MSI-X table/PBA。模型先分配、验证对齐且互不
-重叠的 MMIO aperture 和 BAR role，再执行 capability discovery；只有 discovery
-完成后才能获取 queue lease。
+保留 aperture，并将 BAR4/5 限于 MSI-X table/PBA。Fabric 先配置 64-bit MMIO
+aperture；function activation 时在其中分配 BAR pairs、赋予 role，并校验 size、
+alignment、aperture overflow 和 overlap。随后才执行 capability discovery；
+只有 discovery 完成后才能获取 queue lease。
 
-本阶段只实现 capability/topology 校验、初始配置与动态 resize 的 pair 数限制，
-以及 Fabric 中的 local/global qpair lease 边界。它尚未实现 `PINNED`/
-`PREFERRED` 指定 global ID、DUT register table programming、notify/BAR/MSI-X
-真实硬件下发、PCIe payload propagation 或 `cosim_control`。这些是
+仓库已有通用 VIP BAR discovery、per-queue kick、MSI-X、PCIe sequences 和
+generic Fabric BAR lease 能力。本阶段新增范围只到 capability/topology、pair
+limit 和 Fabric lease 边界；real-DUT AF/service-configuration 的 register
+lowering/execution、BDF/BAR/MSI-X/notify mapping tables、`PINNED`/`PREFERRED`
+global-ID binding 及可信 production write-payload fix 尚未实现，分别由后续
+subprojects 2/3/4 承接。`cosim_control` 和 BAR2 mailbox delivery 则是
 [real-DUT service configuration design](docs/superpowers/specs/2026-08-25-real-dut-service-configuration-design.md)
-中的后续子项目；上述 verification/Fabric BAR model 也不代表这些 real-DUT
-hardware programming 路径已经实现。
+明确排除的范围，不属于这些后续 subprojects；这不否定上述通用 VIP 功能。
 
 ---
 
