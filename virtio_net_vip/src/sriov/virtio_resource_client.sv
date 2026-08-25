@@ -7,6 +7,7 @@ class virtio_resource_client extends uvm_object;
     `uvm_object_utils(virtio_resource_client)
 
     dpu_resource_manager    resource_manager;
+    dpu_dut_caps            dut_caps;
     dpu_function_key_t      function_key;
     dpu_resource_class_id_t qpair_class_id;
     dpu_resource_lease_t    qpair_leases[$];
@@ -26,14 +27,28 @@ class virtio_resource_client extends uvm_object;
         input dpu_function_key_t key,
         output string why
     );
+        dpu_resource_class_id_t bound_qpair_class_id;
+        dpu_dut_caps bound_dut_caps;
+
         if (manager == null) begin
             why = "virtio resource client requires a Fabric resource manager";
             return 0;
         end
-        if (!manager.lookup_resource_class("virtio.qpair", qpair_class_id, why))
+        if (!manager.lookup_resource_class(
+            "virtio.qpair", bound_qpair_class_id, why
+        )) begin
             return 0;
+        end
+        bound_dut_caps = manager.snapshot_dut_caps();
+        if (bound_dut_caps == null) begin
+            why = "virtio resource client requires DUT capabilities";
+            return 0;
+        end
+
         resource_manager = manager;
         function_key = key;
+        qpair_class_id = bound_qpair_class_id;
+        dut_caps = bound_dut_caps;
         device_ready = 0;
         qpairs_frozen = 0;
         why = "";
@@ -61,6 +76,7 @@ class virtio_resource_client extends uvm_object;
     );
         dpu_resource_lease_t leases[$];
         virtio_qpair_mapping_t mapping;
+        int unsigned local_qpair_limit;
 
         if ((resource_manager == null) || !device_ready) begin
             why = "virtio resource client function is not device-ready";
@@ -68,6 +84,25 @@ class virtio_resource_client extends uvm_object;
         end
         if (qpairs_frozen) begin
             why = "frozen virtio resource client cannot reserve QP leases";
+            return 0;
+        end
+        if (dut_caps == null) begin
+            why = "virtio resource client requires DUT capabilities";
+            return 0;
+        end
+        local_qpair_limit = dut_caps.max_vio_net_qpairs_per_device;
+        if (first_local_pair >= local_qpair_limit) begin
+            why = $sformatf(
+                "VIO-net local qpair range exceeds device limit 0..%0d",
+                local_qpair_limit - 1
+            );
+            return 0;
+        end
+        if (count > (local_qpair_limit - first_local_pair)) begin
+            why = $sformatf(
+                "VIO-net local qpair range exceeds device limit 0..%0d",
+                local_qpair_limit - 1
+            );
             return 0;
         end
         if (!resource_manager.acquire_leases(

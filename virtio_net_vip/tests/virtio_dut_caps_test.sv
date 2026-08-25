@@ -424,10 +424,10 @@ class virtio_dut_caps_test extends uvm_test;
 
         if (clients[0].reserve_qpairs(0, 2, why))
             `uvm_fatal("DUT_CAPS",
-                "single PF exceeded the propagated one-qpair quota")
-        if (why != "resource-class per-function quota would be exceeded")
+                "single PF exceeded the propagated one-qpair device limit")
+        if (why != "VIO-net local qpair range exceeds device limit 0..0")
             `uvm_fatal("DUT_CAPS", $sformatf(
-                "per-function qpair rejection used wrong reason: %s", why))
+                "per-device qpair rejection used wrong reason: %s", why))
 
         if (!clients[0].reserve_qpairs(0, 1, why))
             `uvm_fatal("DUT_CAPS", $sformatf(
@@ -490,6 +490,55 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS", "vf_id 16 exceeded the real-DUT capability")
     endtask
 
+    task assert_vio_local_qpair_limit();
+        dpu_bar_pair_lease_t bars[$];
+        virtio_resource_client pf_client;
+        virtio_resource_client vf_client;
+        string why;
+
+        if (!manager.activate_function(valid_pf, bars, why))
+            `uvm_fatal("DUT_CAPS", $sformatf("valid PF activation failed: %s", why))
+        if (!manager.activate_function(valid_vf, bars, why))
+            `uvm_fatal("DUT_CAPS", $sformatf("valid VF activation failed: %s", why))
+
+        pf_client = virtio_resource_client::type_id::create("pf_client");
+        vf_client = virtio_resource_client::type_id::create("vf_client");
+        if (!pf_client.bind_to_fabric(manager, valid_pf, why))
+            `uvm_fatal("DUT_CAPS", $sformatf("PF client bind failed: %s", why))
+        if (!vf_client.bind_to_fabric(manager, valid_vf, why))
+            `uvm_fatal("DUT_CAPS", $sformatf("VF client bind failed: %s", why))
+        if (!pf_client.mark_device_ready(why))
+            `uvm_fatal("DUT_CAPS", $sformatf("PF client ready failed: %s", why))
+        if (!vf_client.mark_device_ready(why))
+            `uvm_fatal("DUT_CAPS", $sformatf("VF client ready failed: %s", why))
+
+        if (!pf_client.reserve_qpairs(0, 32, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "PF rejected valid local pairs 0..31: %s", why))
+
+        if (vf_client.reserve_qpairs(32, 1, why))
+            `uvm_fatal("DUT_CAPS", "VF accepted local pair 32")
+        if (why != "VIO-net local qpair range exceeds device limit 0..31")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "local pair 32 rejection used wrong reason: %s", why))
+
+        if (vf_client.reserve_qpairs(31, 2, why))
+            `uvm_fatal("DUT_CAPS", "VF accepted local pair range 31..32")
+        if (why != "VIO-net local qpair range exceeds device limit 0..31")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "local pair range 31..32 rejection used wrong reason: %s", why))
+
+        if (vf_client.reserve_qpairs(32'hffff_ffff, 2, why))
+            `uvm_fatal("DUT_CAPS", "VF accepted overflowing local pair range")
+        if (why != "VIO-net local qpair range exceeds device limit 0..31")
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "overflowing local pair rejection used wrong reason: %s", why))
+
+        if (!vf_client.reserve_qpairs(0, 1, why))
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "VF could not independently reserve local pair 0: %s", why))
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         assert_invalid_legacy_config_hard_fails();
@@ -498,6 +547,7 @@ class virtio_dut_caps_test extends uvm_test;
         assert_env_propagates_caps_to_fabric();
         configure_fabric();
         assert_manager_topology_limits();
+        assert_vio_local_qpair_limit();
         phase.drop_objection(this);
     endtask
 endclass : virtio_dut_caps_test
