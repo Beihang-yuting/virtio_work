@@ -113,10 +113,12 @@ class virtio_net_env extends uvm_env;
         fabric_cfg = dpu_fabric_env_config::type_id::create("fabric_cfg");
         fabric_cfg.mmio_aperture_base = 64'h0001_0000_0000_0000;
         fabric_cfg.mmio_aperture_limit = 64'h0001_0100_0000_0000;
+        fabric_cfg.dut_caps.copy_from(cfg.dut_caps);
         qpair_profile.name = "virtio.qpair";
         qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
-        qpair_profile.capacity = 2048;
-        qpair_profile.max_per_function = 32;
+        qpair_profile.capacity = cfg.dut_caps.vio_global_qpair_count;
+        qpair_profile.max_per_function =
+            cfg.dut_caps.max_vio_net_qpairs_per_device;
         fabric_cfg.resource_profiles.push_back(qpair_profile);
         if (!fabric.apply_resource_profiles(fabric_cfg, why)) begin
             `uvm_fatal("VIRTIO_ENV", $sformatf(

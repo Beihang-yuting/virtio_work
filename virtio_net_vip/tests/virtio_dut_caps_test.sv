@@ -6,6 +6,23 @@ import uvm_pkg::*;
 import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
 
+class virtio_dut_caps_expected_cfg_error extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "virtio_dut_caps_expected_cfg_error");
+        super.new(name);
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) && (get_id() == "ENV_CFG")) begin
+            caught_count++;
+            set_severity(UVM_INFO);
+        end
+        return THROW;
+    endfunction
+endclass
+
 class virtio_dut_caps_test extends uvm_test;
     `uvm_component_utils(virtio_dut_caps_test)
 
@@ -69,6 +86,65 @@ class virtio_dut_caps_test extends uvm_test;
         end
     endtask
 
+    task assert_virtio_config_uses_dut_caps();
+        virtio_net_env_config cfg;
+        virtio_dut_caps_expected_cfg_error catcher;
+
+        catcher = new();
+        uvm_report_cb::add(null, catcher);
+
+        cfg = virtio_net_env_config::type_id::create("valid_32_qpair_cfg");
+        cfg.default_num_pairs = 32;
+        if (!cfg.validate())
+            `uvm_fatal("DUT_CAPS", "32-qpair default configuration was rejected")
+
+        cfg = virtio_net_env_config::type_id::create("invalid_33_qpair_cfg");
+        cfg.default_num_pairs = 33;
+        if (cfg.validate())
+            `uvm_fatal("DUT_CAPS", "33-qpair default configuration was accepted")
+
+        cfg = virtio_net_env_config::type_id::create("invalid_vf_qpair_cfg");
+        cfg.vf_configs = new[1];
+        cfg.vf_configs[0] = cfg.get_default_driver_config();
+        cfg.vf_configs[0].num_queue_pairs = 33;
+        if (cfg.validate())
+            `uvm_fatal("DUT_CAPS", "VF configuration accepted 33 qpairs")
+
+        cfg = virtio_net_env_config::type_id::create("invalid_host_cfg");
+        cfg.num_hosts = 3;
+        cfg.num_pfs_per_host = new[3];
+        cfg.num_vfs_per_pf = new[3];
+        foreach (cfg.num_pfs_per_host[host_id]) begin
+            cfg.num_pfs_per_host[host_id] = 1;
+            cfg.num_vfs_per_pf[host_id] = new[1];
+        end
+        if (cfg.validate())
+            `uvm_fatal("DUT_CAPS", "three-host topology exceeded real-DUT caps")
+
+        cfg = virtio_net_env_config::type_id::create("invalid_pf_cfg");
+        cfg.num_hosts = 1;
+        cfg.num_pfs_per_host = new[1];
+        cfg.num_pfs_per_host[0] = 5;
+        cfg.num_vfs_per_pf = new[1];
+        cfg.num_vfs_per_pf[0] = new[5];
+        if (cfg.validate())
+            `uvm_fatal("DUT_CAPS", "five-PF topology exceeded real-DUT caps")
+
+        cfg = virtio_net_env_config::type_id::create("invalid_vf_cfg");
+        cfg.num_hosts = 1;
+        cfg.num_pfs_per_host = new[1];
+        cfg.num_pfs_per_host[0] = 1;
+        cfg.num_vfs_per_pf = new[1];
+        cfg.num_vfs_per_pf[0] = new[1];
+        cfg.num_vfs_per_pf[0][0] = 17;
+        if (cfg.validate())
+            `uvm_fatal("DUT_CAPS", "17-VF topology exceeded real-DUT caps")
+
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught_count < 5)
+            `uvm_fatal("DUT_CAPS", "expected invalid configurations were not reported")
+    endtask
+
     task configure_fabric();
         dpu_resource_pool_config_t qpair_profile;
         string why;
@@ -119,6 +195,7 @@ class virtio_dut_caps_test extends uvm_test;
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         assert_real_dut_capability_defaults();
+        assert_virtio_config_uses_dut_caps();
         configure_fabric();
         assert_manager_topology_limits();
         phase.drop_objection(this);

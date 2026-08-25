@@ -24,12 +24,9 @@ class virtio_net_env_config extends uvm_object;
     int unsigned         num_vfs = 0;            // 0 = pure PF mode
     int unsigned         max_vfs = 256;
     int unsigned         num_hosts = 0;           // 0 selects legacy flat-VF mode
-    int unsigned         max_hosts = DPU_MAX_HOSTS;
     int unsigned         num_pfs_per_host[];
     int unsigned         num_vfs_per_pf[][];
-    int unsigned         max_pfs_per_host = DPU_MAX_PFS_PER_HOST;
-    int unsigned         max_vfs_per_pf = DPU_MAX_VFS_PER_PF;
-    int unsigned         max_functions = DPU_MAX_FUNCTIONS;
+    dpu_dut_caps          dut_caps;
 
     // Per-VF configs (optional, falls back to defaults)
     virtio_driver_config_t  vf_configs[];
@@ -77,6 +74,7 @@ class virtio_net_env_config extends uvm_object;
 
     function new(string name = "virtio_net_env_config");
         super.new(name);
+        dut_caps = dpu_dut_caps::type_id::create("dut_caps");
     endfunction
 
     function bit uses_fabric_topology();
@@ -148,6 +146,41 @@ class virtio_net_env_config extends uvm_object;
 
     function bit validate();
         bit ok = 1;
+        string caps_why;
+
+        if (dut_caps == null) begin
+            caps_why = "null capability object";
+            `uvm_error("ENV_CFG", $sformatf(
+                "invalid DUT capabilities: %s", caps_why))
+            ok = 0;
+        end
+        else if (!dut_caps.validate(caps_why)) begin
+            `uvm_error("ENV_CFG", $sformatf(
+                "invalid DUT capabilities: %s", caps_why))
+            ok = 0;
+        end
+        else begin
+            if ((default_num_pairs == 0) ||
+                (default_num_pairs >
+                 dut_caps.max_vio_net_qpairs_per_device)) begin
+                `uvm_error("ENV_CFG", $sformatf(
+                    "default_num_pairs=%0d exceeds VIO-net device limit %0d",
+                    default_num_pairs,
+                    dut_caps.max_vio_net_qpairs_per_device))
+                ok = 0;
+            end
+            foreach (vf_configs[vf_id]) begin
+                if ((vf_configs[vf_id].num_queue_pairs == 0) ||
+                    (vf_configs[vf_id].num_queue_pairs >
+                     dut_caps.max_vio_net_qpairs_per_device)) begin
+                    `uvm_error("ENV_CFG", $sformatf(
+                        "VF%0d num_queue_pairs=%0d exceeds VIO-net device limit %0d",
+                        vf_id, vf_configs[vf_id].num_queue_pairs,
+                        dut_caps.max_vio_net_qpairs_per_device))
+                    ok = 0;
+                end
+            end
+        end
 
         if (num_vfs > max_vfs) begin
             `uvm_error("ENV_CFG",
@@ -155,19 +188,14 @@ class virtio_net_env_config extends uvm_object;
             ok = 0;
         end
 
-        if (uses_fabric_topology()) begin
+        if (uses_fabric_topology() && (dut_caps != null)) begin
             int unsigned total_functions;
 
-            if ((max_hosts > DPU_MAX_HOSTS) ||
-                (max_pfs_per_host > DPU_MAX_PFS_PER_HOST) ||
-                (max_vfs_per_pf > DPU_MAX_VFS_PER_PF) ||
-                (max_functions > DPU_MAX_FUNCTIONS)) begin
-                `uvm_error("ENV_CFG", "configured topology maxima exceed DPU limits")
-                ok = 0;
-            end
-            if ((num_hosts == 0) || (num_hosts > max_hosts) ||
-                (num_hosts > DPU_MAX_HOSTS)) begin
-                `uvm_error("ENV_CFG", "num_hosts is outside the supported DPU range")
+            if ((num_hosts == 0) ||
+                (num_hosts > dut_caps.max_hosts)) begin
+                `uvm_error("ENV_CFG", $sformatf(
+                    "num_hosts=%0d exceeds DUT limit %0d",
+                    num_hosts, dut_caps.max_hosts))
                 ok = 0;
             end
             if (num_pfs_per_host.size() != num_hosts ||
@@ -183,10 +211,12 @@ class virtio_net_env_config extends uvm_object;
                     (host_id >= num_vfs_per_pf.size()))
                     continue;
                 if ((num_pfs_per_host[host_id] == 0) ||
-                    (num_pfs_per_host[host_id] > max_pfs_per_host) ||
-                    (num_pfs_per_host[host_id] > DPU_MAX_PFS_PER_HOST)) begin
+                    (num_pfs_per_host[host_id] >
+                     dut_caps.max_pfs_per_host)) begin
                     `uvm_error("ENV_CFG", $sformatf(
-                        "host %0d PF count exceeds the supported DPU range", host_id))
+                        "host %0d PF count %0d exceeds DUT limit %0d",
+                        host_id, num_pfs_per_host[host_id],
+                        dut_caps.max_pfs_per_host))
                     ok = 0;
                 end
                 if (num_vfs_per_pf[host_id].size() != num_pfs_per_host[host_id]) begin
@@ -200,11 +230,13 @@ class virtio_net_env_config extends uvm_object;
                     pf_block_bdf = pf_bdf +
                         ((host_id * DPU_MAX_PFS_PER_HOST + pf_id) *
                          (DPU_MAX_VFS_PER_PF + 1));
-                    if ((num_vfs_per_pf[host_id][pf_id] > max_vfs_per_pf) ||
-                        (num_vfs_per_pf[host_id][pf_id] > DPU_MAX_VFS_PER_PF)) begin
+                    if (num_vfs_per_pf[host_id][pf_id] >
+                        dut_caps.max_vfs_per_pf) begin
                         `uvm_error("ENV_CFG", $sformatf(
-                            "host %0d PF %0d VF count exceeds the DPU limit",
-                            host_id, pf_id))
+                            "host %0d PF %0d VF count %0d exceeds DUT limit %0d",
+                            host_id, pf_id,
+                            num_vfs_per_pf[host_id][pf_id],
+                            dut_caps.max_vfs_per_pf))
                         ok = 0;
                     end
                     if ((pf_block_bdf + num_vfs_per_pf[host_id][pf_id]) >
@@ -217,10 +249,10 @@ class virtio_net_env_config extends uvm_object;
                     total_functions += num_vfs_per_pf[host_id][pf_id];
                 end
             end
-            if (total_functions > max_functions ||
-                total_functions > DPU_MAX_FUNCTIONS) begin
+            if (total_functions > dut_caps.max_functions) begin
                 `uvm_error("ENV_CFG", $sformatf(
-                    "requested %0d functions exceeds the DPU limit", total_functions))
+                    "requested %0d functions exceeds DUT limit %0d",
+                    total_functions, dut_caps.max_functions))
                 ok = 0;
             end
         end
