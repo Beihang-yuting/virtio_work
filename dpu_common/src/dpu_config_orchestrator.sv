@@ -28,8 +28,11 @@ class dpu_config_orchestrator extends uvm_object;
         output dpu_cfg_status_e status,
         output string why
     );
+        dpu_reg_executor active_executor;
+
         status = DPU_CFG_STATUS_PLAN_INVALID;
         why = "";
+        active_executor = executor;
         if (plan == null) begin
             why = "configuration orchestrator received a null register plan";
             return;
@@ -37,16 +40,16 @@ class dpu_config_orchestrator extends uvm_object;
         if (!plan.freeze(why))
             return;
 
-        if (executor == null) begin
+        if (active_executor == null) begin
             status = DPU_CFG_STATUS_NOT_EXECUTED;
             why = {"validated register plan was not executed because no ",
                    "executor is installed"};
             return;
         end
-        if (!executor.preflight(plan, why)) begin
+        if (!active_executor.preflight(plan, why)) begin
             status = DPU_CFG_STATUS_PREFLIGHT_FAILED;
             if (why == "")
-                why = executor.last_error();
+                why = active_executor.last_error();
             if (why == "") begin
                 why =
                     "register executor preflight failed without an error message";
@@ -54,11 +57,11 @@ class dpu_config_orchestrator extends uvm_object;
             return;
         end
 
-        executor.execute(plan, status);
+        active_executor.execute(plan, status);
         case (status)
             DPU_CFG_STATUS_SUCCEEDED: why = "";
             DPU_CFG_STATUS_EXECUTION_FAILED: begin
-                why = executor.last_error();
+                why = active_executor.last_error();
                 if (why == "") begin
                     why = "register executor failed without an error message";
                 end

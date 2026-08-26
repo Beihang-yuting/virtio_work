@@ -101,7 +101,72 @@ class dpu_test_controlled_executor extends dpu_reg_executor;
         set_last_error(execute_error);
         status = execute_status;
     endtask
+
+    function void prime_last_error(input string why);
+        set_last_error(why);
+    endfunction
 endclass : dpu_test_controlled_executor
+
+class dpu_test_blocking_executor extends dpu_reg_executor;
+    `uvm_object_utils(dpu_test_blocking_executor)
+
+    int unsigned preflight_count;
+    int unsigned execute_count;
+    string failure_text;
+    uvm_event execute_started;
+    uvm_event execute_release;
+
+    protected dpu_reg_plan preflight_plan;
+
+    function new(string name = "dpu_test_blocking_executor");
+        super.new(name);
+        preflight_count = 0;
+        execute_count = 0;
+        failure_text = "blocking executor active handoff failure";
+        execute_started = new({name, "_execute_started"});
+        execute_release = new({name, "_execute_release"});
+        preflight_plan = null;
+    endfunction
+
+    virtual function bit preflight(
+        dpu_reg_plan plan,
+        output string why
+    );
+        preflight_count++;
+        preflight_plan = null;
+        why = "";
+        set_last_error("");
+        if (plan == null) begin
+            why = "blocking executor received a null register plan";
+            set_last_error(why);
+            return 0;
+        end
+        if (!plan.is_frozen()) begin
+            why = "blocking executor requires a frozen register plan";
+            set_last_error(why);
+            return 0;
+        end
+        preflight_plan = plan;
+        return 1;
+    endfunction
+
+    virtual task execute(
+        dpu_reg_plan plan,
+        output dpu_cfg_status_e status
+    );
+        execute_count++;
+        if ((plan == null) || (plan != preflight_plan)) begin
+            set_last_error(
+                "blocking executor execute plan does not match preflight plan");
+            status = DPU_CFG_STATUS_EXECUTION_FAILED;
+            return;
+        end
+        execute_started.trigger();
+        execute_release.wait_ptrigger();
+        set_last_error(failure_text);
+        status = DPU_CFG_STATUS_EXECUTION_FAILED;
+    endtask
+endclass : dpu_test_blocking_executor
 
 class dpu_test_reg_op extends dpu_reg_op;
     `uvm_object_utils(dpu_test_reg_op)
@@ -172,9 +237,6 @@ class dpu_spy_reg_executor_test_probe extends dpu_spy_reg_executor;
                (recorded_results.size() == expected_count);
     endfunction
 
-    function bit preflight_was_called();
-        return preflight_called;
-    endfunction
 endclass : dpu_spy_reg_executor_test_probe
 
 class dpu_reg_plan_test extends uvm_test;
@@ -1426,10 +1488,13 @@ class dpu_reg_plan_test extends uvm_test;
         dpu_config_orchestrator orchestrator;
         dpu_reg_plan plan;
         dpu_reg_op op;
-        dpu_spy_reg_executor_test_probe spy;
+        dpu_spy_reg_executor spy;
         dpu_test_custom_executor custom;
         dpu_test_controlled_executor controlled;
         dpu_test_controlled_executor replaced;
+        dpu_test_controlled_executor handoff_replacement;
+        dpu_test_controlled_executor repeated;
+        dpu_test_blocking_executor blocking;
         dpu_cfg_status_e status;
         int unsigned replaced_preflight_count;
         int unsigned replaced_execute_count;
@@ -1485,8 +1550,7 @@ class dpu_reg_plan_test extends uvm_test;
                 controlled.execute_count, why))
         end
 
-        spy = dpu_spy_reg_executor_test_probe::type_id::create(
-            "preflight_spy");
+        spy = dpu_spy_reg_executor::type_id::create("preflight_spy");
         spy.fail_preflight("injected preflight rejection");
         orchestrator.set_executor(spy);
         plan = build_valid_plan();
@@ -1494,14 +1558,13 @@ class dpu_reg_plan_test extends uvm_test;
         why = "stale preflight diagnostic";
         orchestrator.apply(plan, status, why);
         if ((status !== DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
-            !spy.preflight_was_called() || (spy.record_count() != 0) ||
+            (spy.record_count() != 0) ||
             (why != "injected preflight rejection")) begin
             `uvm_fatal("REG_ORCH", $sformatf(
                 "preflight rejection did not block execution: %s", why))
         end
 
-        spy = dpu_spy_reg_executor_test_probe::type_id::create(
-            "execution_spy");
+        spy = dpu_spy_reg_executor::type_id::create("execution_spy");
         spy.fail_operation("notify_table");
         orchestrator.set_executor(spy);
         plan = build_valid_plan();
@@ -1671,6 +1734,88 @@ class dpu_reg_plan_test extends uvm_test;
             (controlled.preflight_count != replaced_preflight_count) ||
             (controlled.execute_count != replaced_execute_count)) begin
             `uvm_fatal("REG_ORCH", "executor replacement leaked prior state")
+        end
+
+        blocking = dpu_test_blocking_executor::type_id::create(
+            "blocking_executor");
+        handoff_replacement = dpu_test_controlled_executor::type_id::create(
+            "handoff_replacement");
+        handoff_replacement.prime_last_error(
+            "replacement executor idle diagnostic");
+        handoff_replacement.execute_status =
+            DPU_CFG_STATUS_EXECUTION_FAILED;
+        handoff_replacement.execute_error =
+            "replacement executor execution failure";
+        orchestrator.set_executor(blocking);
+        plan = build_valid_plan();
+        status = DPU_CFG_STATUS_SUCCEEDED;
+        why = "stale blocking handoff diagnostic";
+        fork
+            begin
+                orchestrator.apply(plan, status, why);
+            end
+            begin
+                blocking.execute_started.wait_ptrigger();
+                orchestrator.set_executor(handoff_replacement);
+                blocking.execute_release.trigger();
+            end
+        join
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (why != blocking.failure_text) ||
+            (blocking.preflight_count != 1) ||
+            (blocking.execute_count != 1) ||
+            (handoff_replacement.preflight_count != 0) ||
+            (handoff_replacement.execute_count != 0)) begin
+            `uvm_fatal("REG_ORCH", $sformatf(
+                {"active executor changed during execute: status=%0d ",
+                 "blocking=%0d/%0d replacement=%0d/%0d why=%s"},
+                status, blocking.preflight_count, blocking.execute_count,
+                handoff_replacement.preflight_count,
+                handoff_replacement.execute_count, why))
+        end
+
+        plan = build_valid_plan();
+        status = DPU_CFG_STATUS_SUCCEEDED;
+        why = "stale replacement-next-apply diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (why != "replacement executor execution failure") ||
+            (blocking.preflight_count != 1) ||
+            (blocking.execute_count != 1) ||
+            (handoff_replacement.preflight_count != 1) ||
+            (handoff_replacement.execute_count != 1)) begin
+            `uvm_fatal("REG_ORCH",
+                "replacement executor was not deferred until the next apply")
+        end
+
+        repeated = dpu_test_controlled_executor::type_id::create(
+            "repeated_executor");
+        repeated.execute_status = DPU_CFG_STATUS_EXECUTION_FAILED;
+        repeated.execute_error = "first repeated apply failure";
+        orchestrator.set_executor(repeated);
+        plan = build_valid_plan();
+        status = DPU_CFG_STATUS_SUCCEEDED;
+        why = "stale first repeated-apply diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (why != "first repeated apply failure") ||
+            !plan.is_frozen() || (repeated.preflight_count != 1) ||
+            (repeated.execute_count != 1)) begin
+            `uvm_fatal("REG_ORCH", "first repeated apply result changed")
+        end
+
+        repeated.execute_status = DPU_CFG_STATUS_SUCCEEDED;
+        repeated.execute_error = "";
+        status = DPU_CFG_STATUS_PLAN_INVALID;
+        why = "stale second repeated-apply diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status !== DPU_CFG_STATUS_SUCCEEDED) || (why != "") ||
+            !plan.is_frozen() || (repeated.preflight_count != 2) ||
+            (repeated.execute_count != 2) ||
+            !repeated.preflight_saw_frozen_plan ||
+            !repeated.execute_saw_preflight_plan) begin
+            `uvm_fatal("REG_ORCH",
+                "same executor/plan repeated apply leaked prior state")
         end
     endtask
 
