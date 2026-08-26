@@ -62,6 +62,19 @@ class dpu_counted_copy_reg_op extends dpu_reg_op;
     endfunction
 endclass : dpu_counted_copy_reg_op
 
+class dpu_spy_reg_executor_test_probe extends dpu_spy_reg_executor;
+    `uvm_object_utils(dpu_spy_reg_executor_test_probe)
+
+    function new(string name = "dpu_spy_reg_executor_test_probe");
+        super.new(name);
+    endfunction
+
+    function bit history_is_aligned(input int unsigned expected_count);
+        return (recorded_operations.size() == expected_count) &&
+               (recorded_results.size() == expected_count);
+    endfunction
+endclass : dpu_spy_reg_executor_test_probe
+
 class dpu_reg_plan_test extends uvm_test;
     `uvm_component_utils(dpu_reg_plan_test)
 
@@ -944,7 +957,7 @@ class dpu_reg_plan_test extends uvm_test;
         dpu_reg_plan other_plan;
         dpu_reg_plan execute_copy_failure_plan;
         dpu_reg_plan copy_failure_plan;
-        dpu_spy_reg_executor spy;
+        dpu_spy_reg_executor_test_probe spy;
         dpu_reg_op op;
         dpu_reg_op recorded;
         dpu_test_reg_op recorded_bootstrap;
@@ -953,6 +966,9 @@ class dpu_reg_plan_test extends uvm_test;
         dpu_reg_op_result_e result;
         dpu_cfg_status_e status;
         int unsigned before_count;
+        string snapshot_ids[$];
+        dpu_reg_op_result_e snapshot_results[$];
+        bit [63:0] snapshot_payloads[$];
         string expected_ids[$] = '{
             "bootstrap", "notify_table", "notify_verify",
             "notify_commit", "enable"
@@ -962,7 +978,7 @@ class dpu_reg_plan_test extends uvm_test;
         plan = build_valid_plan();
         if (!plan.freeze(why))
             `uvm_fatal("REG_EXEC", why)
-        spy = dpu_spy_reg_executor::type_id::create("spy");
+        spy = dpu_spy_reg_executor_test_probe::type_id::create("spy");
         if (!spy.preflight(plan, why))
             `uvm_fatal("REG_EXEC", $sformatf("spy preflight failed: %s", why))
         if (!spy.preflight_history_was_empty() ||
@@ -1221,8 +1237,18 @@ class dpu_reg_plan_test extends uvm_test;
                 "could not build counted copy failure plan: %s", why))
         end
         before_count = spy.record_count();
-        if (before_count != 5)
+        if ((before_count != 5) || !spy.history_is_aligned(before_count))
             `uvm_fatal("REG_EXEC", "copy failure test lost sentinel history")
+        snapshot_ids.delete();
+        snapshot_results.delete();
+        snapshot_payloads.delete();
+        for (int unsigned index = 0; index < before_count; index++) begin
+            if (!spy.record_at(index, recorded, result, why))
+                `uvm_fatal("REG_EXEC", why)
+            snapshot_ids.push_back(recorded.op_id);
+            snapshot_results.push_back(result);
+            snapshot_payloads.push_back(recorded.payload);
+        end
         if (!spy.preflight(execute_copy_failure_plan, why))
             `uvm_fatal("REG_EXEC", why)
         spy.execute(execute_copy_failure_plan, status);
@@ -1237,6 +1263,20 @@ class dpu_reg_plan_test extends uvm_test;
                 dpu_counted_copy_reg_op::copy_count,
                 spy.record_count(), spy.last_error()))
         end
+        if (!spy.history_is_aligned(before_count)) begin
+            `uvm_fatal("REG_EXEC",
+                "execute copy failure misaligned operation/result history")
+        end
+        foreach (snapshot_ids[index]) begin
+            if (!spy.record_at(index, recorded, result, why) ||
+                (why != "") || (recorded.op_id != snapshot_ids[index]) ||
+                (result != snapshot_results[index]) ||
+                (recorded.payload != snapshot_payloads[index])) begin
+                `uvm_fatal("REG_EXEC", $sformatf(
+                    "execute copy failure changed prior record %0d: %s",
+                    index, why))
+            end
+        end
         recorded = make_mmio_write(
             "stale_partial_record", DPU_REG_PHASE_TABLE, 64'h28010, 64'h0);
         result = DPU_REG_OP_RESULT_SUCCEEDED;
@@ -1246,11 +1286,6 @@ class dpu_reg_plan_test extends uvm_test;
                 "spy record index %0d is out of range", before_count))) begin
             `uvm_fatal("REG_EXEC", $sformatf(
                 "execute copy failure exposed a staged prefix: %s", why))
-        end
-        if (!spy.record_at(0, recorded, result, why) ||
-            (recorded.op_id != "bootstrap") ||
-            (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
-            `uvm_fatal("REG_EXEC", "execute copy failure corrupted old history")
         end
         dpu_counted_copy_reg_op::tamper_on_copy = 0;
 
