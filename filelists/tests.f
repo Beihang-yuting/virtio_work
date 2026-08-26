@@ -1,6 +1,7 @@
 // All maintained test classes followed by the shared top.
 +incdir+virtio_net_vip/tests
 dpu_common/tests/dpu_resource_manager_test.sv
+dpu_common/tests/dpu_reg_plan_test.sv
 virtio_net_vip/tests/virtio_unit_test.sv
 virtio_net_vip/tests/virtio_fabric_resource_test.sv
 virtio_net_vip/tests/virtio_stress_unit_test.sv
