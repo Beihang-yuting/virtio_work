@@ -5,6 +5,104 @@ import uvm_pkg::*;
 `include "uvm_macros.svh"
 import dpu_resource_pkg::*;
 
+class dpu_test_custom_executor extends dpu_reg_executor;
+    `uvm_object_utils(dpu_test_custom_executor)
+
+    int unsigned preflight_count;
+    int unsigned execute_count;
+    bit preflight_saw_frozen_plan;
+
+    function new(string name = "dpu_test_custom_executor");
+        super.new(name);
+        preflight_count = 0;
+        execute_count = 0;
+        preflight_saw_frozen_plan = 0;
+    endfunction
+
+    virtual function bit preflight(
+        dpu_reg_plan plan,
+        output string why
+    );
+        preflight_count++;
+        preflight_saw_frozen_plan = (plan != null) && plan.is_frozen();
+        why = preflight_saw_frozen_plan ?
+            "" : "custom executor needs frozen plan";
+        return preflight_saw_frozen_plan;
+    endfunction
+
+    virtual task execute(
+        dpu_reg_plan plan,
+        output dpu_cfg_status_e status
+    );
+        dpu_reg_op ordered[$];
+        string why;
+
+        execute_count++;
+        if (!plan.ordered_operations(ordered, why)) begin
+            set_last_error(why);
+            status = DPU_CFG_STATUS_EXECUTION_FAILED;
+            return;
+        end
+        set_last_error("");
+        status = DPU_CFG_STATUS_SUCCEEDED;
+    endtask
+endclass : dpu_test_custom_executor
+
+class dpu_test_controlled_executor extends dpu_reg_executor;
+    `uvm_object_utils(dpu_test_controlled_executor)
+
+    bit preflight_result;
+    string preflight_why;
+    string preflight_error;
+    dpu_cfg_status_e execute_status;
+    string execute_error;
+    int unsigned preflight_count;
+    int unsigned execute_count;
+    bit preflight_saw_frozen_plan;
+    bit execute_saw_preflight_plan;
+
+    protected dpu_reg_plan preflight_plan;
+
+    function new(string name = "dpu_test_controlled_executor");
+        super.new(name);
+        preflight_result = 1;
+        preflight_why = "";
+        preflight_error = "";
+        execute_status = DPU_CFG_STATUS_SUCCEEDED;
+        execute_error = "";
+        preflight_count = 0;
+        execute_count = 0;
+        preflight_saw_frozen_plan = 0;
+        execute_saw_preflight_plan = 0;
+        preflight_plan = null;
+    endfunction
+
+    virtual function bit preflight(
+        dpu_reg_plan plan,
+        output string why
+    );
+        preflight_count++;
+        preflight_plan = plan;
+        preflight_saw_frozen_plan =
+            (plan != null) && plan.is_frozen();
+        why = preflight_why;
+        set_last_error(preflight_error);
+        return preflight_result;
+    endfunction
+
+    virtual task execute(
+        dpu_reg_plan plan,
+        output dpu_cfg_status_e status
+    );
+        execute_count++;
+        execute_saw_preflight_plan =
+            (plan != null) && plan.is_frozen() &&
+            (plan == preflight_plan);
+        set_last_error(execute_error);
+        status = execute_status;
+    endtask
+endclass : dpu_test_controlled_executor
+
 class dpu_test_reg_op extends dpu_reg_op;
     `uvm_object_utils(dpu_test_reg_op)
 
@@ -72,6 +170,10 @@ class dpu_spy_reg_executor_test_probe extends dpu_spy_reg_executor;
     function bit history_is_aligned(input int unsigned expected_count);
         return (recorded_operations.size() == expected_count) &&
                (recorded_results.size() == expected_count);
+    endfunction
+
+    function bit preflight_was_called();
+        return preflight_called;
     endfunction
 endclass : dpu_spy_reg_executor_test_probe
 
@@ -1320,6 +1422,268 @@ class dpu_reg_plan_test extends uvm_test;
         dpu_bad_copy_reg_op::tamper_copies = 0;
     endtask
 
+    task assert_orchestrator_contract();
+        dpu_config_orchestrator orchestrator;
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        dpu_spy_reg_executor_test_probe spy;
+        dpu_test_custom_executor custom;
+        dpu_test_controlled_executor controlled;
+        dpu_test_controlled_executor replaced;
+        dpu_cfg_status_e status;
+        int unsigned replaced_preflight_count;
+        int unsigned replaced_execute_count;
+        string why;
+
+        orchestrator =
+            dpu_config_orchestrator::type_id::create("orchestrator");
+        if (orchestrator == null)
+            `uvm_fatal("REG_ORCH", "could not create configuration orchestrator")
+
+        orchestrator.clear_executor();
+        if (orchestrator.has_executor())
+            `uvm_fatal("REG_ORCH", "clear_executor retained an executor")
+        plan = build_valid_plan();
+        status = DPU_CFG_STATUS_SUCCEEDED;
+        why = "stale no-executor diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_NOT_EXECUTED) ||
+            !plan.is_frozen() ||
+            (why != {"validated register plan was not executed because no ",
+                     "executor is installed"})) begin
+            `uvm_fatal("REG_ORCH", $sformatf(
+                "no-executor handoff reported status=%0d why=%s",
+                status, why))
+        end
+
+        spy = dpu_spy_reg_executor_test_probe::type_id::create(
+            "invalid_plan_spy");
+        orchestrator.set_executor(spy);
+        if (!orchestrator.has_executor())
+            `uvm_fatal("REG_ORCH", "set_executor did not install the spy")
+        plan = dpu_reg_plan::type_id::create("invalid_orchestrator_plan");
+        op = make_mmio_write(
+            "invalid", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8000, 64'h0
+        );
+        op.add_dependency("missing");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_ORCH", why)
+        status = DPU_CFG_STATUS_SUCCEEDED;
+        why = "stale validation diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_PLAN_INVALID) ||
+            (spy.record_count() != 0) || spy.preflight_was_called() ||
+            (why !=
+             "operation invalid depends on unknown operation missing")) begin
+            `uvm_fatal("REG_ORCH", $sformatf(
+                "invalid plan reached executor dispatch: status=%0d why=%s",
+                status, why))
+        end
+
+        spy = dpu_spy_reg_executor_test_probe::type_id::create(
+            "preflight_spy");
+        spy.fail_preflight("injected preflight rejection");
+        orchestrator.set_executor(spy);
+        plan = build_valid_plan();
+        status = DPU_CFG_STATUS_SUCCEEDED;
+        why = "stale preflight diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
+            !spy.preflight_was_called() || (spy.record_count() != 0) ||
+            (why != "injected preflight rejection")) begin
+            `uvm_fatal("REG_ORCH", $sformatf(
+                "preflight rejection did not block execution: %s", why))
+        end
+
+        spy = dpu_spy_reg_executor_test_probe::type_id::create(
+            "execution_spy");
+        spy.fail_operation("notify_table");
+        orchestrator.set_executor(spy);
+        plan = build_valid_plan();
+        status = DPU_CFG_STATUS_SUCCEEDED;
+        why = "stale execution diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 2) ||
+            (why !=
+             "injected execution failure at operation notify_table")) begin
+            `uvm_fatal("REG_ORCH", $sformatf(
+                "executor failure was not propagated precisely: %s", why))
+        end
+
+        custom = dpu_test_custom_executor::type_id::create("custom");
+        orchestrator.set_executor(custom);
+        plan = build_valid_plan();
+        status = DPU_CFG_STATUS_PLAN_INVALID;
+        why = "stale custom diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_SUCCEEDED) || (why != "") ||
+            (custom.preflight_count != 1) || (custom.execute_count != 1) ||
+            !custom.preflight_saw_frozen_plan) begin
+            `uvm_fatal("REG_ORCH", "custom executor did not plug into orchestrator")
+        end
+
+        controlled = dpu_test_controlled_executor::type_id::create(
+            "null_plan_executor");
+        orchestrator.set_executor(controlled);
+        status = DPU_CFG_STATUS_SUCCEEDED;
+        why = "stale null-plan diagnostic";
+        orchestrator.apply(null, status, why);
+        if ((status != DPU_CFG_STATUS_PLAN_INVALID) ||
+            (why !=
+             "configuration orchestrator received a null register plan") ||
+            (controlled.preflight_count != 0) ||
+            (controlled.execute_count != 0)) begin
+            `uvm_fatal("REG_ORCH", $sformatf(
+                "null plan reached executor dispatch: status=%0d why=%s",
+                status, why))
+        end
+
+        controlled = dpu_test_controlled_executor::type_id::create(
+            "preflight_output_executor");
+        controlled.preflight_result = 0;
+        controlled.preflight_why = "executor preflight output diagnostic";
+        controlled.preflight_error = "lower-priority executor last error";
+        orchestrator.set_executor(controlled);
+        plan = build_valid_plan();
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
+            (why != "executor preflight output diagnostic") ||
+            (controlled.preflight_count != 1) ||
+            (controlled.execute_count != 0) ||
+            !controlled.preflight_saw_frozen_plan) begin
+            `uvm_fatal("REG_ORCH",
+                "preflight output did not take priority over last_error")
+        end
+
+        controlled = dpu_test_controlled_executor::type_id::create(
+            "preflight_last_error_executor");
+        controlled.preflight_result = 0;
+        controlled.preflight_error = "executor preflight last error";
+        orchestrator.set_executor(controlled);
+        plan = build_valid_plan();
+        why = "stale preflight-last-error diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
+            (why != "executor preflight last error") ||
+            (controlled.preflight_count != 1) ||
+            (controlled.execute_count != 0)) begin
+            `uvm_fatal("REG_ORCH",
+                "empty preflight output did not use executor last_error")
+        end
+
+        controlled = dpu_test_controlled_executor::type_id::create(
+            "preflight_fallback_executor");
+        controlled.preflight_result = 0;
+        orchestrator.set_executor(controlled);
+        plan = build_valid_plan();
+        why = "stale preflight-fallback diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
+            (why !=
+             "register executor preflight failed without an error message") ||
+            (controlled.preflight_count != 1) ||
+            (controlled.execute_count != 0)) begin
+            `uvm_fatal("REG_ORCH", "preflight fallback diagnostic changed")
+        end
+
+        controlled = dpu_test_controlled_executor::type_id::create(
+            "execution_fallback_executor");
+        controlled.execute_status = DPU_CFG_STATUS_EXECUTION_FAILED;
+        orchestrator.set_executor(controlled);
+        plan = build_valid_plan();
+        why = "stale execution-fallback diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (why != "register executor failed without an error message") ||
+            (controlled.preflight_count != 1) ||
+            (controlled.execute_count != 1) ||
+            !controlled.preflight_saw_frozen_plan ||
+            !controlled.execute_saw_preflight_plan) begin
+            `uvm_fatal("REG_ORCH", "execution fallback diagnostic changed")
+        end
+
+        controlled = dpu_test_controlled_executor::type_id::create(
+            "nonterminal_status_executor");
+        controlled.execute_status = DPU_CFG_STATUS_NOT_EXECUTED;
+        orchestrator.set_executor(controlled);
+        plan = build_valid_plan();
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (why !=
+             "register executor returned an invalid terminal status") ||
+            (controlled.preflight_count != 1) ||
+            (controlled.execute_count != 1) ||
+            !controlled.execute_saw_preflight_plan) begin
+            `uvm_fatal("REG_ORCH", "nonterminal executor status escaped")
+        end
+
+        controlled = dpu_test_controlled_executor::type_id::create(
+            "invalid_status_executor");
+        controlled.execute_status = dpu_cfg_status_e'(32'hffff_ffff);
+        orchestrator.set_executor(controlled);
+        plan = build_valid_plan();
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (why !=
+             "register executor returned an invalid terminal status") ||
+            (controlled.preflight_count != 1) ||
+            (controlled.execute_count != 1)) begin
+            `uvm_fatal("REG_ORCH", "invalid enum executor status escaped")
+        end
+
+        controlled = dpu_test_controlled_executor::type_id::create(
+            "unknown_status_executor");
+        controlled.execute_status = dpu_cfg_status_e'('x);
+        orchestrator.set_executor(controlled);
+        plan = build_valid_plan();
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (why !=
+             "register executor returned an invalid terminal status") ||
+            (controlled.preflight_count != 1) ||
+            (controlled.execute_count != 1)) begin
+            `uvm_fatal("REG_ORCH", "unknown enum executor status escaped")
+        end
+
+        replaced_preflight_count = controlled.preflight_count;
+        replaced_execute_count = controlled.execute_count;
+        orchestrator.clear_executor();
+        if (orchestrator.has_executor())
+            `uvm_fatal("REG_ORCH", "clear_executor leaked replaced executor")
+        plan = build_valid_plan();
+        status = DPU_CFG_STATUS_SUCCEEDED;
+        why = "stale cleared-executor diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_NOT_EXECUTED) ||
+            (why != {"validated register plan was not executed because no ",
+                     "executor is installed"}) ||
+            (controlled.preflight_count != replaced_preflight_count) ||
+            (controlled.execute_count != replaced_execute_count)) begin
+            `uvm_fatal("REG_ORCH", "cleared executor retained dispatch state")
+        end
+
+        replaced = dpu_test_controlled_executor::type_id::create(
+            "replacement_executor");
+        orchestrator.set_executor(replaced);
+        if (!orchestrator.has_executor())
+            `uvm_fatal("REG_ORCH", "replacement executor was not installed")
+        plan = build_valid_plan();
+        status = DPU_CFG_STATUS_PLAN_INVALID;
+        why = "stale replacement diagnostic";
+        orchestrator.apply(plan, status, why);
+        if ((status != DPU_CFG_STATUS_SUCCEEDED) || (why != "") ||
+            (replaced.preflight_count != 1) ||
+            (replaced.execute_count != 1) ||
+            !replaced.preflight_saw_frozen_plan ||
+            !replaced.execute_saw_preflight_plan ||
+            (controlled.preflight_count != replaced_preflight_count) ||
+            (controlled.execute_count != replaced_execute_count)) begin
+            `uvm_fatal("REG_ORCH", "executor replacement leaked prior state")
+        end
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         assert_original_operation_contract();
@@ -1336,6 +1700,7 @@ class dpu_reg_plan_test extends uvm_test;
         assert_phase_is_ready_priority_only();
         assert_large_plan_order();
         assert_spy_executor_contract();
+        assert_orchestrator_contract();
         `uvm_info("REG_PLAN_TEST", "register plan contract passed", UVM_LOW)
         phase.drop_objection(this);
     endtask
