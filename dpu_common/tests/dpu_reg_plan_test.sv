@@ -985,6 +985,78 @@ class dpu_reg_plan_test extends uvm_test;
         end
     endtask
 
+    task assert_producer_epoch_requires_commit();
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        string why;
+
+        plan = dpu_reg_plan::type_id::create("orphan_producer_plan");
+        op = make_mmio_write(
+            "table_a", DPU_REG_PHASE_TABLE, 64'h28000, 64'h1);
+        op.commit_group = "epoch.a";
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != {"commit group epoch.a has producer table_a ",
+                     "but no commit operation"}) ||
+            plan.is_frozen()) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "orphan producer was not rejected precisely: %s", why))
+        end
+
+        plan = dpu_reg_plan::type_id::create("enable_bypass_plan");
+        op = make_mmio_write(
+            "table_a", DPU_REG_PHASE_TABLE, 64'h28000, 64'h1);
+        op.commit_group = "epoch.a";
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "enable", DPU_REG_PHASE_ENABLE, 64'h20010, 64'h1);
+        op.add_dependency("table_a");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != {"commit group epoch.a has producer table_a ",
+                     "but no commit operation"}) ||
+            plan.is_frozen()) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "enable dependency bypassed the missing commit: %s", why))
+        end
+
+        plan = dpu_reg_plan::type_id::create("ungrouped_table_plan");
+        op = make_mmio_write(
+            "ordinary_table", DPU_REG_PHASE_TABLE, 64'h28000, 64'h1);
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (!plan.freeze(why) || !plan.is_frozen()) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "ungrouped table write incorrectly required a commit: %s", why))
+        end
+
+        plan = dpu_reg_plan::type_id::create("complete_epoch_plan");
+        op = make_mmio_write(
+            "table_b", DPU_REG_PHASE_TABLE, 64'h28004, 64'h2);
+        op.commit_group = "epoch.complete";
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "table_a", DPU_REG_PHASE_TABLE, 64'h28000, 64'h1);
+        op.commit_group = "epoch.complete";
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "complete_commit", DPU_REG_PHASE_COMMIT, 64'h20044, 64'h1);
+        op.kind = DPU_REG_OP_COMMIT;
+        op.commit_group = "epoch.complete";
+        op.add_dependency("table_b");
+        op.add_dependency("table_a");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (!plan.freeze(why))
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "complete multi-producer epoch was rejected: %s", why))
+    endtask
+
     task assert_deterministic_ready_order();
         dpu_reg_plan plan;
         dpu_reg_op op;
@@ -1831,6 +1903,7 @@ class dpu_reg_plan_test extends uvm_test;
         assert_plan_copy_failure_outputs();
         assert_plan_structural_rejections();
         assert_commit_rejections();
+        assert_producer_epoch_requires_commit();
         assert_deterministic_ready_order();
         assert_phase_is_ready_priority_only();
         assert_large_plan_order();

@@ -165,7 +165,8 @@ class dpu_reg_plan extends uvm_object;
             end
 
             group_id = operations_by_id[op_id].commit_group;
-            if ((operations_by_id[op_id].phase == DPU_REG_PHASE_TABLE) &&
+            if ((group_id != "") &&
+                (operations_by_id[op_id].phase == DPU_REG_PHASE_TABLE) &&
                 (operations_by_id[op_id].kind == DPU_REG_OP_MMIO_WRITE)) begin
                 producers_by_group[group_id][op_id] = 1;
             end
@@ -190,6 +191,24 @@ class dpu_reg_plan extends uvm_object;
                 commit_id_by_group[group_id] = op_id;
             end
         end while (operations_by_id.next(op_id));
+
+        // Every nonempty producer epoch must terminate in its unique commit.
+        // Traverse group and producer string indexes lexically so the missing
+        // commit diagnostic is deterministic without adding quadratic work.
+        if (producers_by_group.first(group_id)) begin
+            do begin
+                if (!commit_id_by_group.exists(group_id)) begin
+                    if (!producers_by_group[group_id].first(producer_id)) begin
+                        why = "register plan producer traversal failed";
+                        return 0;
+                    end
+                    why = $sformatf(
+                        {"commit group %s has producer %s but no commit ",
+                         "operation"}, group_id, producer_id);
+                    return 0;
+                end
+            end while (producers_by_group.next(group_id));
+        end
 
         // Commit coverage is indexed by batch ID and direct dependency edge.
         // Unique commit groups make the aggregate traversal O(V + E).
