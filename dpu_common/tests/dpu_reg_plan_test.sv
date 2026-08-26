@@ -28,6 +28,22 @@ class dpu_test_reg_op extends dpu_reg_op;
     endfunction
 endclass : dpu_test_reg_op
 
+class dpu_bad_copy_reg_op extends dpu_reg_op;
+    `uvm_object_utils(dpu_bad_copy_reg_op)
+
+    static bit tamper_copies;
+
+    function new(string name = "dpu_bad_copy_reg_op");
+        super.new(name);
+    endfunction
+
+    virtual function void do_copy(uvm_object rhs);
+        super.do_copy(rhs);
+        if (tamper_copies)
+            op_id = "tampered_copy_id";
+    endfunction
+endclass : dpu_bad_copy_reg_op
+
 class dpu_reg_plan_test extends uvm_test;
     `uvm_component_utils(dpu_reg_plan_test)
 
@@ -494,6 +510,7 @@ class dpu_reg_plan_test extends uvm_test;
     task assert_plan_add_rejections();
         dpu_reg_plan plan;
         dpu_reg_op op;
+        dpu_bad_copy_reg_op bad_copy;
         string why;
 
         plan = dpu_reg_plan::type_id::create("add_rejections");
@@ -524,6 +541,66 @@ class dpu_reg_plan_test extends uvm_test;
                 "duplicate ID was not rejected precisely: %s", why))
         end
 
+        plan = dpu_reg_plan::type_id::create("bad_copy_plan");
+        bad_copy = dpu_bad_copy_reg_op::type_id::create("bad_copy");
+        configure_mmio_write(
+            bad_copy, "bad_copy", DPU_REG_PHASE_TABLE, 64'h28000, 64'h0);
+        dpu_bad_copy_reg_op::tamper_copies = 1;
+        if (plan.add_operation(bad_copy, why) ||
+            (plan.operation_count() != 0) || (why == "")) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "mismatched copied ID was not rejected atomically: %s", why))
+        end
+        dpu_bad_copy_reg_op::tamper_copies = 0;
+    endtask
+
+    task assert_plan_copy_failure_outputs();
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        dpu_reg_op found;
+        dpu_reg_op ordered[$];
+        dpu_bad_copy_reg_op bad_copy;
+        string why;
+
+        plan = dpu_reg_plan::type_id::create("find_bad_copy_plan");
+        bad_copy = dpu_bad_copy_reg_op::type_id::create("find_bad_copy");
+        configure_mmio_write(
+            bad_copy, "find_bad_copy", DPU_REG_PHASE_TABLE,
+            64'h28000, 64'h0);
+        if (!plan.add_operation(bad_copy, why))
+            `uvm_fatal("REG_PLAN", why)
+        found = make_mmio_write(
+            "stale_find", DPU_REG_PHASE_TABLE, 64'h28004, 64'h0);
+        dpu_bad_copy_reg_op::tamper_copies = 1;
+        if (plan.find_operation("find_bad_copy", found) || (found != null)) begin
+            `uvm_fatal("REG_PLAN",
+                "find_operation exposed a mismatched operation copy")
+        end
+        dpu_bad_copy_reg_op::tamper_copies = 0;
+
+        plan = dpu_reg_plan::type_id::create("ordered_bad_copy_plan");
+        op = make_mmio_write(
+            "a_first", DPU_REG_PHASE_BOOTSTRAP, 64'h1010, 64'h0);
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        bad_copy = dpu_bad_copy_reg_op::type_id::create("z_bad");
+        configure_mmio_write(
+            bad_copy, "z_bad", DPU_REG_PHASE_TABLE, 64'h28000, 64'h0);
+        bad_copy.add_dependency("a_first");
+        if (!plan.add_operation(bad_copy, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (!plan.freeze(why))
+            `uvm_fatal("REG_PLAN", why)
+
+        ordered.push_back(make_mmio_write(
+            "stale_order", DPU_REG_PHASE_TABLE, 64'h28004, 64'h0));
+        dpu_bad_copy_reg_op::tamper_copies = 1;
+        if (plan.ordered_operations(ordered, why) ||
+            (ordered.size() != 0) || (why == "")) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "ordered copy failure leaked partial output: %s", why))
+        end
+        dpu_bad_copy_reg_op::tamper_copies = 0;
     endtask
 
     task assert_plan_structural_rejections();
@@ -586,6 +663,19 @@ class dpu_reg_plan_test extends uvm_test;
             plan.is_frozen()) begin
             `uvm_fatal("REG_PLAN", $sformatf(
                 "duplicate dependency was not rejected precisely: %s", why))
+        end
+
+        plan = dpu_reg_plan::type_id::create("self_dependency_plan");
+        op = make_mmio_write(
+            "self_user", DPU_REG_PHASE_TABLE, 64'h28000, 64'h0);
+        op.add_dependency("self_user");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != "operation self_user depends on itself") ||
+            plan.is_frozen()) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "self dependency was not rejected precisely: %s", why))
         end
 
         plan = dpu_reg_plan::type_id::create("cycle_plan");
@@ -671,6 +761,33 @@ class dpu_reg_plan_test extends uvm_test;
             `uvm_fatal("REG_PLAN", $sformatf(
                 "partial commit was not rejected precisely: %s", why))
         end
+
+        plan = dpu_reg_plan::type_id::create("duplicate_commit_group_plan");
+        op = make_mmio_write(
+            "shared_table", DPU_REG_PHASE_TABLE, 64'h28000, 64'h1);
+        op.commit_group = "shared.batch";
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "commit_b", DPU_REG_PHASE_COMMIT, 64'h20044, 64'h1);
+        op.kind = DPU_REG_OP_COMMIT;
+        op.commit_group = "shared.batch";
+        op.add_dependency("shared_table");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "commit_a", DPU_REG_PHASE_COMMIT, 64'h20044, 64'h1);
+        op.kind = DPU_REG_OP_COMMIT;
+        op.commit_group = "shared.batch";
+        op.add_dependency("shared_table");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != {"commit group shared.batch is used by multiple ",
+                     "commit operations commit_a and commit_b"})) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "duplicate commit group was not rejected precisely: %s", why))
+        end
     endtask
 
     task assert_deterministic_ready_order();
@@ -711,13 +828,21 @@ class dpu_reg_plan_test extends uvm_test;
         dpu_reg_op op;
         dpu_reg_op ordered[$];
         string expected_ids[$] = '{
-            "bootstrap", "table_a", "commit_a", "table_b"
+            "bootstrap", "table_a", "commit_a", "table_b", "commit_b"
         };
         string why;
 
         plan = dpu_reg_plan::type_id::create("multi_stage_plan");
         op = make_mmio_write(
-            "table_b", DPU_REG_PHASE_TABLE, 64'h28004, 64'h2);
+            "commit_b", DPU_REG_PHASE_COMMIT, 64'h20044, 64'h2);
+        op.kind = DPU_REG_OP_COMMIT;
+        op.commit_group = "stage.b";
+        op.add_dependency("table_b");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "table_b", DPU_REG_PHASE_TABLE, 64'h28000, 64'h2);
+        op.commit_group = "stage.b";
         op.add_dependency("commit_a");
         if (!plan.add_operation(op, why))
             `uvm_fatal("REG_PLAN", why)
@@ -751,6 +876,50 @@ class dpu_reg_plan_test extends uvm_test;
         end
     endtask
 
+    task assert_large_plan_order();
+        localparam int unsigned SCALE_OPERATION_COUNT = 1024;
+        localparam int unsigned CHAIN_END = 511;
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        dpu_reg_op ordered[$];
+        string op_id;
+        string dependency_id;
+        string why;
+
+        plan = dpu_reg_plan::type_id::create("scale_plan");
+        for (int unsigned index = 0;
+             index < SCALE_OPERATION_COUNT; index++) begin
+            op_id = $sformatf("scale_%04d", index);
+            op = make_mmio_write(
+                op_id,
+                (index == 0) ? DPU_REG_PHASE_BOOTSTRAP : DPU_REG_PHASE_TABLE,
+                64'h0000_0000_0004_0000 + (index * 4), index
+            );
+            if (index != 0) begin
+                if (index <= CHAIN_END)
+                    dependency_id = $sformatf("scale_%04d", index - 1);
+                else
+                    dependency_id = $sformatf("scale_%04d", CHAIN_END);
+                op.add_dependency(dependency_id);
+            end
+            if (!plan.add_operation(op, why))
+                `uvm_fatal("REG_PLAN", why)
+        end
+
+        if (!plan.freeze(why) || !plan.ordered_operations(ordered, why))
+            `uvm_fatal("REG_PLAN", $sformatf("scale plan rejected: %s", why))
+        if (ordered.size() != SCALE_OPERATION_COUNT)
+            `uvm_fatal("REG_PLAN", "scale plan returned the wrong operation count")
+        foreach (ordered[index]) begin
+            op_id = $sformatf("scale_%04d", index);
+            if (ordered[index].op_id != op_id) begin
+                `uvm_fatal("REG_PLAN", $sformatf(
+                    "scale order[%0d]=%s expected %s",
+                    index, ordered[index].op_id, op_id))
+            end
+        end
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         assert_original_operation_contract();
@@ -760,10 +929,12 @@ class dpu_reg_plan_test extends uvm_test;
         assert_copy_contract();
         assert_plan_validation_and_order();
         assert_plan_add_rejections();
+        assert_plan_copy_failure_outputs();
         assert_plan_structural_rejections();
         assert_commit_rejections();
         assert_deterministic_ready_order();
         assert_phase_is_ready_priority_only();
+        assert_large_plan_order();
         `uvm_info("REG_PLAN_TEST", "register plan contract passed", UVM_LOW)
         phase.drop_objection(this);
     endtask
