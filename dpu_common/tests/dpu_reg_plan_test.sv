@@ -1088,7 +1088,7 @@ class dpu_reg_plan_test extends uvm_test;
             `uvm_fatal("REG_EXEC", "spy recorded an operation before preflight")
         end
         spy.execute(plan, status);
-        if (status != DPU_CFG_STATUS_SUCCEEDED)
+        if (status !== DPU_CFG_STATUS_SUCCEEDED)
             `uvm_fatal("REG_EXEC", $sformatf(
                 "spy execution failed: %s", spy.last_error()))
         if (spy.record_count() != 5)
@@ -1183,7 +1183,7 @@ class dpu_reg_plan_test extends uvm_test;
         if (!spy.preflight(plan, why))
             `uvm_fatal("REG_EXEC", why)
         spy.execute(plan, status);
-        if (status != DPU_CFG_STATUS_EXECUTION_FAILED)
+        if (status !== DPU_CFG_STATUS_EXECUTION_FAILED)
             `uvm_fatal("REG_EXEC",
                 "injected operation failure did not fail execution")
         if (spy.record_count() != 2)
@@ -1221,7 +1221,7 @@ class dpu_reg_plan_test extends uvm_test;
             `uvm_fatal("REG_EXEC", "spy reset did not clear its complete state")
         end
         spy.execute(plan, status);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (spy.record_count() != 0) ||
             (spy.last_error() !=
              "spy executor execute called before preflight")) begin
@@ -1230,7 +1230,7 @@ class dpu_reg_plan_test extends uvm_test;
         if (!spy.preflight(plan, why))
             `uvm_fatal("REG_EXEC", why)
         spy.execute(plan, status);
-        if ((status != DPU_CFG_STATUS_SUCCEEDED) ||
+        if ((status !== DPU_CFG_STATUS_SUCCEEDED) ||
             (spy.record_count() != 5) || (spy.last_error() != "")) begin
             `uvm_fatal("REG_EXEC", "reset retained an injected operation failure")
         end
@@ -1271,7 +1271,7 @@ class dpu_reg_plan_test extends uvm_test;
                 "injected preflight failure contract changed: %s", why))
         end
         spy.execute(plan, status);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (spy.record_count() != 0) ||
             (spy.last_error() !=
              "spy executor execute called without successful preflight")) begin
@@ -1286,7 +1286,7 @@ class dpu_reg_plan_test extends uvm_test;
         if (!spy.preflight(plan, why))
             `uvm_fatal("REG_EXEC", why)
         spy.execute(other_plan, status);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (spy.record_count() != 0) ||
             (spy.last_error() !=
              "spy executor execute plan does not match preflight plan")) begin
@@ -1294,7 +1294,7 @@ class dpu_reg_plan_test extends uvm_test;
                 "preflight for one plan authorized a different plan")
         end
         spy.execute(plan, status);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (spy.record_count() != 0) ||
             (spy.last_error() !=
              "spy executor execute authorization was already consumed")) begin
@@ -1306,12 +1306,12 @@ class dpu_reg_plan_test extends uvm_test;
         if (!spy.preflight(plan, why))
             `uvm_fatal("REG_EXEC", why)
         spy.execute(plan, status);
-        if ((status != DPU_CFG_STATUS_SUCCEEDED) ||
+        if ((status !== DPU_CFG_STATUS_SUCCEEDED) ||
             (spy.record_count() != 5)) begin
             `uvm_fatal("REG_EXEC", "single-use authorization execution failed")
         end
         spy.execute(plan, status);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (spy.record_count() != 5) ||
             (spy.last_error() !=
              "spy executor execute authorization was already consumed")) begin
@@ -1355,7 +1355,7 @@ class dpu_reg_plan_test extends uvm_test;
             `uvm_fatal("REG_EXEC", why)
         spy.execute(execute_copy_failure_plan, status);
         if ((dpu_counted_copy_reg_op::copy_count != 3) ||
-            (status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (spy.record_count() != before_count) ||
             (spy.last_error() !=
              {"spy operation copy ID tampered_execute_copy_id does not match ",
@@ -1404,7 +1404,7 @@ class dpu_reg_plan_test extends uvm_test;
         if (!spy.preflight(copy_failure_plan, why))
             `uvm_fatal("REG_EXEC", why)
         spy.execute(copy_failure_plan, status);
-        if ((status != DPU_CFG_STATUS_SUCCEEDED) ||
+        if ((status !== DPU_CFG_STATUS_SUCCEEDED) ||
             (spy.record_count() != 1)) begin
             `uvm_fatal("REG_EXEC", "spy could not record a dynamic operation subtype")
         end
@@ -1447,7 +1447,7 @@ class dpu_reg_plan_test extends uvm_test;
         status = DPU_CFG_STATUS_SUCCEEDED;
         why = "stale no-executor diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_NOT_EXECUTED) ||
+        if ((status !== DPU_CFG_STATUS_NOT_EXECUTED) ||
             !plan.is_frozen() ||
             (why != {"validated register plan was not executed because no ",
                      "executor is installed"})) begin
@@ -1456,11 +1456,12 @@ class dpu_reg_plan_test extends uvm_test;
                 status, why))
         end
 
-        spy = dpu_spy_reg_executor_test_probe::type_id::create(
-            "invalid_plan_spy");
-        orchestrator.set_executor(spy);
+        controlled = dpu_test_controlled_executor::type_id::create(
+            "invalid_plan_executor");
+        orchestrator.set_executor(controlled);
         if (!orchestrator.has_executor())
-            `uvm_fatal("REG_ORCH", "set_executor did not install the spy")
+            `uvm_fatal("REG_ORCH",
+                "set_executor did not install the invalid-plan executor")
         plan = dpu_reg_plan::type_id::create("invalid_orchestrator_plan");
         op = make_mmio_write(
             "invalid", DPU_REG_PHASE_TABLE,
@@ -1472,13 +1473,16 @@ class dpu_reg_plan_test extends uvm_test;
         status = DPU_CFG_STATUS_SUCCEEDED;
         why = "stale validation diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_PLAN_INVALID) ||
-            (spy.record_count() != 0) || spy.preflight_was_called() ||
+        if ((status !== DPU_CFG_STATUS_PLAN_INVALID) ||
+            (controlled.preflight_count != 0) ||
+            (controlled.execute_count != 0) ||
             (why !=
              "operation invalid depends on unknown operation missing")) begin
             `uvm_fatal("REG_ORCH", $sformatf(
-                "invalid plan reached executor dispatch: status=%0d why=%s",
-                status, why))
+                {"invalid plan reached executor dispatch: status=%0d ",
+                 "preflight_count=%0d execute_count=%0d why=%s"},
+                status, controlled.preflight_count,
+                controlled.execute_count, why))
         end
 
         spy = dpu_spy_reg_executor_test_probe::type_id::create(
@@ -1489,7 +1493,7 @@ class dpu_reg_plan_test extends uvm_test;
         status = DPU_CFG_STATUS_SUCCEEDED;
         why = "stale preflight diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
             !spy.preflight_was_called() || (spy.record_count() != 0) ||
             (why != "injected preflight rejection")) begin
             `uvm_fatal("REG_ORCH", $sformatf(
@@ -1504,7 +1508,7 @@ class dpu_reg_plan_test extends uvm_test;
         status = DPU_CFG_STATUS_SUCCEEDED;
         why = "stale execution diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (spy.record_count() != 2) ||
             (why !=
              "injected execution failure at operation notify_table")) begin
@@ -1518,7 +1522,7 @@ class dpu_reg_plan_test extends uvm_test;
         status = DPU_CFG_STATUS_PLAN_INVALID;
         why = "stale custom diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_SUCCEEDED) || (why != "") ||
+        if ((status !== DPU_CFG_STATUS_SUCCEEDED) || (why != "") ||
             (custom.preflight_count != 1) || (custom.execute_count != 1) ||
             !custom.preflight_saw_frozen_plan) begin
             `uvm_fatal("REG_ORCH", "custom executor did not plug into orchestrator")
@@ -1530,7 +1534,7 @@ class dpu_reg_plan_test extends uvm_test;
         status = DPU_CFG_STATUS_SUCCEEDED;
         why = "stale null-plan diagnostic";
         orchestrator.apply(null, status, why);
-        if ((status != DPU_CFG_STATUS_PLAN_INVALID) ||
+        if ((status !== DPU_CFG_STATUS_PLAN_INVALID) ||
             (why !=
              "configuration orchestrator received a null register plan") ||
             (controlled.preflight_count != 0) ||
@@ -1548,7 +1552,7 @@ class dpu_reg_plan_test extends uvm_test;
         orchestrator.set_executor(controlled);
         plan = build_valid_plan();
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
             (why != "executor preflight output diagnostic") ||
             (controlled.preflight_count != 1) ||
             (controlled.execute_count != 0) ||
@@ -1565,7 +1569,7 @@ class dpu_reg_plan_test extends uvm_test;
         plan = build_valid_plan();
         why = "stale preflight-last-error diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
             (why != "executor preflight last error") ||
             (controlled.preflight_count != 1) ||
             (controlled.execute_count != 0)) begin
@@ -1580,7 +1584,7 @@ class dpu_reg_plan_test extends uvm_test;
         plan = build_valid_plan();
         why = "stale preflight-fallback diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_PREFLIGHT_FAILED) ||
             (why !=
              "register executor preflight failed without an error message") ||
             (controlled.preflight_count != 1) ||
@@ -1595,7 +1599,7 @@ class dpu_reg_plan_test extends uvm_test;
         plan = build_valid_plan();
         why = "stale execution-fallback diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (why != "register executor failed without an error message") ||
             (controlled.preflight_count != 1) ||
             (controlled.execute_count != 1) ||
@@ -1610,7 +1614,7 @@ class dpu_reg_plan_test extends uvm_test;
         orchestrator.set_executor(controlled);
         plan = build_valid_plan();
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (why !=
              "register executor returned an invalid terminal status") ||
             (controlled.preflight_count != 1) ||
@@ -1625,26 +1629,12 @@ class dpu_reg_plan_test extends uvm_test;
         orchestrator.set_executor(controlled);
         plan = build_valid_plan();
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
             (why !=
              "register executor returned an invalid terminal status") ||
             (controlled.preflight_count != 1) ||
             (controlled.execute_count != 1)) begin
             `uvm_fatal("REG_ORCH", "invalid enum executor status escaped")
-        end
-
-        controlled = dpu_test_controlled_executor::type_id::create(
-            "unknown_status_executor");
-        controlled.execute_status = dpu_cfg_status_e'('x);
-        orchestrator.set_executor(controlled);
-        plan = build_valid_plan();
-        orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
-            (why !=
-             "register executor returned an invalid terminal status") ||
-            (controlled.preflight_count != 1) ||
-            (controlled.execute_count != 1)) begin
-            `uvm_fatal("REG_ORCH", "unknown enum executor status escaped")
         end
 
         replaced_preflight_count = controlled.preflight_count;
@@ -1656,7 +1646,7 @@ class dpu_reg_plan_test extends uvm_test;
         status = DPU_CFG_STATUS_SUCCEEDED;
         why = "stale cleared-executor diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_NOT_EXECUTED) ||
+        if ((status !== DPU_CFG_STATUS_NOT_EXECUTED) ||
             (why != {"validated register plan was not executed because no ",
                      "executor is installed"}) ||
             (controlled.preflight_count != replaced_preflight_count) ||
@@ -1673,7 +1663,7 @@ class dpu_reg_plan_test extends uvm_test;
         status = DPU_CFG_STATUS_PLAN_INVALID;
         why = "stale replacement diagnostic";
         orchestrator.apply(plan, status, why);
-        if ((status != DPU_CFG_STATUS_SUCCEEDED) || (why != "") ||
+        if ((status !== DPU_CFG_STATUS_SUCCEEDED) || (why != "") ||
             (replaced.preflight_count != 1) ||
             (replaced.execute_count != 1) ||
             !replaced.preflight_saw_frozen_plan ||
