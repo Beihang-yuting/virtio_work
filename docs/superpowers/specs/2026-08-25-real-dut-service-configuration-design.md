@@ -20,9 +20,10 @@ The module was not loaded during the audit; register and lifecycle behavior in
 this document comes from its matching build source and binary metadata.
 
 The real DUT path is in scope.  `cosim_control`, BAR2 mailbox command delivery,
-and mailbox-based function configuration are out of scope.  Configuration is
-lowered to PCIe Memory Write TLPs issued through the AF BAR0.  Function BAR4 is
-used for the standard MSI-X table and PBA view.
+and mailbox-based function configuration are out of scope.  PCI BAR registers
+are programmed through the corresponding host RC configuration path; internal
+DUT tables are lowered to PCIe Memory Write TLPs targeting the selected AF
+BAR0.  Function BAR4 is used for the standard MSI-X table and PBA view.
 
 ## 2. Design principles
 
@@ -41,6 +42,19 @@ used for the standard MSI-X table and PBA view.
 6. A configuration plan must pass complete validation before its first PCIe
    write.  Partial resource allocation or partial register programming is not
    an accepted result.
+7. `dpu_device_cfg`, not a protocol environment configuration, owns the active
+   host/PF/VF topology, PCIe domains, BDFs, BAR requests, and AF selection.
+   Protocol environments consume resolved service bindings and cannot create or
+   renumber PCIe functions.
+8. Each host is an independent PCIe address domain.  BDF and BAR address
+   uniqueness is enforced within a host domain; equal numeric BDFs and BAR
+   addresses are permitted in different host domains.
+9. Common hardware blocks and business services contribute operations to one
+   dependency-ordered register plan.  Adding network forwarding, RDMA, VBLK,
+   or a future service does not add service-specific branches to the executor.
+10. Plan construction is unconditional.  Execution is supplied by an injected
+    executor object; `PLAN_ONLY`, `MODEL`, and `REAL` are not user-visible
+    configuration modes or scenario values.
 
 ## 3. Configuration model
 
@@ -51,17 +65,33 @@ dpu_device_cfg
 ├── dpu_dut_caps
 ├── administrator function key
 ├── hosts[]
-│   └── functions[]
-│       ├── PCIe identity and BAR declarations
-│       └── services[]
-│           ├── VIO_NET instance
-│           │   └── qpair bindings[]
-│           ├── RDMA instance
-│           │   └── RDMA-specific objects
-│           └── VBLK instance
-│               └── virtio device and virtqueues[]
+│   ├── PCIe domain and MMIO aperture
+│   └── PFs[]
+│       ├── PF function configuration and services[]
+│       └── VFs[]
+│           └── VF function configuration and services[]
+├── network endpoints and forwarding policies[]
+├── scheduler and shared-dataplane policy
 └── scenario metadata
 ```
+
+Each function's `services[]` may contain VIO-net instances and qpair requests,
+RDMA instances and RDMA-specific requests, and VBLK instances with their
+virtio-device and virtqueue requests.
+
+The object arrays are the source of truth.  Host, PF, VF, service, and queue
+counts are derived from array sizes instead of being maintained as independent
+count fields.  IDs may be sparse; a host containing PF0 and PF3, or a PF
+containing VF0 and VF7, is legal when the DUT capability permits those IDs.
+`dpu_dut_caps` describes hardware maxima, while `dpu_device_cfg` describes the
+objects activated by the current test.
+
+`virtio_net_env_config` retains only virtio driver and traffic behavior such as
+ring type, queue depth, negotiated features, RX mode, interrupt policy, and
+dataplane test policy.  It does not own `dut_caps`, the host/PF/VF topology,
+BDF allocation, MMIO apertures, BAR placement, or qpair ownership.  The VIO
+environment receives a resolved VIO service binding from the global DPU
+configuration pipeline.
 
 ### 3.1 Function identity
 
@@ -79,6 +109,24 @@ typedef struct {
 No table may use a bare PF ID or VF ID as its owner.  The full key is used for
 forward and reverse lookup of the BDF, BAR lease, source ID, global function
 ID, service instances, and resource leases.
+
+Logical function identity is distinct from PCIe routing identity:
+
+```systemverilog
+typedef struct {
+    int unsigned host_id;
+    int unsigned segment_id;
+} dpu_pcie_domain_key_t;
+
+typedef struct {
+    dpu_pcie_domain_key_t domain;
+    bit [15:0]            bdf;
+} dpu_pcie_function_id_t;
+```
+
+Two hosts may both contain BDF `01:00.0`.  Reverse lookup therefore uses the
+complete `dpu_pcie_function_id_t`, never a bare 16-bit BDF.  `segment_id`
+defaults to zero and preserves support for more than one PCIe segment per host.
 
 ### 3.2 Service identity
 
@@ -102,23 +150,43 @@ service.  VBLK owns an additional virtio-device object because its
 `virtio_dev_id`, admin/data virtqueues, backend state, and device lifecycle do
 not fit the VIO-net qpair model.
 
-### 3.3 Service extension contract
+### 3.3 Configuration-module extension contract
 
-Each service type supplies the following operations through a service-specific
-configuration and plan builder:
+Common blocks and each service type are registered as configuration modules.
+Every module supplies the following operations through a block- or
+service-specific configuration and plan builder:
 
 ```text
 declare_resources()
+collect_requests()
 validate()
+reserve_resources()
 resolve_bindings()
-build_register_plan()
-build_lifecycle_plan()
+build_table_images()
+contribute_register_plan()
+contribute_checks()
 ```
 
 Adding a service requires a configuration type, resource declarations, a plan
-builder, block-specific sequences, and checkers.  It must not require changes
-to function topology, BAR allocation, BDF lookup, scenario selection, or the
-generic lease core.
+builder, typed table packers, and checkers.  It must not require changes to
+function topology, BAR allocation, BDF lookup, scenario selection, the generic
+lease core, or the executor.  A module never starts a PCIe sequence directly;
+it contributes operations and dependency edges to the shared register plan.
+
+### 3.4 Global network configuration
+
+Network forwarding is a global relationship, not a child of VIO-net or RDMA.
+Physical ports, VIO-net services, RDMA ports, vports, and internal pipeline
+nodes expose stable endpoint keys.  Declarative forwarding policies connect
+endpoints or endpoint groups and carry MAC, VLAN, traffic-class, RSS, multicast,
+and future ACL or routing policy.  Resolution translates endpoint keys into
+global function IDs, source IDs, vport IDs, source/destination ports, scheduler
+paths, and IPRO/EPRO/FDB table bindings.
+
+VIO-net and RDMA modules declare their endpoints but do not privately program
+cross-service forwarding.  VBLK does not participate in the network graph, but
+it shares its owner's PCIe identity, MSI-X namespace, and other common function
+resources.
 
 ## 4. Capability model and limits
 
@@ -215,13 +283,75 @@ by an explicit negative-test policy and still cannot exceed 31.
 
 Exactly one active function is selected as AF.  The default is `host0/pf0`.
 AF selection is validated against the declared topology before BAR allocation.
-The AF owns the configuration executor and issues real PCIe Memory Write TLPs
-to its BAR0.
+Each host has an independent RC configuration path for programming PCI config
+space in that host's domain.  After the selected AF BAR0 has been bootstrapped,
+AF table operations target that BAR0 and may describe functions belonging to
+any host.
 
-The executor consumes an ordered register plan.  A register operation contains
-the target block, BAR-relative address, width, payload, write mask if needed,
-and optional readback policy.  The plan builder, not the low-level PCIe
-sequence, packs register fields.
+### 6.1 Register plan
+
+`dpu_reg_plan` is a directed acyclic graph rather than a procedural sequence.
+A register operation contains at least:
+
+```text
+operation ID and dependency IDs
+owner function/service/module
+target space and target host/domain
+target block and BAR-relative or PCI-config address
+operation kind, width, payload, byte/write mask
+target replication scope
+readback value and mask when required
+poll/retry count and interval when required
+commit group and lifecycle phase
+```
+
+Initial operation kinds cover PCI config writes, MMIO writes, read-and-verify,
+poll-until, commit, and ordering barriers.  Plan validation rejects unknown
+dependencies, cycles, duplicate operation IDs, unsupported target spaces,
+invalid access widths or masks, commit operations whose producers are missing,
+and enable operations with unsatisfied dependencies.  The plan builder, not a
+low-level PCIe sequence, packs register fields.
+
+Configuration modules contribute operations and dependency edges.  The common
+PCIe/BAR, function-identity, MSI-X, and scheduler modules are registered in the
+same way as network forwarding, VIO-net, RDMA, VBLK, and future service
+modules.  The orchestrator validates and topologically orders the combined
+plan only after every module has contributed successfully.
+
+### 6.2 Executor contract
+
+Execution is polymorphic and is not selected by a business scenario enum:
+
+```systemverilog
+virtual class dpu_reg_executor extends uvm_object;
+    pure virtual function bit preflight(
+        dpu_reg_plan plan,
+        output string why
+    );
+    pure virtual task execute(
+        dpu_reg_plan plan,
+        output dpu_cfg_status_e status
+    );
+endclass
+```
+
+The executor may decompose `execute()` into protected virtual primitives for
+PCI config write/read, AF MMIO write/read, replicated target access, delay, and
+polling.  A user can implement a new executor without changing the plan,
+configuration modules, or scenario catalog.  Conversely, a new service adds
+plan operations without adding methods or branches to the generic executor.
+
+There is no `PLAN_ONLY`, `MODEL`, or `REAL` mode field.  Tests that only need
+the plan call `build_plan()` and inspect or dump its result.  The first
+implementation supplies a spy executor that records the ordered operations and
+their statuses.  A later user-provided PCIe executor performs real accesses.
+An optional software register-model executor may be added later without
+changing the public contracts.
+
+The first implementation scope stops at the generic plan, dependency
+validation/order, executor interface, orchestrator handoff, and spy executor.
+It does not implement real-DUT block programming and does not claim that a DUT
+was configured when no executor was installed.
 
 The existing `virtio_bar_mem_wr_seq` accepts a caller payload but does not copy
 it into the lower `pcie_tl_mem_wr_seq` payload.  The lower sequence can
@@ -234,10 +364,11 @@ is considered trustworthy.
 Every activated function receives forward and reverse mappings:
 
 ```text
-function key -> BDF, source ID, global function ID, BAR leases
-BDF          -> function key
-BAR address  -> function key, BAR role, BAR-relative offset
-global func  -> function key
+function key                 -> PCIe function ID, source ID, global function ID,
+                                BAR leases, services
+{host, segment, BDF}         -> function key
+{host, segment, BAR address} -> function key, BAR role, BAR-relative offset
+global function ID           -> function key
 ```
 
 The default BAR roles are:
@@ -248,9 +379,11 @@ BAR2  mailbox/reserved aperture; functional mailbox path is out of scope
 BAR4  standard MSI-X table and PBA aperture
 ```
 
-BAR allocation validates size, alignment, 64-bit aperture overflow, overlap,
-and uniqueness.  Register plans use BAR-relative addresses and are resolved to
-PCIe addresses only by the executor.
+Each host/segment owns an MMIO aperture and BAR allocator.  BAR allocation
+validates size, alignment, 64-bit aperture overflow, overlap, and uniqueness
+within that domain.  Equal numeric BAR bases are legal in different domains.
+Register plans retain the target domain and BAR-relative address; an executor
+resolves them to the corresponding host PCIe address space.
 
 The AF programs the DUT BDF map at:
 
@@ -366,6 +499,14 @@ global function ID, ports, virtio mode, and enable/reset state.  RSS,
 IPRO/EPRO/vport, MAC/VLAN/FDB/promiscuous configuration, and queue
 reset/recovery are explicit dependencies of a complete traffic scenario.
 
+The register plan expresses these relationships as dependency edges.  For
+example, VIO enable depends on the VTX/VRX contexts, MSI-X bindings, scheduler
+path, forwarding path, and committed notify image.  RDMA QP enable depends on
+HMC/context, CQ/CEQ, MSI-X, port/GID, scheduler, and forwarding operations.
+VBLK enable depends on backend, AQ/DQ contexts, MSI-X, and committed BLK notify
+operations.  The orchestrator performs one topological sort; it does not encode
+a growing service-specific `case` statement.
+
 ## 11. VBLK extension
 
 VBLK attaches to a function as a service but uses an independent virtio-device
@@ -418,6 +559,12 @@ scheduler policy.  The same validation and allocation pipeline runs after
 overrides.  A scenario cannot bypass a DUT capability, allocate a global ID,
 or issue a register write.
 
+Scenario values select configuration content only.  Executor selection is an
+environment-composition decision and is never represented by scenario values
+such as plan-only, model, or real.  The same resolved configuration and plan
+are consumed by a spy executor during plan tests or by a user-supplied hardware
+executor during real-DUT tests.
+
 ## 14. Resolution and execution pipeline
 
 The configuration pipeline is:
@@ -428,9 +575,11 @@ scenario preset
 -> topology and service validation
 -> transactional resource reservation
 -> resolved binding graph
--> block-specific register lowering
--> ordered register plan validation
--> AF BAR0/BAR4 PCIe execution
+-> registered modules build typed table images
+-> modules contribute register operations and dependencies
+-> register-plan DAG validation and topological ordering
+-> optional injected executor preflight
+-> executor dispatch to per-host PCI config and/or AF BAR access
 -> readback and state verification
 -> traffic enable
 ```
@@ -442,6 +591,14 @@ starts, the resolved configuration is frozen.  FLR, disable, teardown, and
 migration use service lifecycle plans to freeze, restore, or release the exact
 saved bindings.
 
+Plan construction succeeds independently of executor installation.  If no
+executor is installed, the caller may inspect or dump the validated plan, but
+the orchestrator reports that execution did not occur.  If an executor is
+installed, its complete preflight must pass before the first operation.  The
+first implementation uses a spy executor to prove ordering, payload, target,
+dependency, commit, and failure semantics; real PCIe access remains an explicit
+extension point.
+
 ## 15. Error handling
 
 Validation errors identify the full function and service keys and the rejected
@@ -449,13 +606,16 @@ resource.  Required failures include:
 
 - topology coordinates outside DUT capabilities;
 - no AF, multiple AFs, or AF referring to an inactive function;
-- duplicate BDF, global function ID, BAR range, global qpair, or MSI-X owner;
+- duplicate BDF or overlapping BAR range within one PCIe domain;
+- duplicate global function ID, global qpair, or MSI-X owner across the DUT;
 - a VIO-net device with more than 32 qpairs;
 - VIO local pair outside `0..31` or duplicate within a device;
 - an unavailable PINNED global ID or exhausted resource class;
 - notify entry exhaustion independent of global qpair availability;
 - invalid MSI-X local/global mapping;
 - incomplete scheduler, route, VTX, or VRX dependencies;
+- a cyclic register plan, missing dependency, premature commit/enable, or an
+  operation unsupported by the selected executor;
 - any write payload that is not propagated unchanged to the PCIe TLP.
 
 Hardware write failures stop execution before dependent blocks are enabled.
@@ -489,6 +649,14 @@ Minimum coverage includes:
     silently reassign resources.
 11. A real traffic test observes notify, descriptor processing, DMA, interrupt,
     and packet completion through the DUT rather than a bypass model.
+12. Equal numeric BDFs and BAR bases are accepted in different host domains and
+    rejected when they collide within one domain.
+13. Registered common and service modules contribute to one acyclic plan, and
+    the spy executor observes the exact topological order, targets, payloads,
+    readback policies, commit groups, and enable dependencies.
+14. Building a plan without an executor never reports hardware configuration
+    success, while a new executor can consume the plan without changing any
+    configuration module.
 
 ## 17. Current-code migration boundaries
 
@@ -497,13 +665,21 @@ generic resource manager, a VIO qpair client, BAR4 MSI-X writes, and PCIe
 sequences.  The migration must preserve those reusable pieces while changing
 the following contracts:
 
-- add function/BDF/BAR/global-function reverse lookups;
+- move host/PF/VF topology, DUT capabilities, PCIe domains, BDFs, BARs, and AF
+  selection out of `virtio_net_env_config` and into global `dpu_device_cfg`;
+- add domain-qualified function/BDF/BAR/global-function reverse lookups and
+  independent per-host MMIO apertures;
 - make DUT capabilities the source of topology and service limits;
 - validate VIO local pair range `0..31` in addition to the existing quota;
 - add exact/PREFERRED global-ID lease requests;
 - replace RX/TX `2*g` derivation with one global qpair binding;
-- add AF register plans for BDF, MSI-X, notify, QSCH/DSCH, route, VTX/VRX,
-  VBLK, and service lifecycle;
+- add a configuration-module registry and a shared resolved binding graph for
+  common blocks, global network forwarding, VIO-net, RDMA, and VBLK;
+- add the generic register-plan DAG, dependency validation/order, executor
+  interface, orchestrator handoff, and spy executor before block-specific
+  register lowering;
+- later add AF register modules for BDF, MSI-X, notify, QSCH/DSCH, route,
+  VTX/VRX, VBLK, RDMA, and service lifecycle;
 - fix BAR Memory Write payload propagation before using the executor;
 - connect production queue setup and teardown to resolved leases;
 - add PBA behavior and end-to-end real-DUT data-plane checking.
@@ -512,13 +688,19 @@ This document is the umbrella architecture.  Implementation is split into
 independently testable subprojects, each with its own implementation plan and
 completion gate:
 
-1. capability/topology validation and the mandatory 32-qpair VIO limit;
-2. exact global-resource binding and corrected one-ID-per-qpair semantics;
-3. PCIe payload correctness and common AF BDF/BAR/MSI-X tables;
-4. VIO notify, scheduler, route, VTX/VRX, and real data-plane verification;
-5. VBLK service resources and lifecycle;
-6. RDMA service resources and lifecycle.
+1. generic register-plan DAG, validation/topological ordering, executor
+   interface, orchestrator handoff, and spy executor;
+2. global DPU configuration ownership, independent host PCIe domains, and
+   migration of topology authority out of the VIO environment;
+3. exact global-resource binding and corrected one-ID-per-qpair semantics;
+4. PCIe payload correctness and common AF BDF/BAR/MSI-X plan modules;
+5. network endpoint/forwarding and scheduler plan modules;
+6. VIO notify, route, VTX/VRX, and real data-plane verification;
+7. VBLK service resources, plan module, and lifecycle;
+8. RDMA service resources, plan module, and lifecycle.
 
-The first implementation plan must cover only subproject 1.  Later plans may
-rely on its capability object and validation contract but cannot weaken the
-per-device 32-qpair invariant.
+The next implementation plan covers only subproject 1.  It defines the generic
+plan and execution extension seam without implementing a real-DUT executor or
+any block-specific BDF, MSI-X, notify, scheduler, network, VIO, RDMA, or VBLK
+register programming.  Later plans may supply new executors and modules without
+changing the subproject-1 public contracts.
