@@ -352,6 +352,405 @@ class dpu_reg_plan_test extends uvm_test;
             `uvm_fatal("REG_OP_COPY", "standard copy did not copy base fields")
     endtask
 
+    function automatic dpu_reg_plan build_valid_plan();
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        dpu_test_reg_op bootstrap;
+        string why;
+
+        plan = dpu_reg_plan::type_id::create("valid_plan");
+
+        op = make_mmio_write(
+            "enable", DPU_REG_PHASE_ENABLE,
+            64'h0000_0000_0002_0010, 64'h1
+        );
+        op.add_dependency("notify_commit");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+
+        op = make_mmio_write(
+            "notify_commit", DPU_REG_PHASE_COMMIT,
+            64'h0000_0000_0002_0044, 64'h1
+        );
+        op.kind = DPU_REG_OP_COMMIT;
+        op.commit_group = "vio.notify";
+        op.add_dependency("notify_table");
+        op.add_dependency("notify_verify");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+
+        op = make_mmio_read("notify_verify", DPU_REG_OP_READ_VERIFY);
+        op.expected_value = 64'h0000_0000_1122_3344;
+        op.commit_group = "vio.notify";
+        op.add_dependency("notify_table");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+
+        op = make_mmio_write(
+            "notify_table", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8000, 64'h0000_0000_1122_3344
+        );
+        op.commit_group = "vio.notify";
+        op.add_dependency("bootstrap");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+
+        bootstrap = dpu_test_reg_op::type_id::create("bootstrap_source");
+        configure_mmio_write(
+            bootstrap, "bootstrap", DPU_REG_PHASE_BOOTSTRAP,
+            64'h0000_0000_0000_1010, 64'h0000_0000_5555_aaaa
+        );
+        bootstrap.extension_value = 32'h1234_abcd;
+        if (!plan.add_operation(bootstrap, why))
+            `uvm_fatal("REG_PLAN", why)
+
+        bootstrap.payload = 64'hdead_beef_dead_beef;
+        bootstrap.extension_value = 0;
+        return plan;
+    endfunction
+
+    task assert_plan_validation_and_order();
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        dpu_reg_op found;
+        dpu_reg_op ordered[$];
+        dpu_test_reg_op typed_copy;
+        string expected_ids[$] = '{
+            "bootstrap", "notify_table", "notify_verify",
+            "notify_commit", "enable"
+        };
+        string why;
+
+        plan = build_valid_plan();
+        if (plan.operation_count() != 5)
+            `uvm_fatal("REG_PLAN", "valid plan stored the wrong operation count")
+        if (!plan.validate(why))
+            `uvm_fatal("REG_PLAN", $sformatf("valid plan rejected: %s", why))
+        if (plan.is_frozen())
+            `uvm_fatal("REG_PLAN", "validate unexpectedly froze the plan")
+        if (!plan.find_operation("bootstrap", found))
+            `uvm_fatal("REG_PLAN", "find_operation lost the bootstrap operation")
+        if (!$cast(typed_copy, found) ||
+            (typed_copy.extension_value != 32'h1234_abcd) ||
+            (typed_copy.payload != 64'h0000_0000_5555_aaaa)) begin
+            `uvm_fatal("REG_PLAN", "add/find sliced or aliased the operation copy")
+        end
+        typed_copy.payload = 64'hface_cafe_face_cafe;
+        if (!plan.find_operation("bootstrap", found) ||
+            (found.payload != 64'h0000_0000_5555_aaaa)) begin
+            `uvm_fatal("REG_PLAN", "caller mutated the plan through find_operation")
+        end
+        found = make_mmio_write(
+            "stale", DPU_REG_PHASE_TABLE, 64'h28010, 64'h0);
+        if (plan.find_operation("not_present", found) || (found != null))
+            `uvm_fatal("REG_PLAN", "missing find_operation returned an object")
+
+        ordered.push_back(make_mmio_write(
+            "stale", DPU_REG_PHASE_TABLE, 64'h28010, 64'h0));
+        if (plan.ordered_operations(ordered, why) ||
+            (why != "register plan must be frozen before retrieving order") ||
+            (ordered.size() != 0)) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "unfrozen ordering contract changed: %s", why))
+        end
+
+        if (!plan.freeze(why))
+            `uvm_fatal("REG_PLAN", $sformatf("valid plan rejected: %s", why))
+        if (!plan.is_frozen())
+            `uvm_fatal("REG_PLAN", "successful freeze did not freeze the plan")
+        if (!plan.freeze(why))
+            `uvm_fatal("REG_PLAN", $sformatf("idempotent freeze failed: %s", why))
+        if (!plan.ordered_operations(ordered, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (ordered.size() != expected_ids.size())
+            `uvm_fatal("REG_PLAN", "valid plan returned the wrong operation count")
+        foreach (expected_ids[index]) begin
+            if (ordered[index].op_id != expected_ids[index]) begin
+                `uvm_fatal("REG_PLAN", $sformatf(
+                    "order[%0d]=%s expected %s", index,
+                    ordered[index].op_id, expected_ids[index]))
+            end
+        end
+        if (!$cast(typed_copy, ordered[0]) ||
+            (typed_copy.extension_value != 32'h1234_abcd))
+            `uvm_fatal("REG_PLAN", "ordered_operations sliced the dynamic type")
+        ordered[0].payload = 64'hdead_beef_dead_beef;
+        if (!plan.ordered_operations(ordered, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (ordered[0].payload != 64'h0000_0000_5555_aaaa)
+            `uvm_fatal("REG_PLAN", "caller mutated the frozen plan through a copy")
+
+        op = make_mmio_write(
+            "after_freeze", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8010, 64'h0
+        );
+        if (plan.add_operation(op, why) ||
+            (why != "register plan is frozen")) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "frozen plan accepted an operation: %s", why))
+        end
+    endtask
+
+    task assert_plan_add_rejections();
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        string why;
+
+        plan = dpu_reg_plan::type_id::create("add_rejections");
+        if (plan.add_operation(null, why) ||
+            (why != "cannot add a null register operation") ||
+            (plan.operation_count() != 0)) begin
+            `uvm_fatal("REG_PLAN", $sformatf("null add contract changed: %s", why))
+        end
+
+        op = make_mmio_write(
+            "", DPU_REG_PHASE_TABLE, 64'h0000_0000_0002_8000, 64'h0);
+        if (plan.add_operation(op, why) ||
+            (why != "register operation ID must not be empty") ||
+            (plan.operation_count() != 0)) begin
+            `uvm_fatal("REG_PLAN", $sformatf("empty ID add contract changed: %s", why))
+        end
+
+        op = make_mmio_write(
+            "duplicate", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8000, 64'h0
+        );
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.add_operation(op, why) ||
+            (why != "duplicate register operation ID duplicate") ||
+            (plan.operation_count() != 1)) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "duplicate ID was not rejected precisely: %s", why))
+        end
+
+    endtask
+
+    task assert_plan_structural_rejections();
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        dpu_reg_op ordered[$];
+        string why;
+
+        plan = dpu_reg_plan::type_id::create("empty_plan");
+        if (plan.freeze(why) ||
+            (why != "register plan contains no operations") ||
+            plan.is_frozen()) begin
+            `uvm_fatal("REG_PLAN", $sformatf("empty plan accepted: %s", why))
+        end
+
+        plan = dpu_reg_plan::type_id::create("invalid_operation_plan");
+        op = make_mmio_write(
+            "invalid_width", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8000, 64'h0);
+        op.width_bytes = 3;
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != "operation invalid_width has unsupported MMIO access width 3") ||
+            plan.is_frozen()) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "invalid operation result was not propagated: %s", why))
+        end
+        if (plan.ordered_operations(ordered, why) || (ordered.size() != 0))
+            `uvm_fatal("REG_PLAN", "failed freeze retained a partial order")
+
+        plan = dpu_reg_plan::type_id::create("missing_dependency_plan");
+        op = make_mmio_write(
+            "missing_user", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8000, 64'h0
+        );
+        op.add_dependency("does_not_exist");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != "operation missing_user depends on unknown operation does_not_exist") ||
+            plan.is_frozen()) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "missing dependency was not rejected precisely: %s", why))
+        end
+
+        plan = dpu_reg_plan::type_id::create("repeated_dependency_plan");
+        op = make_mmio_write(
+            "source", DPU_REG_PHASE_BOOTSTRAP, 64'h1010, 64'h0);
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "repeat_user", DPU_REG_PHASE_TABLE, 64'h28000, 64'h0);
+        op.add_dependency("source");
+        op.add_dependency("source");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != "operation repeat_user repeats dependency source") ||
+            plan.is_frozen()) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "duplicate dependency was not rejected precisely: %s", why))
+        end
+
+        plan = dpu_reg_plan::type_id::create("cycle_plan");
+        op = make_mmio_write(
+            "cycle_a", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8000, 64'h0
+        );
+        op.add_dependency("cycle_b");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "cycle_b", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8004, 64'h0
+        );
+        op.add_dependency("cycle_a");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != "register plan contains a dependency cycle") ||
+            plan.is_frozen()) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "cycle was not rejected precisely: %s", why))
+        end
+    endtask
+
+    task assert_commit_rejections();
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        string why;
+
+        plan = dpu_reg_plan::type_id::create("empty_commit_group");
+        op = make_mmio_write(
+            "empty_group_commit", DPU_REG_PHASE_COMMIT, 64'h20044, 64'h1);
+        op.kind = DPU_REG_OP_COMMIT;
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != "operation empty_group_commit commit group must not be empty")) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "empty commit group was not rejected precisely: %s", why))
+        end
+
+        plan = dpu_reg_plan::type_id::create("commit_without_producer");
+        op = make_mmio_read("group_verify", DPU_REG_OP_READ_VERIFY);
+        op.commit_group = "vio.notify";
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "orphan_commit", DPU_REG_PHASE_COMMIT,
+            64'h0000_0000_0002_0044, 64'h1
+        );
+        op.kind = DPU_REG_OP_COMMIT;
+        op.commit_group = "vio.notify";
+        op.add_dependency("group_verify");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != "operation orphan_commit has no table producer in commit group vio.notify")) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "orphan commit was not rejected precisely: %s", why))
+        end
+
+        plan = dpu_reg_plan::type_id::create("partial_commit_plan");
+        op = make_mmio_write(
+            "table_b", DPU_REG_PHASE_TABLE, 64'h28004, 64'h2);
+        op.commit_group = "vio.notify";
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "table_a", DPU_REG_PHASE_TABLE, 64'h28000, 64'h1);
+        op.commit_group = "vio.notify";
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "partial_commit", DPU_REG_PHASE_COMMIT, 64'h20044, 64'h1);
+        op.kind = DPU_REG_OP_COMMIT;
+        op.commit_group = "vio.notify";
+        op.add_dependency("table_a");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (plan.freeze(why) ||
+            (why != "operation partial_commit does not depend on commit-group producer table_b")) begin
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "partial commit was not rejected precisely: %s", why))
+        end
+    endtask
+
+    task assert_deterministic_ready_order();
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        dpu_reg_op ordered[$];
+        string expected_ids[$] = '{"bootstrap", "a_table", "z_table"};
+        string why;
+
+        plan = dpu_reg_plan::type_id::create("deterministic_plan");
+        op = make_mmio_write(
+            "z_table", DPU_REG_PHASE_TABLE, 64'h28010, 64'h0);
+        op.add_dependency("bootstrap");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "a_table", DPU_REG_PHASE_TABLE, 64'h28000, 64'h0);
+        op.add_dependency("bootstrap");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "bootstrap", DPU_REG_PHASE_BOOTSTRAP, 64'h1010, 64'h0);
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        if (!plan.freeze(why) || !plan.ordered_operations(ordered, why))
+            `uvm_fatal("REG_PLAN", why)
+        foreach (expected_ids[index]) begin
+            if (ordered[index].op_id != expected_ids[index]) begin
+                `uvm_fatal("REG_PLAN", $sformatf(
+                    "deterministic order[%0d]=%s expected %s",
+                    index, ordered[index].op_id, expected_ids[index]))
+            end
+        end
+    endtask
+
+    task assert_phase_is_ready_priority_only();
+        dpu_reg_plan plan;
+        dpu_reg_op op;
+        dpu_reg_op ordered[$];
+        string expected_ids[$] = '{
+            "bootstrap", "table_a", "commit_a", "table_b"
+        };
+        string why;
+
+        plan = dpu_reg_plan::type_id::create("multi_stage_plan");
+        op = make_mmio_write(
+            "table_b", DPU_REG_PHASE_TABLE, 64'h28004, 64'h2);
+        op.add_dependency("commit_a");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "commit_a", DPU_REG_PHASE_COMMIT, 64'h20044, 64'h1);
+        op.kind = DPU_REG_OP_COMMIT;
+        op.commit_group = "stage.a";
+        op.add_dependency("table_a");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "table_a", DPU_REG_PHASE_TABLE, 64'h28000, 64'h1);
+        op.commit_group = "stage.a";
+        op.add_dependency("bootstrap");
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+        op = make_mmio_write(
+            "bootstrap", DPU_REG_PHASE_BOOTSTRAP, 64'h1010, 64'h0);
+        if (!plan.add_operation(op, why))
+            `uvm_fatal("REG_PLAN", why)
+
+        if (!plan.freeze(why) || !plan.ordered_operations(ordered, why))
+            `uvm_fatal("REG_PLAN", $sformatf(
+                "multi-stage plan rejected: %s", why))
+        foreach (expected_ids[index]) begin
+            if (ordered[index].op_id != expected_ids[index]) begin
+                `uvm_fatal("REG_PLAN", $sformatf(
+                    "multi-stage order[%0d]=%s expected %s",
+                    index, ordered[index].op_id, expected_ids[index]))
+            end
+        end
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         assert_original_operation_contract();
@@ -359,7 +758,13 @@ class dpu_reg_plan_test extends uvm_test;
         assert_kind_specific_fields();
         assert_pci_boundaries_and_invalid_enum();
         assert_copy_contract();
-        `uvm_info("REG_PLAN_TEST", "register operation contract passed", UVM_LOW)
+        assert_plan_validation_and_order();
+        assert_plan_add_rejections();
+        assert_plan_structural_rejections();
+        assert_commit_rejections();
+        assert_deterministic_ready_order();
+        assert_phase_is_ready_priority_only();
+        `uvm_info("REG_PLAN_TEST", "register plan contract passed", UVM_LOW)
         phase.drop_objection(this);
     endtask
 endclass : dpu_reg_plan_test
