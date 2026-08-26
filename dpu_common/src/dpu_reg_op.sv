@@ -57,7 +57,7 @@ class dpu_reg_op extends uvm_object;
         dependencies.push_back(dependency_id);
     endfunction
 
-    function void copy_from(input dpu_reg_op rhs);
+    protected function void copy_fields_from(input dpu_reg_op rhs);
         op_id = rhs.op_id;
         dependencies = rhs.dependencies;
         owner = rhs.owner;
@@ -82,10 +82,37 @@ class dpu_reg_op extends uvm_object;
         commit_group = rhs.commit_group;
     endfunction
 
+    virtual function void do_copy(uvm_object rhs);
+        dpu_reg_op typed_rhs;
+
+        super.do_copy(rhs);
+        if (!$cast(typed_rhs, rhs)) begin
+            `uvm_error("REG_OP_COPY",
+                "dpu_reg_op::do_copy received an incompatible object")
+            return;
+        end
+        copy_fields_from(typed_rhs);
+    endfunction
+
+    function void copy_from(input dpu_reg_op rhs);
+        if (rhs == null) begin
+            `uvm_error("REG_OP_COPY", "dpu_reg_op::copy_from received null")
+            return;
+        end
+        copy(rhs);
+    endfunction
+
     function dpu_reg_op copy_op(input string copy_name = "dpu_reg_op_copy");
+        uvm_object cloned_object;
         dpu_reg_op copied;
-        copied = new(copy_name);
-        copied.copy_from(this);
+
+        cloned_object = clone();
+        if (!$cast(copied, cloned_object)) begin
+            `uvm_error("REG_OP_COPY",
+                "dpu_reg_op::copy_op clone returned an incompatible object")
+            return null;
+        end
+        copied.set_name(copy_name);
         return copied;
     endfunction
 
@@ -102,6 +129,59 @@ class dpu_reg_op extends uvm_object;
     protected function bit is_mmio_target();
         return (target_space == DPU_REG_TARGET_AF_BAR0) ||
                (target_space == DPU_REG_TARGET_FUNCTION_BAR);
+    endfunction
+
+    protected function bit is_canonical_barrier();
+        return (target_space == DPU_REG_TARGET_NONE) &&
+               (target_block == "") &&
+               !bdf_valid && (bdf == '0) &&
+               (bar_id == 0) && (address == '0) &&
+               (width_bytes == 0) && (payload == '0) &&
+               (write_mask == '0) && (expected_value == '0) &&
+               (read_mask == '0) && (max_attempts == 0) &&
+               (retry_interval === 0) && (commit_group == "");
+    endfunction
+
+    protected function bit validate_write_values(
+        input bit [63:0] valid_mask,
+        output string why
+    );
+        if (write_mask == '0) begin
+            why = $sformatf("operation %s write mask must not be zero", op_id);
+            return 0;
+        end
+        if ((write_mask & ~valid_mask) != '0) begin
+            why = $sformatf(
+                "operation %s write mask exceeds its access width", op_id);
+            return 0;
+        end
+        if ((payload & ~valid_mask) != '0) begin
+            why = $sformatf(
+                "operation %s payload exceeds its access width", op_id);
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    protected function bit validate_read_values(
+        input bit [63:0] valid_mask,
+        output string why
+    );
+        if (read_mask == '0) begin
+            why = $sformatf("operation %s read mask must not be zero", op_id);
+            return 0;
+        end
+        if ((expected_value & ~valid_mask) != '0) begin
+            why = $sformatf(
+                "operation %s expected value exceeds its access width", op_id);
+            return 0;
+        end
+        if ((read_mask & ~valid_mask) != '0) begin
+            why = $sformatf(
+                "operation %s read mask exceeds its access width", op_id);
+            return 0;
+        end
+        return 1;
     endfunction
 
     function bit validate(output string why);
@@ -146,11 +226,8 @@ class dpu_reg_op extends uvm_object;
         end
 
         if (kind == DPU_REG_OP_BARRIER) begin
-            if ((target_space != DPU_REG_TARGET_NONE) ||
-                (width_bytes != 0) || (payload != '0) ||
-                (write_mask != '0) || (read_mask != '0)) begin
-                why = $sformatf(
-                    "operation %s barrier must not describe a register access", op_id);
+            if (!is_canonical_barrier()) begin
+                why = $sformatf("operation %s barrier must be canonical", op_id);
                 return 0;
             end
             return 1;
@@ -191,12 +268,6 @@ class dpu_reg_op extends uvm_object;
                 op_id, width_bytes);
             return 0;
         end
-        if ((target_space == DPU_REG_TARGET_PCI_CONFIG) &&
-            (address > (64'd4096 - width_bytes))) begin
-            why = $sformatf(
-                "operation %s PCI config access exceeds 4KB space", op_id);
-            return 0;
-        end
         if (is_mmio_target() && !(width_bytes inside {1, 2, 4, 8})) begin
             why = $sformatf(
                 "operation %s has unsupported MMIO access width %0d",
@@ -205,6 +276,12 @@ class dpu_reg_op extends uvm_object;
         end
         if ((width_bytes == 0) || ((address % width_bytes) != 0)) begin
             why = $sformatf("operation %s address is not width-aligned", op_id);
+            return 0;
+        end
+        if ((target_space == DPU_REG_TARGET_PCI_CONFIG) &&
+            (address > (64'd4096 - width_bytes))) begin
+            why = $sformatf(
+                "operation %s PCI config access exceeds 4KB space", op_id);
             return 0;
         end
         if ((target_space == DPU_REG_TARGET_AF_BAR0) && (bar_id != 0)) begin
@@ -217,51 +294,67 @@ class dpu_reg_op extends uvm_object;
         end
 
         valid_mask = access_mask();
-        if (kind inside {
-            DPU_REG_OP_PCI_CFG_WRITE, DPU_REG_OP_MMIO_WRITE, DPU_REG_OP_COMMIT
-        }) begin
-            if (write_mask == '0) begin
-                why = $sformatf("operation %s write mask must not be zero", op_id);
-                return 0;
+        case (kind)
+            DPU_REG_OP_PCI_CFG_WRITE,
+            DPU_REG_OP_MMIO_WRITE,
+            DPU_REG_OP_COMMIT: begin
+                if (!validate_write_values(valid_mask, why))
+                    return 0;
+                if ((expected_value != '0) || (read_mask != '0) ||
+                    (max_attempts != 0) || (retry_interval !== 0)) begin
+                    why = $sformatf(
+                        "operation %s write has read/poll fields set", op_id);
+                    return 0;
+                end
+                if ((kind == DPU_REG_OP_COMMIT) &&
+                    (phase != DPU_REG_PHASE_COMMIT)) begin
+                    why = $sformatf(
+                        "operation %s commit must use the commit phase", op_id);
+                    return 0;
+                end
             end
-            if ((write_mask & ~valid_mask) != '0) begin
+
+            DPU_REG_OP_READ_VERIFY: begin
+                if (!validate_read_values(valid_mask, why))
+                    return 0;
+                if ((payload != '0) || (write_mask != '0)) begin
+                    why = $sformatf(
+                        "operation %s read has write fields set", op_id);
+                    return 0;
+                end
+                if ((max_attempts != 0) || (retry_interval !== 0)) begin
+                    why = $sformatf(
+                        "operation %s read-verify has poll fields set", op_id);
+                    return 0;
+                end
+            end
+
+            DPU_REG_OP_POLL_UNTIL: begin
+                if (!validate_read_values(valid_mask, why))
+                    return 0;
+                if ((payload != '0) || (write_mask != '0)) begin
+                    why = $sformatf(
+                        "operation %s poll has write fields set", op_id);
+                    return 0;
+                end
+                if (max_attempts == 0) begin
+                    why = $sformatf(
+                        "operation %s poll attempt count must be nonzero", op_id);
+                    return 0;
+                end
+                if ($isunknown(retry_interval)) begin
+                    why = $sformatf(
+                        "operation %s retry interval must be known", op_id);
+                    return 0;
+                end
+            end
+
+            default: begin
                 why = $sformatf(
-                    "operation %s write mask exceeds its access width", op_id);
+                    "operation %s has unsupported operation kind", op_id);
                 return 0;
             end
-            if ((payload & ~valid_mask) != '0) begin
-                why = $sformatf(
-                    "operation %s payload exceeds its access width", op_id);
-                return 0;
-            end
-        end
-        else begin
-            if (read_mask == '0) begin
-                why = $sformatf("operation %s read mask must not be zero", op_id);
-                return 0;
-            end
-            if ((expected_value & ~valid_mask) != '0) begin
-                why = $sformatf(
-                    "operation %s expected value exceeds its access width", op_id);
-                return 0;
-            end
-            if ((read_mask & ~valid_mask) != '0) begin
-                why = $sformatf(
-                    "operation %s read mask exceeds its access width", op_id);
-                return 0;
-            end
-        end
-        if ((kind == DPU_REG_OP_POLL_UNTIL) && (max_attempts == 0)) begin
-            why = $sformatf(
-                "operation %s poll attempt count must be nonzero", op_id);
-            return 0;
-        end
-        if ((kind == DPU_REG_OP_COMMIT) &&
-            (phase != DPU_REG_PHASE_COMMIT)) begin
-            why = $sformatf(
-                "operation %s commit must use the commit phase", op_id);
-            return 0;
-        end
+        endcase
         return 1;
     endfunction
 endclass : dpu_reg_op
