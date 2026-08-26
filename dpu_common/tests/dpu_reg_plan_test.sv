@@ -1556,6 +1556,120 @@ class dpu_reg_plan_test extends uvm_test;
         dpu_bad_copy_reg_op::tamper_copies = 0;
     endtask
 
+    task assert_spy_failure_configuration_snapshot();
+        dpu_reg_plan plan;
+        dpu_reg_plan other_plan;
+        dpu_spy_reg_executor spy;
+        dpu_reg_op recorded;
+        dpu_reg_op_result_e result;
+        dpu_cfg_status_e status;
+        string why;
+
+        plan = build_valid_plan();
+        other_plan = build_valid_plan();
+        if (!plan.freeze(why) || !other_plan.freeze(why))
+            `uvm_fatal("REG_EXEC_SNAPSHOT", why)
+        spy = dpu_spy_reg_executor::type_id::create("snapshot_spy");
+
+        spy.fail_operation("notify_table");
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC_SNAPSHOT", why)
+        spy.fail_operation("notify_verify");
+        spy.execute(plan, status);
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 2) ||
+            (spy.last_error() !=
+             "injected execution failure at operation notify_table")) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT", $sformatf(
+                {"post-preflight failure mutation changed execution: ",
+                 "status=%0d count=%0d error=%s"},
+                status, spy.record_count(), spy.last_error()))
+        end
+        if (!spy.record_at(0, recorded, result, why) ||
+            (recorded.op_id != "bootstrap") ||
+            (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT",
+                "snapshot failure lost the successful bootstrap prefix")
+        end
+        if (!spy.record_at(1, recorded, result, why) ||
+            (recorded.op_id != "notify_table") ||
+            (result != DPU_REG_OP_RESULT_FAILED)) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT",
+                "snapshot failure did not stop at notify_table")
+        end
+        recorded = make_mmio_write(
+            "stale_snapshot_record", DPU_REG_PHASE_TABLE, 64'h28010, 64'h0);
+        result = DPU_REG_OP_RESULT_SUCCEEDED;
+        if (spy.record_at(2, recorded, result, why) ||
+            (recorded != null) || (result != DPU_REG_OP_RESULT_NOT_RUN) ||
+            (why != "spy record index 2 is out of range")) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT", $sformatf(
+                "snapshot table failure exposed a third record: %s", why))
+        end
+
+        spy.reset_history();
+        spy.fail_operation("notify_table");
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC_SNAPSHOT", why)
+        spy.fail_operation("");
+        spy.execute(plan, status);
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 2) ||
+            (spy.last_error() !=
+             "injected execution failure at operation notify_table")) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT",
+                "clearing configured failure changed authorized execution")
+        end
+
+        spy.reset_history();
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC_SNAPSHOT", why)
+        spy.fail_operation("not_present");
+        spy.execute(plan, status);
+        if ((status !== DPU_CFG_STATUS_SUCCEEDED) ||
+            (spy.record_count() != 5) || (spy.last_error() != "")) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT",
+                "post-preflight unknown failure changed current execution")
+        end
+        if (spy.preflight(plan, why) ||
+            (why !=
+             "spy failure operation not_present is not in the register plan") ||
+            (spy.last_error() != why)) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT", $sformatf(
+                "next preflight did not observe configured failure: %s", why))
+        end
+        spy.execute(plan, status);
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 5) ||
+            (spy.last_error() !=
+             "spy executor execute called without successful preflight")) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT",
+                "failed next preflight retained an execution authorization")
+        end
+
+        spy.reset_history();
+        spy.fail_operation("notify_table");
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC_SNAPSHOT", why)
+        spy.fail_operation("notify_verify");
+        spy.execute(other_plan, status);
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 0) ||
+            (spy.last_error() !=
+             "spy executor execute plan does not match preflight plan")) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT",
+                "snapshot authorization bypassed cross-plan rejection")
+        end
+        spy.execute(plan, status);
+        if ((status !== DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 0) ||
+            (spy.last_error() !=
+             "spy executor execute authorization was already consumed")) begin
+            `uvm_fatal("REG_EXEC_SNAPSHOT",
+                "snapshot authorization was reusable after cross-plan rejection")
+        end
+    endtask
+
     task assert_orchestrator_contract();
         dpu_config_orchestrator orchestrator;
         dpu_reg_plan plan;
@@ -1908,6 +2022,7 @@ class dpu_reg_plan_test extends uvm_test;
         assert_phase_is_ready_priority_only();
         assert_large_plan_order();
         assert_spy_executor_contract();
+        assert_spy_failure_configuration_snapshot();
         assert_orchestrator_contract();
         `uvm_info("REG_PLAN_TEST", "register plan contract passed", UVM_LOW)
         phase.drop_objection(this);

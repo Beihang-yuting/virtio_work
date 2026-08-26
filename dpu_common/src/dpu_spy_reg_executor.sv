@@ -7,6 +7,7 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
     protected dpu_reg_op recorded_operations[$];
     protected dpu_reg_op_result_e recorded_results[$];
     protected string failed_operation_id;
+    protected string authorized_failed_operation_id;
     protected string preflight_failure_text;
     protected bit preflight_called;
     protected bit preflight_empty_history;
@@ -19,6 +20,7 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
         recorded_operations.delete();
         recorded_results.delete();
         failed_operation_id = "";
+        authorized_failed_operation_id = "";
         preflight_failure_text = "";
         preflight_called = 0;
         preflight_empty_history = 0;
@@ -66,6 +68,7 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
         preflight_plan = null;
         execute_authorization_consumed = 0;
         failed_operation_id = "";
+        authorized_failed_operation_id = "";
         preflight_failure_text = "";
         set_last_error("");
     endfunction
@@ -98,6 +101,7 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
             (recorded_results.size() == 0);
         preflight_succeeded = 0;
         preflight_plan = null;
+        authorized_failed_operation_id = "";
         execute_authorization_consumed = 0;
         why = "";
         set_last_error("");
@@ -127,6 +131,7 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
         end
         preflight_succeeded = 1;
         preflight_plan = plan;
+        authorized_failed_operation_id = failed_operation_id;
         return 1;
     endfunction
 
@@ -138,6 +143,8 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
         dpu_reg_op recorded_copy;
         dpu_reg_op staged_operations[$];
         dpu_reg_op_result_e staged_results[$];
+        dpu_reg_plan execution_plan;
+        string execution_failed_operation_id;
         string why;
 
         status = DPU_CFG_STATUS_EXECUTION_FAILED;
@@ -155,8 +162,13 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
                 "spy executor execute called without successful preflight");
             return;
         end
+        execution_plan = preflight_plan;
+        execution_failed_operation_id = authorized_failed_operation_id;
         execute_authorization_consumed = 1;
-        if (plan != preflight_plan) begin
+        preflight_succeeded = 0;
+        preflight_plan = null;
+        authorized_failed_operation_id = "";
+        if (plan != execution_plan) begin
             set_last_error(
                 "spy executor execute plan does not match preflight plan");
             return;
@@ -177,7 +189,7 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
                 return;
             end
             staged_operations.push_back(recorded_copy);
-            if (ordered[index].op_id == failed_operation_id) begin
+            if (ordered[index].op_id == execution_failed_operation_id) begin
                 staged_results.push_back(DPU_REG_OP_RESULT_FAILED);
                 recorded_operations = {
                     recorded_operations, staged_operations
