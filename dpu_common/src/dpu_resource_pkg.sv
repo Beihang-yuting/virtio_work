@@ -14,6 +14,8 @@ package dpu_resource_pkg;
   `include "dpu_reg_plan_types.sv"
   `include "dpu_reg_op.sv"
   `include "dpu_reg_plan.sv"
+  `include "dpu_reg_executor.sv"
+  `include "dpu_spy_reg_executor.sv"
   `include "dpu_dut_caps.sv"
   `include "dpu_resource_manager.sv"
   `include "dpu_fabric_env.sv"

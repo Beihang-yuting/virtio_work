@@ -920,6 +920,242 @@ class dpu_reg_plan_test extends uvm_test;
         end
     endtask
 
+    task assert_spy_executor_contract();
+        dpu_reg_plan plan;
+        dpu_reg_plan unfrozen_plan;
+        dpu_reg_plan other_plan;
+        dpu_reg_plan copy_failure_plan;
+        dpu_spy_reg_executor spy;
+        dpu_reg_op recorded;
+        dpu_bad_copy_reg_op bad_copy;
+        dpu_reg_op_result_e result;
+        dpu_cfg_status_e status;
+        string why;
+
+        plan = build_valid_plan();
+        if (!plan.freeze(why))
+            `uvm_fatal("REG_EXEC", why)
+        spy = dpu_spy_reg_executor::type_id::create("spy");
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC", $sformatf("spy preflight failed: %s", why))
+        if (!spy.preflight_history_was_empty() ||
+            (spy.record_count() != 0)) begin
+            `uvm_fatal("REG_EXEC", "spy recorded an operation before preflight")
+        end
+        spy.execute(plan, status);
+        if (status != DPU_CFG_STATUS_SUCCEEDED)
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "spy execution failed: %s", spy.last_error()))
+        if (spy.record_count() != 5)
+            `uvm_fatal("REG_EXEC", "spy did not record all five operations")
+        if (!spy.record_at(1, recorded, result, why))
+            `uvm_fatal("REG_EXEC", why)
+        if ((recorded.op_id != "notify_table") ||
+            (recorded.target_space != DPU_REG_TARGET_AF_BAR0) ||
+            (recorded.target_scope != DPU_REG_SCOPE_SINGLE) ||
+            (recorded.host_id != 0) || (recorded.segment_id != 0) ||
+            !recorded.bdf_valid || (recorded.bdf != 16'h0000) ||
+            (recorded.bar_id != 0) ||
+            (recorded.address != 64'h0000_0000_0002_8000) ||
+            (recorded.payload != 64'h0000_0000_1122_3344) ||
+            (recorded.commit_group != "vio.notify") ||
+            (recorded.dependencies.size() != 1) ||
+            (recorded.dependencies[0] != "bootstrap") ||
+            (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
+            `uvm_fatal("REG_EXEC",
+                "spy did not preserve table target/payload/result")
+        end
+        recorded.payload = '0;
+        recorded.dependencies.push_back("caller_only");
+        if (!spy.record_at(1, recorded, result, why) ||
+            (recorded.payload != 64'h0000_0000_1122_3344) ||
+            (recorded.dependencies.size() != 1)) begin
+            `uvm_fatal("REG_EXEC", "caller mutated spy history through record_at")
+        end
+        if (!spy.record_at(2, recorded, result, why))
+            `uvm_fatal("REG_EXEC", why)
+        if ((recorded.op_id != "notify_verify") ||
+            (recorded.kind != DPU_REG_OP_READ_VERIFY) ||
+            (recorded.expected_value != 64'h0000_0000_1122_3344) ||
+            (recorded.read_mask != 64'h0000_0000_ffff_ffff) ||
+            (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
+            `uvm_fatal("REG_EXEC", "spy did not preserve readback policy/result")
+        end
+        if (!spy.record_at(3, recorded, result, why))
+            `uvm_fatal("REG_EXEC", why)
+        if ((recorded.op_id != "notify_commit") ||
+            (recorded.kind != DPU_REG_OP_COMMIT) ||
+            (recorded.commit_group != "vio.notify") ||
+            (recorded.dependencies.size() != 2) ||
+            (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
+            `uvm_fatal("REG_EXEC", "spy did not preserve commit policy/result")
+        end
+        if (!spy.record_at(4, recorded, result, why))
+            `uvm_fatal("REG_EXEC", why)
+        if ((recorded.op_id != "enable") ||
+            (recorded.phase != DPU_REG_PHASE_ENABLE) ||
+            (recorded.dependencies.size() != 1) ||
+            (recorded.dependencies[0] != "notify_commit") ||
+            (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
+            `uvm_fatal("REG_EXEC", "spy did not preserve enable dependency/result")
+        end
+
+        recorded = make_mmio_write(
+            "stale_record", DPU_REG_PHASE_TABLE, 64'h28010, 64'h0);
+        result = DPU_REG_OP_RESULT_SUCCEEDED;
+        if (spy.record_at(5, recorded, result, why) ||
+            (recorded != null) || (result != DPU_REG_OP_RESULT_NOT_RUN) ||
+            (why != "spy record index 5 is out of range")) begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "out-of-range spy record contract changed: %s", why))
+        end
+
+        spy.reset_history();
+        spy.fail_operation("notify_table");
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC", why)
+        spy.execute(plan, status);
+        if (status != DPU_CFG_STATUS_EXECUTION_FAILED)
+            `uvm_fatal("REG_EXEC",
+                "injected operation failure did not fail execution")
+        if (spy.record_count() != 2)
+            `uvm_fatal("REG_EXEC", "spy executed commit/enable after table failure")
+        if (!spy.record_at(1, recorded, result, why))
+            `uvm_fatal("REG_EXEC", why)
+        if ((recorded.op_id != "notify_table") ||
+            (result != DPU_REG_OP_RESULT_FAILED)) begin
+            `uvm_fatal("REG_EXEC", "spy did not record the injected table failure")
+        end
+        if (spy.last_error() !=
+            "injected execution failure at operation notify_table") begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "unexpected spy failure text: %s", spy.last_error()))
+        end
+
+        spy.reset_history();
+        if ((spy.record_count() != 0) ||
+            spy.preflight_history_was_empty() || (spy.last_error() != "")) begin
+            `uvm_fatal("REG_EXEC", "spy reset did not clear its complete state")
+        end
+        spy.execute(plan, status);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 0) ||
+            (spy.last_error() !=
+             "spy executor execute called before preflight")) begin
+            `uvm_fatal("REG_EXEC", "execute-before-preflight contract changed")
+        end
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC", why)
+        spy.execute(plan, status);
+        if ((status != DPU_CFG_STATUS_SUCCEEDED) ||
+            (spy.record_count() != 5) || (spy.last_error() != "")) begin
+            `uvm_fatal("REG_EXEC", "reset retained an injected operation failure")
+        end
+
+        spy.reset_history();
+        if (spy.preflight(null, why) ||
+            (why != "spy executor received a null register plan") ||
+            (spy.last_error() != why)) begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "null preflight contract changed: %s", why))
+        end
+        unfrozen_plan = build_valid_plan();
+        if (spy.preflight(unfrozen_plan, why) ||
+            (why != "spy executor requires a frozen register plan") ||
+            (spy.last_error() != why)) begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "unfrozen preflight contract changed: %s", why))
+        end
+        spy.reset_history();
+        spy.fail_operation("not_present");
+        if (spy.preflight(plan, why) ||
+            (why !=
+             "spy failure operation not_present is not in the register plan") ||
+            (spy.last_error() != why)) begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "unknown failure operation contract changed: %s", why))
+        end
+        spy.reset_history();
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC", why)
+        spy.fail_preflight("injected preflight failure");
+        if (spy.preflight(plan, why) ||
+            (why != "injected preflight failure") ||
+            (spy.last_error() != why) ||
+            !spy.preflight_history_was_empty() ||
+            (spy.record_count() != 0)) begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "injected preflight failure contract changed: %s", why))
+        end
+        spy.execute(plan, status);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 0) ||
+            (spy.last_error() !=
+             "spy executor execute called without successful preflight")) begin
+            `uvm_fatal("REG_EXEC",
+                "failed preflight authorized register execution")
+        end
+
+        spy.reset_history();
+        other_plan = build_valid_plan();
+        if (!other_plan.freeze(why))
+            `uvm_fatal("REG_EXEC", why)
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC", why)
+        spy.execute(other_plan, status);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 0) ||
+            (spy.last_error() !=
+             "spy executor execute plan does not match preflight plan")) begin
+            `uvm_fatal("REG_EXEC",
+                "preflight for one plan authorized a different plan")
+        end
+
+        spy.reset_history();
+        if (!spy.preflight(plan, why))
+            `uvm_fatal("REG_EXEC", why)
+        spy.execute(plan, status);
+        if ((status != DPU_CFG_STATUS_SUCCEEDED) ||
+            (spy.record_count() != 5)) begin
+            `uvm_fatal("REG_EXEC", "single-use authorization execution failed")
+        end
+        spy.execute(plan, status);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 5) ||
+            (spy.last_error() !=
+             "spy executor execute authorization was already consumed")) begin
+            `uvm_fatal("REG_EXEC", "execute authorization was reusable")
+        end
+
+        copy_failure_plan = dpu_reg_plan::type_id::create("copy_failure_plan");
+        bad_copy = dpu_bad_copy_reg_op::type_id::create("bad_spy_copy");
+        configure_mmio_write(
+            bad_copy, "bad_spy_copy", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8000, 64'h0);
+        if (!copy_failure_plan.add_operation(bad_copy, why) ||
+            !copy_failure_plan.freeze(why)) begin
+            `uvm_fatal("REG_EXEC", why)
+        end
+        spy.reset_history();
+        if (!spy.preflight(copy_failure_plan, why))
+            `uvm_fatal("REG_EXEC", why)
+        spy.execute(copy_failure_plan, status);
+        if ((status != DPU_CFG_STATUS_SUCCEEDED) ||
+            (spy.record_count() != 1)) begin
+            `uvm_fatal("REG_EXEC", "spy could not record a dynamic operation subtype")
+        end
+        recorded = make_mmio_write(
+            "stale_bad_copy", DPU_REG_PHASE_TABLE, 64'h28010, 64'h0);
+        result = DPU_REG_OP_RESULT_SUCCEEDED;
+        dpu_bad_copy_reg_op::tamper_copies = 1;
+        if (spy.record_at(0, recorded, result, why) ||
+            (recorded != null) || (result != DPU_REG_OP_RESULT_NOT_RUN) ||
+            (why == "") || (spy.record_count() != 1)) begin
+            `uvm_fatal("REG_EXEC", "spy exposed a corrupt dynamic operation copy")
+        end
+        dpu_bad_copy_reg_op::tamper_copies = 0;
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         assert_original_operation_contract();
@@ -935,6 +1171,7 @@ class dpu_reg_plan_test extends uvm_test;
         assert_deterministic_ready_order();
         assert_phase_is_ready_priority_only();
         assert_large_plan_order();
+        assert_spy_executor_contract();
         `uvm_info("REG_PLAN_TEST", "register plan contract passed", UVM_LOW)
         phase.drop_objection(this);
     endtask
