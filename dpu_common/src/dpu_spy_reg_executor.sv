@@ -136,6 +136,8 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
     );
         dpu_reg_op ordered[$];
         dpu_reg_op recorded_copy;
+        dpu_reg_op staged_operations[$];
+        dpu_reg_op_result_e staged_results[$];
         string why;
 
         status = DPU_CFG_STATUS_EXECUTION_FAILED;
@@ -153,20 +155,20 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
                 "spy executor execute called without successful preflight");
             return;
         end
+        execute_authorization_consumed = 1;
         if (plan != preflight_plan) begin
             set_last_error(
                 "spy executor execute plan does not match preflight plan");
             return;
         end
-        execute_authorization_consumed = 1;
         if (!plan.ordered_operations(ordered, why)) begin
             set_last_error(why);
             return;
         end
 
-        // History is cumulative until reset_history(). Every operation copy is
-        // validated before either queue is extended, preserving queue alignment
-        // and keeping a failed copy out of the externally observable history.
+        // History is cumulative until reset_history(). Copies and results for
+        // one execute call remain local until either the whole run succeeds or
+        // an injected functional failure establishes an executed prefix.
         foreach (ordered[index]) begin
             if (!copy_operation(
                 ordered[index], ordered[index].op_id,
@@ -174,16 +176,22 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
                 set_last_error(why);
                 return;
             end
-            recorded_operations.push_back(recorded_copy);
+            staged_operations.push_back(recorded_copy);
             if (ordered[index].op_id == failed_operation_id) begin
-                recorded_results.push_back(DPU_REG_OP_RESULT_FAILED);
+                staged_results.push_back(DPU_REG_OP_RESULT_FAILED);
+                recorded_operations = {
+                    recorded_operations, staged_operations
+                };
+                recorded_results = {recorded_results, staged_results};
                 set_last_error($sformatf(
                     "injected execution failure at operation %s",
                     ordered[index].op_id));
                 return;
             end
-            recorded_results.push_back(DPU_REG_OP_RESULT_SUCCEEDED);
+            staged_results.push_back(DPU_REG_OP_RESULT_SUCCEEDED);
         end
+        recorded_operations = {recorded_operations, staged_operations};
+        recorded_results = {recorded_results, staged_results};
         set_last_error("");
         status = DPU_CFG_STATUS_SUCCEEDED;
     endtask

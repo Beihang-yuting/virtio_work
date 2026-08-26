@@ -44,6 +44,24 @@ class dpu_bad_copy_reg_op extends dpu_reg_op;
     endfunction
 endclass : dpu_bad_copy_reg_op
 
+class dpu_counted_copy_reg_op extends dpu_reg_op;
+    `uvm_object_utils(dpu_counted_copy_reg_op)
+
+    static int unsigned copy_count;
+    static int unsigned tamper_on_copy;
+
+    function new(string name = "dpu_counted_copy_reg_op");
+        super.new(name);
+    endfunction
+
+    virtual function void do_copy(uvm_object rhs);
+        super.do_copy(rhs);
+        copy_count++;
+        if ((tamper_on_copy != 0) && (copy_count == tamper_on_copy))
+            op_id = "tampered_execute_copy_id";
+    endfunction
+endclass : dpu_counted_copy_reg_op
+
 class dpu_reg_plan_test extends uvm_test;
     `uvm_component_utils(dpu_reg_plan_test)
 
@@ -924,12 +942,21 @@ class dpu_reg_plan_test extends uvm_test;
         dpu_reg_plan plan;
         dpu_reg_plan unfrozen_plan;
         dpu_reg_plan other_plan;
+        dpu_reg_plan execute_copy_failure_plan;
         dpu_reg_plan copy_failure_plan;
         dpu_spy_reg_executor spy;
+        dpu_reg_op op;
         dpu_reg_op recorded;
+        dpu_test_reg_op recorded_bootstrap;
         dpu_bad_copy_reg_op bad_copy;
+        dpu_counted_copy_reg_op counted_copy;
         dpu_reg_op_result_e result;
         dpu_cfg_status_e status;
+        int unsigned before_count;
+        string expected_ids[$] = '{
+            "bootstrap", "notify_table", "notify_verify",
+            "notify_commit", "enable"
+        };
         string why;
 
         plan = build_valid_plan();
@@ -948,6 +975,27 @@ class dpu_reg_plan_test extends uvm_test;
                 "spy execution failed: %s", spy.last_error()))
         if (spy.record_count() != 5)
             `uvm_fatal("REG_EXEC", "spy did not record all five operations")
+        foreach (expected_ids[index]) begin
+            if (!spy.record_at(index, recorded, result, why) ||
+                (why != "") || (recorded.op_id != expected_ids[index]) ||
+                (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
+                `uvm_fatal("REG_EXEC", $sformatf(
+                    "spy record[%0d] did not preserve ordered success %s: %s",
+                    index, expected_ids[index], why))
+            end
+        end
+        if (!spy.record_at(0, recorded, result, why) ||
+            !$cast(recorded_bootstrap, recorded) ||
+            (recorded_bootstrap.op_id != "bootstrap") ||
+            (recorded_bootstrap.kind != DPU_REG_OP_MMIO_WRITE) ||
+            (recorded_bootstrap.phase != DPU_REG_PHASE_BOOTSTRAP) ||
+            (recorded_bootstrap.address != 64'h0000_0000_0000_1010) ||
+            (recorded_bootstrap.payload != 64'h0000_0000_5555_aaaa) ||
+            (recorded_bootstrap.extension_value != 32'h1234_abcd) ||
+            (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
+            `uvm_fatal("REG_EXEC",
+                "spy did not preserve the exact successful bootstrap record")
+        end
         if (!spy.record_at(1, recorded, result, why))
             `uvm_fatal("REG_EXEC", why)
         if ((recorded.op_id != "notify_table") ||
@@ -987,6 +1035,8 @@ class dpu_reg_plan_test extends uvm_test;
             (recorded.kind != DPU_REG_OP_COMMIT) ||
             (recorded.commit_group != "vio.notify") ||
             (recorded.dependencies.size() != 2) ||
+            (recorded.dependencies[0] != "notify_table") ||
+            (recorded.dependencies[1] != "notify_verify") ||
             (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
             `uvm_fatal("REG_EXEC", "spy did not preserve commit policy/result")
         end
@@ -1020,11 +1070,26 @@ class dpu_reg_plan_test extends uvm_test;
                 "injected operation failure did not fail execution")
         if (spy.record_count() != 2)
             `uvm_fatal("REG_EXEC", "spy executed commit/enable after table failure")
+        if (!spy.record_at(0, recorded, result, why) ||
+            (recorded.op_id != "bootstrap") ||
+            (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
+            `uvm_fatal("REG_EXEC",
+                "spy did not record successful bootstrap before table failure")
+        end
         if (!spy.record_at(1, recorded, result, why))
             `uvm_fatal("REG_EXEC", why)
         if ((recorded.op_id != "notify_table") ||
             (result != DPU_REG_OP_RESULT_FAILED)) begin
             `uvm_fatal("REG_EXEC", "spy did not record the injected table failure")
+        end
+        recorded = make_mmio_write(
+            "stale_failure_record", DPU_REG_PHASE_TABLE, 64'h28010, 64'h0);
+        result = DPU_REG_OP_RESULT_SUCCEEDED;
+        if (spy.record_at(2, recorded, result, why) ||
+            (recorded != null) || (result != DPU_REG_OP_RESULT_NOT_RUN) ||
+            (why != "spy record index 2 is out of range")) begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "failure history exposed a third record: %s", why))
         end
         if (spy.last_error() !=
             "injected execution failure at operation notify_table") begin
@@ -1110,6 +1175,14 @@ class dpu_reg_plan_test extends uvm_test;
             `uvm_fatal("REG_EXEC",
                 "preflight for one plan authorized a different plan")
         end
+        spy.execute(plan, status);
+        if ((status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != 0) ||
+            (spy.last_error() !=
+             "spy executor execute authorization was already consumed")) begin
+            `uvm_fatal("REG_EXEC",
+                "cross-plan execute did not consume its authorization")
+        end
 
         spy.reset_history();
         if (!spy.preflight(plan, why))
@@ -1126,6 +1199,60 @@ class dpu_reg_plan_test extends uvm_test;
              "spy executor execute authorization was already consumed")) begin
             `uvm_fatal("REG_EXEC", "execute authorization was reusable")
         end
+
+        execute_copy_failure_plan =
+            dpu_reg_plan::type_id::create("execute_copy_failure_plan");
+        op = make_mmio_write(
+            "copy_prefix", DPU_REG_PHASE_BOOTSTRAP, 64'h1010, 64'h0);
+        if (!execute_copy_failure_plan.add_operation(op, why))
+            `uvm_fatal("REG_EXEC", why)
+        counted_copy =
+            dpu_counted_copy_reg_op::type_id::create("counted_copy_source");
+        configure_mmio_write(
+            counted_copy, "execute_copy_failure", DPU_REG_PHASE_TABLE,
+            64'h0000_0000_0002_8000, 64'h0);
+        counted_copy.add_dependency("copy_prefix");
+        dpu_counted_copy_reg_op::copy_count = 0;
+        dpu_counted_copy_reg_op::tamper_on_copy = 3;
+        if (!execute_copy_failure_plan.add_operation(counted_copy, why) ||
+            (dpu_counted_copy_reg_op::copy_count != 1) ||
+            !execute_copy_failure_plan.freeze(why)) begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "could not build counted copy failure plan: %s", why))
+        end
+        before_count = spy.record_count();
+        if (before_count != 5)
+            `uvm_fatal("REG_EXEC", "copy failure test lost sentinel history")
+        if (!spy.preflight(execute_copy_failure_plan, why))
+            `uvm_fatal("REG_EXEC", why)
+        spy.execute(execute_copy_failure_plan, status);
+        if ((dpu_counted_copy_reg_op::copy_count != 3) ||
+            (status != DPU_CFG_STATUS_EXECUTION_FAILED) ||
+            (spy.record_count() != before_count) ||
+            (spy.last_error() !=
+             {"spy operation copy ID tampered_execute_copy_id does not match ",
+              "expected ID execute_copy_failure"})) begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "execute copy failure was not atomic: copies=%0d count=%0d error=%s",
+                dpu_counted_copy_reg_op::copy_count,
+                spy.record_count(), spy.last_error()))
+        end
+        recorded = make_mmio_write(
+            "stale_partial_record", DPU_REG_PHASE_TABLE, 64'h28010, 64'h0);
+        result = DPU_REG_OP_RESULT_SUCCEEDED;
+        if (spy.record_at(before_count, recorded, result, why) ||
+            (recorded != null) || (result != DPU_REG_OP_RESULT_NOT_RUN) ||
+            (why != $sformatf(
+                "spy record index %0d is out of range", before_count))) begin
+            `uvm_fatal("REG_EXEC", $sformatf(
+                "execute copy failure exposed a staged prefix: %s", why))
+        end
+        if (!spy.record_at(0, recorded, result, why) ||
+            (recorded.op_id != "bootstrap") ||
+            (result != DPU_REG_OP_RESULT_SUCCEEDED)) begin
+            `uvm_fatal("REG_EXEC", "execute copy failure corrupted old history")
+        end
+        dpu_counted_copy_reg_op::tamper_on_copy = 0;
 
         copy_failure_plan = dpu_reg_plan::type_id::create("copy_failure_plan");
         bad_copy = dpu_bad_copy_reg_op::type_id::create("bad_spy_copy");
@@ -1150,7 +1277,9 @@ class dpu_reg_plan_test extends uvm_test;
         dpu_bad_copy_reg_op::tamper_copies = 1;
         if (spy.record_at(0, recorded, result, why) ||
             (recorded != null) || (result != DPU_REG_OP_RESULT_NOT_RUN) ||
-            (why == "") || (spy.record_count() != 1)) begin
+            (why != {"spy operation copy ID tampered_copy_id does not match ",
+                     "expected ID bad_spy_copy"}) ||
+            (spy.record_count() != 1)) begin
             `uvm_fatal("REG_EXEC", "spy exposed a corrupt dynamic operation copy")
         end
         dpu_bad_copy_reg_op::tamper_copies = 0;
