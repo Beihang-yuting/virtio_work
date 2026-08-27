@@ -86,6 +86,22 @@ class virtio_monitor_routing_disabled_notify_sva_catcher extends uvm_report_catc
     endfunction
 endclass : virtio_monitor_routing_disabled_notify_sva_catcher
 
+// Calls configure_services() during the owning test's build phase but does
+// not manufacture compatibility children if the preflight is rejected.
+class virtio_service_preflight_probe extends virtio_pf_instance;
+    `uvm_component_utils(virtio_service_preflight_probe)
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+    endfunction
+
+    virtual function void connect_phase(uvm_phase phase);
+    endfunction
+endclass : virtio_service_preflight_probe
+
 // Exercises the public virtio_net_env PCIe binding with two Fabric functions.
 // A TLP emitted on the external endpoint monitor is addressed only by the PF
 // BAR range; the VF must neither observe it nor classify it as DMA.
@@ -121,6 +137,208 @@ class virtio_monitor_routing_test extends uvm_test;
         super.new(name, parent);
     endfunction
 
+    // Break caught: bind_to_device accepts a legacy manager merely because
+    // that manager happens to contain the function and qpair class.
+    protected function bit check_device_bind_requires_snapshot_seed();
+        dpu_resource_manager manager;
+        virtio_resource_client client;
+        dpu_function_key_t key;
+        dpu_resource_class_id_t class_id;
+        string why;
+
+        key.host_id = 0;
+        key.pf_id = 0;
+        key.kind = DPU_FUNCTION_PF;
+        key.vf_id = 0;
+        manager = dpu_resource_manager::type_id::create(
+            "fix1_legacy_device_bind_manager");
+        if (!manager.register_function(key, why) ||
+            !manager.register_resource_class(
+                "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
+                2048, 32, class_id, why) ||
+            !manager.seal_resource_classes(why)) begin
+            `uvm_fatal("FIX1_SETUP", $sformatf(
+                "could not build legacy device-bind probe manager: %s", why))
+            return 0;
+        end
+        client = virtio_resource_client::type_id::create(
+            "fix1_legacy_device_bind_client");
+        if (client.bind_to_device(manager, key, why) ||
+            client.is_bound_to_device() ||
+            (client.resource_manager != null)) begin
+            `uvm_error("FIX1_DEVICE_BIND",
+                {"bind_to_device accepted a non-snapshot manager or retained ",
+                 "owned binding state"})
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    protected function bit resolve_probe_snapshot(
+        input string label,
+        input bit add_vf_bars,
+        output dpu_device_snapshot snapshot,
+        output dpu_device_env_config env_cfg,
+        output dpu_function_key_t parent_key,
+        ref dpu_service_key_t service_keys[$]
+    );
+        virtio_test_device_builder builder;
+        dpu_function_cfg pf_cfg;
+        dpu_function_cfg vf_cfg;
+        dpu_device_resolver resolver;
+        string why;
+
+        builder = virtio_test_device_builder::type_id::create(
+            {label, "_builder"});
+        void'(builder.add_host_domain(0, 0, 16'h0100, 16'h03ff,
+            64'h0000_0002_0000_0000, 64'h0000_0003_0000_0000));
+        pf_cfg = builder.add_pf(
+            0, 0, 0, DPU_ALLOC_PINNED, 16'h0128);
+        vf_cfg = builder.add_vf(
+            0, 0, 0, 0, DPU_ALLOC_PINNED, 16'h02e0);
+        builder.add_real_dut_bars(pf_cfg);
+        if (add_vf_bars)
+            builder.add_real_dut_bars(vf_cfg);
+        void'(builder.add_vio_service(pf_cfg, 0));
+        void'(builder.add_vio_service(vf_cfg, 0));
+        builder.select_af(pf_cfg);
+        env_cfg = builder.make_env_config();
+        resolver = dpu_device_resolver::type_id::create({label, "_resolver"});
+        if (!resolver.resolve(env_cfg.device_cfg, snapshot, why)) begin
+            `uvm_fatal("FIX1_SETUP", $sformatf(
+                "could not resolve %s snapshot: %s", label, why))
+            return 0;
+        end
+        snapshot.list_services(DPU_SERVICE_VIO_NET, service_keys);
+        parent_key = pf_cfg.key;
+        return 1;
+    endfunction
+
+    protected function bit seed_probe_manager(
+        input string label,
+        input dpu_device_snapshot snapshot,
+        input dpu_resource_pool_config_t profiles[$],
+        output dpu_resource_manager manager
+    );
+        dpu_resource_registry_authority authority;
+        string why;
+
+        manager = dpu_resource_manager::type_id::create({label, "_manager"});
+        authority = manager.claim_registry_authority();
+        if ((authority == null) || !manager.configure_from_snapshot(
+                authority, snapshot, profiles, why)) begin
+            `uvm_fatal("FIX1_SETUP", $sformatf(
+                "could not seed %s manager: %s", label, why))
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    // Break caught: a later service fails BAR validation after the earlier PF
+    // child has already been constructed.
+    protected function bit check_late_bar_failure_is_atomic();
+        dpu_device_snapshot snapshot;
+        dpu_device_env_config env_cfg;
+        dpu_resource_manager manager;
+        dpu_function_key_t parent_key;
+        dpu_service_key_t service_keys[$];
+        virtio_service_preflight_probe probe;
+        string why;
+        bit configured;
+
+        if (!resolve_probe_snapshot(
+                "fix1_missing_vf_bar", 0, snapshot, env_cfg,
+                parent_key, service_keys) ||
+            !seed_probe_manager(
+                "fix1_missing_vf_bar", snapshot,
+                env_cfg.resource_profiles, manager)) begin
+            return 0;
+        end
+        probe = virtio_service_preflight_probe::type_id::create(
+            "fix1_missing_vf_bar_probe", this);
+        configured = probe.configure_services(
+            parent_key, snapshot, service_keys, manager, why);
+        if (configured || (probe.pf_function != null) ||
+            (probe.vf_functions.size() != 0)) begin
+            `uvm_error("FIX1_SERVICE_ATOMIC",
+                {"late missing BAR did not reject before all PF/VF child ",
+                 "construction"})
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    // Break caught: group construction begins before qpair and manager
+    // authority dependencies have been validated.
+    protected function bit check_manager_dependencies_are_preflighted();
+        dpu_device_snapshot snapshot;
+        dpu_device_env_config env_cfg;
+        dpu_resource_manager missing_qpair_manager;
+        dpu_resource_manager legacy_manager;
+        dpu_function_key_t parent_key;
+        dpu_function_key_t function_keys[$];
+        dpu_service_key_t service_keys[$];
+        dpu_resource_pool_config_t no_profiles[$];
+        dpu_resource_class_id_t class_id;
+        virtio_service_preflight_probe qpair_probe;
+        virtio_service_preflight_probe seed_probe;
+        string why;
+        bit configured;
+        bit passed;
+
+        if (!resolve_probe_snapshot(
+                "fix1_manager_preflight", 1, snapshot, env_cfg,
+                parent_key, service_keys) ||
+            !seed_probe_manager(
+                "fix1_missing_qpair", snapshot,
+                no_profiles, missing_qpair_manager)) begin
+            return 0;
+        end
+        qpair_probe = virtio_service_preflight_probe::type_id::create(
+            "fix1_missing_qpair_probe", this);
+        passed = 1;
+        configured = qpair_probe.configure_services(
+            parent_key, snapshot, service_keys, missing_qpair_manager, why);
+        if (configured || (qpair_probe.pf_function != null) ||
+            (qpair_probe.vf_functions.size() != 0)) begin
+            `uvm_error("FIX1_QPAIR_PREFLIGHT",
+                {"missing virtio.qpair was not rejected before all PF/VF ",
+                 "child construction"})
+            passed = 0;
+        end
+
+        legacy_manager = dpu_resource_manager::type_id::create(
+            "fix1_unseeded_group_manager");
+        snapshot.list_functions(function_keys);
+        foreach (function_keys[index]) begin
+            if (!legacy_manager.register_function(function_keys[index], why)) begin
+                `uvm_fatal("FIX1_SETUP", $sformatf(
+                    "could not register legacy probe function: %s", why))
+                return 0;
+            end
+        end
+        if (!legacy_manager.register_resource_class(
+                "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
+                2048, 32, class_id, why) ||
+            !legacy_manager.seal_resource_classes(why)) begin
+            `uvm_fatal("FIX1_SETUP", $sformatf(
+                "could not configure legacy group manager: %s", why))
+            return 0;
+        end
+        seed_probe = virtio_service_preflight_probe::type_id::create(
+            "fix1_unseeded_group_probe", this);
+        configured = seed_probe.configure_services(
+            parent_key, snapshot, service_keys, legacy_manager, why);
+        if (configured || (seed_probe.pf_function != null) ||
+            (seed_probe.vf_functions.size() != 0)) begin
+            `uvm_error("FIX1_SEED_PREFLIGHT",
+                {"unseeded manager was not rejected before all PF/VF child ",
+                 "construction"})
+            passed = 0;
+        end
+        return passed;
+    endfunction
+
     virtual function void build_phase(uvm_phase phase);
         dpu_function_cfg pf_cfg;
         dpu_function_cfg vf_cfg;
@@ -129,8 +347,20 @@ class virtio_monitor_routing_test extends uvm_test;
         virtio_driver_config_t pf_behavior;
         virtio_driver_config_t vf_behavior;
         string why;
+        bit fix1_checks_passed;
 
         super.build_phase(phase);
+
+        fix1_checks_passed = check_device_bind_requires_snapshot_seed();
+        fix1_checks_passed = check_late_bar_failure_is_atomic() &&
+                             fix1_checks_passed;
+        fix1_checks_passed = check_manager_dependencies_are_preflighted() &&
+                             fix1_checks_passed;
+        if (!fix1_checks_passed) begin
+            `uvm_fatal("FIX1_RED",
+                "snapshot device binding/service preflight checks failed")
+            return;
+        end
 
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
         pcie_cfg.if_mode = TLM_MODE;

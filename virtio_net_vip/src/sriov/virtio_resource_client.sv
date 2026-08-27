@@ -45,6 +45,10 @@ class virtio_resource_client extends uvm_object;
                 "virtio resource client requires a device resource manager";
             return 0;
         end
+        if (!legacy_fabric_name && !manager.is_snapshot_seeded()) begin
+            why = "virtio resource client requires a snapshot-seeded device manager";
+            return 0;
+        end
         if (!legacy_fabric_name && !manager.contains_function(key)) begin
             why = "virtio resource client function is not declared by the device snapshot";
             return 0;

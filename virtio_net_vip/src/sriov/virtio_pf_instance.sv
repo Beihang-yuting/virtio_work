@@ -61,6 +61,14 @@ class virtio_pf_instance extends uvm_component;
         dpu_bar_pair_lease_t bars[$];
         dpu_bar_role_e required_roles[$];
         dpu_function_key_t seen_owners[$];
+        dpu_function_key_t resolved_owners[$];
+        dpu_pcie_function_id_t resolved_pcie_ids[$];
+        dpu_bar_pair_lease_t resolved_device_bars[$];
+        dpu_bar_pair_lease_t resolved_mailbox_bars[$];
+        dpu_bar_pair_lease_t resolved_msix_bars[$];
+        dpu_resource_class_id_t qpair_class_id;
+        dpu_dut_caps snapshot_caps;
+        dpu_dut_caps manager_caps;
         bit owner_seen;
         int unsigned vf_count;
 
@@ -81,6 +89,57 @@ class virtio_pf_instance extends uvm_component;
         if (manager == null) begin
             why = "VIO service group requires a device resource manager";
             return 0;
+        end
+        if (!manager.is_snapshot_seeded()) begin
+            why = "VIO service group requires a snapshot-seeded device manager";
+            return 0;
+        end
+        if (!manager.lookup_resource_class(
+                "virtio.qpair", qpair_class_id, why)) begin
+            why = {"VIO service group requires virtio.qpair: ", why};
+            return 0;
+        end
+        snapshot_caps = snapshot.snapshot_dut_caps();
+        manager_caps = manager.snapshot_dut_caps();
+        if ((snapshot_caps == null) || !snapshot_caps.validate(why)) begin
+            why = {"VIO service group snapshot capabilities are invalid: ", why};
+            return 0;
+        end
+        if ((manager_caps == null) || !manager_caps.validate(why)) begin
+            why = {"VIO service group manager capabilities are invalid: ", why};
+            return 0;
+        end
+        if ((manager_caps.max_hosts != snapshot_caps.max_hosts) ||
+            (manager_caps.max_pfs_per_host != snapshot_caps.max_pfs_per_host) ||
+            (manager_caps.max_vfs_per_pf != snapshot_caps.max_vfs_per_pf) ||
+            (manager_caps.max_functions != snapshot_caps.max_functions) ||
+            (manager_caps.global_msix_vector_count !=
+             snapshot_caps.global_msix_vector_count) ||
+            (manager_caps.vio_global_qpair_count !=
+             snapshot_caps.vio_global_qpair_count) ||
+            (manager_caps.max_vio_net_qpairs_per_device !=
+             snapshot_caps.max_vio_net_qpairs_per_device) ||
+            (manager_caps.vio_notify_entries_per_bank !=
+             snapshot_caps.vio_notify_entries_per_bank) ||
+            (manager_caps.bar_profiles.size() !=
+             snapshot_caps.bar_profiles.size())) begin
+            why = "VIO service group manager capabilities differ from snapshot";
+            return 0;
+        end
+        foreach (snapshot_caps.bar_profiles[index]) begin
+            dpu_bar_profile_t manager_profile;
+            dpu_bar_profile_t snapshot_profile;
+
+            snapshot_profile = snapshot_caps.bar_profiles[index];
+            if (!manager_caps.lookup_bar_profile(
+                    snapshot_profile.kind, snapshot_profile.role,
+                    manager_profile, why) ||
+                (manager_profile.even_bar_id != snapshot_profile.even_bar_id) ||
+                (manager_profile.size != snapshot_profile.size) ||
+                (manager_profile.alignment != snapshot_profile.alignment)) begin
+                why = "VIO service group manager BAR capabilities differ from snapshot";
+                return 0;
+            end
         end
         if (service_keys.size() == 0) begin
             why = "VIO service group is empty";
@@ -114,25 +173,8 @@ class virtio_pf_instance extends uvm_component;
                 return 0;
             end
             seen_owners.push_back(owner);
-        end
-
-        pf_key = parent_pf_key;
-        host_id = parent_pf_key.host_id;
-        pf_id = parent_pf_key.pf_id;
-        vf_count = 0;
-        foreach (seen_owners[index]) begin
-            if (seen_owners[index].kind == DPU_FUNCTION_VF)
-                vf_count++;
-        end
-        vf_keys = new[vf_count];
-        vf_bdfs = new[vf_count];
-        vf_functions = new[vf_count];
-
-        foreach (service_keys[index]) begin
-            if (!snapshot.get_service_owner(service_keys[index], owner, why) ||
-                !snapshot.get_pcie_id(owner, pcie_id, why)) begin
+            if (!snapshot.get_pcie_id(owner, pcie_id, why))
                 return 0;
-            end
             bars.delete();
             foreach (required_roles[role_index]) begin
                 dpu_bar_pair_lease_t bar;
@@ -151,6 +193,34 @@ class virtio_pf_instance extends uvm_component;
                 why = "snapshot-seeded manager does not contain VIO service owner";
                 return 0;
             end
+            resolved_owners.push_back(owner);
+            resolved_pcie_ids.push_back(pcie_id);
+            resolved_device_bars.push_back(bars[0]);
+            resolved_mailbox_bars.push_back(bars[1]);
+            resolved_msix_bars.push_back(bars[2]);
+        end
+
+        // No component or topology-view state is mutated before every service
+        // dependency above has passed preflight.
+        pf_key = parent_pf_key;
+        host_id = parent_pf_key.host_id;
+        pf_id = parent_pf_key.pf_id;
+        vf_count = 0;
+        foreach (seen_owners[index]) begin
+            if (seen_owners[index].kind == DPU_FUNCTION_VF)
+                vf_count++;
+        end
+        vf_keys = new[vf_count];
+        vf_bdfs = new[vf_count];
+        vf_functions = new[vf_count];
+
+        foreach (service_keys[index]) begin
+            owner = resolved_owners[index];
+            pcie_id = resolved_pcie_ids[index];
+            bars.delete();
+            bars.push_back(resolved_device_bars[index]);
+            bars.push_back(resolved_mailbox_bars[index]);
+            bars.push_back(resolved_msix_bars[index]);
             if (owner.kind == DPU_FUNCTION_PF) begin
                 if (pf_function != null) begin
                     why = "VIO service group declares duplicate PF service";
