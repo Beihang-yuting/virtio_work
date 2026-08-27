@@ -29,6 +29,7 @@ class virtio_dynamic_reconfig extends uvm_report_object;
     `uvm_object_utils(virtio_dynamic_reconfig)
 
     protected dpu_dut_caps dut_caps;
+    local dpu_device_snapshot bound_device_snapshot;
     local int unsigned     enforced_max_vio_net_qpairs_per_device;
     local bit              dut_caps_bound;
 
@@ -39,6 +40,7 @@ class virtio_dynamic_reconfig extends uvm_report_object;
     function new(string name = "virtio_dynamic_reconfig");
         super.new(name);
         dut_caps = null;
+        bound_device_snapshot = null;
         enforced_max_vio_net_qpairs_per_device =
             DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
         dut_caps_bound = 0;
@@ -72,6 +74,53 @@ class virtio_dynamic_reconfig extends uvm_report_object;
 
         dut_caps = bound_dut_caps;
         enforced_max_vio_net_qpairs_per_device = bound_qpair_limit;
+        dut_caps_bound = 1;
+        why = "";
+        return 1;
+    endfunction
+
+    function bit bind_device_snapshot(
+        input dpu_device_snapshot snapshot,
+        output string why
+    );
+        dpu_dut_caps snapshot_caps;
+        string caps_why;
+
+        if (dut_caps_bound) begin
+            if (snapshot == null) begin
+                why = "dynamic reconfig device snapshot ownership cannot be cleared";
+                return 0;
+            end
+            if (snapshot == bound_device_snapshot) begin
+                why = "";
+                return 1;
+            end
+            why = "dynamic reconfig device snapshot ownership cannot be reassigned";
+            return 0;
+        end
+        if (snapshot == null) begin
+            why = "dynamic reconfig device snapshot is null";
+            return 0;
+        end
+        if (!snapshot.is_frozen()) begin
+            why = "dynamic reconfig device snapshot is not frozen";
+            return 0;
+        end
+        snapshot_caps = snapshot.snapshot_dut_caps();
+        if (snapshot_caps == null) begin
+            why = "dynamic reconfig device snapshot has no DUT capabilities";
+            return 0;
+        end
+        if (!snapshot_caps.validate(caps_why)) begin
+            why = $sformatf("invalid device snapshot DUT capabilities: %s",
+                            caps_why);
+            return 0;
+        end
+
+        dut_caps = snapshot_caps;
+        enforced_max_vio_net_qpairs_per_device =
+            snapshot_caps.max_vio_net_qpairs_per_device;
+        bound_device_snapshot = snapshot;
         dut_caps_bound = 1;
         why = "";
         return 1;

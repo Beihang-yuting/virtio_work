@@ -390,10 +390,11 @@ class virtio_net_env extends uvm_env;
         // Create concurrency/dynamic reconfig
         conc_ctrl    = virtio_concurrency_controller::type_id::create("conc_ctrl");
         dyn_reconfig = virtio_dynamic_reconfig::type_id::create("dyn_reconfig");
-        if (!dyn_reconfig.bind_dut_caps(effective_dut_caps, why)) begin
+        if (snapshot_topology &&
+            !dyn_reconfig.bind_device_snapshot(device_snapshot, why)) begin
             configuration_valid = 0;
             `uvm_fatal("VIRTIO_ENV", $sformatf(
-                "Dynamic reconfiguration capability bind failed: %s", why))
+                "Dynamic reconfiguration device snapshot bind failed: %s", why))
             return;
         end
 
