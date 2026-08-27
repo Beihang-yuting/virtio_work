@@ -73,8 +73,7 @@ class dpu_resource_manager extends uvm_object;
     protected function string function_key_name(
         input dpu_function_key_t key
     );
-        return $sformatf("%0d:%0d:%0d:%0d", key.host_id, key.pf_id,
-                         key.kind, key.vf_id);
+        return dpu_function_key_name(key);
     endfunction
 
     protected function bit validate_function_key(
@@ -516,7 +515,7 @@ class dpu_resource_manager extends uvm_object;
         dpu_bar_pair_lease_t proposed_bars[$];
         bit [63:0] cursor;
         bit [63:0] device_bar_size;
-        bit [63:0] reserved_bar_size;
+        bit [63:0] mailbox_bar_size;
         bit [63:0] msix_bar_size;
 
         bars.delete();
@@ -541,21 +540,21 @@ class dpu_resource_manager extends uvm_object;
 
         if (key.kind == DPU_FUNCTION_PF) begin
             device_bar_size = 64'h0000_0000_0200_0000;
-            reserved_bar_size = 64'h0000_0000_0001_0000;
+            mailbox_bar_size = 64'h0000_0000_0001_0000;
             msix_bar_size = 64'h0000_0000_0001_0000;
         end
         else begin
             device_bar_size = 64'h0000_0000_0000_4000;
-            reserved_bar_size = 64'h0000_0000_0000_4000;
+            mailbox_bar_size = 64'h0000_0000_0000_4000;
             msix_bar_size = 64'h0000_0000_0000_8000;
         end
 
         cursor = next_bar_address;
-        if (!allocate_bar_pair(DPU_BAR_FUNCTION_DEVICE, 0, device_bar_size,
+        if (!allocate_bar_pair(DPU_BAR_DEVICE_MEMORY, 0, device_bar_size,
                                cursor, bar, cursor, why))
             return 0;
         proposed_bars.push_back(bar);
-        if (!allocate_bar_pair(DPU_BAR_RESERVED, 2, reserved_bar_size,
+        if (!allocate_bar_pair(DPU_BAR_MAILBOX, 2, mailbox_bar_size,
                                cursor, bar, cursor, why))
             return 0;
         proposed_bars.push_back(bar);

@@ -12,6 +12,24 @@ class dpu_dut_caps extends uvm_object;
     int unsigned vio_global_qpair_count;
     int unsigned max_vio_net_qpairs_per_device;
     int unsigned vio_notify_entries_per_bank;
+    dpu_bar_profile_t bar_profiles[$];
+
+    protected function void add_bar_profile(
+        input dpu_function_kind_e kind,
+        input dpu_bar_role_e role,
+        input int unsigned even_bar_id,
+        input bit [63:0] size,
+        input bit [63:0] alignment
+    );
+        dpu_bar_profile_t profile;
+
+        profile.kind = kind;
+        profile.role = role;
+        profile.even_bar_id = even_bar_id;
+        profile.size = size;
+        profile.alignment = alignment;
+        bar_profiles.push_back(profile);
+    endfunction
 
     function new(string name = "dpu_dut_caps");
         super.new(name);
@@ -23,6 +41,18 @@ class dpu_dut_caps extends uvm_object;
         vio_global_qpair_count = DPU_MAX_VIO_GLOBAL_QPAIRS;
         max_vio_net_qpairs_per_device = DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
         vio_notify_entries_per_bank = DPU_MAX_VIO_NOTIFY_ENTRIES_PER_BANK;
+        add_bar_profile(DPU_FUNCTION_PF, DPU_BAR_DEVICE_MEMORY, 0,
+                        64'h0000_0000_0200_0000, 64'h0000_0000_0200_0000);
+        add_bar_profile(DPU_FUNCTION_PF, DPU_BAR_MAILBOX, 2,
+                        64'h0000_0000_0001_0000, 64'h0000_0000_0001_0000);
+        add_bar_profile(DPU_FUNCTION_PF, DPU_BAR_MSIX, 4,
+                        64'h0000_0000_0001_0000, 64'h0000_0000_0001_0000);
+        add_bar_profile(DPU_FUNCTION_VF, DPU_BAR_DEVICE_MEMORY, 0,
+                        64'h0000_0000_0000_4000, 64'h0000_0000_0000_4000);
+        add_bar_profile(DPU_FUNCTION_VF, DPU_BAR_MAILBOX, 2,
+                        64'h0000_0000_0000_4000, 64'h0000_0000_0000_4000);
+        add_bar_profile(DPU_FUNCTION_VF, DPU_BAR_MSIX, 4,
+                        64'h0000_0000_0000_8000, 64'h0000_0000_0000_8000);
     endfunction
 
     function void copy_from(input dpu_dut_caps rhs);
@@ -34,6 +64,33 @@ class dpu_dut_caps extends uvm_object;
         vio_global_qpair_count = rhs.vio_global_qpair_count;
         max_vio_net_qpairs_per_device = rhs.max_vio_net_qpairs_per_device;
         vio_notify_entries_per_bank = rhs.vio_notify_entries_per_bank;
+        bar_profiles.delete();
+        foreach (rhs.bar_profiles[index])
+            bar_profiles.push_back(rhs.bar_profiles[index]);
+    endfunction
+
+    function bit lookup_bar_profile(
+        input dpu_function_kind_e kind,
+        input dpu_bar_role_e role,
+        output dpu_bar_profile_t profile,
+        output string why
+    );
+        foreach (bar_profiles[index]) begin
+            if ((bar_profiles[index].kind == kind) &&
+                (bar_profiles[index].role == role)) begin
+                profile = bar_profiles[index];
+                why = "";
+                return 1;
+            end
+        end
+        profile.kind = DPU_FUNCTION_PF;
+        profile.role = DPU_BAR_DEVICE_MEMORY;
+        profile.even_bar_id = 0;
+        profile.size = '0;
+        profile.alignment = '0;
+        why = $sformatf("no BAR profile for function kind %0d role %0d",
+                        kind, role);
+        return 0;
     endfunction
 
     function bit validate(output string why);
@@ -103,6 +160,27 @@ class dpu_dut_caps extends uvm_object;
             DPU_MAX_VIO_NOTIFY_ENTRIES_PER_BANK) begin
             why = "DUT VIO notify capability exceeds the model ceiling";
             return 0;
+        end
+        foreach (bar_profiles[first]) begin
+            for (int second = first + 1;
+                 second < bar_profiles.size(); second++) begin
+                if ((bar_profiles[first].kind == bar_profiles[second].kind) &&
+                    (bar_profiles[first].role == bar_profiles[second].role)) begin
+                    why = $sformatf(
+                        "DUT BAR profiles duplicate function kind %0d role %0d",
+                        bar_profiles[first].kind, bar_profiles[first].role);
+                    return 0;
+                end
+                if ((bar_profiles[first].kind == bar_profiles[second].kind) &&
+                    (bar_profiles[first].even_bar_id ==
+                     bar_profiles[second].even_bar_id)) begin
+                    why = $sformatf(
+                        "DUT BAR profiles duplicate function kind %0d BAR%0d",
+                        bar_profiles[first].kind,
+                        bar_profiles[first].even_bar_id);
+                    return 0;
+                end
+            end
         end
         return 1;
     endfunction

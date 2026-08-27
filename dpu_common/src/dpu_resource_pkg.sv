@@ -10,6 +10,7 @@ package dpu_resource_pkg;
   import uvm_pkg::*;
   `include "uvm_macros.svh"
 
+  `include "dpu_device_types.sv"
   `include "dpu_resource_types.sv"
   `include "dpu_reg_plan_types.sv"
   `include "dpu_reg_op.sv"

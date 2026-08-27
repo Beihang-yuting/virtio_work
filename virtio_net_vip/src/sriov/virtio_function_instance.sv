@@ -60,8 +60,8 @@ class virtio_function_instance extends uvm_component;
     endfunction
 
     // Fabric topology supplies all identity and BAR leases before transport
-    // discovery.  BAR0/1 is the virtio function window, BAR2/3 is a consumed
-    // reservation, and BAR4/5 is MSI-X only; the BAR accessor enforces roles.
+    // discovery.  BAR0/1 is the virtio function window, BAR2/3 is the mailbox,
+    // and BAR4/5 is MSI-X only; the BAR accessor enforces roles.
     virtual function bit configure_function(
         input dpu_function_kind_e kind,
         input dpu_function_key_t key,
@@ -126,10 +126,6 @@ class virtio_function_instance extends uvm_component;
     );
         bar_pairs = bars;
         apply_function_configuration();
-    endfunction
-
-    virtual function bit is_reserved_bar(input int unsigned bar_id);
-        return (bar_id == 2) || (bar_id == 3);
     endfunction
 
     // Side-effect-free half of PCIe binding.  The environment preflights all

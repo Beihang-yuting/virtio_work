@@ -65,6 +65,12 @@ class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
         write.be = be;
         config_writes.push_back(write);
     endtask
+
+    // Exposes the accessor's protected functional-access policy to this
+    // focused test without changing the production API.
+    function bit probe_functional_bar_access(input int unsigned bar_id);
+        return allow_functional_bar_access(bar_id);
+    endfunction
 endclass : virtio_fabric_cfg_stub_accessor
 
 // This deliberately small UVM driver observes requests issued through the
@@ -95,25 +101,25 @@ class virtio_fabric_cfg_tlp_capture_driver extends uvm_driver #(pcie_tl_tlp);
     endtask
 endclass : virtio_fabric_cfg_tlp_capture_driver
 
-// Temporarily demotes only the deliberate reserved-BAR negative access.  It
-// is registered immediately around that access and then removed, so discovery
-// cannot be made green by a persistent global report override.
-class virtio_expected_bar_reserved_catcher extends uvm_report_catcher;
+// Counts a specific report without changing its severity.  It proves the
+// mailbox probe does not retain the obsolete BAR_RESERVED behavior.
+class virtio_bar_report_counter extends uvm_report_catcher;
+    string report_id;
     int unsigned caught_count;
 
-    function new(string name = "expected_bar_reserved_catcher");
+    function new(string name, string expected_report_id);
         super.new(name);
+        report_id = expected_report_id;
         caught_count = 0;
     endfunction
 
     function action_e catch();
-        if ((get_id() == "BAR_RESERVED") && (get_severity() == UVM_ERROR)) begin
+        if (get_id() == report_id) begin
             caught_count++;
-            set_severity(UVM_INFO);
         end
         return THROW;
     endfunction
-endclass : virtio_expected_bar_reserved_catcher
+endclass : virtio_bar_report_counter
 
 // Scoped negative-path catcher.  Production failures remain fatal outside
 // these narrow test calls; each helper also verifies that its expected report
@@ -217,10 +223,10 @@ class virtio_fabric_resource_test extends uvm_test;
         bars.push_back(make_fabric_bar_pair(
             DPU_BAR_MSIX, 4, 64'h0001_0000_3000_0000, 64'h0000_0000_0001_0000));
         bars.push_back(make_fabric_bar_pair(
-            DPU_BAR_FUNCTION_DEVICE, 0, 64'h0001_0000_1000_0000,
+            DPU_BAR_DEVICE_MEMORY, 0, 64'h0001_0000_1000_0000,
             64'h0000_0000_0010_0000));
         bars.push_back(make_fabric_bar_pair(
-            DPU_BAR_RESERVED, 2, 64'h0001_0000_2000_0000,
+            DPU_BAR_MAILBOX, 2, 64'h0001_0000_2000_0000,
             64'h0000_0000_0001_0000));
     endfunction
 
@@ -390,7 +396,7 @@ class virtio_fabric_resource_test extends uvm_test;
 
         make_valid_fabric_bar_pairs(bars);
         bars.push_back(make_fabric_bar_pair(
-            DPU_BAR_RESERVED, 6, 64'h0001_0000_4000_0000,
+            DPU_BAR_MAILBOX, 6, 64'h0001_0000_4000_0000,
             64'h0000_0000_0001_0000));
         assert_fabric_lease_set_rejected("extra_lease", bars, "exactly three");
 
@@ -419,26 +425,26 @@ class virtio_fabric_resource_test extends uvm_test;
     task assert_bar_layout(input virtio_function_instance function_instance);
         dpu_bar_pair_lease_t bars[$];
         bit [63:0] device_size;
-        bit [63:0] reserved_size;
+        bit [63:0] mailbox_size;
         bit [63:0] msix_size;
 
         bars = function_instance.bar_pairs;
         if (function_instance.function_kind == DPU_FUNCTION_PF) begin
             device_size = 64'h0000_0000_0200_0000;
-            reserved_size = 64'h0000_0000_0001_0000;
+            mailbox_size = 64'h0000_0000_0001_0000;
             msix_size = 64'h0000_0000_0001_0000;
         end
         else begin
             device_size = 64'h0000_0000_0000_4000;
-            reserved_size = 64'h0000_0000_0000_4000;
+            mailbox_size = 64'h0000_0000_0000_4000;
             msix_size = 64'h0000_0000_0000_8000;
         end
 
         if ((bars.size() != 3) ||
-            (bars[0].role != DPU_BAR_FUNCTION_DEVICE) ||
+            (bars[0].role != DPU_BAR_DEVICE_MEMORY) ||
             (bars[0].even_bar_id != 0) || (bars[0].size != device_size) ||
-            (bars[1].role != DPU_BAR_RESERVED) ||
-            (bars[1].even_bar_id != 2) || (bars[1].size != reserved_size) ||
+            (bars[1].role != DPU_BAR_MAILBOX) ||
+            (bars[1].even_bar_id != 2) || (bars[1].size != mailbox_size) ||
             (bars[2].role != DPU_BAR_MSIX) ||
             (bars[2].even_bar_id != 4) || (bars[2].size != msix_size)) begin
             `uvm_fatal("FABRIC_RESOURCE", "function BAR pair layout is incorrect")
@@ -452,16 +458,13 @@ class virtio_fabric_resource_test extends uvm_test;
 
         if ((function_instance.transport.bar.bar_base[0] != bars[0].base) ||
             (function_instance.transport.bar.bar_size[0] != bars[0].size) ||
-            // BAR2/3 is programmed as a Fabric reservation, but the accessor
-            // must reject functional use of it.
+            // BAR2/3 is the Fabric-owned mailbox pair.
             (function_instance.transport.bar.bar_base[2] != bars[1].base) ||
             (function_instance.transport.bar.bar_size[2] != bars[1].size) ||
             (function_instance.transport.bar.bar_base[3] != '0) ||
             (function_instance.transport.bar.bar_size[3] != '0) ||
             (function_instance.transport.bar.bar_base[4] != bars[2].base) ||
-            (function_instance.transport.bar.bar_size[4] != bars[2].size) ||
-            !function_instance.is_reserved_bar(2) ||
-            !function_instance.is_reserved_bar(3)) begin
+            (function_instance.transport.bar.bar_size[4] != bars[2].size)) begin
             `uvm_fatal("FABRIC_RESOURCE",
                 "BAR roles were not reflected in the transport binding")
         end
@@ -573,9 +576,8 @@ class virtio_fabric_resource_test extends uvm_test;
 
     task discover_fabric_function(input virtio_function_instance function_instance);
         virtio_fabric_cfg_stub_accessor config_stub;
-        virtio_expected_bar_reserved_catcher expected_bar_error;
-        bit [31:0] reserved_data;
-        int unsigned reserved_errors;
+        virtio_bar_report_counter bar_reserved_reports;
+        bit functional_access_allowed;
 
         config_stub = virtio_fabric_cfg_stub_accessor::type_id::create(
             $sformatf("cfg_stub_%0d_%0d_%0d_%0d",
@@ -597,28 +599,19 @@ class virtio_fabric_resource_test extends uvm_test;
         assert_fabric_bar_config_writes(function_instance, config_stub);
         assert_bar_layout(function_instance);
 
-        reserved_errors = config_stub.get_reserved_bar_access_error_count();
-        if (reserved_errors != 0) begin
-            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "Fabric discovery made %0d functional access(es) to BAR2/3",
-                reserved_errors))
-        end
-        // Demote only the deliberate negative access.  A discovery-time
-        // BAR2/3 access above remains visible and fatal.
-        expected_bar_error = new($sformatf("expected_bar_error_%0d_%0d_%0d_%0d",
+        // Catches a production regression that leaves the configured BAR2
+        // mailbox inaccessible or emits the obsolete BAR_RESERVED report.
+        bar_reserved_reports = new($sformatf("bar_reserved_reports_%0d_%0d_%0d_%0d",
             function_instance.function_key.host_id,
             function_instance.function_key.pf_id,
             function_instance.function_key.kind,
-            function_instance.function_key.vf_id));
-        uvm_report_cb::add(null, expected_bar_error);
-        config_stub.read_reg(2, 32'h0, 4, reserved_data);
-        uvm_report_cb::delete(null, expected_bar_error);
-        if ((reserved_data != '0) ||
-            (expected_bar_error.caught_count != 1) ||
-            (config_stub.get_reserved_bar_access_error_count() !=
-             (reserved_errors + 1))) begin
+            function_instance.function_key.vf_id), "BAR_RESERVED");
+        uvm_report_cb::add(null, bar_reserved_reports);
+        functional_access_allowed = config_stub.probe_functional_bar_access(2);
+        uvm_report_cb::delete(null, bar_reserved_reports);
+        if (!functional_access_allowed || (bar_reserved_reports.caught_count != 0)) begin
             `uvm_fatal("FABRIC_RESOURCE",
-                "BAR2/3 access did not produce a reserved-BAR monitor error")
+                "configured BAR2 mailbox was not functionally accessible")
         end
     endtask
 

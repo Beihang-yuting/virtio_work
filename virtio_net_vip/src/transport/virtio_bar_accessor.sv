@@ -228,7 +228,6 @@ class virtio_bar_accessor extends uvm_object;
     bit         fabric_bar_layout_active;
     bit         fabric_bar_role_valid[6];
     dpu_bar_role_e fabric_bar_role[6];
-    protected int unsigned reserved_bar_access_error_count;
 
     // ===== PCIe layer references =====
     uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr;   // RC Agent's sequencer
@@ -246,13 +245,12 @@ class virtio_bar_accessor extends uvm_object;
         requester_id        = 16'h0;
         next_bar_alloc_addr = 64'h0000_0000_C000_0000;  // Default MMIO window
         fabric_bar_layout_active = 0;
-        reserved_bar_access_error_count = 0;
         for (int i = 0; i < 6; i++) begin
             bar_base[i] = '0;
             bar_size[i] = '0;
             bar_type[i] = '0;
             fabric_bar_role_valid[i] = 0;
-            fabric_bar_role[i] = DPU_BAR_RESERVED;
+            fabric_bar_role[i] = DPU_BAR_DEVICE_MEMORY;
         end
     endfunction
 
@@ -273,11 +271,11 @@ class virtio_bar_accessor extends uvm_object;
             int unsigned lease_slot;
 
             if ((bars[index].even_bar_id == 0) &&
-                (bars[index].role == DPU_BAR_FUNCTION_DEVICE)) begin
+                (bars[index].role == DPU_BAR_DEVICE_MEMORY)) begin
                 lease_slot = 0;
             end
             else if ((bars[index].even_bar_id == 2) &&
-                     (bars[index].role == DPU_BAR_RESERVED)) begin
+                     (bars[index].role == DPU_BAR_MAILBOX)) begin
                 lease_slot = 1;
             end
             else if ((bars[index].even_bar_id == 4) &&
@@ -286,7 +284,7 @@ class virtio_bar_accessor extends uvm_object;
             end
             else begin
                 `uvm_error("BAR_ACCESSOR", $sformatf(
-                    "Fabric BAR lease %0d has invalid role %0d for even BAR%0d; expected BAR0=function-device, BAR2=reserved, or BAR4=MSI-X",
+                    "Fabric BAR lease %0d has invalid role %0d for even BAR%0d; expected BAR0=device-memory, BAR2=mailbox, or BAR4=MSI-X",
                     index, bars[index].role, bars[index].even_bar_id))
                 return;
             end
@@ -311,13 +309,12 @@ class virtio_bar_accessor extends uvm_object;
         // has validated.  A malformed retry must not leave a partial layout
         // that can later be programmed into PCI config space.
         fabric_bar_layout_active = 1;
-        reserved_bar_access_error_count = 0;
         for (int unsigned bar_id = 0; bar_id < 6; bar_id++) begin
             bar_base[bar_id] = '0;
             bar_size[bar_id] = '0;
             bar_type[bar_id] = '0;
             fabric_bar_role_valid[bar_id] = 0;
-            fabric_bar_role[bar_id] = DPU_BAR_RESERVED;
+            fabric_bar_role[bar_id] = DPU_BAR_DEVICE_MEMORY;
         end
         foreach (bars[index]) begin
             bar_base[bars[index].even_bar_id] = bars[index].base;
@@ -332,10 +329,6 @@ class virtio_bar_accessor extends uvm_object;
 
     function bit fabric_bar_layout_is_active();
         return fabric_bar_layout_active;
-    endfunction
-
-    function int unsigned get_reserved_bar_access_error_count();
-        return reserved_bar_access_error_count;
     endfunction
 
     protected function bit fabric_bar_pair_is_programmable(
@@ -400,7 +393,6 @@ class virtio_bar_accessor extends uvm_object;
     endfunction
 
     // Program the Fabric-owned 64-bit BAR pairs through PCIe config space.
-    // BAR2/3 remains reserved after configuration; it is not an MMIO window.
     virtual task program_fabric_bar_pairs();
         string why;
         bit [31:0] low_dword;
@@ -412,9 +404,9 @@ class virtio_bar_accessor extends uvm_object;
             return;
         end
         if (!fabric_bar_pair_is_programmable(
-            0, DPU_BAR_FUNCTION_DEVICE, why
+            0, DPU_BAR_DEVICE_MEMORY, why
         ) || !fabric_bar_pair_is_programmable(
-            2, DPU_BAR_RESERVED, why
+            2, DPU_BAR_MAILBOX, why
         ) || !fabric_bar_pair_is_programmable(
             4, DPU_BAR_MSIX, why
         )) begin
@@ -445,23 +437,33 @@ class virtio_bar_accessor extends uvm_object;
     protected function bit allow_functional_bar_access(input int unsigned bar_id);
         if (!fabric_bar_layout_active)
             return 1;
-        if ((bar_id == 2) || (bar_id == 3)) begin
-            reserved_bar_access_error_count++;
-            `uvm_error("BAR_RESERVED", $sformatf(
-                "functional MMIO access to Fabric-reserved BAR%0d was blocked", bar_id))
+        if ((bar_id > 5) || ((bar_id % 2) != 0)) begin
+            `uvm_error("BAR_FUNCTION_WINDOW", $sformatf(
+                "functional MMIO access must use an even Fabric BAR base, not BAR%0d",
+                bar_id))
             return 0;
         end
-        if ((bar_id == 4) || (bar_id == 5)) begin
+        if (bar_id == 4) begin
             `uvm_error("BAR_MSIX_ONLY", $sformatf(
                 "functional MMIO access to MSI-X-only BAR%0d was blocked", bar_id))
             return 0;
         end
-        if (bar_id != 0) begin
+        if ((bar_id == 0) && fabric_bar_role_valid[0] &&
+            (fabric_bar_role[0] == DPU_BAR_DEVICE_MEMORY))
+            return 1;
+        if ((bar_id == 2) && fabric_bar_role_valid[2] &&
+            (fabric_bar_role[2] == DPU_BAR_MAILBOX))
+            return 1;
+        if ((bar_id == 0) || (bar_id == 2)) begin
             `uvm_error("BAR_FUNCTION_WINDOW", $sformatf(
-                "functional MMIO access must use Fabric BAR0/1, not BAR%0d", bar_id))
+                "functional MMIO access to Fabric BAR%0d has an incompatible role",
+                bar_id))
             return 0;
         end
-        return 1;
+        `uvm_error("BAR_FUNCTION_WINDOW", $sformatf(
+            "functional MMIO access must use Fabric BAR0/1 or BAR2/3, not BAR%0d",
+            bar_id))
+        return 0;
     endfunction
 
     protected function bit allow_msix_bar_access(input int unsigned bar_id);

@@ -17,11 +17,6 @@ localparam int unsigned DPU_MAX_GLOBAL_MSIX_VECTORS = 256;
 localparam int unsigned DPU_MAX_VIO_NOTIFY_ENTRIES_PER_BANK = 1024;
 
 typedef enum int unsigned {
-  DPU_FUNCTION_PF,
-  DPU_FUNCTION_VF
-} dpu_function_kind_e;
-
-typedef enum int unsigned {
   DPU_RESOURCE_KIND_FUNCTION,
   DPU_RESOURCE_KIND_BAR,
   DPU_RESOURCE_KIND_QUEUE,
@@ -30,21 +25,6 @@ typedef enum int unsigned {
 } dpu_resource_kind_e;
 
 typedef int unsigned dpu_resource_class_id_t;
-
-typedef enum int unsigned {
-  // These roles describe generic function BAR placement, not protocol roles.
-  DPU_BAR_FUNCTION_DEVICE,
-  DPU_BAR_RESERVED,
-  DPU_BAR_MSIX
-} dpu_bar_role_e;
-
-// A PF and every VF each identify an independent DPU function.
-typedef struct {
-  int unsigned host_id;
-  int unsigned pf_id;
-  dpu_function_kind_e kind;
-  int unsigned vf_id;
-} dpu_function_key_t;
 
 typedef struct {
   dpu_function_key_t owner;

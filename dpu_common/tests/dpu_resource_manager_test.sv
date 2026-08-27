@@ -59,24 +59,131 @@ class dpu_resource_manager_test extends uvm_test;
         return profile;
     endfunction
 
+    task assert_canonical_device_identities_and_bar_profiles();
+        dpu_function_key_t function_key;
+        dpu_function_key_t different_function_key;
+        dpu_pcie_domain_key_t domain_key;
+        dpu_pcie_domain_key_t different_domain_key;
+        dpu_service_key_t service_key;
+        dpu_bar_profile_t profile;
+        dpu_dut_caps source_caps;
+        dpu_dut_caps copied_caps;
+        dpu_dut_caps duplicate_caps;
+        string why;
+
+        // Catches a production regression that drops one of the canonical
+        // function identity fields from the name or equality comparison.
+        function_key = make_function_key(1, 2, DPU_FUNCTION_VF, 3);
+        different_function_key = make_function_key(1, 2, DPU_FUNCTION_VF, 4);
+        if ((dpu_function_key_name(function_key) != "h1.pf2.k1.vf3") ||
+            !dpu_same_function_key(function_key, function_key) ||
+            dpu_same_function_key(function_key, different_function_key)) begin
+            `uvm_fatal("DPU_DEVICE_TYPES", "function key helpers lost identity")
+        end
+        domain_key.host_id = 1;
+        domain_key.segment_id = 7;
+        different_domain_key = domain_key;
+        different_domain_key.segment_id = 8;
+        if (!dpu_same_domain_key(domain_key, domain_key) ||
+            dpu_same_domain_key(domain_key, different_domain_key)) begin
+            `uvm_fatal("DPU_DEVICE_TYPES", "domain key helper lost identity")
+        end
+        service_key.function_key = function_key;
+        service_key.service_kind = DPU_SERVICE_RDMA;
+        service_key.service_instance_id = 5;
+        if (dpu_service_key_name(service_key) != "h1.pf2.k1.vf3.svc1.i5") begin
+            `uvm_fatal("DPU_DEVICE_TYPES", "service key name lost identity")
+        end
+
+        // Catches a production regression that changes a default BAR role,
+        // BAR ID, size, alignment, copy isolation, or duplicate validation.
+        source_caps = dpu_dut_caps::type_id::create("source_caps");
+        if (!source_caps.lookup_bar_profile(
+            DPU_FUNCTION_PF, DPU_BAR_DEVICE_MEMORY, profile, why) ||
+            (profile.even_bar_id != 0) ||
+            (profile.size != 64'h0000_0000_0200_0000) ||
+            (profile.alignment != 64'h0000_0000_0200_0000)) begin
+            `uvm_fatal("DPU_CAPS", {"missing PF device-memory profile: ", why})
+        end
+        if (!source_caps.lookup_bar_profile(
+            DPU_FUNCTION_PF, DPU_BAR_MAILBOX, profile, why) ||
+            (profile.even_bar_id != 2) ||
+            (profile.size != 64'h0000_0000_0001_0000) ||
+            (profile.alignment != 64'h0000_0000_0001_0000)) begin
+            `uvm_fatal("DPU_CAPS", {"missing PF mailbox profile: ", why})
+        end
+        if (!source_caps.lookup_bar_profile(
+            DPU_FUNCTION_PF, DPU_BAR_MSIX, profile, why) ||
+            (profile.even_bar_id != 4) ||
+            (profile.size != 64'h0000_0000_0001_0000) ||
+            (profile.alignment != 64'h0000_0000_0001_0000)) begin
+            `uvm_fatal("DPU_CAPS", {"missing PF MSI-X profile: ", why})
+        end
+        if (!source_caps.lookup_bar_profile(
+            DPU_FUNCTION_VF, DPU_BAR_DEVICE_MEMORY, profile, why) ||
+            (profile.even_bar_id != 0) ||
+            (profile.size != 64'h0000_0000_0000_4000) ||
+            (profile.alignment != 64'h0000_0000_0000_4000)) begin
+            `uvm_fatal("DPU_CAPS", {"missing VF device-memory profile: ", why})
+        end
+        if (!source_caps.lookup_bar_profile(
+            DPU_FUNCTION_VF, DPU_BAR_MAILBOX, profile, why) ||
+            (profile.even_bar_id != 2) ||
+            (profile.size != 64'h0000_0000_0000_4000) ||
+            (profile.alignment != 64'h0000_0000_0000_4000)) begin
+            `uvm_fatal("DPU_CAPS", {"missing VF mailbox profile: ", why})
+        end
+        if (!source_caps.lookup_bar_profile(
+            DPU_FUNCTION_VF, DPU_BAR_MSIX, profile, why) ||
+            (profile.even_bar_id != 4) ||
+            (profile.size != 64'h0000_0000_0000_8000) ||
+            (profile.alignment != 64'h0000_0000_0000_8000)) begin
+            `uvm_fatal("DPU_CAPS", {"missing VF MSI-X profile: ", why})
+        end
+        copied_caps = dpu_dut_caps::type_id::create("copied_caps");
+        copied_caps.copy_from(source_caps);
+        source_caps.bar_profiles[0].size = '0;
+        if (copied_caps.bar_profiles[0].size != 64'h0000_0000_0200_0000) begin
+            `uvm_fatal("DPU_CAPS", "BAR profile copy aliases its source")
+        end
+        duplicate_caps = dpu_dut_caps::type_id::create("duplicate_caps");
+        duplicate_caps.bar_profiles.push_back(duplicate_caps.bar_profiles[0]);
+        if (duplicate_caps.validate(why)) begin
+            `uvm_fatal("DPU_CAPS", "duplicate BAR profile unexpectedly validated")
+        end
+    endtask
+
     task assert_pf_bar_layout(input dpu_bar_pair_lease_t bars[$]);
+        dpu_bar_profile_t profile;
+        string why;
+
         if (bars.size() != 3) begin
             `uvm_fatal("DPU_RESOURCE", "PF activation did not return three BAR pairs")
         end
-        if ((bars[0].role != DPU_BAR_FUNCTION_DEVICE) ||
+        if ((bars[0].role != DPU_BAR_DEVICE_MEMORY) ||
             (bars[0].even_bar_id != 0) ||
             (bars[0].size != 64'h0000_0000_0200_0000)) begin
             `uvm_fatal("DPU_RESOURCE", "PF function-device BAR pair is incorrect")
         end
-        if ((bars[1].role != DPU_BAR_RESERVED) ||
+        // Catches a production regression that leaves BAR2 as a generic
+        // reservation instead of exposing the real-DUT mailbox window.
+        if ((bars[1].role != DPU_BAR_MAILBOX) ||
             (bars[1].even_bar_id != 2) ||
             (bars[1].size != 64'h0000_0000_0001_0000)) begin
-            `uvm_fatal("DPU_RESOURCE", "PF reserved BAR pair is incorrect")
+            `uvm_fatal("DPU_RESOURCE", "PF mailbox BAR pair is incorrect")
         end
         if ((bars[2].role != DPU_BAR_MSIX) ||
             (bars[2].even_bar_id != 4) ||
             (bars[2].size != 64'h0000_0000_0001_0000)) begin
             `uvm_fatal("DPU_RESOURCE", "PF MSI-X BAR pair is incorrect")
+        end
+        // Catches a production regression that omits or misdescribes the
+        // canonical PF mailbox profile used by the allocator.
+        if (!fabric_cfg.dut_caps.lookup_bar_profile(
+            DPU_FUNCTION_PF, DPU_BAR_MAILBOX, profile, why) ||
+            (profile.even_bar_id != 2) ||
+            (profile.size != 64'h0000_0000_0001_0000)) begin
+            `uvm_fatal("DPU_CAPS", {"missing PF mailbox profile: ", why})
         end
     endtask
 
@@ -264,6 +371,7 @@ class dpu_resource_manager_test extends uvm_test;
 
         phase.raise_objection(this);
 
+        assert_canonical_device_identities_and_bar_profiles();
         assert_registration_and_activation_guards();
 
         qpair_profile = make_resource_profile(
