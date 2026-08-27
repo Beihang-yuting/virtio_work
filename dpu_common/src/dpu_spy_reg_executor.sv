@@ -6,6 +6,8 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
 
     protected dpu_reg_op recorded_operations[$];
     protected dpu_reg_op_result_e recorded_results[$];
+    protected string latest_attempt_operation_ids[$];
+    protected dpu_reg_op_result_e latest_attempt_results[$];
     protected string failed_operation_id;
     protected string authorized_failed_operation_id;
     protected string preflight_failure_text;
@@ -19,6 +21,8 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
         super.new(name);
         recorded_operations.delete();
         recorded_results.delete();
+        latest_attempt_operation_ids.delete();
+        latest_attempt_results.delete();
         failed_operation_id = "";
         authorized_failed_operation_id = "";
         preflight_failure_text = "";
@@ -59,9 +63,23 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
         return 1;
     endfunction
 
+    local function void capture_latest_attempt(
+        input dpu_reg_op operations[$],
+        input dpu_reg_op_result_e results[$]
+    );
+        latest_attempt_operation_ids.delete();
+        latest_attempt_results.delete();
+        foreach (operations[index]) begin
+            latest_attempt_operation_ids.push_back(operations[index].op_id);
+            latest_attempt_results.push_back(results[index]);
+        end
+    endfunction
+
     function void reset_history();
         recorded_operations.delete();
         recorded_results.delete();
+        latest_attempt_operation_ids.delete();
+        latest_attempt_results.delete();
         preflight_called = 0;
         preflight_empty_history = 0;
         preflight_succeeded = 0;
@@ -95,6 +113,8 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
     );
         dpu_reg_op injected_failure_operation;
 
+        latest_attempt_operation_ids.delete();
+        latest_attempt_results.delete();
         preflight_called = 1;
         preflight_empty_history =
             (recorded_operations.size() == 0) &&
@@ -191,6 +211,7 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
             staged_operations.push_back(recorded_copy);
             if (ordered[index].op_id == execution_failed_operation_id) begin
                 staged_results.push_back(DPU_REG_OP_RESULT_FAILED);
+                capture_latest_attempt(staged_operations, staged_results);
                 recorded_operations = {
                     recorded_operations, staged_operations
                 };
@@ -202,6 +223,7 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
             end
             staged_results.push_back(DPU_REG_OP_RESULT_SUCCEEDED);
         end
+        capture_latest_attempt(staged_operations, staged_results);
         recorded_operations = {recorded_operations, staged_operations};
         recorded_results = {recorded_results, staged_results};
         set_last_error("");
@@ -237,9 +259,10 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
         if (report == null)
             return;
         report.clear_results();
-        foreach (recorded_operations[index]) begin
+        foreach (latest_attempt_operation_ids[index]) begin
             report.append_result(
-                recorded_operations[index].op_id, recorded_results[index]);
+                latest_attempt_operation_ids[index],
+                latest_attempt_results[index]);
         end
     endfunction
 endclass : dpu_spy_reg_executor

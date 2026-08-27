@@ -388,6 +388,77 @@ class dpu_device_bootstrap_plan_test extends uvm_test;
             `uvm_fatal("BOOTSTRAP_TEST", {"snapshot identity lookup failed: ", why})
     endfunction
 
+    task automatic test_reused_spy_success_exports_latest_attempt();
+        dpu_config_orchestrator orchestrator;
+        dpu_spy_reg_executor spy;
+        dpu_reg_plan plan;
+        dpu_execution_report first_report;
+        dpu_execution_report second_report;
+        string why;
+
+        if (!no_executor_env.build_bootstrap_plan(plan, why))
+            `uvm_fatal("BOOTSTRAP_TEST", {"reuse plan build failed: ", why})
+        orchestrator = dpu_config_orchestrator::type_id::create(
+            "reuse_success_orchestrator");
+        spy = dpu_spy_reg_executor::type_id::create("reuse_success_spy");
+        orchestrator.set_executor(spy);
+
+        orchestrator.apply_with_report(plan, first_report);
+        expect_terminal(first_report, DPU_CFG_STATUS_SUCCEEDED, "");
+        if ((first_report.result_count() != 12) ||
+            (spy.record_count() != 12))
+            `uvm_fatal("BOOTSTRAP_TEST", "first reuse apply result/history mismatch")
+
+        orchestrator.apply_with_report(plan, second_report);
+        expect_terminal(second_report, DPU_CFG_STATUS_SUCCEEDED, "");
+        if ((second_report.result_count() != 12) ||
+            (spy.record_count() != 24)) begin
+            `uvm_fatal("BOOTSTRAP_TEST",
+                $sformatf(
+                    "second reuse report/history mismatch: report=%0d history=%0d",
+                    second_report.result_count(), spy.record_count()))
+        end
+        expect_result(second_report, 0, "pci.h1.s7.b0042.bar0.low",
+                      DPU_REG_OP_RESULT_SUCCEEDED);
+        expect_result(second_report, 11, "bootstrap.final_barrier",
+                      DPU_REG_OP_RESULT_SUCCEEDED);
+    endtask
+
+    task automatic test_reused_spy_preflight_failure_exports_no_results();
+        dpu_config_orchestrator orchestrator;
+        dpu_spy_reg_executor spy;
+        dpu_reg_plan plan;
+        dpu_execution_report first_report;
+        dpu_execution_report second_report;
+        string why;
+
+        if (!no_executor_env.build_bootstrap_plan(plan, why))
+            `uvm_fatal("BOOTSTRAP_TEST", {"reuse plan build failed: ", why})
+        orchestrator = dpu_config_orchestrator::type_id::create(
+            "reuse_preflight_orchestrator");
+        spy = dpu_spy_reg_executor::type_id::create("reuse_preflight_spy");
+        orchestrator.set_executor(spy);
+
+        orchestrator.apply_with_report(plan, first_report);
+        expect_terminal(first_report, DPU_CFG_STATUS_SUCCEEDED, "");
+        if ((first_report.result_count() != 12) ||
+            (spy.record_count() != 12))
+            `uvm_fatal("BOOTSTRAP_TEST", "reuse preflight setup apply mismatch")
+
+        spy.fail_preflight("reuse injected preflight failure");
+        orchestrator.apply_with_report(plan, second_report);
+        expect_terminal(second_report, DPU_CFG_STATUS_PREFLIGHT_FAILED,
+                        "reuse injected preflight failure");
+        if ((second_report.result_count() != 0) ||
+            (spy.record_count() != 12) ||
+            spy.preflight_history_was_empty()) begin
+            `uvm_fatal("BOOTSTRAP_TEST",
+                $sformatf(
+                    "reused preflight report/history mismatch: report=%0d history=%0d",
+                    second_report.result_count(), spy.record_count()))
+        end
+    endtask
+
     task automatic test_success_and_report_copy();
         dpu_reg_plan plan;
         dpu_execution_report report;
@@ -510,6 +581,8 @@ class dpu_device_bootstrap_plan_test extends uvm_test;
 
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
+        test_reused_spy_preflight_failure_exports_no_results();
+        test_reused_spy_success_exports_latest_attempt();
         test_success_and_report_copy();
         test_no_executor();
         test_preflight_failure();
