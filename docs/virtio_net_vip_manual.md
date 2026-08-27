@@ -1542,7 +1542,7 @@ global lease。当前 `virtio_resource_client` 虽保存一份 `g`，但其兼�
 字段；这些 directional fields 不能直接解释为 Fabric 的两份 global lease ID。
 real-DUT 目标是让 VTX 和 VRX 两个硬件 block 以方向选择共享同一个 `g`。替换
 当前 `2*g` derivation、完成 one-ID-per-qpair semantics 属于 subproject 2，
-不在本 first stage 中。
+不在当前 global DPU configuration ownership 子项目中。
 
 每个 PF 或 VF VIO-net device 有自己的 real-DUT notify-address matching
 domain/base 和独立的 local-qpair domain；一个 device 最多拥有 32 个 local
@@ -1578,29 +1578,22 @@ Fabric 拥有 `virtio.qpair` 的不透明 resource-class ID；它不是 core enu
 所有 resource profiles 必须在任何 function activation 前完成 register，并在
 注册完成后 seal registry。
 
-当前 verification/Fabric model 的 BAR 布局仍是三组 64-bit pair lease。
-PF 的 BAR0/1、BAR2/3、BAR4/5 分别建模为 32 MiB function-device、64 KiB
-reserved、64 KiB MSI-X table/PBA；VF 的对应大小为 16 KiB、16 KiB、32 KiB。
-模型将 virtio functional capability 限制在 BAR0/1，阻止 BAR2/3 的功能访问，
-并将 BAR4/5 限于 MSI-X table/PBA。Fabric 先配置 64-bit MMIO aperture；每个
-function activation 在该 aperture 中分配 BAR pairs 并赋予 role，同时检查 size、
-alignment、64-bit aperture overflow 和地址 overlap。完成 BAR role 配置与
-capability discovery 后，resource client 才标记 device-ready 并允许 queue lease。
+当前 real-DUT profile 的 BAR 布局是三组 64-bit pair。PF 的
+BAR0/1、BAR2/3、BAR4/5 分别是 32 MiB device memory/AF registers、64 KiB
+mailbox 和 64 KiB MSI-X table/PBA；VF 的对应大小为 16 KiB、16 KiB 和
+32 KiB。`dpu_device_cfg` 为每个 function 声明这三个 BAR request，resolver
+在 domain 的 MMIO windows 中检查 role、size、alignment、overflow 和 overlap，
+并将完整解析结果发布到冻结的 `dpu_device_snapshot`。
 
-仓库现有通用能力包括 VIP BAR discovery、标准 per-queue kick、MSI-X、PCIe
-sequences，以及 generic Fabric BAR leases；这些能力不应与 real-DUT AF/service
-configuration 混为一谈。当前 first stage 新增的是 capability/topology
-validation、初始配置和 dynamic resize 限制，以及 Fabric local/global qpair
-lease 边界。它没有实现 real-DUT AF register lowering/execution、BDF/BAR/MSI-X/
-notify mapping tables、`PINNED`/`PREFERRED` global-ID binding，也没有修复基础
-production `virtio_bar_mem_wr_seq` 到下层 PCIe TLP 的可信 payload propagation。
-one-ID-per-qpair、common AF mappings/payload、VIO notify/data-plane 分别属于后续
-subprojects 2、3、4。
+当前边界已包含 resolved PCI BAR 和 AF declaration/bootstrap plan lowering，
+但仓库不提供 production real-DUT executor。只有测试或集成环境显式
+注入 `dpu_reg_executor` 后才会访问硬件；未注入时报告
+`NOT_EXECUTED`，不伪报硬件成功。
 
-`cosim_control` 与 BAR2 mailbox command delivery 是
+`cosim_control` 与 BAR2/3 mailbox command delivery 是
 [real-DUT service configuration design](superpowers/specs/2026-08-25-real-dut-service-configuration-design.md)
-明确列出的 out-of-scope 项，不属于这些后续 subprojects。上述边界既不把
-real-DUT AF hardware programming 写成已实现，也不否定仓库已有的通用 VIP 功能。
+明确列出的 out-of-scope 项。BAR2/3 的 mailbox role 和地址解析已定义，
+但这不表示本仓库实现了 mailbox command transport/delivery。
 
 完整回归使用：
 

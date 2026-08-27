@@ -56,12 +56,66 @@ _validate_virtio_test_manifest() {
   done
 }
 
+_validate_global_dpu_static_contracts() {
+  local manifest_root builder definition_count named_use_count literal_count
+  local executor_input_count executor_assignment_count
+
+  manifest_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if awk '
+      BEGIN { RS = "" }
+      /BAR2\/3/ && tolower($0) ~ /reserved/ {
+        print FILENAME ": BAR2/3 and reserved occur in one paragraph" > "/dev/stderr"
+        found = 1
+      }
+      END { exit(found ? 0 : 1) }
+    ' "$manifest_root/README.md" \
+      "$manifest_root/docs/virtio_net_vip_manual.md"; then
+    echo "stale BAR2/3 reserved description is forbidden" >&2
+    return 1
+  fi
+
+  builder="$manifest_root/dpu_common/src/dpu_device_bootstrap_plan_builder.sv"
+  definition_count="$(awk '
+      $0 == "localparam bit [63:0] DPU_AF_DECLARATION_ADDR = 64\047h1010;" {
+        count++
+      }
+      END { print count + 0 }
+    ' "$builder")"
+  named_use_count="$(grep -c \
+    '^[[:space:]]*DPU_AF_DECLARATION_ADDR);$' "$builder" || true)"
+  literal_count="$(grep -c "64'h1010" "$builder" || true)"
+  if [[ "$definition_count" -ne 1 || "$named_use_count" -ne 3 ||
+        "$literal_count" -ne 1 ]]; then
+    echo "production AF declaration contract requires one definition and three named uses" >&2
+    return 1
+  fi
+
+  executor_input_count="$(grep -c \
+    '^function void configure_devices(input dpu_reg_executor injected_executor);$' \
+    "$manifest_root/README.md" || true)"
+  executor_assignment_count="$(grep -c \
+    '^global_cfg.executor = injected_executor;' \
+    "$manifest_root/README.md" || true)"
+  if [[ "$executor_input_count" -ne 1 ||
+        "$executor_assignment_count" -ne 1 ]]; then
+    echo "README executor example requires one explicit input and one injection" >&2
+    return 1
+  fi
+}
+
 _validate_virtio_test_manifest || {
   manifest_status=$?
   unset -f _validate_virtio_test_manifest
   return "$manifest_status" 2>/dev/null || exit "$manifest_status"
 }
 unset -f _validate_virtio_test_manifest
+
+_validate_global_dpu_static_contracts || {
+  contract_status=$?
+  unset -f _validate_global_dpu_static_contracts
+  return "$contract_status" 2>/dev/null || exit "$contract_status"
+}
+unset -f _validate_global_dpu_static_contracts
 
 is_virtio_maintained_test() {
   local requested="$1"

@@ -1,6 +1,8 @@
 `ifndef DPU_DEVICE_BOOTSTRAP_PLAN_BUILDER_SV
 `define DPU_DEVICE_BOOTSTRAP_PLAN_BUILDER_SV
 
+localparam bit [63:0] DPU_AF_DECLARATION_ADDR = 64'h1010;
+
 class dpu_device_bootstrap_plan_builder extends uvm_object;
     `uvm_object_utils(dpu_device_bootstrap_plan_builder)
 
@@ -108,7 +110,8 @@ class dpu_device_bootstrap_plan_builder extends uvm_object;
 
         op = make_target_op(
             "af.valid.pre_read", DPU_REG_OP_READ_VERIFY,
-            DPU_REG_TARGET_AF_BAR0, af_pcie_id, 0, "af_bar0", 64'h1010);
+            DPU_REG_TARGET_AF_BAR0, af_pcie_id, 0, "af_bar0",
+            DPU_AF_DECLARATION_ADDR);
         op.expected_value = 64'h0;
         op.read_mask = 64'h8;
         op.add_dependency(bars_complete_id);
@@ -117,7 +120,8 @@ class dpu_device_bootstrap_plan_builder extends uvm_object;
 
         op = make_target_op(
             "af.declare.write", DPU_REG_OP_MMIO_WRITE,
-            DPU_REG_TARGET_AF_BAR0, af_pcie_id, 0, "af_bar0", 64'h1010);
+            DPU_REG_TARGET_AF_BAR0, af_pcie_id, 0, "af_bar0",
+            DPU_AF_DECLARATION_ADDR);
         op.payload = 64'h5555_aaaa;
         op.write_mask = 64'h0000_0000_ffff_ffff;
         op.add_dependency("af.valid.pre_read");
@@ -126,7 +130,8 @@ class dpu_device_bootstrap_plan_builder extends uvm_object;
 
         op = make_target_op(
             "af.winner.read", DPU_REG_OP_READ_VERIFY,
-            DPU_REG_TARGET_AF_BAR0, af_pcie_id, 0, "af_bar0", 64'h1010);
+            DPU_REG_TARGET_AF_BAR0, af_pcie_id, 0, "af_bar0",
+            DPU_AF_DECLARATION_ADDR);
         op.expected_value = selected_host_value;
         op.read_mask = 64'hf;
         op.add_dependency("af.declare.write");

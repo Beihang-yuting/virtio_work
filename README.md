@@ -301,6 +301,7 @@ host/PF/VF topology、DUT capability、BDF 或 BAR placement 字段。这是 har
 `dpu_device_cfg` 对象，不是旧配置转换器。
 
 ```systemverilog
+function void configure_devices(input dpu_reg_executor injected_executor);
 virtio_test_device_builder b;
 dpu_function_cfg pf0, vf0;
 dpu_service_key_t vf0_vio;
@@ -327,11 +328,12 @@ if (!vio_cfg.add_service_config(vf0_vio, vf0_behavior, why))
   `uvm_fatal("CFG", why)
 
 global_cfg = b.make_env_config();
-global_cfg.executor = injected_executor; // 与 plan construction 分开注入
+global_cfg.executor = injected_executor;
 uvm_config_db#(dpu_device_env_config)::set(
     this, "device_env", "cfg", global_cfg);
 uvm_config_db#(virtio_net_env_config)::set(
     this, "device_env.env", "cfg", vio_cfg);
+endfunction
 ```
 
 `add_real_dut_bars()` 为每个 function 显式添加三个 request：PF0 为
