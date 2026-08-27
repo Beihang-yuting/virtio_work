@@ -1827,12 +1827,14 @@ class virtio_dut_caps_test extends uvm_test;
         virtio_net_env_config undeclared_cfg;
         virtio_net_env_config over_cap_cfg;
         virtio_net_env_config invalid_local_cfg;
+        virtio_net_env_config same_function_cfg;
         dpu_device_snapshot snapshot;
         dpu_dut_caps observed_caps;
         dpu_service_key_t first_key;
         dpu_service_key_t second_key;
         dpu_service_key_t rdma_key;
         dpu_service_key_t undeclared_key;
+        dpu_service_key_t same_function_second_key;
         virtio_driver_config_t first_cfg;
         virtio_driver_config_t second_cfg;
         virtio_driver_config_t observed_cfg;
@@ -1870,6 +1872,32 @@ class virtio_dut_caps_test extends uvm_test;
         end
         if (cfg.add_service_config(rdma_key, second_cfg, why))
             `uvm_fatal("DUT_CAPS", "RDMA service key was accepted as VIO override")
+
+        // Catches duplicate detection that compares service instance instead
+        // of enforcing the one-VIO-service-per-function profile.
+        same_function_cfg = virtio_net_env_config::type_id::create(
+            "same_function_service_keyed_cfg");
+        same_function_cfg.default_num_pairs = 1;
+        same_function_second_key = first_key;
+        same_function_second_key.service_instance_id = 1;
+        if (!same_function_cfg.add_service_config(first_key, first_cfg, why))
+            `uvm_fatal("DUT_CAPS", {"could not add first same-function VIO override: ", why})
+        if (same_function_cfg.add_service_config(
+                same_function_second_key, second_cfg, why))
+            `uvm_fatal("DUT_CAPS",
+                "same function accepted a second VIO service instance")
+        if (!same_function_cfg.get_service_config(
+                first_key, 32, observed_cfg, why) ||
+            (observed_cfg.num_queue_pairs != 31) ||
+            (observed_cfg.queue_size != 64))
+            `uvm_fatal("DUT_CAPS",
+                "same-function rejection altered the first VIO override")
+        if (!same_function_cfg.get_service_config(
+                same_function_second_key, 32, observed_cfg, why) ||
+            (observed_cfg.num_queue_pairs != 1) ||
+            (observed_cfg.queue_size != 256))
+            `uvm_fatal("DUT_CAPS",
+                "rejected same-function VIO override was partially stored")
 
         if (!cfg.get_service_config(first_key, 4, observed_cfg, why) ||
             (observed_cfg.num_queue_pairs != 2) ||

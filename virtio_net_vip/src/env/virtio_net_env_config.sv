@@ -205,6 +205,15 @@ class virtio_net_env_config extends uvm_object;
             why = {"duplicate VIO service configuration ", service_name};
             return 0;
         end
+        foreach (m_service_configs[existing_name]) begin
+            if (dpu_same_function_key(
+                    m_service_configs[existing_name].key.function_key,
+                    key.function_key)) begin
+                why = {"VIO function already has service configuration ",
+                       dpu_function_key_name(key.function_key)};
+                return 0;
+            end
+        end
         if (!validate_driver_behavior(driver_cfg, service_name, why))
             return 0;
         m_service_configs[service_name].key = key;
