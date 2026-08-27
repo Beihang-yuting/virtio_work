@@ -17,21 +17,63 @@ class dpu_device_resolver_test extends uvm_test;
         input dpu_bar_role_e role
     );
         dpu_bar_request request;
-        dpu_bar_profile_t profile;
-        dpu_dut_caps caps;
-        string why;
 
-        caps = dpu_dut_caps::type_id::create("caps");
-        if (!caps.lookup_bar_profile(kind, role, profile, why))
-            `uvm_fatal("RESOLVER_TEST", why)
         request = dpu_bar_request::type_id::create("bar_request");
         request.role = role;
-        request.even_bar_id = profile.even_bar_id;
-        request.size = profile.size;
-        request.alignment = profile.alignment;
         request.placement = DPU_ALLOC_AUTO;
         request.pinned_base = '0;
+        case (kind)
+            DPU_FUNCTION_PF: case (role)
+                DPU_BAR_DEVICE_MEMORY: begin
+                    request.even_bar_id = 0;
+                    request.size = 64'h0000_0000_0200_0000;
+                    request.alignment = 64'h0000_0000_0200_0000;
+                end
+                DPU_BAR_MAILBOX: begin
+                    request.even_bar_id = 2;
+                    request.size = 64'h0000_0000_0001_0000;
+                    request.alignment = 64'h0000_0000_0001_0000;
+                end
+                DPU_BAR_MSIX: begin
+                    request.even_bar_id = 4;
+                    request.size = 64'h0000_0000_0001_0000;
+                    request.alignment = 64'h0000_0000_0001_0000;
+                end
+                default: `uvm_fatal("RESOLVER_TEST", "unsupported PF BAR role")
+            endcase
+            DPU_FUNCTION_VF: case (role)
+                DPU_BAR_DEVICE_MEMORY: begin
+                    request.even_bar_id = 0;
+                    request.size = 64'h0000_0000_0000_4000;
+                    request.alignment = 64'h0000_0000_0000_4000;
+                end
+                DPU_BAR_MAILBOX: begin
+                    request.even_bar_id = 2;
+                    request.size = 64'h0000_0000_0000_4000;
+                    request.alignment = 64'h0000_0000_0000_4000;
+                end
+                DPU_BAR_MSIX: begin
+                    request.even_bar_id = 4;
+                    request.size = 64'h0000_0000_0000_8000;
+                    request.alignment = 64'h0000_0000_0000_8000;
+                end
+                default: `uvm_fatal("RESOLVER_TEST", "unsupported VF BAR role")
+            endcase
+            default: `uvm_fatal("RESOLVER_TEST", "unsupported function kind")
+        endcase
         return request;
+    endfunction
+
+    function automatic void expect_bar_request(
+        input dpu_bar_request request,
+        input dpu_bar_role_e role,
+        input int unsigned even_bar_id,
+        input bit [63:0] size,
+        input bit [63:0] alignment
+    );
+        if ((request.role != role) || (request.even_bar_id != even_bar_id) ||
+            (request.size != size) || (request.alignment != alignment))
+            `uvm_fatal("RESOLVER_TEST", "BAR request does not match literal profile")
     endfunction
 
     function automatic dpu_function_cfg make_function(
@@ -172,6 +214,34 @@ class dpu_device_resolver_test extends uvm_test;
     // Catches a regression where the validator rejects a legal sparse topology.
     function void test_valid_sparse_config(input dpu_device_resolver resolver);
         expect_valid(resolver, make_valid_cfg());
+    endfunction
+
+    // Catches a DUT BAR profile that disagrees with real BAR0/1, BAR2/3, or BAR4/5.
+    function void test_real_dut_bar_profile_literals(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        expect_bar_request(cfg.functions[0].bars[0], DPU_BAR_DEVICE_MEMORY,
+                           0, 64'h0000_0000_0200_0000,
+                           64'h0000_0000_0200_0000);
+        expect_bar_request(cfg.functions[0].bars[1], DPU_BAR_MAILBOX,
+                           2, 64'h0000_0000_0001_0000,
+                           64'h0000_0000_0001_0000);
+        expect_bar_request(cfg.functions[0].bars[2], DPU_BAR_MSIX,
+                           4, 64'h0000_0000_0001_0000,
+                           64'h0000_0000_0001_0000);
+        expect_bar_request(cfg.functions[3].bars[0], DPU_BAR_DEVICE_MEMORY,
+                           0, 64'h0000_0000_0000_4000,
+                           64'h0000_0000_0000_4000);
+        expect_bar_request(cfg.functions[3].bars[1], DPU_BAR_MAILBOX,
+                           2, 64'h0000_0000_0000_4000,
+                           64'h0000_0000_0000_4000);
+        expect_bar_request(cfg.functions[3].bars[2], DPU_BAR_MSIX,
+                           4, 64'h0000_0000_0000_8000,
+                           64'h0000_0000_0000_8000);
+        expect_valid(resolver, cfg);
     endfunction
 
     // Catches shallow child copies that let a clone mutate its source host.
@@ -324,6 +394,7 @@ class dpu_device_resolver_test extends uvm_test;
         phase.raise_objection(this);
         resolver = dpu_device_resolver::type_id::create("resolver");
         test_valid_sparse_config(resolver);
+        test_real_dut_bar_profile_literals(resolver);
         test_copy_from_is_deep(resolver);
         test_duplicate_host_key(resolver);
         test_duplicate_pcie_domain_key(resolver);
