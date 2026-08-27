@@ -31,6 +31,13 @@ class virtio_net_env_config extends uvm_object;
     // Per-VF configs (optional, falls back to defaults)
     virtio_driver_config_t  vf_configs[];
 
+    typedef struct {
+        dpu_service_key_t key;
+        virtio_driver_config_t cfg;
+    } service_config_entry_t;
+
+    protected service_config_entry_t m_service_configs[string];
+
     // ===== Default driver config =====
     int unsigned         default_num_pairs = 1;
     int unsigned         default_queue_size = 256;  // 0 = device max
@@ -100,19 +107,22 @@ class virtio_net_env_config extends uvm_object;
     endfunction
 
     // ========================================================================
-    // get_default_driver_config
+    // make_default_driver_config
     //
-    // Build a virtio_driver_config_t from the default fields. Used for VFs
-    // that do not have an explicit entry in vf_configs[].
+    // Build behavior from the default fields and cap it with the authority
+    // supplied by the caller.  The legacy getter below remains temporarily
+    // for unconverted positional callers.
     // ========================================================================
 
-    function virtio_driver_config_t get_default_driver_config();
+    function virtio_driver_config_t make_default_driver_config(
+        input int unsigned max_pairs
+    );
         virtio_driver_config_t cfg;
-        cfg.num_queue_pairs     = default_num_pairs;
+
+        cfg.num_queue_pairs     = (default_num_pairs > max_pairs) ?
+                                  max_pairs : default_num_pairs;
         cfg.queue_size          = default_queue_size;
-        cfg.max_vio_net_qpairs_per_device =
-            (dut_caps == null) ? DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE :
-                                 dut_caps.max_vio_net_qpairs_per_device;
+        cfg.max_vio_net_qpairs_per_device = max_pairs;
         cfg.vq_type             = default_vq_type;
         cfg.driver_features     = default_driver_features;
         cfg.rx_buf_mode         = default_rx_mode;
@@ -126,6 +136,14 @@ class virtio_net_env_config extends uvm_object;
         cfg.bw_limit_mbps       = bw_limit_mbps;
         cfg.mode                = default_driver_mode;
         return cfg;
+    endfunction
+
+    function virtio_driver_config_t get_default_driver_config();
+        int unsigned max_pairs;
+
+        max_pairs = (dut_caps == null) ? DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE :
+                                        dut_caps.max_vio_net_qpairs_per_device;
+        return make_default_driver_config(max_pairs);
     endfunction
 
     // ========================================================================
@@ -146,6 +164,163 @@ class virtio_net_env_config extends uvm_object;
             (dut_caps == null) ? DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE :
                                  dut_caps.max_vio_net_qpairs_per_device;
         return cfg;
+    endfunction
+
+    protected function bit validate_driver_behavior(
+        input virtio_driver_config_t driver_cfg,
+        input string label,
+        output string why
+    );
+        if (driver_cfg.num_queue_pairs == 0) begin
+            why = {label, " has zero queue pairs"};
+            return 0;
+        end
+        if ((driver_cfg.queue_size != 0) &&
+            ((driver_cfg.queue_size & (driver_cfg.queue_size - 1)) != 0)) begin
+            why = {label, " queue size is not a power of two"};
+            return 0;
+        end
+        if (driver_cfg.bw_limit_enable && (driver_cfg.bw_limit_mbps == 0)) begin
+            why = {label, " enables a zero bandwidth limit"};
+            return 0;
+        end
+        why = "";
+        return 1;
+    endfunction
+
+    function bit add_service_config(
+        input dpu_service_key_t key,
+        input virtio_driver_config_t driver_cfg,
+        output string why
+    );
+        string service_name;
+
+        service_name = dpu_service_key_name(key);
+        if (key.service_kind != DPU_SERVICE_VIO_NET) begin
+            why = {"VIO service configuration requires VIO-net key ",
+                   service_name};
+            return 0;
+        end
+        if (m_service_configs.exists(service_name)) begin
+            why = {"duplicate VIO service configuration ", service_name};
+            return 0;
+        end
+        if (!validate_driver_behavior(driver_cfg, service_name, why))
+            return 0;
+        m_service_configs[service_name].key = key;
+        m_service_configs[service_name].cfg = driver_cfg;
+        why = "";
+        return 1;
+    endfunction
+
+    function bit get_service_config(
+        input dpu_service_key_t key,
+        input int unsigned max_pairs,
+        output virtio_driver_config_t driver_cfg,
+        output string why
+    );
+        string service_name;
+
+        service_name = dpu_service_key_name(key);
+        if (key.service_kind != DPU_SERVICE_VIO_NET) begin
+            why = {"VIO service configuration requires VIO-net key ",
+                   service_name};
+            return 0;
+        end
+        if ((max_pairs == 0) ||
+            (max_pairs > DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE)) begin
+            why = $sformatf("VIO behavior max pairs %0d is outside 1..%0d",
+                            max_pairs, DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE);
+            return 0;
+        end
+        if (m_service_configs.exists(service_name))
+            driver_cfg = m_service_configs[service_name].cfg;
+        else
+            driver_cfg = make_default_driver_config(max_pairs);
+        if (driver_cfg.num_queue_pairs > max_pairs)
+            driver_cfg.num_queue_pairs = max_pairs;
+        driver_cfg.max_vio_net_qpairs_per_device = max_pairs;
+        why = "";
+        return 1;
+    endfunction
+
+    function bit validate_local(output string why);
+        virtio_driver_config_t default_cfg;
+
+        if (mem_base >= mem_end) begin
+            why = $sformatf("mem_base=0x%016h >= mem_end=0x%016h",
+                            mem_base, mem_end);
+            return 0;
+        end
+        default_cfg = make_default_driver_config(
+            DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE);
+        if (!validate_driver_behavior(default_cfg, "default VIO behavior", why))
+            return 0;
+        foreach (m_service_configs[service_name]) begin
+            if (m_service_configs[service_name].key.service_kind !=
+                DPU_SERVICE_VIO_NET) begin
+                why = {"VIO service configuration requires VIO-net key ",
+                       service_name};
+                return 0;
+            end
+            if (!validate_driver_behavior(m_service_configs[service_name].cfg,
+                                          service_name, why))
+                return 0;
+        end
+        why = "";
+        return 1;
+    endfunction
+
+    function bit validate_against_snapshot(
+        input dpu_device_snapshot snapshot,
+        output string why
+    );
+        dpu_dut_caps snapshot_caps;
+        dpu_function_key_t owner;
+        string service_why;
+
+        if ((snapshot == null) || !snapshot.is_frozen()) begin
+            why = "VIO service configuration requires a non-null frozen snapshot";
+            return 0;
+        end
+        if (!validate_local(why))
+            return 0;
+        snapshot_caps = snapshot.snapshot_dut_caps();
+        if (snapshot_caps == null) begin
+            why = "frozen snapshot has no DUT capabilities";
+            return 0;
+        end
+        if ((snapshot_caps.max_vio_net_qpairs_per_device == 0) ||
+            (snapshot_caps.max_vio_net_qpairs_per_device >
+             DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE)) begin
+            why = "frozen snapshot has an invalid VIO qpair capability";
+            return 0;
+        end
+        foreach (m_service_configs[service_name]) begin
+            if (m_service_configs[service_name].key.service_kind !=
+                DPU_SERVICE_VIO_NET) begin
+                why = {"VIO service configuration requires VIO-net key ",
+                       service_name};
+                return 0;
+            end
+            if (!snapshot.get_service_owner(
+                    m_service_configs[service_name].key, owner, service_why)) begin
+                why = {"VIO service configuration is not declared by snapshot ",
+                       service_name, ": ", service_why};
+                return 0;
+            end
+            if (m_service_configs[service_name].cfg.num_queue_pairs >
+                snapshot_caps.max_vio_net_qpairs_per_device) begin
+                why = $sformatf(
+                    "VIO service configuration %s queue pairs %0d exceeds snapshot limit %0d",
+                    service_name,
+                    m_service_configs[service_name].cfg.num_queue_pairs,
+                    snapshot_caps.max_vio_net_qpairs_per_device);
+                return 0;
+            end
+        end
+        why = "";
+        return 1;
     endfunction
 
     // ========================================================================

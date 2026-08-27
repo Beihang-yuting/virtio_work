@@ -812,6 +812,63 @@ class virtio_dut_caps_test extends uvm_test;
         return key;
     endfunction
 
+    function automatic dpu_device_snapshot make_vio_behavior_snapshot(
+        input dpu_service_key_t first_service,
+        input dpu_service_key_t second_service
+    );
+        dpu_device_snapshot snapshot;
+        dpu_dut_caps caps;
+        dpu_function_key_t first_pf;
+        dpu_function_key_t second_pf;
+        dpu_pcie_function_id_t pcie_id;
+        dpu_bar_pair_lease_t af_bar;
+        string why;
+
+        snapshot = dpu_device_snapshot::type_id::create(
+            "vio_behavior_snapshot");
+        caps = dpu_dut_caps::type_id::create("vio_behavior_caps");
+        caps.max_vio_net_qpairs_per_device = 4;
+        if (!snapshot.set_dut_caps(caps, why))
+            `uvm_fatal("DUT_CAPS", {"could not set VIO behavior caps: ", why})
+
+        first_pf = first_service.function_key;
+        first_pf.kind = DPU_FUNCTION_PF;
+        first_pf.vf_id = 0;
+        second_pf = second_service.function_key;
+        second_pf.kind = DPU_FUNCTION_PF;
+        second_pf.vf_id = 0;
+
+        pcie_id.domain.host_id = first_pf.host_id;
+        pcie_id.domain.segment_id = 0;
+        pcie_id.bdf = 16'h0010;
+        if (!snapshot.add_function(first_pf, pcie_id, why))
+            `uvm_fatal("DUT_CAPS", {"could not add first VIO function: ", why})
+        pcie_id.bdf = 16'h0011;
+        if (!snapshot.add_function(first_service.function_key, pcie_id, why))
+            `uvm_fatal("DUT_CAPS", {"could not add first VIO service: ", why})
+
+        pcie_id.domain.host_id = second_pf.host_id;
+        pcie_id.domain.segment_id = 1;
+        pcie_id.bdf = 16'h0010;
+        if (!snapshot.add_function(second_pf, pcie_id, why))
+            `uvm_fatal("DUT_CAPS", {"could not add second VIO function: ", why})
+        pcie_id.bdf = 16'h0011;
+        if (!snapshot.add_function(second_service.function_key, pcie_id, why))
+            `uvm_fatal("DUT_CAPS", {"could not add second VIO service: ", why})
+
+        af_bar.role = DPU_BAR_DEVICE_MEMORY;
+        af_bar.even_bar_id = 0;
+        af_bar.base = 64'h0000_0001_0000_0000;
+        af_bar.size = 64'h0000_0000_0000_4000;
+        if (!snapshot.add_bar(first_pf, af_bar, why) ||
+            !snapshot.add_service(first_service, why) ||
+            !snapshot.add_service(second_service, why) ||
+            !snapshot.set_expected_af(first_pf, why) ||
+            !snapshot.freeze(why))
+            `uvm_fatal("DUT_CAPS", {"could not freeze VIO behavior snapshot: ", why})
+        return snapshot;
+    endfunction
+
     function virtio_net_env_config make_fatal_probe_cfg(
         input string name,
         input int unsigned num_vfs
@@ -1763,6 +1820,120 @@ class virtio_dut_caps_test extends uvm_test;
                 cfg.get_name(), catcher.caught_count, expected_message))
         end
         total_caught += catcher.caught_count;
+    endtask
+
+    task assert_service_keyed_vio_behavior();
+        virtio_net_env_config cfg;
+        virtio_net_env_config undeclared_cfg;
+        virtio_net_env_config over_cap_cfg;
+        virtio_net_env_config invalid_local_cfg;
+        dpu_device_snapshot snapshot;
+        dpu_dut_caps observed_caps;
+        dpu_service_key_t first_key;
+        dpu_service_key_t second_key;
+        dpu_service_key_t rdma_key;
+        dpu_service_key_t undeclared_key;
+        virtio_driver_config_t first_cfg;
+        virtio_driver_config_t second_cfg;
+        virtio_driver_config_t observed_cfg;
+        string why;
+
+        first_key.function_key = make_key(0, 0, DPU_FUNCTION_VF, 7);
+        first_key.service_kind = DPU_SERVICE_VIO_NET;
+        first_key.service_instance_id = 0;
+        second_key.function_key = make_key(1, 0, DPU_FUNCTION_VF, 7);
+        second_key.service_kind = DPU_SERVICE_VIO_NET;
+        second_key.service_instance_id = 0;
+        rdma_key = first_key;
+        rdma_key.service_kind = DPU_SERVICE_RDMA;
+        undeclared_key = first_key;
+        undeclared_key.service_instance_id = 1;
+        snapshot = make_vio_behavior_snapshot(first_key, second_key);
+
+        cfg = virtio_net_env_config::type_id::create("service_keyed_cfg");
+        cfg.default_num_pairs = 9;
+        first_cfg.num_queue_pairs = 2;
+        first_cfg.queue_size = 512;
+        second_cfg.num_queue_pairs = 3;
+        second_cfg.queue_size = 1024;
+        if (!cfg.add_service_config(first_key, first_cfg, why))
+            `uvm_fatal("DUT_CAPS", {"could not add first VIO override: ", why})
+        first_cfg.num_queue_pairs = 31;
+        first_cfg.queue_size = 64;
+        if (!cfg.add_service_config(second_key, second_cfg, why))
+            `uvm_fatal("DUT_CAPS", {"could not add second VIO override: ", why})
+        if (cfg.add_service_config(first_key, second_cfg, why) ||
+            (why != {"duplicate VIO service configuration ",
+                     dpu_service_key_name(first_key)})) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "duplicate VIO override was not rejected precisely: %s", why))
+        end
+        if (cfg.add_service_config(rdma_key, second_cfg, why))
+            `uvm_fatal("DUT_CAPS", "RDMA service key was accepted as VIO override")
+
+        if (!cfg.get_service_config(first_key, 4, observed_cfg, why) ||
+            (observed_cfg.num_queue_pairs != 2) ||
+            (observed_cfg.queue_size != 512) ||
+            (observed_cfg.max_vio_net_qpairs_per_device != 4)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "first full service key did not retain its own VIO behavior: %s",
+                why))
+        end
+        observed_cfg.num_queue_pairs = 1;
+        if (!cfg.get_service_config(first_key, 4, observed_cfg, why) ||
+            (observed_cfg.num_queue_pairs != 2))
+            `uvm_fatal("DUT_CAPS", "VIO override lookup exposed owned storage")
+        if (!cfg.get_service_config(second_key, 4, observed_cfg, why) ||
+            (observed_cfg.num_queue_pairs != 3) ||
+            (observed_cfg.queue_size != 1024)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "cross-host equal PF/VF IDs aliased VIO behavior: %s", why))
+        end
+        if (cfg.get_service_config(rdma_key, 4, observed_cfg, why))
+            `uvm_fatal("DUT_CAPS", "RDMA key was accepted by VIO behavior lookup")
+
+        observed_caps = snapshot.snapshot_dut_caps();
+        if ((observed_caps == null) ||
+            (observed_caps.max_vio_net_qpairs_per_device != 4))
+            `uvm_fatal("DUT_CAPS", "VIO behavior snapshot did not expose cap 4")
+        observed_caps.max_vio_net_qpairs_per_device = 32;
+        if (!cfg.get_service_config(undeclared_key, 4, observed_cfg, why) ||
+            (observed_cfg.num_queue_pairs != 4) ||
+            (observed_cfg.max_vio_net_qpairs_per_device != 4)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "absent VIO override did not cap default behavior at snapshot limit: %s",
+                why))
+        end
+        if (!cfg.validate_local(why) ||
+            !cfg.validate_against_snapshot(snapshot, why))
+            `uvm_fatal("DUT_CAPS", {"valid service-keyed VIO behavior rejected: ", why})
+        if (cfg.validate_against_snapshot(null, why))
+            `uvm_fatal("DUT_CAPS", "null snapshot accepted VIO behavior overrides")
+
+        undeclared_cfg = virtio_net_env_config::type_id::create(
+            "undeclared_service_keyed_cfg");
+        if (!undeclared_cfg.add_service_config(undeclared_key, second_cfg, why) ||
+            undeclared_cfg.validate_against_snapshot(snapshot, why))
+            `uvm_fatal("DUT_CAPS", "undeclared VIO service override was accepted")
+
+        over_cap_cfg = virtio_net_env_config::type_id::create("over_cap_vio_cfg");
+        second_cfg.num_queue_pairs = 5;
+        if (!over_cap_cfg.add_service_config(first_key, second_cfg, why) ||
+            !over_cap_cfg.validate_local(why))
+            `uvm_fatal("DUT_CAPS", {"local VIO behavior unexpectedly owned cap validation: ", why})
+        if (over_cap_cfg.validate_against_snapshot(snapshot, why))
+            `uvm_fatal("DUT_CAPS", "snapshot accepted VIO override beyond cap 4")
+
+        invalid_local_cfg = virtio_net_env_config::type_id::create(
+            "invalid_local_vio_cfg");
+        invalid_local_cfg.default_queue_size = 3;
+        if (invalid_local_cfg.validate_local(why))
+            `uvm_fatal("DUT_CAPS", "local VIO validation accepted non-power-of-two queue size")
+        invalid_local_cfg.default_queue_size = 256;
+        invalid_local_cfg.bw_limit_enable = 1;
+        invalid_local_cfg.bw_limit_mbps = 0;
+        if (invalid_local_cfg.validate_local(why))
+            `uvm_fatal("DUT_CAPS", "local VIO validation accepted zero enabled bandwidth limit")
     endtask
 
     task assert_virtio_config_uses_dut_caps();
@@ -4139,6 +4310,7 @@ class virtio_dut_caps_test extends uvm_test;
         assert_env_function_configuration_failure_returns();
         assert_pf_build_failure_stops_later_phases();
         assert_real_dut_capability_defaults();
+        assert_service_keyed_vio_behavior();
         assert_virtio_config_uses_dut_caps();
         assert_env_propagates_caps_to_fabric();
         assert_expected_error_catchers_match_client();
