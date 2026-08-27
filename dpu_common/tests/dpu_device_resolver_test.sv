@@ -5,6 +5,73 @@ import uvm_pkg::*;
 `include "uvm_macros.svh"
 import dpu_resource_pkg::*;
 
+class dpu_snapshot_integrity_probe extends dpu_device_snapshot;
+    `uvm_object_utils(dpu_snapshot_integrity_probe)
+
+    function new(string name = "dpu_snapshot_integrity_probe");
+        super.new(name);
+    endfunction
+
+    function void corrupt_add_reverse_only(
+        input dpu_pcie_function_id_t pcie_id,
+        input dpu_function_key_t key
+    );
+        m_reverse_functions[dpu_pcie_function_id_name(pcie_id)] = key;
+    endfunction
+
+    function void corrupt_add_unordered_bar(
+        input dpu_function_key_t key,
+        input dpu_pcie_domain_key_t domain,
+        input dpu_bar_pair_lease_t bar
+    );
+        string bar_name;
+
+        bar_name = dpu_function_bar_key_name(key, bar.role);
+        m_bars[bar_name] = bar;
+        m_bar_domains[bar_name] = domain;
+        m_bar_functions[bar_name] = key;
+    endfunction
+
+    function void corrupt_delete_bar_domain(
+        input dpu_function_key_t key,
+        input dpu_bar_role_e role
+    );
+        m_bar_domains.delete(dpu_function_bar_key_name(key, role));
+    endfunction
+
+    function void corrupt_bar_owner(
+        input dpu_function_key_t key,
+        input dpu_bar_role_e role,
+        input dpu_function_key_t wrong_owner
+    );
+        m_bar_functions[dpu_function_bar_key_name(key, role)] = wrong_owner;
+    endfunction
+
+    function void corrupt_bar_domain(
+        input dpu_function_key_t key,
+        input dpu_bar_role_e role,
+        input dpu_pcie_domain_key_t wrong_domain
+    );
+        m_bar_domains[dpu_function_bar_key_name(key, role)] = wrong_domain;
+    endfunction
+
+    function void corrupt_bar_base(
+        input dpu_function_key_t key,
+        input dpu_bar_role_e role,
+        input bit [63:0] wrong_base
+    );
+        m_bars[dpu_function_bar_key_name(key, role)].base = wrong_base;
+    endfunction
+
+    function void corrupt_bar_role(
+        input dpu_function_key_t key,
+        input dpu_bar_role_e indexed_role,
+        input dpu_bar_role_e wrong_role
+    );
+        m_bars[dpu_function_bar_key_name(key, indexed_role)].role = wrong_role;
+    endfunction
+endclass : dpu_snapshot_integrity_probe
+
 class dpu_device_resolver_test extends uvm_test;
     `uvm_component_utils(dpu_device_resolver_test)
 
@@ -316,6 +383,71 @@ class dpu_device_resolver_test extends uvm_test;
             end
         end
         `uvm_fatal("RESOLVER_TEST", "missing PF BAR profile in fixture")
+    endfunction
+
+    function automatic dpu_snapshot_integrity_probe make_mutable_snapshot();
+        dpu_snapshot_integrity_probe snapshot;
+        dpu_dut_caps caps;
+        dpu_function_key_t af_key;
+        dpu_function_key_t peer_key;
+        dpu_pcie_function_id_t pcie_id;
+        dpu_bar_pair_lease_t bar;
+        string why;
+
+        snapshot = dpu_snapshot_integrity_probe::type_id::create(
+            "mutable_snapshot");
+        caps = dpu_dut_caps::type_id::create("snapshot_caps");
+        af_key.host_id = 0;
+        af_key.pf_id = 0;
+        af_key.kind = DPU_FUNCTION_PF;
+        af_key.vf_id = 0;
+        peer_key.host_id = 0;
+        peer_key.pf_id = 1;
+        peer_key.kind = DPU_FUNCTION_PF;
+        peer_key.vf_id = 0;
+        pcie_id.domain.host_id = 0;
+        pcie_id.domain.segment_id = 0;
+        pcie_id.bdf = 16'h0010;
+        if (!snapshot.set_dut_caps(caps, why) ||
+            !snapshot.add_function(af_key, pcie_id, why))
+            `uvm_fatal("RESOLVER_TEST", {"snapshot fixture failed: ", why})
+        pcie_id.bdf = 16'h0011;
+        if (!snapshot.add_function(peer_key, pcie_id, why))
+            `uvm_fatal("RESOLVER_TEST", {"snapshot fixture failed: ", why})
+        bar.role = DPU_BAR_DEVICE_MEMORY;
+        bar.even_bar_id = 0;
+        bar.base = 64'h0000_0001_0000_0000;
+        bar.size = 64'h0000_0000_0200_0000;
+        if (!snapshot.add_bar(af_key, bar, why))
+            `uvm_fatal("RESOLVER_TEST", {"snapshot fixture failed: ", why})
+        bar.role = DPU_BAR_MAILBOX;
+        bar.even_bar_id = 2;
+        bar.base = 64'h0000_0001_0200_0000;
+        bar.size = 64'h0000_0000_0001_0000;
+        if (!snapshot.add_bar(peer_key, bar, why) ||
+            !snapshot.set_expected_af(af_key, why))
+            `uvm_fatal("RESOLVER_TEST", {"snapshot fixture failed: ", why})
+        return snapshot;
+    endfunction
+
+    function automatic bit freeze_rejects_corruption(
+        input dpu_snapshot_integrity_probe snapshot,
+        input string expected
+    );
+        string why;
+
+        if (snapshot.freeze(why)) begin
+            `uvm_error("RESOLVER_TEST",
+                {"malformed snapshot unexpectedly froze: ", expected})
+            return 0;
+        end
+        if (snapshot.is_frozen())
+            `uvm_fatal("RESOLVER_TEST", "failed freeze published snapshot state")
+        if (!contains(why, expected))
+            `uvm_fatal("RESOLVER_TEST",
+                $sformatf("expected freeze diagnostic '%s', got '%s'",
+                          expected, why))
+        return 1;
     endfunction
 
     // Catches a regression where the validator rejects a legal sparse topology.
@@ -669,6 +801,66 @@ class dpu_device_resolver_test extends uvm_test;
         expect_resolution_invalid(resolver, cfg, "BDF space exhausted");
     endfunction
 
+    // Catches AUTO allocation probing the entire 16-bit BDF space instead of
+    // iterating the configured high ranges, and catches a 16-bit loop counter
+    // that wraps before assigning the inclusive 16'hffff endpoint.
+    function void test_auto_bdf_scans_sorted_ranges_to_ffff(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg cfg;
+        dpu_device_snapshot snapshot;
+        dpu_function_cfg function_cfg;
+        dpu_function_key_t last_key;
+
+        cfg = dpu_device_cfg::type_id::create("high_bdf_cfg");
+        cfg.dut_caps.max_hosts = 4;
+        cfg.dut_caps.max_pfs_per_host = 16;
+        cfg.dut_caps.max_vfs_per_pf = 16;
+        for (int unsigned host_id = 0; host_id < 4; host_id++) begin
+            dpu_host_cfg host;
+
+            host = make_host(host_id, host_id);
+            host.pcie_domains[0].bdf_ranges[0].first_bdf = 16'hff00;
+            host.pcie_domains[0].bdf_ranges[0].last_bdf = 16'hffff;
+            for (int unsigned range_index = 1; range_index < 64;
+                 range_index++) begin
+                dpu_bdf_range_t repeated_range;
+
+                repeated_range.first_bdf = 16'hff00;
+                repeated_range.last_bdf = 16'hffff;
+                host.pcie_domains[0].bdf_ranges.push_back(repeated_range);
+            end
+            cfg.hosts.push_back(host);
+            for (int unsigned pf_id = 0; pf_id < 16; pf_id++) begin
+                function_cfg = make_function(host_id, pf_id,
+                                             DPU_FUNCTION_PF, 0, host_id);
+                function_cfg.bars.delete();
+                if ((host_id == 0) && (pf_id == 0))
+                    function_cfg.bars.push_back(
+                        make_bar(DPU_FUNCTION_PF, DPU_BAR_DEVICE_MEMORY));
+                cfg.functions.push_back(function_cfg);
+                for (int unsigned vf_id = 0; vf_id < 15; vf_id++) begin
+                    function_cfg = make_function(host_id, pf_id,
+                                                 DPU_FUNCTION_VF, vf_id,
+                                                 host_id);
+                    function_cfg.bars.delete();
+                    cfg.functions.push_back(function_cfg);
+                end
+            end
+        end
+        cfg.af_request.requester.host_id = 0;
+        cfg.af_request.requester.pf_id = 0;
+        cfg.af_request.requester.kind = DPU_FUNCTION_PF;
+        cfg.af_request.requester.vf_id = 0;
+
+        expect_resolved(resolver, cfg, snapshot);
+        last_key.host_id = 3;
+        last_key.pf_id = 15;
+        last_key.kind = DPU_FUNCTION_VF;
+        last_key.vf_id = 14;
+        expect_pcie_id(snapshot, last_key, 3, 3, 16'hffff);
+    endfunction
+
     // Catches acceptance of an odd or out-of-range 64-bit BAR pair.
     function void test_bar_pair_shape(input dpu_device_resolver resolver);
         dpu_device_cfg cfg;
@@ -874,6 +1066,81 @@ class dpu_device_resolver_test extends uvm_test;
             `uvm_fatal("RESOLVER_TEST", "failed resolve changed old snapshot")
     endfunction
 
+    // Catches freeze accepting reverse-only BDFs, incomplete BAR maps/order,
+    // wrong BAR owners/domains, overlapping intervals, or BAR key/value drift.
+    function void test_snapshot_freeze_cross_checks_all_indexes();
+        dpu_snapshot_integrity_probe snapshot;
+        dpu_function_key_t af_key;
+        dpu_function_key_t peer_key;
+        dpu_pcie_function_id_t phantom_pcie;
+        dpu_pcie_domain_key_t wrong_domain;
+        dpu_bar_pair_lease_t unordered_bar;
+        int unsigned missed_rejections;
+
+        af_key.host_id = 0;
+        af_key.pf_id = 0;
+        af_key.kind = DPU_FUNCTION_PF;
+        af_key.vf_id = 0;
+        peer_key.host_id = 0;
+        peer_key.pf_id = 1;
+        peer_key.kind = DPU_FUNCTION_PF;
+        peer_key.vf_id = 0;
+        missed_rejections = 0;
+
+        snapshot = make_mutable_snapshot();
+        phantom_pcie.domain.host_id = 0;
+        phantom_pcie.domain.segment_id = 0;
+        phantom_pcie.bdf = 16'h0012;
+        snapshot.corrupt_add_reverse_only(phantom_pcie, peer_key);
+        if (!freeze_rejects_corruption(snapshot, "PCIe index cardinality"))
+            missed_rejections++;
+
+        snapshot = make_mutable_snapshot();
+        unordered_bar.role = DPU_BAR_MSIX;
+        unordered_bar.even_bar_id = 4;
+        unordered_bar.base = 64'h0000_0001_0201_0000;
+        unordered_bar.size = 64'h0000_0000_0001_0000;
+        wrong_domain.host_id = 0;
+        wrong_domain.segment_id = 0;
+        snapshot.corrupt_add_unordered_bar(peer_key, wrong_domain,
+                                           unordered_bar);
+        if (!freeze_rejects_corruption(snapshot, "BAR index cardinality"))
+            missed_rejections++;
+
+        snapshot = make_mutable_snapshot();
+        snapshot.corrupt_delete_bar_domain(peer_key, DPU_BAR_MAILBOX);
+        if (!freeze_rejects_corruption(snapshot, "BAR index cardinality"))
+            missed_rejections++;
+
+        snapshot = make_mutable_snapshot();
+        snapshot.corrupt_bar_owner(peer_key, DPU_BAR_MAILBOX, af_key);
+        if (!freeze_rejects_corruption(snapshot, "BAR owning function"))
+            missed_rejections++;
+
+        snapshot = make_mutable_snapshot();
+        wrong_domain.host_id = 0;
+        wrong_domain.segment_id = 9;
+        snapshot.corrupt_bar_domain(peer_key, DPU_BAR_MAILBOX, wrong_domain);
+        if (!freeze_rejects_corruption(snapshot, "BAR owning domain"))
+            missed_rejections++;
+
+        snapshot = make_mutable_snapshot();
+        snapshot.corrupt_bar_base(peer_key, DPU_BAR_MAILBOX,
+                                  64'h0000_0001_0000_0000);
+        if (!freeze_rejects_corruption(snapshot, "BAR interval overlap"))
+            missed_rejections++;
+
+        snapshot = make_mutable_snapshot();
+        snapshot.corrupt_bar_role(peer_key, DPU_BAR_MAILBOX, DPU_BAR_MSIX);
+        if (!freeze_rejects_corruption(snapshot, "BAR key identity"))
+            missed_rejections++;
+
+        if (missed_rejections != 0)
+            `uvm_fatal("RESOLVER_TEST",
+                $sformatf("snapshot freeze missed %0d integrity defects",
+                          missed_rejections))
+    endfunction
+
     virtual task run_phase(uvm_phase phase);
         dpu_device_resolver resolver;
 
@@ -898,6 +1165,7 @@ class dpu_device_resolver_test extends uvm_test;
         test_pinned_bdf_out_of_range(resolver);
         test_pinned_bdf_same_domain_duplicate(resolver);
         test_auto_bdf_exhaustion(resolver);
+        test_auto_bdf_scans_sorted_ranges_to_ffff(resolver);
         test_bar_pair_shape(resolver);
         test_bar_role_pair_mismatch_on_resolve(resolver);
         test_pinned_bar_misaligned(resolver);
@@ -907,6 +1175,7 @@ class dpu_device_resolver_test extends uvm_test;
         test_bar_arithmetic_guards(resolver);
         test_snapshot_immutability_and_service_queries(resolver);
         test_failed_resolve_is_atomic(resolver);
+        test_snapshot_freeze_cross_checks_all_indexes();
         phase.drop_objection(this);
     endtask
 endclass : dpu_device_resolver_test

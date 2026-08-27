@@ -110,6 +110,22 @@ class dpu_device_resolver extends uvm_object;
         end
     endfunction
 
+    protected function void sort_bdf_ranges(ref dpu_bdf_range_t ranges[$]);
+        dpu_bdf_range_t swap;
+
+        for (int left = 0; left < ranges.size(); left++) begin
+            for (int right = left + 1; right < ranges.size(); right++) begin
+                if ((ranges[right].first_bdf < ranges[left].first_bdf) ||
+                    ((ranges[right].first_bdf == ranges[left].first_bdf) &&
+                     (ranges[right].last_bdf < ranges[left].last_bdf))) begin
+                    swap = ranges[left];
+                    ranges[left] = ranges[right];
+                    ranges[right] = swap;
+                end
+            end
+        end
+    endfunction
+
     protected function bit find_domain(
         input dpu_device_cfg cfg,
         input dpu_pcie_domain_key_t key,
@@ -542,11 +558,12 @@ class dpu_device_resolver extends uvm_object;
                 pcie_id;
         end
 
-        // The finite numeric scan is independent of authored range ordering
-        // and cannot wrap a 16-bit BDF candidate.
+        // Scan sorted authored ranges directly. The widened counter is stopped
+        // explicitly after testing the inclusive endpoint, including 16'hffff.
         foreach (functions[index]) begin
             dpu_pcie_domain_cfg domain;
             dpu_pcie_function_id_t pcie_id;
+            dpu_bdf_range_t sorted_ranges[$];
             bit found;
 
             if (functions[index].bdf_mode != DPU_ALLOC_AUTO)
@@ -557,23 +574,34 @@ class dpu_device_resolver extends uvm_object;
                 return 0;
             end
             found = 0;
-            for (int unsigned candidate = 0; candidate <= 16'hffff;
-                 candidate++) begin
-                string pcie_name;
+            foreach (domain.bdf_ranges[range_index])
+                sorted_ranges.push_back(domain.bdf_ranges[range_index]);
+            sort_bdf_ranges(sorted_ranges);
+            foreach (sorted_ranges[range_index]) begin
+                int unsigned candidate;
 
-                if (!bdf_in_ranges(domain, candidate[15:0]) ||
-                    bdf_reserved(domain, candidate[15:0]))
-                    continue;
-                pcie_id.domain = functions[index].domain_key;
-                pcie_id.bdf = candidate[15:0];
-                pcie_name = dpu_pcie_function_id_name(pcie_id);
-                if (used_bdfs.exists(pcie_name))
-                    continue;
-                used_bdfs[pcie_name] = 1;
-                pcie_by_function[
-                    dpu_function_key_name(functions[index].key)] = pcie_id;
-                found = 1;
-                break;
+                candidate = sorted_ranges[range_index].first_bdf;
+                forever begin
+                    string pcie_name;
+
+                    if (!bdf_reserved(domain, candidate[15:0])) begin
+                        pcie_id.domain = functions[index].domain_key;
+                        pcie_id.bdf = candidate[15:0];
+                        pcie_name = dpu_pcie_function_id_name(pcie_id);
+                        if (!used_bdfs.exists(pcie_name)) begin
+                            used_bdfs[pcie_name] = 1;
+                            pcie_by_function[dpu_function_key_name(
+                                functions[index].key)] = pcie_id;
+                            found = 1;
+                            break;
+                        end
+                    end
+                    if (candidate == sorted_ranges[range_index].last_bdf)
+                        break;
+                    candidate++;
+                end
+                if (found)
+                    break;
             end
             if (!found) begin
                 why = {"BDF space exhausted for ",

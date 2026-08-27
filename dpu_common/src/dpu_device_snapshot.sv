@@ -72,6 +72,32 @@ class dpu_device_snapshot extends uvm_object;
         return 1;
     endfunction
 
+    protected function bit lookup_bar_address(
+        input dpu_pcie_domain_key_t domain,
+        input bit [63:0] address,
+        output dpu_bar_address_match_t match
+    );
+        foreach (m_bar_order[index]) begin
+            string bar_name;
+
+            bar_name = m_bar_order[index];
+            if (m_bars.exists(bar_name) &&
+                m_bar_domains.exists(bar_name) &&
+                m_bar_functions.exists(bar_name) &&
+                dpu_same_domain_key(m_bar_domains[bar_name], domain) &&
+                (address >= m_bars[bar_name].base) &&
+                ((address - m_bars[bar_name].base) < m_bars[bar_name].size)) begin
+                match.function_key = m_bar_functions[bar_name];
+                match.role = m_bars[bar_name].role;
+                match.bar_base = m_bars[bar_name].base;
+                match.bar_size = m_bars[bar_name].size;
+                match.offset = address - m_bars[bar_name].base;
+                return 1;
+            end
+        end
+        return 0;
+    endfunction
+
     function bit is_frozen();
         return m_frozen;
     endfunction
@@ -255,6 +281,9 @@ class dpu_device_snapshot extends uvm_object;
     endfunction
 
     function bit freeze(output string why);
+        bit function_names[string];
+        bit bar_names[string];
+        bit service_names[string];
         string af_name;
         string af_bar_name;
 
@@ -268,13 +297,27 @@ class dpu_device_snapshot extends uvm_object;
             why = "snapshot has no expected AF";
             return 0;
         end
+        if ((m_function_order.size() != m_functions.num()) ||
+            (m_pcie_ids.num() != m_functions.num()) ||
+            (m_reverse_functions.num() != m_functions.num())) begin
+            why = "snapshot PCIe index cardinality mismatch";
+            return 0;
+        end
         foreach (m_function_order[index]) begin
             string function_name;
             string pcie_name;
 
             function_name = m_function_order[index];
-            if (!m_pcie_ids.exists(function_name)) begin
+            if (function_names.exists(function_name) ||
+                !m_functions.exists(function_name) ||
+                !m_pcie_ids.exists(function_name)) begin
                 why = {"snapshot function has no PCIe ID ", function_name};
+                return 0;
+            end
+            function_names[function_name] = 1;
+            if (dpu_function_key_name(m_functions[function_name]) !=
+                function_name) begin
+                why = {"snapshot function index key mismatch ", function_name};
                 return 0;
             end
             pcie_name = dpu_pcie_function_id_name(m_pcie_ids[function_name]);
@@ -285,16 +328,153 @@ class dpu_device_snapshot extends uvm_object;
                 return 0;
             end
         end
+        if ((m_bar_order.size() != m_bars.num()) ||
+            (m_bar_domains.num() != m_bars.num()) ||
+            (m_bar_functions.num() != m_bars.num())) begin
+            why = "snapshot BAR index cardinality mismatch";
+            return 0;
+        end
+        foreach (m_bar_order[index]) begin
+            string bar_name;
+            string owner_name;
+            bit owner_matches_key;
+
+            bar_name = m_bar_order[index];
+            if (bar_names.exists(bar_name) || !m_bars.exists(bar_name) ||
+                !m_bar_domains.exists(bar_name) ||
+                !m_bar_functions.exists(bar_name)) begin
+                why = {"snapshot BAR index cardinality mismatch ", bar_name};
+                return 0;
+            end
+            bar_names[bar_name] = 1;
+            owner_name = dpu_function_key_name(m_bar_functions[bar_name]);
+            if (!m_functions.exists(owner_name) ||
+                !m_pcie_ids.exists(owner_name)) begin
+                why = {"snapshot BAR owning function mismatch ", bar_name};
+                return 0;
+            end
+            owner_matches_key = 0;
+            foreach (m_function_order[function_index]) begin
+                string candidate_owner_name;
+
+                candidate_owner_name = m_function_order[function_index];
+                if (dpu_function_bar_key_name(
+                        m_functions[candidate_owner_name],
+                        m_bars[bar_name].role) == bar_name) begin
+                    owner_matches_key = 1;
+                    if (!dpu_same_function_key(
+                            m_bar_functions[bar_name],
+                            m_functions[candidate_owner_name])) begin
+                        why = {"snapshot BAR owning function mismatch ",
+                               bar_name};
+                        return 0;
+                    end
+                    break;
+                end
+            end
+            if (!owner_matches_key) begin
+                why = {"snapshot BAR key identity mismatch ", bar_name};
+                return 0;
+            end
+            if (!dpu_same_domain_key(m_bar_domains[bar_name],
+                                     m_pcie_ids[owner_name].domain)) begin
+                why = {"snapshot BAR owning domain mismatch ", bar_name};
+                return 0;
+            end
+            if ((m_bars[bar_name].size == 0) ||
+                (m_bars[bar_name].base >
+                 (64'hffff_ffff_ffff_ffff - m_bars[bar_name].size))) begin
+                why = {"snapshot BAR interval is invalid ", bar_name};
+                return 0;
+            end
+        end
+        for (int left = 0; left < m_bar_order.size(); left++) begin
+            string left_name;
+            bit [63:0] left_end;
+
+            left_name = m_bar_order[left];
+            left_end = m_bars[left_name].base + m_bars[left_name].size;
+            for (int right = left + 1; right < m_bar_order.size(); right++) begin
+                string right_name;
+                bit [63:0] right_end;
+
+                right_name = m_bar_order[right];
+                right_end = m_bars[right_name].base +
+                    m_bars[right_name].size;
+                if (dpu_same_domain_key(m_bar_domains[left_name],
+                                        m_bar_domains[right_name]) &&
+                    (m_bars[left_name].base < right_end) &&
+                    (m_bars[right_name].base < left_end)) begin
+                    why = {"snapshot BAR interval overlap ", left_name,
+                           " and ", right_name};
+                    return 0;
+                end
+            end
+        end
+        foreach (m_bar_order[index]) begin
+            string bar_name;
+            bit [63:0] bar_last;
+            dpu_bar_address_match_t match;
+
+            bar_name = m_bar_order[index];
+            bar_last = m_bars[bar_name].base + m_bars[bar_name].size - 1;
+            if (!lookup_bar_address(m_bar_domains[bar_name],
+                                    m_bars[bar_name].base, match)) begin
+                why = {"snapshot BAR base address round-trip missing ",
+                       bar_name};
+                return 0;
+            end
+            if (
+                !dpu_same_function_key(match.function_key,
+                                       m_bar_functions[bar_name]) ||
+                (match.role != m_bars[bar_name].role) ||
+                (match.bar_base != m_bars[bar_name].base) ||
+                (match.bar_size != m_bars[bar_name].size) ||
+                (match.offset != 0)) begin
+                why = {"snapshot BAR base address round-trip mismatch ",
+                       bar_name};
+                return 0;
+            end
+            if (!lookup_bar_address(m_bar_domains[bar_name], bar_last,
+                                    match)) begin
+                why = {"snapshot BAR last address round-trip missing ",
+                       bar_name};
+                return 0;
+            end
+            if (
+                !dpu_same_function_key(match.function_key,
+                                       m_bar_functions[bar_name]) ||
+                (match.role != m_bars[bar_name].role) ||
+                (match.bar_base != m_bars[bar_name].base) ||
+                (match.bar_size != m_bars[bar_name].size) ||
+                (match.offset != (m_bars[bar_name].size - 1))) begin
+                why = {"snapshot BAR last address round-trip mismatch ",
+                       bar_name};
+                return 0;
+            end
+        end
+        if ((m_service_order.size() != m_services.num()) ||
+            (m_service_owners.num() != m_services.num())) begin
+            why = "snapshot service index cardinality mismatch";
+            return 0;
+        end
         foreach (m_service_order[index]) begin
             string service_name;
 
             service_name = m_service_order[index];
-            if (!m_service_owners.exists(service_name) ||
+            if (service_names.exists(service_name) ||
+                !m_services.exists(service_name) ||
+                !m_service_owners.exists(service_name) ||
+                !m_functions.exists(dpu_function_key_name(
+                    m_services[service_name].function_key)) ||
+                (dpu_service_key_name(m_services[service_name]) !=
+                 service_name) ||
                 !dpu_same_function_key(m_service_owners[service_name],
                                        m_services[service_name].function_key)) begin
                 why = {"snapshot service indexes disagree ", service_name};
                 return 0;
             end
+            service_names[service_name] = 1;
         end
         af_name = dpu_function_key_name(m_expected_af);
         af_bar_name = dpu_function_bar_key_name(m_expected_af,
@@ -420,21 +600,8 @@ class dpu_device_snapshot extends uvm_object;
         match.offset = '0;
         if (!queryable(why))
             return 0;
-        foreach (m_bar_order[index]) begin
-            string bar_name;
-
-            bar_name = m_bar_order[index];
-            if (dpu_same_domain_key(m_bar_domains[bar_name], domain) &&
-                (address >= m_bars[bar_name].base) &&
-                ((address - m_bars[bar_name].base) < m_bars[bar_name].size)) begin
-                match.function_key = m_bar_functions[bar_name];
-                match.role = m_bars[bar_name].role;
-                match.bar_base = m_bars[bar_name].base;
-                match.bar_size = m_bars[bar_name].size;
-                match.offset = address - m_bars[bar_name].base;
-                return 1;
-            end
-        end
+        if (lookup_bar_address(domain, address, match))
+            return 1;
         why = $sformatf("no BAR contains %s address %016h",
                         dpu_pcie_domain_key_name(domain), address);
         return 0;
