@@ -268,13 +268,14 @@ make test TEST=virtio_unit_test
 
 `make compile` 仅编译；`make test` 编译后运行指定测试。`scripts/test_manifest.sh`
 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的单一事实源；`make regression`
-按该顺序运行 `dpu_resource_manager_test`、`virtio_dut_caps_test`、
+按该顺序运行 `dpu_resource_manager_test`、`dpu_reg_plan_test`、
+`dpu_device_resolver_test`、`dpu_device_bootstrap_plan_test`、`virtio_dut_caps_test`、
 `virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、
 `virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、
 `virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、
 `virtio_e2e_test`、`virtio_full_integration_test`、`virtio_pf_lifecycle_reset_test`、
 `virtio_monitor_routing_test`、`virtio_dual_test`、`virtio_smoke_test` 和
-`virtio_traffic_test`。
+`virtio_traffic_test`，共 21 项。
 `make check-deps` 会验证 submodule 固定 SHA、VCS 环境以及外部源码完整性。
 
 `pcie_tl_vip@3e2d8c972f1baa78e073f98e8a38ad2f04db6e1a` 和
@@ -286,59 +287,67 @@ make test TEST=virtio_unit_test
 
 ---
 
-## DPU Fabric 部署边界
+## Global DPU 配置边界
 
-`dpu_dut_caps` 是 real-DUT 能力的单一来源。默认拓扑能力是
-`2 hosts × 4 PFs/host × 16 VFs/PF`。`DPU_MAX_HOSTS`、
-`DPU_MAX_PFS_PER_HOST`、`DPU_MAX_VFS_PER_PF`、`DPU_MAX_FUNCTIONS` 等
-compile-time `DPU_MAX_*` 常量仅是 model/encoding ceiling，不是 real-DUT
-default。参数化场景可在 `dut_caps` 中使用更小的非零合法能力，但不能超过相应
-compile-time ceiling。
+`dpu_device_cfg` 是 host、PCIe domain、PF/VF、BDF/BAR request、AF 和
+service 声明的唯一可变 authoring authority。`dpu_device_env` 将它一次性
+解析为冻结的 `dpu_device_snapshot` 并发布给 protocol children；VIO 只使用
+snapshot 和完整 `dpu_service_key_t` 绑定 behavior，不再拥有任何
+host/PF/VF topology、DUT capability、BDF 或 BAR placement 字段。这是 hard cut，
+没有旧拓扑的 compatibility translator。
 
-VIO global qpair ID 是 11 bits，编码域为 `0..2047`，因此默认 profile
-共有 2048 个全局 pair 资源。一份 Fabric global qpair lease `g` 表示 RX/TX
-queue pair 的一次全局 pair allocation，不是 RX、TX 两份 lease；当前
-`virtio_resource_client` 仍暴露 `rx_global_qid=2*g` 和 `tx_global_qid=2*g+1`
-方向字段，不能把它们直接当作两份 11-bit lease ID，而 real-DUT VTX/VRX 共享
-同一个 `g` 的纠正属于后续 subproject 2，本阶段未改。
+下面是一个显式 host0/domain0/PF0/VF0 测试场景。
+`virtio_test_device_builder` 仅是 test-only authoring convenience，它写入公开的
+`dpu_device_cfg` 对象，不是旧配置转换器。
 
-当前 DUT profile 中，每个 PF 或 VF 的 VIO-net 设备各自拥有一个 real-DUT
-notify-address matching domain/base 和独立的 local-qpair domain；每设备最多 32
-个 local queue pairs，编号 `0..31`。该 matching domain 不等同于标准 virtio PCI
-Notification capability 的 per-queue `notify_off` 和据此计算的 kick address。
-不同设备可以复用同一个 local pair ID；Fabric 通过 function/device 上下文解析的
-global qpair lease 在整个 Fabric 中仍保持排他。本阶段只建立 function/local-pair
-ownership 和 limit，不编程 AF VIO notify mapping table；该表属于 subproject 4。
+```systemverilog
+virtio_test_device_builder b;
+dpu_function_cfg pf0, vf0;
+dpu_service_key_t vf0_vio;
+dpu_device_env_config global_cfg;
+virtio_net_env_config vio_cfg;
+virtio_driver_config_t vf0_behavior;
+string why;
 
-`dut_caps.max_vio_net_qpairs_per_device` 同时驱动初始
-`virtio_net_env_config`、dynamic resize、VIO local lease range 和
-`virtio.qpair` profile 的 per-function quota。默认 capability/quota 为 32，
-因此默认配置拒绝第 33 个 pair，Fabric lease acquisition 也拒绝 local pair ID
-超出 `0..31`。如果参数化场景把该 capability 合法缩小为 16，这四处边界会同步
-缩小为 16，local pair ID 范围也变为 `0..15`；32 是设备/model ceiling，
-不是不可缩小的常量 quota。
+b = virtio_test_device_builder::type_id::create("b");
+void'(b.add_host_domain(0, 0, 16'h0010, 16'h00ff,
+                        64'h0000_0002_0000_0000,
+                        64'h0000_0003_0000_0000));
+pf0 = b.add_pf(0, 0, 0, DPU_ALLOC_PINNED, 16'h0010);
+vf0 = b.add_vf(0, 0, 0, 0, DPU_ALLOC_PINNED, 16'h0011);
+b.add_real_dut_bars(pf0);
+b.add_real_dut_bars(vf0);
+b.select_af(pf0);
+vf0_vio = b.add_vio_service(vf0, 0);
 
-`virtio.qpair` resource-class ID 由 Fabric 持有，是不透明值而非 core enum
-常量；所有 resource profiles 都必须在 function activation 前完成 register，
-随后 seal registry。
+vio_cfg = virtio_net_env_config::type_id::create("vio_cfg");
+vf0_behavior = vio_cfg.make_default_driver_config(32);
+vf0_behavior.num_queue_pairs = 8;
+if (!vio_cfg.add_service_config(vf0_vio, vf0_behavior, why))
+  `uvm_fatal("CFG", why)
 
-当前 verification/Fabric model 还定义三组 64-bit BAR pair lease：PF 的
-BAR0/1、BAR2/3、BAR4/5 分别为 32 MiB function-device、64 KiB reserved、
-64 KiB MSI-X table/PBA；VF 分别为 16 KiB、16 KiB、32 KiB。模型只允许在
-BAR0/1 发现 virtio functional capabilities，将 BAR2/3 视为不可功能访问的
-保留 aperture，并将 BAR4/5 限于 MSI-X table/PBA。Fabric 先配置 64-bit MMIO
-aperture；function activation 时在其中分配 BAR pairs、赋予 role，并校验 size、
-alignment、aperture overflow 和 overlap。随后才执行 capability discovery；
-只有 discovery 完成后才能获取 queue lease。
+global_cfg = b.make_env_config();
+global_cfg.executor = injected_executor; // 与 plan construction 分开注入
+uvm_config_db#(dpu_device_env_config)::set(
+    this, "device_env", "cfg", global_cfg);
+uvm_config_db#(virtio_net_env_config)::set(
+    this, "device_env.env", "cfg", vio_cfg);
+```
 
-仓库已有通用 VIP BAR discovery、per-queue kick、MSI-X、PCIe sequences 和
-generic Fabric BAR lease 能力。本阶段新增范围只到 capability/topology、pair
-limit 和 Fabric lease 边界；real-DUT AF/service-configuration 的 register
-lowering/execution、BDF/BAR/MSI-X/notify mapping tables、`PINNED`/`PREFERRED`
-global-ID binding 及可信 production write-payload fix 尚未实现；上述工作由后续
-subprojects 2–4 分阶段承接。`cosim_control` 和 BAR2 mailbox delivery 则是
-[real-DUT service configuration design](docs/superpowers/specs/2026-08-25-real-dut-service-configuration-design.md)
-明确排除的范围，不属于这些后续 subprojects；这不否定上述通用 VIP 功能。
+`add_real_dut_bars()` 为每个 function 显式添加三个 request：PF0 为
+BAR0/1 `DPU_BAR_DEVICE_MEMORY` 32 MiB、BAR2/3 `DPU_BAR_MAILBOX` 64 KiB、
+BAR4/5 `DPU_BAR_MSIX` 64 KiB；VF0 的三对分别是 16 KiB、16 KiB 和
+32 KiB。BAR2/3 是 mailbox，不是保留 aperture。AF bootstrap 从冻结
+snapshot 的 PF0 BAR0 生成，其 driver-aligned `DPU_AF_DECLARATION_ADDR`
+为 `0x1010`；有 executor 时由独立注入的 `dpu_reg_executor` 执行，没有
+executor 时报告 `NOT_EXECUTED`，不伪报硬件成功。
+
+未来的 `total_qpairs=100` 只是 normalization/placement 扩展：按每个 VIO
+设备最多 32 pairs，至少需要四个设备。Host/PF inventory 始终显式；
+未来只能从已声明的 PF VF pool 激活 VF，且 execution 仍只接收解析后的
+显式 bindings。预留选择语义为 `AUTO_MINIMUM`、`FIXED`、
+`ALL_ELIGIBLE`，partial assignment 语义为 `EXACT` 和 `AT_LEAST`；本子项目
+不实现自动 VF activation、qpair placement 或后续 DUT-table lowering。
 
 ---
 

@@ -24,6 +24,45 @@ VIRTIO_MAINTAINED_TESTS=(
   virtio_traffic_test
 )
 
+_validate_virtio_test_manifest() {
+  local manifest_root required test_name count
+  local -A seen=()
+
+  manifest_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  for test_name in "${VIRTIO_MAINTAINED_TESTS[@]}"; do
+    if [[ -n "${seen[$test_name]+present}" ]]; then
+      echo "duplicate maintained test: $test_name" >&2
+      return 1
+    fi
+    seen["$test_name"]=1
+  done
+
+  for required in dpu_device_resolver_test dpu_device_bootstrap_plan_test; do
+    count=0
+    for test_name in "${VIRTIO_MAINTAINED_TESTS[@]}"; do
+      [[ "$test_name" == "$required" ]] && count=$((count + 1))
+    done
+    if [[ "$count" -ne 1 ]]; then
+      echo "required maintained test must appear exactly once: $required" >&2
+      return 1
+    fi
+    count="$(awk -v source="dpu_common/tests/${required}.sv" \
+      '$0 == source { count++ } END { print count + 0 }' \
+      "$manifest_root/filelists/tests.f")"
+    if [[ "$count" -ne 1 ]]; then
+      echo "required test source must appear exactly once: dpu_common/tests/${required}.sv" >&2
+      return 1
+    fi
+  done
+}
+
+_validate_virtio_test_manifest || {
+  manifest_status=$?
+  unset -f _validate_virtio_test_manifest
+  return "$manifest_status" 2>/dev/null || exit "$manifest_status"
+}
+unset -f _validate_virtio_test_manifest
+
 is_virtio_maintained_test() {
   local requested="$1"
   local maintained

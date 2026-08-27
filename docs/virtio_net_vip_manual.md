@@ -1248,12 +1248,40 @@ typedef struct {
 
 #### 4.10.1 配置对象 (`virtio_net_env_config`)
 
-所有可配置参数：
+`virtio_net_env_config` 只拥有 VIO driver/queue/traffic/verification behavior。
+Global topology 另由 `dpu_device_cfg` 显式声明 host、domain、PF0/VF0、
+每个 function 的三个 BAR request、AF PF0 和 VIO service；
+`dpu_device_env` 解析并发布冻结的 `dpu_device_snapshot`。VIO 不包含
+host/PF/VF topology、DUT capability、BDF 或 BAR placement 字段，也不从 count
+matrix 或位置推导它们。
+
+上述显式场景使用 real-DUT profile：PF0 与 VF0 各有
+BAR0/1 `DPU_BAR_DEVICE_MEMORY`、BAR2/3 `DPU_BAR_MAILBOX` 和 BAR4/5
+`DPU_BAR_MSIX`。PF0 通过 `DPU_AF_SELECTED` 被选为 AF，AF declaration 使用
+BAR0 + `DPU_AF_DECLARATION_ADDR` (`0x1010`)。VIO service declaration 生成完整
+`dpu_service_key_t` (`{function_key, service_kind, service_instance_id}`)，例如：
+
+```systemverilog
+dpu_service_key_t vf0_vio;
+virtio_driver_config_t behavior;
+string why;
+
+vf0_vio = builder.add_vio_service(vf0, 0);
+behavior = vio_cfg.make_default_driver_config(32);
+behavior.num_queue_pairs = 8;
+if (!vio_cfg.add_service_config(vf0_vio, behavior, why))
+  `uvm_fatal("CFG", why)
+```
+
+这个 override 由全 service key 索引，不使用 VF 队列位置。Global config
+与 VIO config 分别通过 `uvm_config_db` 传入 `dpu_device_env` 及其 VIO child；
+bootstrap plan 只读 snapshot，`dpu_reg_executor` 在 `dpu_device_env_config.executor`
+中与 plan construction 分开注入。本仓库不提供 production real-DUT executor。
+
+VIO behavior 可配置参数：
 
 | 类别 | 参数 | 默认值 | 说明 |
 |------|------|--------|------|
-| 拓扑 | `num_vfs` | 0 | VF 数量（0=纯 PF 模式） |
-| | `max_vfs` | 256 | 最大 VF 数 |
 | 默认值 | `default_num_pairs` | 1 | 默认队列对数 |
 | | `default_queue_size` | 256 | 默认队列大小 |
 | | `default_vq_type` | `VQ_SPLIT` | 默认队列类型 |
@@ -1263,7 +1291,6 @@ typedef struct {
 | | `default_napi_budget` | 64 | NAPI 预算 |
 | | `default_rx_buf_size` | 1526 | RX buffer 大小 |
 | | `default_driver_mode` | `DRV_MODE_AUTO` | 默认驱动模式 |
-| PCIe | `pf_bdf` | `16'h0100` | PF 的 BDF |
 | 内存 | `mem_base` | `64'h1_0000_0000` | host_mem 起始地址 |
 | | `mem_end` | `64'h1_FFFF_FFFF` | host_mem 结束地址 |
 | IOMMU | `iommu_strict` | 1 | 严格权限检查 |
@@ -1426,9 +1453,23 @@ endclass
 | `VIRTIO_F_ACCESS_PLATFORM` | 33 | 完整（必需） | 始终开启 |
 | `VIRTIO_F_RING_PACKED` | 34 | 完整 | `default_vq_type = VQ_PACKED` |
 | `VIRTIO_F_IN_ORDER` | 35 | 框架 | `default_driver_features[35]` |
-| `VIRTIO_F_SR_IOV` | 37 | 完整 | `num_vfs > 0` |
+| `VIRTIO_F_SR_IOV` | 37 | 完整 | snapshot 显式 VF VIO service |
 | `VIRTIO_F_NOTIFICATION_DATA` | 38 | 完整 | `default_driver_features[38]` |
 | `VIRTIO_F_RING_RESET` | 40 | 完整 | `default_driver_features[40]` |
+
+### 5.1 预留的 total-qpair placement 边界
+
+`total_qpairs=100` 是后续 normalization 特性，不是当前 VIO 配置字段。
+real-DUT 每个 VIO device 最多 32 qpairs，因此 100 pairs 需要至少
+`ceil(100/32) = 4` 个设备。Host/PF inventory 仍必须显式声明；后续阶段
+可以从已声明的 PF VF pool 激活 VF，但不得根据 queue demand 合成 PF。
+
+预留的 device selection 语义是 `AUTO_MINIMUM`、`FIXED` 和
+`ALL_ELIGIBLE`。显式 partial assignment 使用 `EXACT` 或 `AT_LEAST`：
+`EXACT` 设备不接收 remainder，`AT_LEAST` 设备可在 32-pair limit 内接收
+更多。Normalization 必须先将所有选择展开为显式 resolved bindings；
+execution 只消费这些 bindings，不执行 automatic VF activation、qpair placement
+或 local/global qid、MSI-X、notify、port、scheduler 分配。
 
 ---
 
