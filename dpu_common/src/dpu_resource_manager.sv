@@ -260,6 +260,29 @@ class dpu_resource_manager extends uvm_object;
         caps = snapshot.snapshot_dut_caps();
         if ((caps == null) || !caps.validate(why))
             return 0;
+        // A scenario profile may narrow the frozen DUT capability, never
+        // expand it or become a second hardware-capability authority.
+        foreach (profiles[index]) begin
+            if (profiles[index].name != "virtio.qpair")
+                continue;
+            if (profiles[index].capacity > caps.vio_global_qpair_count) begin
+                why = $sformatf(
+                    {"virtio.qpair capacity %0d exceeds snapshot ",
+                     "vio_global_qpair_count %0d"},
+                    profiles[index].capacity,
+                    caps.vio_global_qpair_count);
+                return 0;
+            end
+            if (profiles[index].max_per_function >
+                caps.max_vio_net_qpairs_per_device) begin
+                why = $sformatf(
+                    {"virtio.qpair max_per_function %0d exceeds snapshot ",
+                     "max_vio_net_qpairs_per_device %0d"},
+                    profiles[index].max_per_function,
+                    caps.max_vio_net_qpairs_per_device);
+                return 0;
+            end
+        end
 
         candidate = new({get_name(), "_snapshot_candidate"});
         candidate.dut_caps.copy_from(caps);

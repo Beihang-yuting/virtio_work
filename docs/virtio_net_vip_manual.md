@@ -1561,18 +1561,22 @@ real-DUT AF notify table 的 logical match 是：
 本阶段只建立 function/local-pair ownership 与 limit，不生成或编程该 AF table；
 notify mapping、scheduler、route 和 VTX/VRX lowering 属于 subproject 4。
 
-限制由同一个 `dut_caps.max_vio_net_qpairs_per_device` 在以下边界执行：
+冻结 snapshot 中的 VIO qpair capabilities 是硬件上限，并在以下边界执行：
 
-1. 初始 `virtio_net_env_config` 拒绝超过 capability 的默认或 per-VF pair 数；
+1. 初始 `virtio_net_env_config` 将默认行为和 service-keyed override 限制在
+   `max_vio_net_qpairs_per_device` 内；
 2. dynamic resize 拒绝超过 capability 的 pair 数（也拒绝 0）；
 3. VIO client 在最终 Fabric lease acquisition 时拒绝越过 capability 的 local
    pair range；
-4. `virtio.qpair` profile 的 per-function quota 取同一个 capability 值。
+4. `virtio.qpair` profile 的 global `capacity` 和 `max_per_function` 分别不得超过
+   snapshot 的 `vio_global_qpair_count` 和 `max_vio_net_qpairs_per_device`；profile
+   可以为具体场景声明更小的 quota，但不能扩大硬件能力。
 
-默认 capability/quota 是 32，所以默认配置拒绝第 33 个 pair，local pair ID
-必须在 `0..31`。如果 `dut_caps` 合法配置为 16，以上四处边界会同步降为 16，
-local pair ID 范围相应变为 `0..15`。32 是每设备的默认 capability 和
-device/model ceiling，并非所有参数化场景中固定不变的 quota。
+默认 per-device capability 是 32，所以默认配置拒绝第 33 个 pair，local pair
+ID 必须在 `0..31`。如果 snapshot capability 合法配置为 16，前三处设备边界和
+profile 上限会降为 16，local pair ID 范围相应变为 `0..15`；场景 profile 还可
+在这个上限内继续收窄。32 是每设备的默认 capability 和 device/model ceiling，
+并非所有参数化场景中固定不变的 quota。
 
 Fabric 拥有 `virtio.qpair` 的不透明 resource-class ID；它不是 core enum 常量。
 所有 resource profiles 必须在任何 function activation 前完成 register，并在
@@ -1601,7 +1605,17 @@ mailbox 和 64 KiB MSI-X table/PBA；VF 的对应大小为 16 KiB、16 KiB 和
 make regression
 ```
 
-`scripts/test_manifest.sh` 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的单一事实源。该入口按清单顺序运行 `dpu_resource_manager_test`、`virtio_dut_caps_test`、`virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、`virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、`virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、`virtio_e2e_test`、`virtio_full_integration_test`、`virtio_pf_lifecycle_reset_test`、`virtio_monitor_routing_test`、`virtio_dual_test`、`virtio_smoke_test` 和 `virtio_traffic_test`。该入口要求 `make check-deps` 先通过；无 VCS 环境时它应在编译前报告 VCS 依赖错误。
+`scripts/test_manifest.sh` 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的
+单一事实源。该入口按清单顺序运行 `dpu_resource_manager_test`、
+`dpu_reg_plan_test`、`dpu_device_resolver_test`、
+`dpu_device_bootstrap_plan_test`、`virtio_dut_caps_test`、
+`virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、
+`virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、
+`virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、
+`virtio_e2e_test`、`virtio_full_integration_test`、
+`virtio_pf_lifecycle_reset_test`、`virtio_monitor_routing_test`、
+`virtio_dual_test`、`virtio_smoke_test` 和 `virtio_traffic_test`，共 21 项。该入口
+要求 `make check-deps` 先通过；无 VCS 环境时它应在编译前报告 VCS 依赖错误。
 
 ### 6.2 编写测试
 
@@ -1895,9 +1909,11 @@ BAR 地址通过 `bar_accessor.enumerate_bars()` 自动枚举和分配。默认 
 
 | 方法 | 说明 |
 |------|------|
-| `get_default_driver_config()` | 从默认参数构建 `virtio_driver_config_t` |
-| `get_vf_config(vf_idx)` | 获取指定 VF 的配置（有则用，无则回退默认） |
-| `validate()` | 配置合法性检查 |
+| `make_default_driver_config(max_pairs)` | 从默认字段构建并按 snapshot 上限裁剪 `virtio_driver_config_t` |
+| `add_service_config(service_key, cfg, why)` | 按 VIO service key 添加 function 行为 override |
+| `get_service_config(service_key, max_pairs, cfg, why)` | 按 service key 取得 override；未配置时回退到裁剪后的默认行为 |
+| `validate_local(why)` | 检查与 snapshot 无关的本地配置合法性 |
+| `validate_against_snapshot(snapshot, why)` | 检查 service ownership 并按冻结 snapshot capability 校验/裁剪 |
 | `convert2string()` | 格式化输出 |
 
 ---

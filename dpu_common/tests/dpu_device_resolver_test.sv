@@ -1155,6 +1155,56 @@ class dpu_device_resolver_test extends uvm_test;
             `uvm_fatal("RESOLVER_TEST", "failed resolve changed old snapshot")
     endfunction
 
+    // Break caught: aggregate authored function count is ignored even when
+    // every individual function key is within its per-host/PF/VF limits.
+    // The rejected second candidate must not replace or mutate the first
+    // frozen snapshot.
+    function void test_aggregate_function_cap_is_atomic(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg good_cfg;
+        dpu_device_cfg over_capacity_cfg;
+        dpu_device_snapshot first_snapshot;
+        dpu_device_snapshot failed_snapshot;
+        dpu_function_key_t first_keys[$];
+        dpu_dut_caps first_caps;
+        string expected_why;
+        string why;
+
+        good_cfg = make_valid_cfg();
+        expect_resolved(resolver, good_cfg, first_snapshot);
+        over_capacity_cfg = clone_cfg(good_cfg);
+        over_capacity_cfg.dut_caps.max_functions =
+            over_capacity_cfg.functions.size() - 1;
+        expected_why = $sformatf(
+            "configured function count %0d exceeds DUT max_functions %0d",
+            over_capacity_cfg.functions.size(),
+            over_capacity_cfg.dut_caps.max_functions);
+
+        failed_snapshot = first_snapshot;
+        if (resolver.resolve(over_capacity_cfg, failed_snapshot, why)) begin
+            `uvm_fatal("RESOLVER_TEST",
+                "aggregate over-capacity candidate unexpectedly resolved")
+        end
+        if (why != expected_why) begin
+            `uvm_fatal("RESOLVER_TEST", $sformatf(
+                "expected precise diagnostic '%s', got '%s'",
+                expected_why, why))
+        end
+        if (failed_snapshot != null) begin
+            `uvm_fatal("RESOLVER_TEST",
+                "aggregate-cap failure retained a replacement snapshot")
+        end
+        first_snapshot.list_functions(first_keys);
+        first_caps = first_snapshot.snapshot_dut_caps();
+        if ((first_keys.size() != good_cfg.functions.size()) ||
+            (first_caps == null) ||
+            (first_caps.max_functions != good_cfg.dut_caps.max_functions)) begin
+            `uvm_fatal("RESOLVER_TEST",
+                "aggregate-cap failure mutated the prior frozen snapshot")
+        end
+    endfunction
+
     // Catches freeze accepting reverse-only BDFs, incomplete BAR maps/order,
     // wrong BAR owners/domains, overlapping intervals, or BAR key/value drift.
     function void test_snapshot_freeze_cross_checks_all_indexes();
@@ -1324,6 +1374,7 @@ class dpu_device_resolver_test extends uvm_test;
         test_auto_bar_exhaustion(resolver);
         test_bar_arithmetic_guards(resolver);
         test_snapshot_immutability_and_service_queries(resolver);
+        test_aggregate_function_cap_is_atomic(resolver);
         test_failed_resolve_is_atomic(resolver);
         test_snapshot_freeze_cross_checks_all_indexes();
         test_snapshot_manager_seeding_is_atomic();

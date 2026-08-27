@@ -32,6 +32,13 @@ class virtio_bar_mem_rd_seq extends uvm_sequence #(pcie_tl_tlp);
     bit [31:0]  rdata;
     bit         cpl_ok;
 
+    // An endpoint-aware accessor supplies these per sequence.  The base
+    // sequences ignore them; the TLM factory overrides use them to keep
+    // completions from equal tag/BDF values in independent domains distinct.
+    virtio_tlm_completion_adapter endpoint_completion_adapter;
+    dpu_pcie_function_id_t        endpoint_pcie_id;
+    bit                           endpoint_pcie_id_valid;
+
     function new(string name = "virtio_bar_mem_rd_seq");
         super.new(name);
         first_be  = 4'hF;
@@ -39,6 +46,8 @@ class virtio_bar_mem_rd_seq extends uvm_sequence #(pcie_tl_tlp);
         is_64bit  = 0;
         rdata     = '0;
         cpl_ok    = 0;
+        endpoint_completion_adapter = null;
+        endpoint_pcie_id_valid = 0;
     endfunction
 
     virtual task body();
@@ -89,6 +98,9 @@ class virtio_bar_mem_wr_seq extends uvm_sequence #(pcie_tl_tlp);
     bit [3:0]   first_be;
     bit [3:0]   last_be;
     bit         is_64bit;
+    virtio_tlm_completion_adapter endpoint_completion_adapter;
+    dpu_pcie_function_id_t        endpoint_pcie_id;
+    bit                           endpoint_pcie_id_valid;
 
     function new(string name = "virtio_bar_mem_wr_seq");
         super.new(name);
@@ -96,6 +108,8 @@ class virtio_bar_mem_wr_seq extends uvm_sequence #(pcie_tl_tlp);
         last_be  = 4'h0;
         is_64bit = 0;
         wdata    = '0;
+        endpoint_completion_adapter = null;
+        endpoint_pcie_id_valid = 0;
     endfunction
 
     virtual task body();
@@ -125,12 +139,17 @@ class virtio_bar_cfg_rd_seq extends uvm_sequence #(pcie_tl_tlp);
     // Response
     bit [31:0]  rdata;
     bit         cpl_ok;
+    virtio_tlm_completion_adapter endpoint_completion_adapter;
+    dpu_pcie_function_id_t        endpoint_pcie_id;
+    bit                           endpoint_pcie_id_valid;
 
     function new(string name = "virtio_bar_cfg_rd_seq");
         super.new(name);
         first_be = 4'hF;
         rdata    = '0;
         cpl_ok   = 0;
+        endpoint_completion_adapter = null;
+        endpoint_pcie_id_valid = 0;
     endfunction
 
     virtual task body();
@@ -175,11 +194,16 @@ class virtio_bar_cfg_wr_seq extends uvm_sequence #(pcie_tl_tlp);
     bit [9:0]   reg_num;
     bit [3:0]   first_be;
     bit [31:0]  wdata;
+    virtio_tlm_completion_adapter endpoint_completion_adapter;
+    dpu_pcie_function_id_t        endpoint_pcie_id;
+    bit                           endpoint_pcie_id_valid;
 
     function new(string name = "virtio_bar_cfg_wr_seq");
         super.new(name);
         first_be = 4'hF;
         wdata = '0;
+        endpoint_completion_adapter = null;
+        endpoint_pcie_id_valid = 0;
     endfunction
 
     virtual task body();
@@ -232,6 +256,9 @@ class virtio_bar_accessor extends uvm_object;
     // ===== PCIe layer references =====
     uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr;   // RC Agent's sequencer
     bit [15:0]   requester_id;                     // This function's BDF
+    dpu_pcie_function_id_t pcie_id;
+    bit                    pcie_id_valid;
+    virtio_tlm_completion_adapter endpoint_completion_adapter;
 
     // ===== BAR enumeration base address allocator =====
     bit [63:0]   next_bar_alloc_addr;
@@ -243,6 +270,8 @@ class virtio_bar_accessor extends uvm_object;
     function new(string name = "virtio_bar_accessor");
         super.new(name);
         requester_id        = 16'h0;
+        pcie_id_valid       = 0;
+        endpoint_completion_adapter = null;
         next_bar_alloc_addr = 64'h0000_0000_C000_0000;  // Default MMIO window
         fabric_bar_layout_active = 0;
         for (int i = 0; i < 6; i++) begin
@@ -252,6 +281,27 @@ class virtio_bar_accessor extends uvm_object;
             fabric_bar_role_valid[i] = 0;
             fabric_bar_role[i] = DPU_BAR_DEVICE_MEMORY;
         end
+    endfunction
+
+    // Preserve the complete Fabric identity at the point that owns request
+    // generation.  requester_id remains the PCIe header's numeric BDF field;
+    // it is never used to select an external domain.
+    function void configure_pcie_identity(
+        input dpu_pcie_function_id_t function_pcie_id
+    );
+        pcie_id = function_pcie_id;
+        pcie_id_valid = 1;
+        requester_id = function_pcie_id.bdf;
+    endfunction
+
+    function void bind_pcie_path(
+        input dpu_pcie_function_id_t function_pcie_id,
+        input uvm_sequencer #(pcie_tl_tlp) endpoint_rc_seqr,
+        input virtio_tlm_completion_adapter completion_adapter = null
+    );
+        configure_pcie_identity(function_pcie_id);
+        pcie_rc_seqr = endpoint_rc_seqr;
+        endpoint_completion_adapter = completion_adapter;
     endfunction
 
     // Fabric owns physical BAR placement.  These pairs must therefore never
@@ -577,6 +627,9 @@ class virtio_bar_accessor extends uvm_object;
         rd_seq.first_be = be;
         rd_seq.last_be  = 4'h0;
         rd_seq.is_64bit = (addr[63:32] != 0);
+        rd_seq.endpoint_completion_adapter = endpoint_completion_adapter;
+        rd_seq.endpoint_pcie_id = pcie_id;
+        rd_seq.endpoint_pcie_id_valid = pcie_id_valid;
         rd_seq.start(pcie_rc_seqr);
 
         if (!rd_seq.cpl_ok) begin
@@ -617,6 +670,9 @@ class virtio_bar_accessor extends uvm_object;
         wr_seq.first_be = be;
         wr_seq.last_be  = 4'h0;
         wr_seq.is_64bit = (addr[63:32] != 0);
+        wr_seq.endpoint_completion_adapter = endpoint_completion_adapter;
+        wr_seq.endpoint_pcie_id = pcie_id;
+        wr_seq.endpoint_pcie_id_valid = pcie_id_valid;
         wr_seq.start(pcie_rc_seqr);
 
         `uvm_info("BAR_ACCESSOR",
@@ -674,6 +730,9 @@ class virtio_bar_accessor extends uvm_object;
         rd_seq.target_bdf = requester_id;
         rd_seq.reg_num    = reg_num;
         rd_seq.first_be   = 4'hF;
+        rd_seq.endpoint_completion_adapter = endpoint_completion_adapter;
+        rd_seq.endpoint_pcie_id = pcie_id;
+        rd_seq.endpoint_pcie_id_valid = pcie_id_valid;
         rd_seq.start(pcie_rc_seqr);
 
         if (!rd_seq.cpl_ok) begin
@@ -713,6 +772,9 @@ class virtio_bar_accessor extends uvm_object;
         wr_seq.reg_num    = reg_num;
         wr_seq.first_be   = be;
         wr_seq.wdata      = data;
+        wr_seq.endpoint_completion_adapter = endpoint_completion_adapter;
+        wr_seq.endpoint_pcie_id = pcie_id;
+        wr_seq.endpoint_pcie_id_valid = pcie_id_valid;
         wr_seq.start(pcie_rc_seqr);
 
         `uvm_info("BAR_ACCESSOR",
@@ -896,6 +958,9 @@ class virtio_bar_accessor extends uvm_object;
         rd_seq.first_be = 4'h0;   // Zero BE triggers UR in many EP models
         rd_seq.last_be  = 4'h0;
         rd_seq.is_64bit = (addr[63:32] != 0);
+        rd_seq.endpoint_completion_adapter = endpoint_completion_adapter;
+        rd_seq.endpoint_pcie_id = pcie_id;
+        rd_seq.endpoint_pcie_id_valid = pcie_id_valid;
 
         `uvm_info("BAR_ACCESSOR",
             $sformatf("read_reg_with_error: BAR%0d offset=0x%08h (injecting error)",
@@ -941,6 +1006,9 @@ class virtio_bar_accessor extends uvm_object;
         wr_seq.first_be = 4'h0;  // Zero BE for error injection
         wr_seq.last_be  = 4'h0;
         wr_seq.is_64bit = (addr[63:32] != 0);
+        wr_seq.endpoint_completion_adapter = endpoint_completion_adapter;
+        wr_seq.endpoint_pcie_id = pcie_id;
+        wr_seq.endpoint_pcie_id_valid = pcie_id_valid;
 
         `uvm_info("BAR_ACCESSOR",
             $sformatf("write_reg_with_error: BAR%0d offset=0x%08h data=0x%08h (injecting error)",

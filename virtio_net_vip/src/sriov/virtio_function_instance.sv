@@ -10,6 +10,8 @@ class virtio_function_instance extends uvm_component;
     // Identity and snapshot-owned placement.
     int unsigned            vf_index;
     bit [15:0]              bdf;
+    dpu_pcie_function_id_t  pcie_id;
+    bit                     pcie_id_valid;
     dpu_function_key_t      function_key;
     dpu_function_kind_e     function_kind;
     dpu_service_key_t       service_key;
@@ -43,6 +45,7 @@ class virtio_function_instance extends uvm_component;
     function new(string name, uvm_component parent);
         super.new(name, parent);
         function_kind = DPU_FUNCTION_PF;
+        pcie_id_valid = 0;
         pending_pcie_fsm = null;
         pending_pcie_ops = null;
         pcie_bind_prepared = 0;
@@ -129,6 +132,8 @@ class virtio_function_instance extends uvm_component;
         function_key = key;
         service_key = service;
         bdf = pcie_id.bdf;
+        this.pcie_id = pcie_id;
+        pcie_id_valid = 1;
         vf_index = key.vf_id;
         bar_pairs = bars;
         resource_manager = manager;
@@ -521,11 +526,18 @@ class virtio_function_instance extends uvm_component;
 
         if ((transport == null) || (vq_mgr == null) || (resource_client == null))
             return;
-        transport.bdf = bdf;
-        transport.notify_mgr.set_function_bdf(bdf);
+        if (pcie_id_valid)
+            transport.configure_pcie_identity(pcie_id);
+        else begin
+            // Compatibility for standalone instances authored before a
+            // frozen snapshot is attached.  Environment-owned functions
+            // always take the full-identity branch above.
+            transport.bdf = bdf;
+            transport.notify_mgr.set_function_bdf(bdf);
+            transport.bar.requester_id = bdf;
+        end
         transport.is_vf = (function_kind == DPU_FUNCTION_VF);
         transport.vf_index = vf_index;
-        transport.bar.requester_id = bdf;
         vq_mgr.bdf = bdf;
         if (bar_pairs.size() != 0)
             transport.bar.configure_fabric_bar_pairs(bar_pairs);

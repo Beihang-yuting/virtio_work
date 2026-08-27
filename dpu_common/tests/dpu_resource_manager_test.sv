@@ -382,6 +382,122 @@ class dpu_resource_manager_test extends uvm_test;
         end
     endtask
 
+    // Breaks caught: snapshot seeding accepts a virtio.qpair scenario profile
+    // that claims more global or per-function queues than the frozen DUT
+    // capabilities.  Failed seeds must leave no functions/classes published,
+    // while deliberately smaller scenario quotas remain legal.
+    task assert_snapshot_qpair_profile_caps(
+        input dpu_device_snapshot snapshot
+    );
+        dpu_dut_caps caps;
+        dpu_resource_manager capacity_manager;
+        dpu_resource_manager per_function_manager;
+        dpu_resource_manager smaller_manager;
+        dpu_resource_registry_authority capacity_authority;
+        dpu_resource_registry_authority per_function_authority;
+        dpu_resource_registry_authority smaller_authority;
+        dpu_resource_pool_config_t profiles[$];
+        dpu_function_key_t function_keys[$];
+        dpu_resource_class_id_t class_id;
+        int unsigned missed_rejections;
+        string expected_why;
+        string why;
+
+        caps = snapshot.snapshot_dut_caps();
+        snapshot.list_functions(function_keys);
+        if ((caps == null) || (function_keys.size() == 0)) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "qpair profile cap test requires a populated frozen snapshot")
+        end
+        missed_rejections = 0;
+
+        capacity_manager = dpu_resource_manager::type_id::create(
+            "excessive_qpair_capacity_manager");
+        capacity_authority = capacity_manager.claim_registry_authority();
+        profiles.push_back(make_resource_profile(
+            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
+            caps.vio_global_qpair_count + 1,
+            caps.max_vio_net_qpairs_per_device));
+        expected_why = $sformatf(
+            {"virtio.qpair capacity %0d exceeds snapshot ",
+             "vio_global_qpair_count %0d"},
+            profiles[0].capacity, caps.vio_global_qpair_count);
+        if (capacity_manager.configure_from_snapshot(
+            capacity_authority, snapshot, profiles, why)) begin
+            missed_rejections++;
+        end
+        else begin
+            if (why != expected_why) begin
+                `uvm_fatal("DPU_RESOURCE", $sformatf(
+                    "expected precise capacity diagnostic '%s', got '%s'",
+                    expected_why, why))
+            end
+            if (capacity_manager.is_snapshot_seeded() ||
+                capacity_manager.contains_function(function_keys[0]) ||
+                capacity_manager.lookup_resource_class(
+                    "virtio.qpair", class_id, why)) begin
+                `uvm_fatal("DPU_RESOURCE",
+                    "excessive qpair capacity partially seeded the manager")
+            end
+        end
+
+        profiles.delete();
+        per_function_manager = dpu_resource_manager::type_id::create(
+            "excessive_qpair_per_function_manager");
+        per_function_authority =
+            per_function_manager.claim_registry_authority();
+        profiles.push_back(make_resource_profile(
+            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
+            caps.vio_global_qpair_count,
+            caps.max_vio_net_qpairs_per_device + 1));
+        expected_why = $sformatf(
+            {"virtio.qpair max_per_function %0d exceeds snapshot ",
+             "max_vio_net_qpairs_per_device %0d"},
+            profiles[0].max_per_function,
+            caps.max_vio_net_qpairs_per_device);
+        if (per_function_manager.configure_from_snapshot(
+            per_function_authority, snapshot, profiles, why)) begin
+            missed_rejections++;
+        end
+        else begin
+            if (why != expected_why) begin
+                `uvm_fatal("DPU_RESOURCE", $sformatf(
+                    {"expected precise per-function diagnostic '%s', ",
+                     "got '%s'"}, expected_why, why))
+            end
+            if (per_function_manager.is_snapshot_seeded() ||
+                per_function_manager.contains_function(function_keys[0]) ||
+                per_function_manager.lookup_resource_class(
+                    "virtio.qpair", class_id, why)) begin
+                `uvm_fatal("DPU_RESOURCE",
+                    "excessive per-function qpair quota partially seeded the manager")
+            end
+        end
+
+        profiles.delete();
+        smaller_manager = dpu_resource_manager::type_id::create(
+            "smaller_qpair_profile_manager");
+        smaller_authority = smaller_manager.claim_registry_authority();
+        profiles.push_back(make_resource_profile(
+            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
+            caps.vio_global_qpair_count - 1,
+            caps.max_vio_net_qpairs_per_device - 1));
+        if (!smaller_manager.configure_from_snapshot(
+                smaller_authority, snapshot, profiles, why) ||
+            !smaller_manager.is_seeded_from_snapshot(snapshot) ||
+            !smaller_manager.lookup_resource_class(
+                "virtio.qpair", class_id, why)) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                "smaller qpair scenario quota was rejected: %s", why))
+        end
+
+        if (missed_rejections != 0) begin
+            `uvm_fatal("DPU_RESOURCE", $sformatf(
+                {"snapshot qpair profile cap validation missed %0d ",
+                 "excessive profiles"}, missed_rejections))
+        end
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         dpu_resource_manager manager;
         dpu_resource_manager child_manager;
@@ -425,6 +541,7 @@ class dpu_resource_manager_test extends uvm_test;
         assert_global_qpair_capacity(
             manager, qpair_class_id, 2048
         );
+        assert_snapshot_qpair_profile_caps(device_env.get_snapshot());
 
         phase.drop_objection(this);
     endtask

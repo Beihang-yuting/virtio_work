@@ -109,14 +109,18 @@ class virtio_monitor_routing_test extends uvm_test;
     `uvm_component_utils(virtio_monitor_routing_test)
 
     pcie_tl_env                    pcie_env;
+    pcie_tl_env                    reused_pcie_env;
     dpu_device_env                 device_env;
     virtio_net_env                 virtio_env;
     pcie_tl_env_config             pcie_cfg;
+    pcie_tl_env_config             reused_pcie_cfg;
     dpu_device_env_config          device_env_cfg;
     virtio_net_env_config          virtio_cfg;
     virtio_test_device_builder     device_builder;
+    virtio_tlm_completion_adapter  tlm_adapter;
     virtio_monitor_routing_collector pf_collector;
     virtio_monitor_routing_collector vf_collector;
+    virtio_monitor_routing_collector reused_domain_collector;
 
     localparam bit [15:0] PF_BDF       = 16'h0128;
     localparam bit [15:0] VF_BDF       = 16'h02e0;
@@ -132,9 +136,40 @@ class virtio_monitor_routing_test extends uvm_test;
     localparam bit [31:0] NOTIFY_LEN   = 32'h0000_0040;
     localparam bit [63:0] PF_MSIX_ADDR = 64'h0000_0000_FEE0_0450;
     localparam bit [31:0] PF_MSIX_DATA = 32'h0000_0045;
+    localparam bit [31:0] DOMAIN_MMIO_OFF = 32'h0000_0800;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
+    endfunction
+
+    protected function void pin_real_dut_bars(
+        input dpu_function_cfg function_cfg,
+        input bit [63:0] device_base,
+        input bit [63:0] mailbox_base,
+        input bit [63:0] msix_base
+    );
+        bit [63:0] bases[3];
+
+        bases[0] = device_base;
+        bases[1] = mailbox_base;
+        bases[2] = msix_base;
+        device_builder.add_real_dut_bars(function_cfg);
+        foreach (function_cfg.bars[index]) begin
+            function_cfg.bars[index].placement = DPU_ALLOC_PINNED;
+            function_cfg.bars[index].pinned_base = bases[index];
+        end
+    endfunction
+
+    protected function virtio_function_instance find_vio_function(
+        input dpu_function_key_t key
+    );
+        foreach (virtio_env.function_instances[index]) begin
+            if (dpu_same_function_key(
+                    virtio_env.function_instances[index].function_key, key)) begin
+                return virtio_env.function_instances[index];
+            end
+        end
+        return null;
     endfunction
 
     // Break caught: bind_to_device accepts a manager that was not seeded from
@@ -314,10 +349,13 @@ class virtio_monitor_routing_test extends uvm_test;
     virtual function void build_phase(uvm_phase phase);
         dpu_function_cfg pf_cfg;
         dpu_function_cfg vf_cfg;
+        dpu_function_cfg reused_pf_cfg;
         dpu_service_key_t pf_service_key;
         dpu_service_key_t vf_service_key;
+        dpu_service_key_t reused_pf_service_key;
         virtio_driver_config_t pf_behavior;
         virtio_driver_config_t vf_behavior;
+        virtio_driver_config_t reused_pf_behavior;
         string why;
         bit fix1_checks_passed;
 
@@ -334,6 +372,13 @@ class virtio_monitor_routing_test extends uvm_test;
             return;
         end
 
+        // Both TLM roots use the same completion bridge.  The endpoint bind
+        // below must retain the selected PCIe domain when equal tag/BDF values
+        // are in flight concurrently.
+        tlm_adapter = virtio_tlm_completion_adapter::type_id::create(
+            "domain_tlm_adapter");
+        tlm_adapter.install_factory_overrides();
+
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
         pcie_cfg.if_mode = TLM_MODE;
         pcie_cfg.rc_agent_enable = 1;
@@ -344,21 +389,50 @@ class virtio_monitor_routing_test extends uvm_test;
         pcie_cfg.infinite_credit = 1;
         pcie_cfg.scb_enable = 0;
         pcie_cfg.cov_enable = 0;
+        pcie_cfg.response_delay_min = 20;
+        pcie_cfg.response_delay_max = 20;
         uvm_config_db#(pcie_tl_env_config)::set(this, "pcie_env", "cfg", pcie_cfg);
         pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
+
+        reused_pcie_cfg = pcie_tl_env_config::type_id::create(
+            "reused_pcie_cfg");
+        reused_pcie_cfg.if_mode = TLM_MODE;
+        reused_pcie_cfg.rc_agent_enable = 1;
+        reused_pcie_cfg.ep_agent_enable = 1;
+        reused_pcie_cfg.rc_is_active = UVM_ACTIVE;
+        reused_pcie_cfg.ep_is_active = UVM_ACTIVE;
+        reused_pcie_cfg.ep_auto_response = 1;
+        reused_pcie_cfg.infinite_credit = 1;
+        reused_pcie_cfg.scb_enable = 0;
+        reused_pcie_cfg.cov_enable = 0;
+        reused_pcie_cfg.response_delay_min = 0;
+        reused_pcie_cfg.response_delay_max = 0;
+        uvm_config_db#(pcie_tl_env_config)::set(
+            this, "reused_pcie_env", "cfg", reused_pcie_cfg);
+        reused_pcie_env = pcie_tl_env::type_id::create(
+            "reused_pcie_env", this);
 
         device_builder = virtio_test_device_builder::type_id::create(
             "device_builder");
         void'(device_builder.add_host_domain(0, 0, 16'h0100, 16'h03ff,
             64'h0000_0002_0000_0000, 64'h0000_0003_0000_0000));
+        void'(device_builder.add_host_domain(1, 0, 16'h0100, 16'h03ff,
+            64'h0000_0002_0000_0000, 64'h0000_0003_0000_0000));
         pf_cfg = device_builder.add_pf(
             0, 0, 0, DPU_ALLOC_PINNED, PF_BDF);
         vf_cfg = device_builder.add_vf(
             0, 0, 0, 0, DPU_ALLOC_PINNED, VF_BDF);
-        device_builder.add_real_dut_bars(pf_cfg);
+        pin_real_dut_bars(
+            pf_cfg, PF_BAR0_BASE, PF_BAR2_BASE, PF_BAR4_BASE);
         device_builder.add_real_dut_bars(vf_cfg);
         pf_service_key = device_builder.add_vio_service(pf_cfg, 0);
         vf_service_key = device_builder.add_vio_service(vf_cfg, 0);
+        reused_pf_cfg = device_builder.add_pf(
+            1, 0, 0, DPU_ALLOC_PINNED, PF_BDF);
+        pin_real_dut_bars(
+            reused_pf_cfg, PF_BAR0_BASE, PF_BAR2_BASE, PF_BAR4_BASE);
+        reused_pf_service_key = device_builder.add_vio_service(
+            reused_pf_cfg, 0);
         device_builder.select_af(pf_cfg);
         device_env_cfg = device_builder.make_env_config();
 
@@ -369,6 +443,8 @@ class virtio_monitor_routing_test extends uvm_test;
         pf_behavior.num_queue_pairs = 3;
         vf_behavior = virtio_cfg.make_default_driver_config(32);
         vf_behavior.num_queue_pairs = 5;
+        reused_pf_behavior = virtio_cfg.make_default_driver_config(32);
+        reused_pf_behavior.num_queue_pairs = 7;
         if (!virtio_cfg.add_service_config(
                 pf_service_key, pf_behavior, why)) begin
             `uvm_fatal("ROUTING_TEST", {"could not author PF behavior: ", why})
@@ -377,6 +453,12 @@ class virtio_monitor_routing_test extends uvm_test;
         if (!virtio_cfg.add_service_config(
                 vf_service_key, vf_behavior, why)) begin
             `uvm_fatal("ROUTING_TEST", {"could not author VF behavior: ", why})
+            return;
+        end
+        if (!virtio_cfg.add_service_config(
+                reused_pf_service_key, reused_pf_behavior, why)) begin
+            `uvm_fatal("ROUTING_TEST",
+                {"could not author reused-domain PF behavior: ", why})
             return;
         end
 
@@ -391,12 +473,26 @@ class virtio_monitor_routing_test extends uvm_test;
             "pf_collector", this);
         vf_collector = virtio_monitor_routing_collector::type_id::create(
             "vf_collector", this);
+        reused_domain_collector =
+            virtio_monitor_routing_collector::type_id::create(
+                "reused_domain_collector", this);
     endfunction
 
     virtual function void connect_phase(uvm_phase phase);
+        dpu_device_snapshot snapshot;
+        dpu_function_key_t host0_pf_key;
+        dpu_function_key_t host1_pf_key;
+        dpu_pcie_function_id_t host0_pf_pcie;
+        dpu_pcie_function_id_t host0_vf_pcie;
+        dpu_pcie_function_id_t host1_pf_pcie;
+        virtio_pcie_function_endpoint endpoints[$];
+        virtio_pcie_function_endpoint endpoint;
+        virtio_function_instance reused_pf;
+        string why;
+
         super.connect_phase(phase);
 
-        if ((virtio_env.pf_instances.size() != 1) ||
+        if ((virtio_env.pf_instances.size() != 2) ||
             (virtio_env.pf_instances[0] == null) ||
             (virtio_env.pf_instances[0].pf_function == null) ||
             (virtio_env.pf_instances[0].vf_functions.size() != 1)) begin
@@ -405,10 +501,48 @@ class virtio_monitor_routing_test extends uvm_test;
             return;
         end
 
-        // Public binding is responsible for configuring every PF/VF observer
-        // and wiring both directions of the external PCIe monitor stream.
-        if (!virtio_env.bind_pcie(pcie_env.rc_agent.sequencer, null,
-            pcie_env.rc_agent.monitor, pcie_env.ep_agent.monitor)) begin
+        host0_pf_key.host_id = 0;
+        host0_pf_key.pf_id = 0;
+        host0_pf_key.kind = DPU_FUNCTION_PF;
+        host0_pf_key.vf_id = 0;
+        host1_pf_key = host0_pf_key;
+        host1_pf_key.host_id = 1;
+        snapshot = device_env.get_snapshot();
+        reused_pf = find_vio_function(host1_pf_key);
+        if ((snapshot == null) || (reused_pf == null) ||
+            !snapshot.get_pcie_id(host0_pf_key, host0_pf_pcie, why) ||
+            !snapshot.get_pcie_id(
+                virtio_env.pf_instances[0].vf_functions[0].function_key,
+                host0_vf_pcie, why) ||
+            !snapshot.get_pcie_id(host1_pf_key, host1_pf_pcie, why)) begin
+            `uvm_fatal("MON_ROUTE", {"could not resolve endpoint identities: ", why})
+            return;
+        end
+
+        endpoint = virtio_pcie_function_endpoint::type_id::create(
+            "host0_pf_endpoint");
+        endpoint.configure(host0_pf_pcie, pcie_env.rc_agent.sequencer,
+            pcie_env.rc_agent.rc_driver, tlm_adapter,
+            pcie_env.rc_agent.monitor, pcie_env.ep_agent.monitor);
+        endpoints.push_back(endpoint);
+        endpoint = virtio_pcie_function_endpoint::type_id::create(
+            "host0_vf_endpoint");
+        endpoint.configure(host0_vf_pcie, pcie_env.rc_agent.sequencer,
+            pcie_env.rc_agent.rc_driver, tlm_adapter,
+            pcie_env.rc_agent.monitor, pcie_env.ep_agent.monitor);
+        endpoints.push_back(endpoint);
+        endpoint = virtio_pcie_function_endpoint::type_id::create(
+            "host1_pf_endpoint");
+        endpoint.configure(host1_pf_pcie, reused_pcie_env.rc_agent.sequencer,
+            reused_pcie_env.rc_agent.rc_driver, tlm_adapter,
+            reused_pcie_env.rc_agent.monitor,
+            reused_pcie_env.ep_agent.monitor);
+        endpoints.push_back(endpoint);
+
+        // Public binding must select the configured endpoint with the complete
+        // {host, segment, BDF} identity.  Equal numeric BDF/BAR values in the
+        // two domains are intentional.
+        if (!virtio_env.bind_pcie_endpoints(endpoints)) begin
             `uvm_fatal("MON_ROUTE", "failed to bind virtio environment to PCIe")
             return;
         end
@@ -417,11 +551,15 @@ class virtio_monitor_routing_test extends uvm_test;
             pf_collector.analysis_export);
         virtio_env.pf_instances[0].vf_functions[0].driver_agent.monitor.txn_ap.connect(
             vf_collector.analysis_export);
+        reused_pf.driver_agent.monitor.txn_ap.connect(
+            reused_domain_collector.analysis_export);
     endfunction
 
     virtual task run_phase(uvm_phase phase);
         virtio_function_instance pf;
         virtio_function_instance vf;
+        virtio_function_instance reused_pf;
+        dpu_function_key_t reused_pf_key;
         pcie_tl_mem_tlp tlp;
 
         phase.raise_objection(this);
@@ -430,6 +568,12 @@ class virtio_monitor_routing_test extends uvm_test;
 
         pf = virtio_env.pf_instances[0].pf_function;
         vf = virtio_env.pf_instances[0].vf_functions[0];
+        reused_pf_key = pf.function_key;
+        reused_pf_key.host_id = 1;
+        reused_pf = find_vio_function(reused_pf_key);
+        assert(reused_pf != null)
+            else `uvm_fatal("ROUTING_TEST",
+                "reused-domain VIO function was not constructed")
         assert((pf.bdf == PF_BDF) && (pf.transport.bdf == PF_BDF) &&
                (vf.bdf == VF_BDF) && (vf.transport.bdf == VF_BDF))
             else `uvm_fatal("ROUTING_TEST",
@@ -452,7 +596,8 @@ class virtio_monitor_routing_test extends uvm_test;
             else `uvm_fatal("ROUTING_TEST",
                 "VIO functions did not receive the global resource manager")
         assert((pf.drv_cfg.num_queue_pairs == 3) &&
-               (vf.drv_cfg.num_queue_pairs == 5))
+               (vf.drv_cfg.num_queue_pairs == 5) &&
+               (reused_pf.drv_cfg.num_queue_pairs == 7))
             else `uvm_fatal("ROUTING_TEST",
                 "PF/VF behavior was not routed by canonical service key")
         if ($test$plusargs("ROUTING_BIND_ONLY")) begin
@@ -467,6 +612,7 @@ class virtio_monitor_routing_test extends uvm_test;
         end
         configure_function_ranges(pf);
         configure_function_ranges(vf);
+        configure_function_ranges(reused_pf);
         virtio_env.cov.enable_all();
 
         tlp = make_pf_status_write(pf);
@@ -486,9 +632,21 @@ class virtio_monitor_routing_test extends uvm_test;
         assert(vf_collector.count == 0)
             else `uvm_fatal("ROUTING_TEST", $sformatf(
                 "VF observed another function's MMIO (%0d events)", vf_collector.count))
-        assert(virtio_env.scb.monitor_event_count == 1)
+        assert(reused_domain_collector.count == 0)
+            else `uvm_fatal("ROUTING_TEST",
+                "same-BDF/BAR function in another domain observed host0 MMIO")
+
+        reused_pcie_env.ep_agent.monitor.tlp_ap.write(
+            make_pf_status_write(reused_pf));
+        assert(reused_domain_collector.count == 1)
+            else `uvm_fatal("ROUTING_TEST",
+                "host1 endpoint monitor did not reach its same-BDF/BAR owner")
+        assert((pf_collector.count == 1) && (vf_collector.count == 0))
+            else `uvm_fatal("ROUTING_TEST",
+                "host1 endpoint monitor leaked into the host0 domain")
+        assert(virtio_env.scb.monitor_event_count == 2)
             else `uvm_fatal("ROUTING_TEST", $sformatf(
-                "shared scoreboard should receive exactly one monitor event, saw %0d",
+                "shared scoreboard should receive both domain-owned monitor events, saw %0d",
                 virtio_env.scb.monitor_event_count))
         assert(virtio_env.cov.cg_lifecycle.get_inst_coverage() > 0.0)
             else `uvm_fatal("ROUTING_TEST",
@@ -498,10 +656,173 @@ class virtio_monitor_routing_test extends uvm_test;
         test_real_msix_memory_write(pf, vf);
         test_protocol_vif_isolation(pf, vf);
         test_queue_and_device_resets(pf);
+        assert_domain_reused_transport_path(pf, reused_pf);
 
         `uvm_info("ROUTING_TEST", "External PCIe monitor routing PASSED", UVM_NONE)
         phase.drop_objection(this);
     endtask
+
+    // The production transport and accessor must preserve endpoint identity
+    // for both requests and completions.  The two roots intentionally use the
+    // same BDF and BAR address and return different data; host0 is delayed so
+    // equal tag/BDF completions arrive in the opposite order.
+    protected task assert_domain_reused_transport_path(
+        input virtio_function_instance host0_pf,
+        input virtio_function_instance host1_pf
+    );
+        bit [31:0] host0_cfg;
+        bit [31:0] host1_cfg;
+        bit [31:0] host0_mmio;
+        bit [31:0] host1_mmio;
+        bit [31:0] host0_cfg_written;
+        bit [31:0] host1_cfg_written;
+        bit [31:0] host0_mmio_written;
+        bit [31:0] host1_mmio_written;
+        bit [63:0] mmio_address;
+
+        if ((host0_pf.pcie_id.bdf != host1_pf.pcie_id.bdf) ||
+            dpu_same_domain_key(
+                host0_pf.pcie_id.domain, host1_pf.pcie_id.domain) ||
+            !dpu_same_domain_key(
+                host0_pf.transport.pcie_id.domain,
+                host0_pf.pcie_id.domain) ||
+            !dpu_same_domain_key(
+                host1_pf.transport.pcie_id.domain,
+                host1_pf.pcie_id.domain) ||
+            !dpu_same_domain_key(
+                host0_pf.transport.bar.pcie_id.domain,
+                host0_pf.pcie_id.domain) ||
+            !dpu_same_domain_key(
+                host1_pf.transport.bar.pcie_id.domain,
+                host1_pf.pcie_id.domain) ||
+            !dpu_same_domain_key(
+                host0_pf.driver_agent.observer.function_pcie_id.domain,
+                host0_pf.pcie_id.domain) ||
+            !dpu_same_domain_key(
+                host1_pf.driver_agent.observer.function_pcie_id.domain,
+                host1_pf.pcie_id.domain)) begin
+            `uvm_fatal("ROUTING_TEST",
+                "full PCIe identity did not reach function/transport/accessor/observer")
+        end
+        if ((host0_pf.transport.bar.pcie_rc_seqr !=
+             pcie_env.rc_agent.sequencer) ||
+            (host1_pf.transport.bar.pcie_rc_seqr !=
+             reused_pcie_env.rc_agent.sequencer)) begin
+            `uvm_fatal("ROUTING_TEST",
+                "domain-qualified endpoint selection chose the wrong RC sequencer")
+        end
+
+        pcie_env.cfg_mgr.cfg_space[0] = 8'h34;
+        pcie_env.cfg_mgr.cfg_space[1] = 8'h12;
+        pcie_env.cfg_mgr.cfg_space[2] = 8'h78;
+        pcie_env.cfg_mgr.cfg_space[3] = 8'h56;
+        reused_pcie_env.cfg_mgr.cfg_space[0] = 8'hcd;
+        reused_pcie_env.cfg_mgr.cfg_space[1] = 8'hab;
+        reused_pcie_env.cfg_mgr.cfg_space[2] = 8'h21;
+        reused_pcie_env.cfg_mgr.cfg_space[3] = 8'h43;
+        fork
+            host0_pf.transport.bar.config_read(12'h000, host0_cfg);
+            host1_pf.transport.bar.config_read(12'h000, host1_cfg);
+        join
+        if ((host0_cfg != 32'h5678_1234) ||
+            (host1_cfg != 32'h4321_abcd)) begin
+            `uvm_fatal("ROUTING_TEST", $sformatf(
+                "domain-qualified config completions aliased: host0=0x%08h host1=0x%08h",
+                host0_cfg, host1_cfg))
+        end
+
+        fork
+            host0_pf.transport.bar.config_write(
+                PCI_CFG_COMMAND, 32'h0000_0005, 4'h3);
+            host1_pf.transport.bar.config_write(
+                PCI_CFG_COMMAND, 32'h0000_0006, 4'h3);
+        join
+        fork
+            host0_pf.transport.bar.config_read(
+                PCI_CFG_COMMAND, host0_cfg_written);
+            host1_pf.transport.bar.config_read(
+                PCI_CFG_COMMAND, host1_cfg_written);
+        join
+        if ((host0_cfg_written[15:0] != 16'h0005) ||
+            (host1_cfg_written[15:0] != 16'h0006)) begin
+            `uvm_fatal("ROUTING_TEST",
+                "domain-qualified config write/readback crossed endpoints")
+        end
+
+        mmio_address = PF_BAR0_BASE + DOMAIN_MMIO_OFF;
+        write_ep_mem32(pcie_env.ep_agent.ep_driver,
+            mmio_address, 32'ha0a0_0001);
+        write_ep_mem32(reused_pcie_env.ep_agent.ep_driver,
+            mmio_address, 32'hb0b0_0002);
+        fork
+            host0_pf.transport.bar.read_reg(
+                0, DOMAIN_MMIO_OFF, 4, host0_mmio);
+            host1_pf.transport.bar.read_reg(
+                0, DOMAIN_MMIO_OFF, 4, host1_mmio);
+        join
+        if ((host0_mmio != 32'ha0a0_0001) ||
+            (host1_mmio != 32'hb0b0_0002)) begin
+            `uvm_fatal("ROUTING_TEST", $sformatf(
+                "domain-qualified MMIO completions aliased: host0=0x%08h host1=0x%08h",
+                host0_mmio, host1_mmio))
+        end
+
+        fork
+            host0_pf.transport.bar.write_reg(
+                0, DOMAIN_MMIO_OFF, 4, 32'h0a0a_1111);
+            host1_pf.transport.bar.write_reg(
+                0, DOMAIN_MMIO_OFF, 4, 32'h0b0b_2222);
+        join
+        // Posted writes retire at the RC sequencer before the asynchronous
+        // TLM loopback invokes the EP model.  Poll the real endpoint memories
+        // for bounded completion instead of racing that transport handoff.
+        for (int unsigned poll = 0; poll < 100; poll++) begin
+            host0_mmio_written = read_ep_mem32(
+                pcie_env.ep_agent.ep_driver, mmio_address);
+            host1_mmio_written = read_ep_mem32(
+                reused_pcie_env.ep_agent.ep_driver, mmio_address);
+            if ((host0_mmio_written == 32'h0a0a_1111) &&
+                (host1_mmio_written == 32'h0b0b_2222)) begin
+                break;
+            end
+            #1ns;
+        end
+        if ((host0_mmio_written != 32'h0a0a_1111) ||
+            (host1_mmio_written != 32'h0b0b_2222)) begin
+            `uvm_fatal("ROUTING_TEST", $sformatf(
+                {"domain-qualified MMIO writes crossed endpoint memories: ",
+                 "host0=0x%08h host1=0x%08h"},
+                host0_mmio_written, host1_mmio_written))
+        end
+    endtask
+
+    protected function void write_ep_mem32(
+        input pcie_tl_ep_driver ep_driver,
+        input bit [63:0] address,
+        input bit [31:0] data
+    );
+        ep_driver.mem_space[address] = data[7:0];
+        ep_driver.mem_space[address + 1] = data[15:8];
+        ep_driver.mem_space[address + 2] = data[23:16];
+        ep_driver.mem_space[address + 3] = data[31:24];
+    endfunction
+
+    protected function bit [31:0] read_ep_mem32(
+        input pcie_tl_ep_driver ep_driver,
+        input bit [63:0] address
+    );
+        bit [31:0] data;
+
+        data[7:0] = ep_driver.mem_space.exists(address) ?
+            ep_driver.mem_space[address] : 8'h00;
+        data[15:8] = ep_driver.mem_space.exists(address + 1) ?
+            ep_driver.mem_space[address + 1] : 8'h00;
+        data[23:16] = ep_driver.mem_space.exists(address + 2) ?
+            ep_driver.mem_space[address + 2] : 8'h00;
+        data[31:24] = ep_driver.mem_space.exists(address + 3) ?
+            ep_driver.mem_space[address + 3] : 8'h00;
+        return data;
+    endfunction
 
     protected function void configure_function_ranges(
         input virtio_function_instance function_instance

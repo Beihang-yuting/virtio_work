@@ -375,11 +375,16 @@ class my_test extends virtio_base_test;
     endfunction
 
     virtual task run_phase(uvm_phase phase);
+        virtio_function_instance pf_vio;
         virtio_smoke_vseq vseq;
         phase.raise_objection(this);
 
+        // virtio_base_test declares a VIO-net service on PF0.  Per-function
+        // behavior is authored by that service key; the runtime owner is the
+        // corresponding PF function, not an undeclared positional VF.
+        pf_vio = env.pf_instances[0].pf_function;
         vseq = virtio_smoke_vseq::type_id::create("vseq");
-        vseq.vf_seqr = env.vf_instances[0].driver_agent.sequencer;
+        vseq.vf_seqr = pf_vio.driver_agent.sequencer;
         vseq.start(env.v_seqr);
 
         phase.drop_objection(this);

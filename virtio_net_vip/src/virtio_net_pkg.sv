@@ -51,8 +51,10 @@ package virtio_net_pkg;
   // Phase 4 – Transport (PCI)
   // ---------------------------------------------------------------------------
   `include "transport/virtio_pci_regs.sv"
+  typedef class virtio_tlm_completion_adapter;
   `include "transport/virtio_bar_accessor.sv"
   `include "transport/virtio_tlm_completion_adapter.sv"
+  `include "transport/virtio_pcie_function_endpoint.sv"
   `include "transport/virtio_pci_cap_manager.sv"
   `include "transport/virtio_notification_manager.sv"
   `include "transport/virtio_pci_transport.sv"

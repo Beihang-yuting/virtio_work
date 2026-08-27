@@ -34,6 +34,8 @@ class virtio_pci_transport extends uvm_object;
 
     // ===== Identity =====
     bit [15:0]    bdf;
+    dpu_pcie_function_id_t pcie_id;
+    bit                     pcie_id_valid;
     bit           is_vf = 0;
     int unsigned  vf_index = 0;
 
@@ -71,6 +73,37 @@ class virtio_pci_transport extends uvm_object;
         device_features = '0;
         driver_features = '0;
         bdf             = 16'h0;
+        pcie_id_valid   = 0;
+    endfunction
+
+    function void configure_pcie_identity(
+        input dpu_pcie_function_id_t function_pcie_id
+    );
+        pcie_id = function_pcie_id;
+        pcie_id_valid = 1;
+        bdf = function_pcie_id.bdf;
+        bar.configure_pcie_identity(function_pcie_id);
+        notify_mgr.set_function_bdf(function_pcie_id.bdf);
+    endfunction
+
+    function bit bind_pcie_endpoint(
+        input virtio_pcie_function_endpoint endpoint
+    );
+        if (endpoint == null) begin
+            `uvm_fatal("TRANSPORT", "PCIe endpoint bind received null")
+            return 0;
+        end
+        if (!pcie_id_valid || !endpoint.matches_id(pcie_id)) begin
+            `uvm_fatal("TRANSPORT", $sformatf(
+                "PCIe endpoint %s does not match transport identity %s",
+                dpu_pcie_function_id_name(endpoint.pcie_id),
+                pcie_id_valid ? dpu_pcie_function_id_name(pcie_id) :
+                    "<unconfigured>"))
+            return 0;
+        end
+        bar.bind_pcie_path(
+            pcie_id, endpoint.rc_seqr, endpoint.completion_adapter);
+        return 1;
     endfunction
 
     virtual function void configure_fabric_managed(

@@ -46,39 +46,6 @@ class virtio_dynamic_reconfig extends uvm_report_object;
         dut_caps_bound = 0;
     endfunction
 
-    function bit bind_dut_caps(
-        input dpu_dut_caps caps,
-        output string why
-    );
-        dpu_dut_caps bound_dut_caps;
-        int unsigned bound_qpair_limit;
-        string caps_why;
-
-        if (dut_caps_bound) begin
-            why = "dynamic reconfig DUT capabilities are already bound";
-            return 0;
-        end
-        if (caps == null) begin
-            why = "dynamic reconfig DUT capabilities are null";
-            return 0;
-        end
-        if (!caps.validate(caps_why)) begin
-            why = $sformatf("invalid DUT capabilities: %s", caps_why);
-            return 0;
-        end
-        bound_dut_caps = dpu_dut_caps::type_id::create(
-            "dynamic_reconfig_bound_dut_caps");
-        bound_dut_caps.copy_from(caps);
-        bound_qpair_limit =
-            bound_dut_caps.max_vio_net_qpairs_per_device;
-
-        dut_caps = bound_dut_caps;
-        enforced_max_vio_net_qpairs_per_device = bound_qpair_limit;
-        dut_caps_bound = 1;
-        why = "";
-        return 1;
-    endfunction
-
     function bit bind_device_snapshot(
         input dpu_device_snapshot snapshot,
         output string why

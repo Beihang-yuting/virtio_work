@@ -284,6 +284,12 @@ class dpu_device_resolver extends uvm_object;
         end
         if (!cfg.dut_caps.validate(why))
             return 0;
+        if (cfg.functions.size() > cfg.dut_caps.max_functions) begin
+            why = $sformatf(
+                "configured function count %0d exceeds DUT max_functions %0d",
+                cfg.functions.size(), cfg.dut_caps.max_functions);
+            return 0;
+        end
 
         foreach (cfg.hosts[host_index]) begin
             if (cfg.hosts[host_index] == null) begin

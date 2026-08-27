@@ -13,6 +13,8 @@ class virtio_pcie_observer_adapter extends uvm_subscriber #(pcie_tl_tlp);
     // adapter is explicitly bound to one function, then filters the common
     // stream using its BDF and current BAR/capability placement.
     bit [15:0] function_bdf;
+    dpu_pcie_function_id_t function_pcie_id;
+    bit                    function_pcie_id_valid;
     bit        function_bound;
     virtio_pci_transport transport;
 
@@ -27,6 +29,7 @@ class virtio_pcie_observer_adapter extends uvm_subscriber #(pcie_tl_tlp);
     function new(string name, uvm_component parent);
         super.new(name, parent);
         function_bdf = '0;
+        function_pcie_id_valid = 0;
         function_bound = 0;
         transport = null;
         // No capability range is valid until it is either explicitly supplied
@@ -68,7 +71,28 @@ class virtio_pcie_observer_adapter extends uvm_subscriber #(pcie_tl_tlp);
         input bit [15:0] device_bdf,
         input virtio_pci_transport transport_ref
     );
+        if ((transport_ref != null) && transport_ref.pcie_id_valid) begin
+            commit_mandatory_function_identity_binding(
+                transport_ref.pcie_id, transport_ref);
+            return;
+        end
         function_bdf = device_bdf;
+        function_pcie_id_valid = 0;
+        transport = transport_ref;
+        function_bound = (transport_ref != null);
+        common_cfg_base = '1;
+        common_cfg_limit = '0;
+        notify_cfg_base = '1;
+        notify_cfg_limit = '0;
+    endfunction
+
+    function void commit_mandatory_function_identity_binding(
+        input dpu_pcie_function_id_t device_pcie_id,
+        input virtio_pci_transport transport_ref
+    );
+        function_pcie_id = device_pcie_id;
+        function_pcie_id_valid = 1;
+        function_bdf = device_pcie_id.bdf;
         transport = transport_ref;
         function_bound = (transport_ref != null);
         common_cfg_base = '1;
