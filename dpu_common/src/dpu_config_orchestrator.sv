@@ -23,27 +23,34 @@ class dpu_config_orchestrator extends uvm_object;
         return executor != null;
     endfunction
 
-    task apply(
+    task apply_with_report(
         dpu_reg_plan plan,
-        output dpu_cfg_status_e status,
-        output string why
+        output dpu_execution_report report
     );
         dpu_reg_executor active_executor;
+        dpu_cfg_status_e status;
+        string why;
 
         status = DPU_CFG_STATUS_PLAN_INVALID;
         why = "";
+        report = dpu_execution_report::type_id::create(
+            {get_name(), "_execution_report"});
         active_executor = executor;
         if (plan == null) begin
             why = "configuration orchestrator received a null register plan";
+            report.set_terminal(status, why);
             return;
         end
-        if (!plan.freeze(why))
+        if (!plan.freeze(why)) begin
+            report.set_terminal(status, why);
             return;
+        end
 
         if (active_executor == null) begin
             status = DPU_CFG_STATUS_NOT_EXECUTED;
             why = {"validated register plan was not executed because no ",
                    "executor is installed"};
+            report.set_terminal(status, why);
             return;
         end
         if (!active_executor.preflight(plan, why)) begin
@@ -54,6 +61,8 @@ class dpu_config_orchestrator extends uvm_object;
                 why =
                     "register executor preflight failed without an error message";
             end
+            active_executor.export_results(report);
+            report.set_terminal(status, why);
             return;
         end
 
@@ -71,6 +80,20 @@ class dpu_config_orchestrator extends uvm_object;
                 why = "register executor returned an invalid terminal status";
             end
         endcase
+        active_executor.export_results(report);
+        report.set_terminal(status, why);
+    endtask
+
+    task apply(
+        dpu_reg_plan plan,
+        output dpu_cfg_status_e status,
+        output string why
+    );
+        dpu_execution_report report;
+
+        apply_with_report(plan, report);
+        status = report.status();
+        why = report.reason();
     endtask
 endclass : dpu_config_orchestrator
 

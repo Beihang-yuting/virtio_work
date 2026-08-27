@@ -232,6 +232,16 @@ class dpu_spy_reg_executor extends dpu_reg_executor;
         result = recorded_results[index];
         return 1;
     endfunction
+
+    virtual function void export_results(input dpu_execution_report report);
+        if (report == null)
+            return;
+        report.clear_results();
+        foreach (recorded_operations[index]) begin
+            report.append_result(
+                recorded_operations[index].op_id, recorded_results[index]);
+        end
+    endfunction
 endclass : dpu_spy_reg_executor
 
 `endif // DPU_SPY_REG_EXECUTOR_SV

@@ -21,12 +21,14 @@ class dpu_device_env extends uvm_env;
 
     protected dpu_device_snapshot snapshot;
     protected dpu_resource_manager resource_manager;
+    protected dpu_config_orchestrator orchestrator;
     protected dpu_device_state_e state;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
         snapshot = null;
         resource_manager = null;
+        orchestrator = null;
         state = DPU_DEVICE_UNRESOLVED;
     endfunction
 
@@ -36,6 +38,7 @@ class dpu_device_env extends uvm_env;
         dpu_device_snapshot candidate_snapshot;
         dpu_resource_manager candidate_manager;
         dpu_resource_registry_authority authority;
+        dpu_config_orchestrator candidate_orchestrator;
         string why;
 
         super.build_phase(phase);
@@ -65,9 +68,14 @@ class dpu_device_env extends uvm_env;
             `uvm_fatal("DPU_DEVICE_ENV", {"resource manager seeding failed: ", why})
             return;
         end
+        candidate_orchestrator = dpu_config_orchestrator::type_id::create(
+            "dpu_config_orchestrator");
+        if (cfg.executor != null)
+            candidate_orchestrator.set_executor(cfg.executor);
 
         snapshot = candidate_snapshot;
         resource_manager = candidate_manager;
+        orchestrator = candidate_orchestrator;
         state = DPU_DEVICE_RESOLVED;
         uvm_config_db#(dpu_device_snapshot)::set(
             this, "*", "dpu_device_snapshot", snapshot
@@ -88,6 +96,60 @@ class dpu_device_env extends uvm_env;
     function dpu_device_state_e get_state();
         return state;
     endfunction
+
+    function bit build_bootstrap_plan(
+        output dpu_reg_plan plan,
+        output string why
+    );
+        dpu_device_bootstrap_plan_builder builder;
+
+        plan = null;
+        why = "";
+        if (state != DPU_DEVICE_RESOLVED) begin
+            why = $sformatf(
+                "bootstrap plan build requires RESOLVED state, current state is %0d",
+                state);
+            return 0;
+        end
+        builder = dpu_device_bootstrap_plan_builder::type_id::create(
+            "dpu_device_bootstrap_plan_builder");
+        return builder.build(snapshot, plan, why);
+    endfunction
+
+    task apply_bootstrap(
+        input dpu_reg_plan plan,
+        output dpu_execution_report report
+    );
+        if (state != DPU_DEVICE_RESOLVED) begin
+            report = dpu_execution_report::type_id::create(
+                "rejected_bootstrap_report");
+            report.set_terminal(
+                DPU_CFG_STATUS_PLAN_INVALID,
+                $sformatf(
+                    "bootstrap apply requires RESOLVED state, current state is %0d",
+                    state));
+            return;
+        end
+        if (orchestrator == null) begin
+            report = dpu_execution_report::type_id::create(
+                "missing_orchestrator_report");
+            report.set_terminal(
+                DPU_CFG_STATUS_PLAN_INVALID,
+                "device environment has no configuration orchestrator");
+            return;
+        end
+
+        state = DPU_DEVICE_APPLYING;
+        orchestrator.apply_with_report(plan, report);
+        case (report.status())
+            DPU_CFG_STATUS_SUCCEEDED:
+                state = DPU_DEVICE_ACTIVE;
+            DPU_CFG_STATUS_EXECUTION_FAILED:
+                state = DPU_DEVICE_FAILED;
+            default:
+                state = DPU_DEVICE_RESOLVED;
+        endcase
+    endtask
 endclass : dpu_device_env
 
 `endif // DPU_DEVICE_ENV_SV

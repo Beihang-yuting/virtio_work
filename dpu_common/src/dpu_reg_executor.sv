@@ -26,6 +26,11 @@ virtual class dpu_reg_executor extends uvm_object;
         dpu_reg_plan plan,
         output dpu_cfg_status_e status
     );
+
+    virtual function void export_results(input dpu_execution_report report);
+        if (report != null)
+            report.clear_results();
+    endfunction
 endclass : dpu_reg_executor
 
 `endif // DPU_REG_EXECUTOR_SV

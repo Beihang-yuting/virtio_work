@@ -15,6 +15,7 @@ package dpu_resource_pkg;
   `include "dpu_reg_plan_types.sv"
   `include "dpu_reg_op.sv"
   `include "dpu_reg_plan.sv"
+  `include "dpu_execution_report.sv"
   `include "dpu_reg_executor.sv"
   `include "dpu_spy_reg_executor.sv"
   `include "dpu_config_orchestrator.sv"
@@ -23,6 +24,7 @@ package dpu_resource_pkg;
   `include "dpu_device_snapshot.sv"
   `include "dpu_device_resolver.sv"
   `include "dpu_resource_manager.sv"
+  `include "dpu_device_bootstrap_plan_builder.sv"
   `include "dpu_device_env.sv"
   `include "dpu_fabric_env.sv"
 
