@@ -1,9 +1,7 @@
 `ifndef VIRTIO_VF_INSTANCE_SV
 `define VIRTIO_VF_INSTANCE_SV
 
-// Compatibility surface for existing flat-VF environments.  The complete
-// implementation belongs to virtio_function_instance; this wrapper prevents
-// legacy callers from accidentally creating a PF through a VF API.
+// VF specialization of the snapshot/service-resolved function instance.
 class virtio_vf_instance extends virtio_function_instance;
     `uvm_component_utils(virtio_vf_instance)
 
@@ -12,21 +10,28 @@ class virtio_vf_instance extends virtio_function_instance;
         function_kind = DPU_FUNCTION_VF;
     endfunction
 
-    virtual function bit configure_function(
-        input dpu_function_kind_e kind,
-        input dpu_function_key_t key,
-        input bit [15:0] device_bdf,
-        input dpu_bar_pair_lease_t bars[$],
-        input dpu_resource_manager manager = null,
+    virtual function bit configure_from_service(
+        input dpu_device_snapshot snapshot,
+        input dpu_service_key_t service,
+        input dpu_resource_manager manager,
         input uvm_object pcie_ctx = null
     );
-        if ((kind != DPU_FUNCTION_VF) || (key.kind != DPU_FUNCTION_VF)) begin
+        dpu_function_key_t owner;
+        string why;
+
+        if ((snapshot == null) || !snapshot.is_frozen() ||
+            !snapshot.get_service_owner(service, owner, why)) begin
             `uvm_fatal("VF_INSTANCE",
-                "compatibility virtio_vf_instance requires a VF function key")
+                "VF instance requires a frozen snapshot-declared service")
             return 0;
         end
-        return super.configure_function(
-            kind, key, device_bdf, bars, manager, pcie_ctx);
+        if (owner.kind != DPU_FUNCTION_VF) begin
+            `uvm_fatal("VF_INSTANCE",
+                "virtio_vf_instance requires a VF-owned service")
+            return 0;
+        end
+        return super.configure_from_service(
+            snapshot, service, manager, pcie_ctx);
     endfunction
 endclass : virtio_vf_instance
 

@@ -16,6 +16,7 @@ class virtio_function_instance extends uvm_component;
     dpu_bar_pair_lease_t    bar_pairs[$];
     dpu_resource_manager    resource_manager;
     virtio_resource_client  resource_client;
+    protected dpu_device_snapshot configuration_snapshot;
 
     // PCIe context is owned by the PCIe function manager, not this function.
     uvm_object              pcie_ctx_ref;
@@ -57,32 +58,65 @@ class virtio_function_instance extends uvm_component;
         apply_function_configuration();
     endfunction
 
-    // Fabric topology supplies all identity and BAR leases before transport
-    // discovery.  BAR0/1 is the virtio function window, BAR2/3 is the mailbox,
-    // and BAR4/5 is MSI-X only; the BAR accessor enforces roles.
-    virtual function bit configure_function(
-        input dpu_function_kind_e kind,
-        input dpu_function_key_t key,
-        input bit [15:0] device_bdf,
-        input dpu_bar_pair_lease_t bars[$],
-        input dpu_resource_manager manager = null,
+    // Resolve all identity and placement from one frozen, service-keyed device
+    // snapshot. Callers cannot provide raw BDF/BAR values, and an established
+    // function binding cannot move to a different snapshot.
+    virtual function bit configure_from_service(
+        input dpu_device_snapshot snapshot,
+        input dpu_service_key_t service,
+        input dpu_resource_manager manager,
         input uvm_object pcie_ctx = null
     );
+        dpu_function_key_t key;
+        dpu_pcie_function_id_t pcie_id;
+        dpu_bar_pair_lease_t bars[$];
+        dpu_bar_pair_lease_t bar;
         string why;
 
-        if (kind != key.kind) begin
-            `uvm_error("FUNCTION_INSTANCE", $sformatf(
-                "transport kind %0d disagrees with Fabric function key kind %0d",
-                kind, key.kind))
+        if ((snapshot == null) || !snapshot.is_frozen()) begin
+            `uvm_fatal("FUNCTION_INSTANCE",
+                "function configuration requires a frozen device snapshot")
             return 0;
         end
-        if ((manager == null) || !manager.is_snapshot_seeded() ||
+        if (service.service_kind != DPU_SERVICE_VIO_NET) begin
+            `uvm_fatal("FUNCTION_INSTANCE",
+                "function configuration requires a VIO-net service key")
+            return 0;
+        end
+        if (!snapshot.get_service_owner(service, key, why) ||
+            !snapshot.get_pcie_id(key, pcie_id, why) ||
+            !snapshot.get_bar(key, DPU_BAR_DEVICE_MEMORY, bar, why)) begin
+            `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                "could not resolve snapshot VIO function: %s", why))
+            return 0;
+        end
+        bars.push_back(bar);
+        if (!snapshot.get_bar(key, DPU_BAR_MAILBOX, bar, why)) begin
+            `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                "could not resolve snapshot VIO function: %s", why))
+            return 0;
+        end
+        bars.push_back(bar);
+        if (!snapshot.get_bar(key, DPU_BAR_MSIX, bar, why)) begin
+            `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                "could not resolve snapshot VIO function: %s", why))
+            return 0;
+        end
+        bars.push_back(bar);
+        if ((configuration_snapshot != null) &&
+            (configuration_snapshot != snapshot)) begin
+            `uvm_fatal("FUNCTION_INSTANCE",
+                {"function configuration ownership cannot be reassigned to a ",
+                 "different device snapshot"})
+            return 0;
+        end
+        if ((manager == null) || !manager.is_seeded_from_snapshot(snapshot) ||
             !manager.contains_function(key)) begin
             `uvm_fatal("FUNCTION_INSTANCE",
                 "function configuration requires its snapshot-seeded device manager")
             return 0;
         end
-        if ((manager != null) && (resource_client != null)) begin
+        if (resource_client != null) begin
             if (!resource_client.bind_to_device(manager, key, why)) begin
                 `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                     "could not bind device resources for %0d:%0d:%0d:%0d: %s",
@@ -90,9 +124,11 @@ class virtio_function_instance extends uvm_component;
                 return 0;
             end
         end
-        function_kind = kind;
+        configuration_snapshot = snapshot;
+        function_kind = key.kind;
         function_key = key;
-        bdf = device_bdf;
+        service_key = service;
+        bdf = pcie_id.bdf;
         vf_index = key.vf_id;
         bar_pairs = bars;
         resource_manager = manager;

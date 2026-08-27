@@ -45,6 +45,7 @@ class dpu_resource_manager extends uvm_object;
     protected dpu_resource_registry_authority registry_authority;
     protected bit                            registry_authority_claimed;
     protected bit                            snapshot_configured;
+    protected dpu_device_snapshot            configured_snapshot;
     protected dpu_dut_caps                  dut_caps;
 
     function new(string name = "dpu_resource_manager");
@@ -55,6 +56,7 @@ class dpu_resource_manager extends uvm_object;
         registry_authority = new();
         registry_authority_claimed = 0;
         snapshot_configured = 0;
+        configured_snapshot = null;
     endfunction
 
     protected function string function_key_name(
@@ -284,6 +286,7 @@ class dpu_resource_manager extends uvm_object;
         active_global_ids.delete();
         next_resource_class_id = candidate.next_resource_class_id;
         resource_classes_sealed = candidate.resource_classes_sealed;
+        configured_snapshot = snapshot;
         snapshot_configured = 1;
         return 1;
     endfunction
@@ -369,6 +372,11 @@ class dpu_resource_manager extends uvm_object;
 
     function bit is_snapshot_seeded();
         return snapshot_configured;
+    endfunction
+
+    function bit is_seeded_from_snapshot(input dpu_device_snapshot snapshot);
+        return snapshot_configured && (snapshot != null) &&
+               (configured_snapshot == snapshot);
     endfunction
 
     protected function bit seal_resource_classes_internal(output string why);

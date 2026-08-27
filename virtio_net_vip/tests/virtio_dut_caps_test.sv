@@ -719,6 +719,17 @@ class virtio_dut_caps_test extends uvm_test;
         return key;
     endfunction
 
+    function automatic dpu_service_key_t make_vio_service_key(
+        input dpu_function_key_t key
+    );
+        dpu_service_key_t service;
+
+        service.function_key = key;
+        service.service_kind = DPU_SERVICE_VIO_NET;
+        service.service_instance_id = 0;
+        return service;
+    endfunction
+
     function automatic dpu_device_snapshot make_vio_behavior_snapshot(
         input dpu_service_key_t first_service,
         input dpu_service_key_t second_service
@@ -1317,12 +1328,13 @@ class virtio_dut_caps_test extends uvm_test;
     task assert_function_bind_fatal_returns();
         dpu_resource_manager manager_a;
         dpu_resource_manager manager_b;
+        dpu_device_snapshot snapshot_a;
+        dpu_device_snapshot snapshot_b;
         dpu_function_key_t key_a;
         dpu_function_key_t key_b;
         dpu_pcie_function_id_t pcie_a;
-        dpu_pcie_function_id_t pcie_b;
-        dpu_bar_pair_lease_t bars_a[$];
-        dpu_bar_pair_lease_t bars_b[$];
+        dpu_service_key_t service_a;
+        dpu_service_key_t service_b;
         virtio_dut_caps_transport_config_spy transport_spy;
         virtio_dut_caps_expected_exact_fatal catcher;
         virtio_dut_caps_expected_exact_fatal null_manager_catcher;
@@ -1333,18 +1345,16 @@ class virtio_dut_caps_test extends uvm_test;
 
         manager_a = manager_device_env.get_resource_manager();
         manager_b = propagated_caps_device_env.get_resource_manager();
+        snapshot_a = manager_device_env.get_snapshot();
+        snapshot_b = propagated_caps_device_env.get_snapshot();
         key_a = make_key(0, 0, DPU_FUNCTION_PF, 0);
         key_b = make_key(0, 1, DPU_FUNCTION_PF, 0);
+        service_a = make_vio_service_key(key_a);
+        service_b = make_vio_service_key(key_b);
         if ((manager_a == null) || !manager_a.is_snapshot_seeded() ||
             (manager_b == null) || !manager_b.is_snapshot_seeded() ||
-            !manager_device_env.get_snapshot().get_pcie_id(
-                key_a, pcie_a, why) ||
-            !manager_device_env.get_snapshot().list_bars(
-                key_a, bars_a, why) ||
-            !propagated_caps_device_env.get_snapshot().get_pcie_id(
-                key_b, pcie_b, why) ||
-            !propagated_caps_device_env.get_snapshot().list_bars(
-                key_b, bars_b, why)) begin
+            !snapshot_a.get_pcie_id(
+                key_a, pcie_a, why)) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
                 "function fatal-return probe could not resolve device bindings: %s",
                 why))
@@ -1352,8 +1362,8 @@ class virtio_dut_caps_test extends uvm_test;
         transport_spy = virtio_dut_caps_transport_config_spy::type_id::create(
             "fatal_bind_transport_spy");
         fatal_binding_function.transport = transport_spy;
-        configuration_succeeded = fatal_binding_function.configure_function(
-            DPU_FUNCTION_PF, key_a, pcie_a.bdf, bars_a, manager_a);
+        configuration_succeeded = fatal_binding_function.configure_from_service(
+            snapshot_a, service_a, manager_a);
         if (!configuration_succeeded ||
             (transport_spy.configure_fabric_count != 1) ||
             (fatal_binding_function.resource_client.resource_manager !=
@@ -1363,13 +1373,13 @@ class virtio_dut_caps_test extends uvm_test;
         end
 
         expected_message =
-            {"could not bind device resources for 0:1:0:0: ",
-             "virtio resource client device binding ownership cannot be reassigned"};
+            {"function configuration ownership cannot be reassigned to a ",
+             "different device snapshot"};
         catcher = new("function_bind_return_catcher",
             fatal_binding_function, "FUNCTION_INSTANCE", expected_message);
         uvm_report_cb::add(null, catcher);
-        configuration_succeeded = fatal_binding_function.configure_function(
-            DPU_FUNCTION_PF, key_b, pcie_b.bdf, bars_b, manager_b);
+        configuration_succeeded = fatal_binding_function.configure_from_service(
+            snapshot_b, service_b, manager_b);
         uvm_report_cb::delete(null, catcher);
 
         if ((catcher.caught_count != 1) || configuration_succeeded ||
@@ -1408,8 +1418,8 @@ class virtio_dut_caps_test extends uvm_test;
         null_manager_catcher = new("function_null_manager_return_catcher",
             fatal_binding_function, "FUNCTION_INSTANCE", expected_message);
         uvm_report_cb::add(null, null_manager_catcher);
-        configuration_succeeded = fatal_binding_function.configure_function(
-            DPU_FUNCTION_PF, key_b, pcie_b.bdf, bars_b, null);
+        configuration_succeeded = fatal_binding_function.configure_from_service(
+            snapshot_a, service_a, null);
         uvm_report_cb::delete(null, null_manager_catcher);
 
         identity_preserved =
@@ -1442,10 +1452,11 @@ class virtio_dut_caps_test extends uvm_test;
     task assert_env_function_configuration_failure_returns();
         dpu_resource_manager owner_manager;
         dpu_resource_manager candidate_manager;
+        dpu_device_snapshot candidate_snapshot;
         dpu_dut_caps retained_caps;
         dpu_function_key_t original_key;
+        dpu_service_key_t candidate_service;
         dpu_bar_pair_lease_t original_bars[$];
-        dpu_bar_pair_lease_t candidate_bars[$];
         virtio_function_instance failing_function;
         virtio_dut_caps_expected_exact_fatal catcher;
         string why;
@@ -1456,6 +1467,7 @@ class virtio_dut_caps_test extends uvm_test;
         failing_function = helper_fatal_env.pf_instances[0].pf_function;
         owner_manager = helper_fatal_device_env.get_resource_manager();
         candidate_manager = propagated_caps_device_env.get_resource_manager();
+        candidate_snapshot = propagated_caps_device_env.get_snapshot();
         if ((failing_function == null) || (owner_manager == null) ||
             !owner_manager.is_snapshot_seeded() ||
             (candidate_manager == null) ||
@@ -1467,23 +1479,17 @@ class virtio_dut_caps_test extends uvm_test;
                 "environment function-failure probe has no device-owned baseline")
         end
         original_key = failing_function.function_key;
+        candidate_service = make_vio_service_key(original_key);
         original_bdf = failing_function.bdf;
         original_bars = failing_function.bar_pairs;
-        if (!propagated_caps_device_env.get_snapshot().list_bars(
-                original_key, candidate_bars, why)) begin
-            `uvm_fatal("DUT_CAPS", $sformatf(
-                "environment function-failure probe has no candidate BARs: %s",
-                why))
-        end
         catcher = new("env_function_failure_catcher",
             failing_function,
             "FUNCTION_INSTANCE",
-            {"could not bind device resources for 0:0:0:0: ",
-             "virtio resource client device binding ownership cannot be reassigned"});
+            {"function configuration ownership cannot be reassigned to a ",
+             "different device snapshot"});
         uvm_report_cb::add(null, catcher);
-        configuration_succeeded = failing_function.configure_function(
-            DPU_FUNCTION_PF, original_key, 16'h7fff, candidate_bars,
-            candidate_manager);
+        configuration_succeeded = failing_function.configure_from_service(
+            candidate_snapshot, candidate_service, candidate_manager);
         uvm_report_cb::delete(null, catcher);
 
         bars_preserved =

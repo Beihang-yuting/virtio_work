@@ -59,10 +59,6 @@ class virtio_pf_instance extends uvm_component;
         dpu_bar_role_e required_roles[$];
         dpu_function_key_t seen_owners[$];
         dpu_function_key_t resolved_owners[$];
-        dpu_pcie_function_id_t resolved_pcie_ids[$];
-        dpu_bar_pair_lease_t resolved_device_bars[$];
-        dpu_bar_pair_lease_t resolved_mailbox_bars[$];
-        dpu_bar_pair_lease_t resolved_msix_bars[$];
         dpu_resource_class_id_t qpair_class_id;
         dpu_dut_caps snapshot_caps;
         dpu_dut_caps manager_caps;
@@ -89,6 +85,10 @@ class virtio_pf_instance extends uvm_component;
         end
         if (!manager.is_snapshot_seeded()) begin
             why = "VIO service group requires a snapshot-seeded device manager";
+            return 0;
+        end
+        if (!manager.is_seeded_from_snapshot(snapshot)) begin
+            why = "VIO service group manager belongs to a different snapshot";
             return 0;
         end
         if (!manager.lookup_resource_class(
@@ -191,10 +191,6 @@ class virtio_pf_instance extends uvm_component;
                 return 0;
             end
             resolved_owners.push_back(owner);
-            resolved_pcie_ids.push_back(pcie_id);
-            resolved_device_bars.push_back(bars[0]);
-            resolved_mailbox_bars.push_back(bars[1]);
-            resolved_msix_bars.push_back(bars[2]);
         end
 
         // No component or topology-view state is mutated before every service
@@ -212,11 +208,6 @@ class virtio_pf_instance extends uvm_component;
 
         foreach (service_keys[index]) begin
             owner = resolved_owners[index];
-            pcie_id = resolved_pcie_ids[index];
-            bars.delete();
-            bars.push_back(resolved_device_bars[index]);
-            bars.push_back(resolved_mailbox_bars[index]);
-            bars.push_back(resolved_msix_bars[index]);
             if (owner.kind == DPU_FUNCTION_PF) begin
                 if (pf_function != null) begin
                     why = "VIO service group declares duplicate PF service";
@@ -224,12 +215,11 @@ class virtio_pf_instance extends uvm_component;
                 end
                 pf_function = virtio_function_instance::type_id::create(
                     "pf_function", this);
-                if (!pf_function.configure_function(
-                        DPU_FUNCTION_PF, owner, pcie_id.bdf, bars, manager)) begin
+                if (!pf_function.configure_from_service(
+                        snapshot, service_keys[index], manager)) begin
                     why = "could not configure resolved PF VIO function";
                     return 0;
                 end
-                pf_function.service_key = service_keys[index];
             end
             else begin
                 int unsigned vf_index;
@@ -241,12 +231,11 @@ class virtio_pf_instance extends uvm_component;
                 vf_keys[vf_index] = owner;
                 vf_functions[vf_index] = virtio_vf_instance::type_id::create(
                     $sformatf("vf_function_%0d", owner.vf_id), this);
-                if (!vf_functions[vf_index].configure_function(
-                        DPU_FUNCTION_VF, owner, pcie_id.bdf, bars, manager)) begin
+                if (!vf_functions[vf_index].configure_from_service(
+                        snapshot, service_keys[index], manager)) begin
                     why = "could not configure resolved VF VIO function";
                     return 0;
                 end
-                vf_functions[vf_index].service_key = service_keys[index];
             end
         end
         services_configured = 1;

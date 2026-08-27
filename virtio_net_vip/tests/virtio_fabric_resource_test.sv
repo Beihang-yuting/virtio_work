@@ -629,6 +629,13 @@ class virtio_fabric_resource_test extends uvm_test;
         virtio_expected_bar_report_catcher msix_only_error;
         bit mailbox_access_allowed;
         bit msix_functional_access_allowed;
+        int unsigned msix_bar_ids[2];
+        string expected_report_ids[2];
+
+        msix_bar_ids[0] = 4;
+        msix_bar_ids[1] = 5;
+        expected_report_ids[0] = "BAR_MSIX_ONLY";
+        expected_report_ids[1] = "BAR_FUNCTION_WINDOW";
 
         config_stub = virtio_fabric_cfg_stub_accessor::type_id::create(
             $sformatf("cfg_stub_%0d_%0d_%0d_%0d",
@@ -656,19 +663,24 @@ class virtio_fabric_resource_test extends uvm_test;
                 "configured BAR2 mailbox was not functionally accessible")
         end
 
-        msix_only_error = new($sformatf("msix_only_error_%0d_%0d_%0d_%0d",
-            function_instance.function_key.host_id,
-            function_instance.function_key.pf_id,
-            function_instance.function_key.kind,
-            function_instance.function_key.vf_id), "BAR_MSIX_ONLY", UVM_ERROR);
-        uvm_report_cb::add(null, msix_only_error);
-        msix_functional_access_allowed =
-            config_stub.probe_functional_bar_access(4);
-        uvm_report_cb::delete(null, msix_only_error);
-        if (msix_functional_access_allowed ||
-            (msix_only_error.caught_count != 1)) begin
-            `uvm_fatal("FABRIC_RESOURCE",
-                "BAR4 functional access was not rejected as MSI-X-only")
+        foreach (msix_bar_ids[index]) begin
+            msix_only_error = new($sformatf(
+                "msix_only_error_%0d_%0d_%0d_%0d_bar%0d",
+                function_instance.function_key.host_id,
+                function_instance.function_key.pf_id,
+                function_instance.function_key.kind,
+                function_instance.function_key.vf_id,
+                msix_bar_ids[index]), expected_report_ids[index], UVM_ERROR);
+            uvm_report_cb::add(null, msix_only_error);
+            msix_functional_access_allowed =
+                config_stub.probe_functional_bar_access(msix_bar_ids[index]);
+            uvm_report_cb::delete(null, msix_only_error);
+            if (msix_functional_access_allowed ||
+                (msix_only_error.caught_count != 1)) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "BAR%0d functional access was not rejected",
+                    msix_bar_ids[index]))
+            end
         end
     endtask
 
@@ -858,8 +870,12 @@ class virtio_fabric_resource_test extends uvm_test;
         dpu_bar_pair_lease_t host0_bar;
         dpu_bar_pair_lease_t host1_bar;
         dpu_bar_address_match_t match;
+        dpu_bar_role_e roles[3];
         string why;
 
+        roles[0] = DPU_BAR_DEVICE_MEMORY;
+        roles[1] = DPU_BAR_MAILBOX;
+        roles[2] = DPU_BAR_MSIX;
         host0_key = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
         host1_key = make_function_key(1, 0, DPU_FUNCTION_PF, 0);
         if (!device_snapshot.get_pcie_id(host0_key, host0_pcie, why) ||
@@ -869,19 +885,113 @@ class virtio_fabric_resource_test extends uvm_test;
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
                 "independent domains did not reuse the same numeric BDF: %s", why))
         end
-        if (!device_snapshot.get_bar(
-                host0_key, DPU_BAR_DEVICE_MEMORY, host0_bar, why) ||
-            !device_snapshot.get_bar(
-                host1_key, DPU_BAR_DEVICE_MEMORY, host1_bar, why) ||
-            (host0_bar.base != host1_bar.base) ||
-            !device_snapshot.resolve_bar_address(
-                host0_pcie.domain, host0_bar.base, match, why) ||
-            !dpu_same_function_key(match.function_key, host0_key) ||
-            !device_snapshot.resolve_bar_address(
-                host1_pcie.domain, host1_bar.base, match, why) ||
-            !dpu_same_function_key(match.function_key, host1_key)) begin
+        foreach (roles[index]) begin
+            if (!device_snapshot.get_bar(
+                    host0_key, roles[index], host0_bar, why) ||
+                !device_snapshot.get_bar(
+                    host1_key, roles[index], host1_bar, why) ||
+                (host0_bar.base != host1_bar.base) ||
+                (host0_bar.size != host1_bar.size) ||
+                !device_snapshot.resolve_bar_address(
+                    host0_pcie.domain, host0_bar.base, match, why) ||
+                !dpu_same_function_key(match.function_key, host0_key) ||
+                (match.role != roles[index]) ||
+                (match.bar_base != host0_bar.base) ||
+                (match.bar_size != host0_bar.size) ||
+                !device_snapshot.resolve_bar_address(
+                    host1_pcie.domain, host1_bar.base, match, why) ||
+                !dpu_same_function_key(match.function_key, host1_key) ||
+                (match.role != roles[index]) ||
+                (match.bar_base != host1_bar.base) ||
+                (match.bar_size != host1_bar.size)) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    {"independent domains did not reuse and route BAR role ",
+                     "%0d: %s"}, roles[index], why))
+            end
+        end
+    endtask
+
+    // Break caught: a function already owned by one frozen device snapshot
+    // accepts the same service identity from a second snapshot and silently
+    // replaces its BDF/BAR transport placement.
+    task assert_snapshot_function_binding_is_immutable();
+        virtio_test_device_builder forged_builder;
+        dpu_function_cfg forged_pf;
+        dpu_device_resolver resolver;
+        dpu_device_snapshot forged_snapshot;
+        virtio_function_instance function_view;
+        virtio_expected_bar_report_catcher catcher;
+        dpu_bar_pair_lease_t original_bars[$];
+        bit [15:0] original_bdf;
+        bit configuration_succeeded;
+        bit bars_preserved;
+        string why;
+
+        function_view = env.pf_instances[0].pf_function;
+        original_bdf = function_view.bdf;
+        original_bars = function_view.bar_pairs;
+        if (!function_view.configure_from_service(
+                device_snapshot, function_view.service_key,
+                function_view.resource_manager)) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "idempotent snapshot/service function binding was rejected")
+        end
+
+        forged_builder = virtio_test_device_builder::type_id::create(
+            "forged_function_binding_builder");
+        void'(forged_builder.add_host_domain(
+            0, 0, 16'h0300, 16'h03ff,
+            64'h0000_0006_0000_0000, 64'h0000_0007_0000_0000));
+        forged_pf = forged_builder.add_pf(
+            0, 0, 0, DPU_ALLOC_PINNED, 16'h0330);
+        pin_real_dut_bars(forged_builder, forged_pf,
+            64'h0000_0006_0000_0000, 64'h0000_0006_0200_0000,
+            64'h0000_0006_0201_0000);
+        void'(forged_builder.add_vio_service(forged_pf, 0));
+        forged_builder.select_af(forged_pf);
+        resolver = dpu_device_resolver::type_id::create(
+            "forged_function_binding_resolver");
+        if (!resolver.resolve(
+                forged_builder.device_cfg, forged_snapshot, why)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "independent domains did not route reused numeric BARs: %s", why))
+                "could not resolve forged function snapshot: %s", why))
+        end
+
+        catcher = new("snapshot_function_reassignment_catcher",
+            "FUNCTION_INSTANCE", UVM_FATAL);
+        uvm_report_cb::add(null, catcher);
+        configuration_succeeded = function_view.configure_from_service(
+            forged_snapshot, function_view.service_key,
+            function_view.resource_manager);
+        uvm_report_cb::delete(null, catcher);
+
+        bars_preserved =
+            (function_view.bar_pairs.size() == original_bars.size());
+        if (bars_preserved) begin
+            foreach (original_bars[index]) begin
+                if ((function_view.bar_pairs[index].role !=
+                     original_bars[index].role) ||
+                    (function_view.bar_pairs[index].even_bar_id !=
+                     original_bars[index].even_bar_id) ||
+                    (function_view.bar_pairs[index].base !=
+                     original_bars[index].base) ||
+                    (function_view.bar_pairs[index].size !=
+                     original_bars[index].size)) begin
+                    bars_preserved = 0;
+                end
+            end
+        end
+        if (configuration_succeeded || (catcher.caught_count != 1) ||
+            (catcher.last_message !=
+             {"function configuration ownership cannot be reassigned to a ",
+              "different device snapshot"}) ||
+            (function_view.bdf != original_bdf) || !bars_preserved ||
+            (function_view.transport.bdf != original_bdf) ||
+            (function_view.transport.notify_mgr.function_bdf != original_bdf) ||
+            (function_view.transport.bar.requester_id != original_bdf) ||
+            (function_view.vq_mgr.bdf != original_bdf)) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "rejected snapshot reassignment changed function placement")
         end
     endtask
 
@@ -965,8 +1075,6 @@ class virtio_fabric_resource_test extends uvm_test;
         bar_range_t all_bars[$];
         int unsigned stale_global_rx_qid;
         string why;
-        virtio_function_instance function_view;
-        bit function_configuration_succeeded;
 
         phase.raise_objection(this);
 
@@ -983,32 +1091,13 @@ class virtio_fabric_resource_test extends uvm_test;
         assert_same_domain_collisions_rejected();
         assert_snapshot_order_and_reverse_lookup();
         assert_independent_domain_numeric_reuse();
+        assert_snapshot_function_binding_is_immutable();
 
         if ((env.pf_instances.size() != 4) ||
             (env.vf_instances.size() != 22)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
                 "expected 4 PFs and 22 VFs, received %0d and %0d",
                 env.pf_instances.size(), env.vf_instances.size()))
-        end
-
-        // A generic function must not be able to take its transport role
-        // from one kind while Fabric ownership comes from a different key.
-        // Override the expected rejection so the test can verify state was
-        // left unchanged without ending this negative-path regression.
-        function_view = env.pf_instances[0].pf_function;
-        function_view.set_report_severity_id_override(
-            UVM_ERROR, "FUNCTION_INSTANCE", UVM_INFO
-        );
-        function_configuration_succeeded = function_view.configure_function(
-            DPU_FUNCTION_VF, function_view.function_key, function_view.bdf,
-            function_view.bar_pairs, function_view.resource_manager
-        );
-        if (function_configuration_succeeded ||
-            (function_view.function_kind != DPU_FUNCTION_PF) ||
-            function_view.transport.is_vf ||
-            (function_view.function_key.kind != DPU_FUNCTION_PF)) begin
-            `uvm_fatal("FABRIC_RESOURCE",
-                "function accepted a transport kind that disagrees with its Fabric key")
         end
 
         foreach (env.pf_instances[pf_index]) begin
