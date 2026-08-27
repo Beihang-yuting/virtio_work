@@ -2,11 +2,11 @@
 `define DPU_RESOURCE_MANAGER_SV
 
 // =============================================================================
-// DPU Fabric resource manager
+// DPU generic resource manager
 //
-// This manager owns only topology, address-space, and generic resource-class
-// state.  Protocol environments choose labels and translate granted leases into
-// their own protocol objects.
+// Snapshot-seeded managers own generic resource classes and lease state for
+// functions declared by the global device snapshot.  The legacy Fabric path
+// remains only for intermediate maintained callers.
 // =============================================================================
 
 class dpu_resource_function_state;
@@ -29,6 +29,10 @@ class dpu_resource_fabric_authority;
 endclass : dpu_resource_fabric_authority
 
 
+class dpu_resource_registry_authority;
+endclass : dpu_resource_registry_authority
+
+
 class dpu_resource_manager extends uvm_object;
     `uvm_object_utils(dpu_resource_manager)
 
@@ -47,6 +51,9 @@ class dpu_resource_manager extends uvm_object;
     protected dpu_resource_class_id_t next_resource_class_id;
     protected int unsigned            activated_function_count;
     protected bit                     resource_classes_sealed;
+    protected dpu_resource_registry_authority registry_authority;
+    protected bit                            registry_authority_claimed;
+    protected bit                            snapshot_configured;
     protected dpu_resource_fabric_authority fabric_registry_authority;
     protected bit                           fabric_registry_authority_claimed;
     protected dpu_dut_caps                  dut_caps;
@@ -62,6 +69,9 @@ class dpu_resource_manager extends uvm_object;
         next_resource_class_id = 0;
         activated_function_count = 0;
         resource_classes_sealed = 0;
+        registry_authority = new();
+        registry_authority_claimed = 0;
+        snapshot_configured = 0;
         fabric_registry_authority = new();
         fabric_registry_authority_claimed = 0;
         aperture_configured = 0;
@@ -254,6 +264,10 @@ class dpu_resource_manager extends uvm_object;
         string parent_key_name;
         dpu_function_key_t parent_key;
 
+        if (registry_authority_claimed) begin
+            why = "function registration requires the device registry authority";
+            return 0;
+        end
         if (!validate_function_key(key, why))
             return 0;
 
@@ -311,7 +325,7 @@ class dpu_resource_manager extends uvm_object;
     );
         string ignored_why;
 
-        if (fabric_registry_authority_claimed)
+        if (fabric_registry_authority_claimed || registry_authority_claimed)
             return 0;
         return configure_mmio_aperture_internal(base, limit, ignored_why);
     endfunction
@@ -324,10 +338,78 @@ class dpu_resource_manager extends uvm_object;
     // config_db. A client can name the capability type but cannot obtain this
     // manager-owned handle after that claim.
     function dpu_resource_fabric_authority claim_fabric_registry_authority();
-        if (fabric_registry_authority_claimed)
+        if (fabric_registry_authority_claimed || registry_authority_claimed)
             return null;
         fabric_registry_authority_claimed = 1;
         return fabric_registry_authority;
+    endfunction
+
+    function dpu_resource_registry_authority claim_registry_authority();
+        if (registry_authority_claimed || fabric_registry_authority_claimed ||
+            (function_states.num() != 0) || (class_id_by_name.num() != 0) ||
+            resource_classes_sealed || aperture_configured)
+            return null;
+        registry_authority_claimed = 1;
+        return registry_authority;
+    endfunction
+
+    function bit configure_from_snapshot(
+        input dpu_resource_registry_authority authority,
+        input dpu_device_snapshot snapshot,
+        input dpu_resource_pool_config_t profiles[$],
+        output string why
+    );
+        dpu_resource_manager candidate;
+        dpu_dut_caps caps;
+        dpu_function_key_t function_keys[$];
+        dpu_resource_class_id_t class_id;
+
+        why = "";
+        if (!registry_authority_claimed || (authority == null) ||
+            (authority != registry_authority)) begin
+            why = "snapshot configuration requires the device registry authority";
+            return 0;
+        end
+        if (snapshot_configured) begin
+            why = "resource manager has already been configured from a snapshot";
+            return 0;
+        end
+        if ((snapshot == null) || !snapshot.is_frozen()) begin
+            why = "device snapshot is not a frozen snapshot";
+            return 0;
+        end
+        caps = snapshot.snapshot_dut_caps();
+        if ((caps == null) || !caps.validate(why))
+            return 0;
+
+        candidate = new({get_name(), "_snapshot_candidate"});
+        candidate.dut_caps.copy_from(caps);
+        snapshot.list_functions(function_keys);
+        foreach (function_keys[index]) begin
+            if (!candidate.register_function(function_keys[index], why))
+                return 0;
+        end
+        foreach (profiles[index]) begin
+            if (!candidate.register_resource_class_internal(
+                    profiles[index].name, profiles[index].kind,
+                    profiles[index].capacity, profiles[index].max_per_function,
+                    class_id, why))
+                return 0;
+        end
+        if (!candidate.seal_resource_classes_internal(why))
+            return 0;
+
+        dut_caps.copy_from(candidate.dut_caps);
+        function_states = candidate.function_states;
+        class_id_by_name = candidate.class_id_by_name;
+        resource_profiles_by_id = candidate.resource_profiles_by_id;
+        class_allocated_count = candidate.class_allocated_count;
+        active_global_ids.delete();
+        next_resource_class_id = candidate.next_resource_class_id;
+        activated_function_count = 0;
+        resource_classes_sealed = candidate.resource_classes_sealed;
+        snapshot_configured = 1;
+        return 1;
     endfunction
 
     function bit fabric_configure_dut_caps(
@@ -434,8 +516,8 @@ class dpu_resource_manager extends uvm_object;
         output string why
     );
         class_id = '0;
-        if (fabric_registry_authority_claimed) begin
-            why = "only the DPU Fabric environment can register resource classes";
+        if (fabric_registry_authority_claimed || registry_authority_claimed) begin
+            why = "resource-class registration requires the owning environment";
             return 0;
         end
         return register_resource_class_internal(
@@ -486,8 +568,8 @@ class dpu_resource_manager extends uvm_object;
     endfunction
 
     function bit seal_resource_classes(output string why);
-        if (fabric_registry_authority_claimed) begin
-            why = "only the DPU Fabric environment can seal resource classes";
+        if (fabric_registry_authority_claimed || registry_authority_claimed) begin
+            why = "resource-class sealing requires the owning environment";
             return 0;
         end
         return seal_resource_classes_internal(why);
@@ -532,6 +614,13 @@ class dpu_resource_manager extends uvm_object;
         if (!resource_classes_sealed) begin
             why = "resource classes must be sealed before function activation";
             return 0;
+        end
+        if (snapshot_configured) begin
+            state.activated = 1;
+            state.device_ready = 0;
+            activated_function_count++;
+            why = "";
+            return 1;
         end
         if (!aperture_configured) begin
             why = "MMIO aperture has not been configured";

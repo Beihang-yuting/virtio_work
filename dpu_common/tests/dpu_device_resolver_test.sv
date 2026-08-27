@@ -72,11 +72,100 @@ class dpu_snapshot_integrity_probe extends dpu_device_snapshot;
     endfunction
 endclass : dpu_snapshot_integrity_probe
 
-class dpu_device_resolver_test extends uvm_test;
-    `uvm_component_utils(dpu_device_resolver_test)
+
+class dpu_snapshot_publication_probe extends uvm_component;
+    `uvm_component_utils(dpu_snapshot_publication_probe)
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+        dpu_device_env owner;
+        dpu_device_snapshot snapshot;
+        dpu_resource_manager manager;
+        dpu_dut_caps copied_caps;
+        dpu_dut_caps copied_caps_again;
+        dpu_function_key_t keys[$];
+        dpu_function_key_t undeclared;
+        dpu_resource_class_id_t class_id;
+        string why;
+
+        super.build_phase(phase);
+        if (!$cast(owner, get_parent()))
+            `uvm_fatal("DEVICE_ENV_TEST", "publication probe has no device-env parent")
+        if (!uvm_config_db#(dpu_device_snapshot)::get(
+                this, "", "dpu_device_snapshot", snapshot))
+            `uvm_fatal("DEVICE_ENV_TEST", "device env did not publish snapshot")
+        if (!uvm_config_db#(dpu_resource_manager)::get(
+                this, "", "dpu_resource_manager", manager))
+            `uvm_fatal("DEVICE_ENV_TEST", "device env did not publish manager")
+        if ((snapshot == null) || !snapshot.is_frozen() ||
+            (snapshot != owner.get_snapshot()))
+            `uvm_fatal("DEVICE_ENV_TEST", "child did not receive exact frozen snapshot")
+        if ((manager == null) || (manager != owner.get_resource_manager()) ||
+            (owner.get_state() != DPU_DEVICE_RESOLVED))
+            `uvm_fatal("DEVICE_ENV_TEST", "child did not receive resolved exact manager")
+
+        snapshot.list_functions(keys);
+        if (keys.size() != 4)
+            `uvm_fatal("DEVICE_ENV_TEST", "snapshot omitted declared functions")
+        foreach (keys[index]) begin
+            if (!manager.restore_function(keys[index], why))
+                `uvm_fatal("DEVICE_ENV_TEST", {"manager omitted snapshot function: ", why})
+        end
+
+        copied_caps = manager.snapshot_dut_caps();
+        if ((copied_caps == null) || (copied_caps.max_hosts != 2) ||
+            (copied_caps.max_pfs_per_host != 4) ||
+            (copied_caps.max_vfs_per_pf != 16) ||
+            (copied_caps.max_functions != DPU_MAX_FUNCTIONS))
+            `uvm_fatal("DEVICE_ENV_TEST", "manager did not copy snapshot capabilities")
+        copied_caps.max_hosts = 1;
+        copied_caps_again = manager.snapshot_dut_caps();
+        if (copied_caps_again.max_hosts != 2)
+            `uvm_fatal("DEVICE_ENV_TEST", "manager capabilities alias returned copy")
+
+        if (!manager.lookup_resource_class("virtio.qpair", class_id, why))
+            `uvm_fatal("DEVICE_ENV_TEST", {"manager omitted qpair profile: ", why})
+        undeclared.host_id = 0;
+        undeclared.pf_id = 1;
+        undeclared.kind = DPU_FUNCTION_PF;
+        undeclared.vf_id = 0;
+        if (manager.register_function(undeclared, why))
+            `uvm_fatal("DEVICE_ENV_TEST", "manager registered undeclared function")
+    endfunction
+endclass : dpu_snapshot_publication_probe
+
+class dpu_device_resolver_test extends uvm_test;
+    `uvm_component_utils(dpu_device_resolver_test)
+
+    dpu_device_env_config device_env_cfg;
+    dpu_device_env device_env;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+        dpu_resource_pool_config_t qpair_profile;
+
+        super.build_phase(phase);
+        device_env_cfg = dpu_device_env_config::type_id::create("device_env_cfg");
+        device_env_cfg.device_cfg = make_valid_cfg();
+        qpair_profile.name = "virtio.qpair";
+        qpair_profile.class_id = '0;
+        qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
+        qpair_profile.capacity = 2048;
+        qpair_profile.max_per_function = 32;
+        device_env_cfg.resource_profiles.push_back(qpair_profile);
+        uvm_config_db#(dpu_device_env_config)::set(
+            this, "device_env", "cfg", device_env_cfg
+        );
+        device_env = dpu_device_env::type_id::create("device_env", this);
+        dpu_snapshot_publication_probe::type_id::create(
+            "publication_probe", device_env
+        );
     endfunction
 
     function automatic dpu_bar_request make_bar(
@@ -1141,6 +1230,67 @@ class dpu_device_resolver_test extends uvm_test;
                           missed_rejections))
     endfunction
 
+    function void test_snapshot_manager_seeding_is_atomic();
+        dpu_resource_manager manager;
+        dpu_resource_registry_authority authority;
+        dpu_device_snapshot snapshot;
+        dpu_resource_pool_config_t profiles[$];
+        dpu_resource_pool_config_t profile;
+        dpu_function_key_t keys[$];
+        dpu_resource_class_id_t class_id;
+        string why;
+
+        snapshot = device_env.get_snapshot();
+        manager = dpu_resource_manager::type_id::create("atomic_manager");
+        authority = manager.claim_registry_authority();
+        if (authority == null)
+            `uvm_fatal("DEVICE_ENV_TEST", "could not claim snapshot authority")
+
+        profile.name = "valid.profile";
+        profile.class_id = '0;
+        profile.kind = DPU_RESOURCE_KIND_QUEUE;
+        profile.capacity = 8;
+        profile.max_per_function = 2;
+        profiles.push_back(profile);
+        profile.name = "invalid.profile";
+        profile.capacity = 0;
+        profiles.push_back(profile);
+        if (manager.configure_from_snapshot(authority, snapshot, profiles, why))
+            `uvm_fatal("DEVICE_ENV_TEST", "invalid snapshot seed unexpectedly succeeded")
+        snapshot.list_functions(keys);
+        if ((keys.size() == 0) || manager.restore_function(keys[0], why))
+            `uvm_fatal("DEVICE_ENV_TEST", "failed seed retained function registration")
+        if (manager.lookup_resource_class("valid.profile", class_id, why))
+            `uvm_fatal("DEVICE_ENV_TEST", "failed seed retained profile registration")
+
+        profiles.delete();
+        profile.name = "virtio.qpair";
+        profile.capacity = 2048;
+        profile.max_per_function = 32;
+        profiles.push_back(profile);
+        if (!manager.configure_from_snapshot(authority, snapshot, profiles, why))
+            `uvm_fatal("DEVICE_ENV_TEST", {"snapshot seed failed: ", why})
+        if (!manager.lookup_resource_class("virtio.qpair", class_id, why))
+            `uvm_fatal("DEVICE_ENV_TEST", {"seed omitted qpair profile: ", why})
+        if (manager.configure_from_snapshot(authority, snapshot, profiles, why))
+            `uvm_fatal("DEVICE_ENV_TEST", "manager accepted second snapshot seed")
+    endfunction
+
+    function void test_snapshot_seed_copies_resource_profiles();
+        dpu_resource_class_id_t class_id;
+        string why;
+
+        device_env_cfg.resource_profiles[0].name = "mutated.authoring.profile";
+        device_env_cfg.resource_profiles[0].capacity = 1;
+        if (!device_env.get_resource_manager().lookup_resource_class(
+                "virtio.qpair", class_id, why))
+            `uvm_fatal("DEVICE_ENV_TEST",
+                {"manager aliased authoring profile: ", why})
+        if (device_env.get_resource_manager().lookup_resource_class(
+                "mutated.authoring.profile", class_id, why))
+            `uvm_fatal("DEVICE_ENV_TEST", "manager retained mutable authoring profile")
+    endfunction
+
     virtual task run_phase(uvm_phase phase);
         dpu_device_resolver resolver;
 
@@ -1176,6 +1326,8 @@ class dpu_device_resolver_test extends uvm_test;
         test_snapshot_immutability_and_service_queries(resolver);
         test_failed_resolve_is_atomic(resolver);
         test_snapshot_freeze_cross_checks_all_indexes();
+        test_snapshot_manager_seeding_is_atomic();
+        test_snapshot_seed_copies_resource_profiles();
         phase.drop_objection(this);
     endtask
 endclass : dpu_device_resolver_test

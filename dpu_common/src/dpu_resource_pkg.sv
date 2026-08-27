@@ -23,6 +23,7 @@ package dpu_resource_pkg;
   `include "dpu_device_snapshot.sv"
   `include "dpu_device_resolver.sv"
   `include "dpu_resource_manager.sv"
+  `include "dpu_device_env.sv"
   `include "dpu_fabric_env.sv"
 
 endpackage : dpu_resource_pkg
