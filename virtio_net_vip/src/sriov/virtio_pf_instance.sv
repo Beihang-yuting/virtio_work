@@ -41,10 +41,164 @@ class virtio_pf_instance extends uvm_component;
     virtio_pf_manager           pf_manager;
     virtio_pf_lifecycle_reset_owner lifecycle_reset_owner;
     protected bit               configuration_valid;
+    protected bit               services_configured;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
         configuration_valid = 0;
+        services_configured = 0;
+    endfunction
+
+    function bit configure_services(
+        input dpu_function_key_t parent_pf_key,
+        input dpu_device_snapshot snapshot,
+        input dpu_service_key_t service_keys[$],
+        input dpu_resource_manager manager,
+        output string why
+    );
+        dpu_function_key_t owner;
+        dpu_pcie_function_id_t pcie_id;
+        dpu_bar_pair_lease_t bars[$];
+        dpu_bar_role_e required_roles[$];
+        dpu_function_key_t seen_owners[$];
+        bit owner_seen;
+        int unsigned vf_count;
+
+        why = "";
+        if (services_configured) begin
+            why = "PF service group is already configured";
+            return 0;
+        end
+        if ((parent_pf_key.kind != DPU_FUNCTION_PF) ||
+            (parent_pf_key.vf_id != 0)) begin
+            why = "VIO service group requires a PF parent key";
+            return 0;
+        end
+        if ((snapshot == null) || !snapshot.is_frozen()) begin
+            why = "VIO service group requires a frozen device snapshot";
+            return 0;
+        end
+        if (manager == null) begin
+            why = "VIO service group requires a device resource manager";
+            return 0;
+        end
+        if (service_keys.size() == 0) begin
+            why = "VIO service group is empty";
+            return 0;
+        end
+        required_roles.push_back(DPU_BAR_DEVICE_MEMORY);
+        required_roles.push_back(DPU_BAR_MAILBOX);
+        required_roles.push_back(DPU_BAR_MSIX);
+
+        foreach (service_keys[index]) begin
+            if (service_keys[index].service_kind != DPU_SERVICE_VIO_NET) begin
+                why = "VIO service group contains a non-VIO service";
+                return 0;
+            end
+            if (!snapshot.get_service_owner(service_keys[index], owner, why))
+                return 0;
+            if ((owner.host_id != parent_pf_key.host_id) ||
+                (owner.pf_id != parent_pf_key.pf_id) ||
+                ((owner.kind != DPU_FUNCTION_PF) &&
+                 (owner.kind != DPU_FUNCTION_VF))) begin
+                why = "VIO service owner does not belong to its PF group";
+                return 0;
+            end
+            owner_seen = 0;
+            foreach (seen_owners[seen_index]) begin
+                if (dpu_same_function_key(seen_owners[seen_index], owner))
+                    owner_seen = 1;
+            end
+            if (owner_seen) begin
+                why = "VIO service group declares duplicate function ownership";
+                return 0;
+            end
+            seen_owners.push_back(owner);
+        end
+
+        pf_key = parent_pf_key;
+        host_id = parent_pf_key.host_id;
+        pf_id = parent_pf_key.pf_id;
+        vf_count = 0;
+        foreach (seen_owners[index]) begin
+            if (seen_owners[index].kind == DPU_FUNCTION_VF)
+                vf_count++;
+        end
+        vf_keys = new[vf_count];
+        vf_bdfs = new[vf_count];
+        vf_functions = new[vf_count];
+
+        foreach (service_keys[index]) begin
+            if (!snapshot.get_service_owner(service_keys[index], owner, why) ||
+                !snapshot.get_pcie_id(owner, pcie_id, why)) begin
+                return 0;
+            end
+            bars.delete();
+            foreach (required_roles[role_index]) begin
+                dpu_bar_pair_lease_t bar;
+
+                if (!snapshot.get_bar(owner, required_roles[role_index], bar, why))
+                    return 0;
+                bars.push_back(bar);
+            end
+            if ((bars[0].role != DPU_BAR_DEVICE_MEMORY) ||
+                (bars[1].role != DPU_BAR_MAILBOX) ||
+                (bars[2].role != DPU_BAR_MSIX)) begin
+                why = "VIO service owner BAR roles are not device-memory, mailbox, MSI-X";
+                return 0;
+            end
+            if (!manager.contains_function(owner)) begin
+                why = "snapshot-seeded manager does not contain VIO service owner";
+                return 0;
+            end
+            if (owner.kind == DPU_FUNCTION_PF) begin
+                if (pf_function != null) begin
+                    why = "VIO service group declares duplicate PF service";
+                    return 0;
+                end
+                pf_bdf = pcie_id.bdf;
+                pf_function = virtio_function_instance::type_id::create(
+                    "pf_function", this);
+                if (!pf_function.configure_function(
+                        DPU_FUNCTION_PF, owner, pcie_id.bdf, bars, manager)) begin
+                    why = "could not configure resolved PF VIO function";
+                    return 0;
+                end
+                pf_function.service_key = service_keys[index];
+            end
+            else begin
+                int unsigned vf_index;
+
+                vf_index = 0;
+                while ((vf_index < vf_functions.size()) &&
+                       (vf_functions[vf_index] != null))
+                    vf_index++;
+                vf_keys[vf_index] = owner;
+                vf_bdfs[vf_index] = pcie_id.bdf;
+                vf_functions[vf_index] = virtio_vf_instance::type_id::create(
+                    $sformatf("vf_function_%0d", owner.vf_id), this);
+                if (!vf_functions[vf_index].configure_function(
+                        DPU_FUNCTION_VF, owner, pcie_id.bdf, bars, manager)) begin
+                    why = "could not configure resolved VF VIO function";
+                    return 0;
+                end
+                vf_functions[vf_index].service_key = service_keys[index];
+            end
+        end
+        num_vfs = vf_functions.size();
+        services_configured = 1;
+        configuration_valid = 1;
+        return 1;
+    endfunction
+
+    function void collect_functions(ref virtio_function_instance functions[$]);
+        functions.delete();
+        if (pf_function != null)
+            functions.push_back(pf_function);
+        foreach (vf_functions[index]) begin
+            if (vf_functions[index] != null)
+                functions.push_back(vf_functions[index]);
+        end
     endfunction
 
     function void configure_topology(
@@ -76,6 +230,11 @@ class virtio_pf_instance extends uvm_component;
         dpu_bar_pair_lease_t no_bars[$];
 
         super.build_phase(phase);
+        if (services_configured) begin
+            pf_manager = virtio_pf_manager::type_id::create("pf_manager");
+            pf_manager.pf_index = pf_id;
+            return;
+        end
         pf_function = virtio_function_instance::type_id::create(
             "pf_function", this
         );
@@ -108,12 +267,14 @@ class virtio_pf_instance extends uvm_component;
         pf_manager.vf_instances = new[vf_functions.size()];
         foreach (vf_functions[vf_id])
             pf_manager.vf_instances[vf_id] = vf_functions[vf_id];
-        pf_manager.pf_transport = pf_function.transport;
-        lifecycle_reset_owner = virtio_pf_lifecycle_reset_owner::type_id::create(
-            "lifecycle_reset_owner"
-        );
-        lifecycle_reset_owner.pf_function = pf_function;
-        pf_manager.configure_pf_lifecycle_reset_owner(lifecycle_reset_owner);
+        if (pf_function != null) begin
+            pf_manager.pf_transport = pf_function.transport;
+            lifecycle_reset_owner = virtio_pf_lifecycle_reset_owner::type_id::create(
+                "lifecycle_reset_owner"
+            );
+            lifecycle_reset_owner.pf_function = pf_function;
+            pf_manager.configure_pf_lifecycle_reset_owner(lifecycle_reset_owner);
+        end
     endfunction
 
     function bit configure_fabric_resources(

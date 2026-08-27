@@ -3,6 +3,7 @@
 
 import uvm_pkg::*;
 `include "uvm_macros.svh"
+import dpu_resource_pkg::*;
 import pcie_tl_pkg::*;
 import virtio_net_pkg::*;
 
@@ -92,15 +93,23 @@ class virtio_monitor_routing_test extends uvm_test;
     `uvm_component_utils(virtio_monitor_routing_test)
 
     pcie_tl_env                    pcie_env;
+    dpu_device_env                 device_env;
     virtio_net_env                 virtio_env;
     pcie_tl_env_config             pcie_cfg;
+    dpu_device_env_config          device_env_cfg;
     virtio_net_env_config          virtio_cfg;
+    virtio_test_device_builder     device_builder;
     virtio_monitor_routing_collector pf_collector;
     virtio_monitor_routing_collector vf_collector;
 
-    localparam bit [63:0] PF_BAR0_BASE = 64'h0000_0000_C100_0000;
-    localparam bit [63:0] VF_BAR0_BASE = 64'h0000_0000_C200_0000;
-    localparam bit [63:0] BAR0_SIZE    = 64'h0000_0000_0001_0000;
+    localparam bit [15:0] PF_BDF       = 16'h0128;
+    localparam bit [15:0] VF_BDF       = 16'h02e0;
+    localparam bit [63:0] PF_BAR0_BASE = 64'h0000_0002_0000_0000;
+    localparam bit [63:0] PF_BAR2_BASE = 64'h0000_0002_0200_0000;
+    localparam bit [63:0] PF_BAR4_BASE = 64'h0000_0002_0201_0000;
+    localparam bit [63:0] VF_BAR0_BASE = 64'h0000_0002_0202_0000;
+    localparam bit [63:0] VF_BAR2_BASE = 64'h0000_0002_0202_4000;
+    localparam bit [63:0] VF_BAR4_BASE = 64'h0000_0002_0202_8000;
     localparam bit [31:0] COMMON_OFF   = 32'h0000_0100;
     localparam bit [31:0] COMMON_LEN   = 32'h0000_0040;
     localparam bit [31:0] NOTIFY_OFF   = 32'h0000_0200;
@@ -113,6 +122,14 @@ class virtio_monitor_routing_test extends uvm_test;
     endfunction
 
     virtual function void build_phase(uvm_phase phase);
+        dpu_function_cfg pf_cfg;
+        dpu_function_cfg vf_cfg;
+        dpu_service_key_t pf_service_key;
+        dpu_service_key_t vf_service_key;
+        virtio_driver_config_t pf_behavior;
+        virtio_driver_config_t vf_behavior;
+        string why;
+
         super.build_phase(phase);
 
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
@@ -128,19 +145,45 @@ class virtio_monitor_routing_test extends uvm_test;
         uvm_config_db#(pcie_tl_env_config)::set(this, "pcie_env", "cfg", pcie_cfg);
         pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
 
+        device_builder = virtio_test_device_builder::type_id::create(
+            "device_builder");
+        void'(device_builder.add_host_domain(0, 0, 16'h0100, 16'h03ff,
+            64'h0000_0002_0000_0000, 64'h0000_0003_0000_0000));
+        pf_cfg = device_builder.add_pf(
+            0, 0, 0, DPU_ALLOC_PINNED, PF_BDF);
+        vf_cfg = device_builder.add_vf(
+            0, 0, 0, 0, DPU_ALLOC_PINNED, VF_BDF);
+        device_builder.add_real_dut_bars(pf_cfg);
+        device_builder.add_real_dut_bars(vf_cfg);
+        pf_service_key = device_builder.add_vio_service(pf_cfg, 0);
+        vf_service_key = device_builder.add_vio_service(vf_cfg, 0);
+        device_builder.select_af(pf_cfg);
+        device_env_cfg = device_builder.make_env_config();
+
         virtio_cfg = virtio_net_env_config::type_id::create("virtio_cfg");
-        virtio_cfg.num_hosts = 1;
-        virtio_cfg.num_pfs_per_host = new[1];
-        virtio_cfg.num_pfs_per_host[0] = 1;
-        virtio_cfg.num_vfs_per_pf = new[1];
-        virtio_cfg.num_vfs_per_pf[0] = new[1];
-        virtio_cfg.num_vfs_per_pf[0][0] = 1;
-        virtio_cfg.pf_bdf = 16'h0100;
         virtio_cfg.scb_enable = 1;
         virtio_cfg.cov_enable = 1;
+        pf_behavior = virtio_cfg.make_default_driver_config(32);
+        pf_behavior.num_queue_pairs = 3;
+        vf_behavior = virtio_cfg.make_default_driver_config(32);
+        vf_behavior.num_queue_pairs = 5;
+        if (!virtio_cfg.add_service_config(
+                pf_service_key, pf_behavior, why)) begin
+            `uvm_fatal("ROUTING_TEST", {"could not author PF behavior: ", why})
+            return;
+        end
+        if (!virtio_cfg.add_service_config(
+                vf_service_key, vf_behavior, why)) begin
+            `uvm_fatal("ROUTING_TEST", {"could not author VF behavior: ", why})
+            return;
+        end
+
+        uvm_config_db#(dpu_device_env_config)::set(
+            this, "device_env", "cfg", device_env_cfg);
+        device_env = dpu_device_env::type_id::create("device_env", this);
         uvm_config_db#(virtio_net_env_config)::set(
-            this, "virtio_env", "cfg", virtio_cfg);
-        virtio_env = virtio_net_env::type_id::create("virtio_env", this);
+            this, "device_env.virtio_env", "cfg", virtio_cfg);
+        virtio_env = virtio_net_env::type_id::create("virtio_env", device_env);
 
         pf_collector = virtio_monitor_routing_collector::type_id::create(
             "pf_collector", this);
@@ -150,6 +193,15 @@ class virtio_monitor_routing_test extends uvm_test;
 
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
+
+        if ((virtio_env.pf_instances.size() != 1) ||
+            (virtio_env.pf_instances[0] == null) ||
+            (virtio_env.pf_instances[0].pf_function == null) ||
+            (virtio_env.pf_instances[0].vf_functions.size() != 1)) begin
+            `uvm_fatal("MON_ROUTE",
+                "VIO environment did not consume the parent device snapshot")
+            return;
+        end
 
         // Public binding is responsible for configuring every PF/VF observer
         // and wiring both directions of the external PCIe monitor stream.
@@ -176,6 +228,31 @@ class virtio_monitor_routing_test extends uvm_test;
 
         pf = virtio_env.pf_instances[0].pf_function;
         vf = virtio_env.pf_instances[0].vf_functions[0];
+        assert((pf.bdf == PF_BDF) && (pf.transport.bdf == PF_BDF) &&
+               (vf.bdf == VF_BDF) && (vf.transport.bdf == VF_BDF))
+            else `uvm_fatal("ROUTING_TEST",
+                "PF/VF BDFs did not come from the frozen snapshot")
+        assert(vf.bdf != (pf.bdf + 1))
+            else `uvm_fatal("ROUTING_TEST",
+                "VF BDF unexpectedly used arithmetic PF+VF placement")
+        assert((pf.bar_pairs.size() == 3) &&
+               (pf.bar_pairs[0].base == PF_BAR0_BASE) &&
+               (pf.bar_pairs[1].base == PF_BAR2_BASE) &&
+               (pf.bar_pairs[2].base == PF_BAR4_BASE) &&
+               (vf.bar_pairs.size() == 3) &&
+               (vf.bar_pairs[0].base == VF_BAR0_BASE) &&
+               (vf.bar_pairs[1].base == VF_BAR2_BASE) &&
+               (vf.bar_pairs[2].base == VF_BAR4_BASE))
+            else `uvm_fatal("ROUTING_TEST",
+                "PF/VF BAR copies differ from resolved snapshot values")
+        assert((pf.resource_manager == device_env.get_resource_manager()) &&
+               (vf.resource_manager == device_env.get_resource_manager()))
+            else `uvm_fatal("ROUTING_TEST",
+                "VIO functions did not receive the global resource manager")
+        assert((pf.drv_cfg.num_queue_pairs == 3) &&
+               (vf.drv_cfg.num_queue_pairs == 5))
+            else `uvm_fatal("ROUTING_TEST",
+                "PF/VF behavior was not routed by canonical service key")
         if ($test$plusargs("ROUTING_BIND_ONLY")) begin
             assert((pf.driver_agent.ops != null) &&
                    (pf.driver_agent.fsm != null) &&
@@ -186,8 +263,8 @@ class virtio_monitor_routing_test extends uvm_test;
             phase.drop_objection(this);
             return;
         end
-        configure_function_ranges(pf, PF_BAR0_BASE);
-        configure_function_ranges(vf, VF_BAR0_BASE);
+        configure_function_ranges(pf);
+        configure_function_ranges(vf);
         virtio_env.cov.enable_all();
 
         tlp = make_pf_status_write(pf);
@@ -225,11 +302,8 @@ class virtio_monitor_routing_test extends uvm_test;
     endtask
 
     protected function void configure_function_ranges(
-        input virtio_function_instance function_instance,
-        input bit [63:0] bar_base
+        input virtio_function_instance function_instance
     );
-        function_instance.transport.bar.bar_base[0] = bar_base;
-        function_instance.transport.bar.bar_size[0] = BAR0_SIZE;
         function_instance.transport.cap_mgr.common_cfg_found = 1;
         function_instance.transport.cap_mgr.common_cfg_cap.bar = 0;
         function_instance.transport.cap_mgr.common_cfg_cap.offset = COMMON_OFF;

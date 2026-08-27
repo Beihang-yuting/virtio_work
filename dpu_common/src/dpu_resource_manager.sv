@@ -561,6 +561,17 @@ class dpu_resource_manager extends uvm_object;
         return 1;
     endfunction
 
+    // Clients may bind only to functions already owned by the device
+    // registry.  This is intentionally read-only: protocol environments do
+    // not author topology or register functions themselves.
+    function bit contains_function(input dpu_function_key_t key);
+        return function_states.exists(function_key_name(key));
+    endfunction
+
+    function bit is_snapshot_seeded();
+        return snapshot_configured;
+    endfunction
+
     protected function bit seal_resource_classes_internal(output string why);
         resource_classes_sealed = 1;
         why = "";

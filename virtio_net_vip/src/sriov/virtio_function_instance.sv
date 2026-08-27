@@ -12,6 +12,7 @@ class virtio_function_instance extends uvm_component;
     bit [15:0]              bdf;
     dpu_function_key_t      function_key;
     dpu_function_kind_e     function_kind;
+    dpu_service_key_t       service_key;
     dpu_bar_pair_lease_t    bar_pairs[$];
     dpu_resource_manager    resource_manager;
     virtio_resource_client  resource_client;
@@ -79,20 +80,38 @@ class virtio_function_instance extends uvm_component;
             return 0;
         end
         if ((resource_client != null) &&
-            resource_client.is_bound_to_fabric() && (manager == null)) begin
-            why =
-                "virtio resource client binding ownership cannot be cleared";
-            `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
-                key.host_id, key.pf_id, key.kind, key.vf_id, why))
+            resource_client.is_bound_to_device() && (manager == null)) begin
+            if ((resource_client.resource_manager != null) &&
+                resource_client.resource_manager.is_snapshot_seeded()) begin
+                why =
+                    "virtio resource client device binding ownership cannot be cleared";
+                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                    "could not bind device resources for %0d:%0d:%0d:%0d: %s",
+                    key.host_id, key.pf_id, key.kind, key.vf_id, why))
+            end
+            else begin
+                why = "virtio resource client binding ownership cannot be cleared";
+                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                    "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
+                    key.host_id, key.pf_id, key.kind, key.vf_id, why))
+            end
             return 0;
         end
-        if ((manager != null) && (resource_client != null) &&
-            !resource_client.bind_to_fabric(manager, key, why)) begin
-            `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
-                key.host_id, key.pf_id, key.kind, key.vf_id, why))
-            return 0;
+        if ((manager != null) && (resource_client != null)) begin
+            if (manager.is_snapshot_seeded()) begin
+                if (!resource_client.bind_to_device(manager, key, why)) begin
+                    `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                        "could not bind device resources for %0d:%0d:%0d:%0d: %s",
+                        key.host_id, key.pf_id, key.kind, key.vf_id, why))
+                    return 0;
+                end
+            end
+            else if (!resource_client.bind_to_fabric(manager, key, why)) begin
+                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                    "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
+                    key.host_id, key.pf_id, key.kind, key.vf_id, why))
+                return 0;
+            end
         end
         function_kind = kind;
         function_key = key;
@@ -525,7 +544,16 @@ class virtio_function_instance extends uvm_component;
 
         if (resource_manager == null)
             return;
-        if (!resource_client.bind_to_fabric(resource_manager, function_key, why)) begin
+        if (resource_manager.is_snapshot_seeded()) begin
+            if (!resource_client.bind_to_device(resource_manager, function_key, why)) begin
+                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                    "could not bind device resources for %0d:%0d:%0d:%0d: %s",
+                    function_key.host_id, function_key.pf_id, function_key.kind,
+                    function_key.vf_id, why))
+                return;
+            end
+        end
+        else if (!resource_client.bind_to_fabric(resource_manager, function_key, why)) begin
             `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                 "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
                 function_key.host_id, function_key.pf_id, function_key.kind,

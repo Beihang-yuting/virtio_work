@@ -29,9 +29,10 @@ class virtio_resource_client extends uvm_object;
         qpairs_frozen = 0;
     endfunction
 
-    function bit bind_to_fabric(
+    protected function bit bind_to_manager(
         input dpu_resource_manager manager,
         input dpu_function_key_t key,
+        input bit legacy_fabric_name,
         output string why
     );
         dpu_resource_class_id_t candidate_qpair_class_id;
@@ -39,7 +40,13 @@ class virtio_resource_client extends uvm_object;
         int unsigned bound_qpair_limit;
 
         if (manager == null) begin
-            why = "virtio resource client requires a Fabric resource manager";
+            why = legacy_fabric_name ?
+                "virtio resource client requires a Fabric resource manager" :
+                "virtio resource client requires a device resource manager";
+            return 0;
+        end
+        if (!legacy_fabric_name && !manager.contains_function(key)) begin
+            why = "virtio resource client function is not declared by the device snapshot";
             return 0;
         end
         if (!manager.lookup_resource_class(
@@ -49,7 +56,9 @@ class virtio_resource_client extends uvm_object;
         end
         bound_dut_caps = manager.snapshot_dut_caps();
         if (bound_dut_caps == null) begin
-            why = "virtio resource client requires DUT capabilities";
+            why = legacy_fabric_name ?
+                "virtio resource client requires DUT capabilities" :
+                "virtio resource client requires device capabilities";
             return 0;
         end
         bound_qpair_limit =
@@ -66,8 +75,9 @@ class virtio_resource_client extends uvm_object;
                 why = "";
                 return 1;
             end
-            why =
-                "virtio resource client binding ownership cannot be reassigned";
+            why = legacy_fabric_name ?
+                "virtio resource client binding ownership cannot be reassigned" :
+                "virtio resource client device binding ownership cannot be reassigned";
             return 0;
         end
 
@@ -86,8 +96,29 @@ class virtio_resource_client extends uvm_object;
         return 1;
     endfunction
 
-    function bit is_bound_to_fabric();
+    function bit bind_to_device(
+        input dpu_resource_manager manager,
+        input dpu_function_key_t key,
+        output string why
+    );
+        return bind_to_manager(manager, key, 0, why);
+    endfunction
+
+    // Transitional name for callers not yet migrated to device ownership.
+    function bit bind_to_fabric(
+        input dpu_resource_manager manager,
+        input dpu_function_key_t key,
+        output string why
+    );
+        return bind_to_manager(manager, key, 1, why);
+    endfunction
+
+    function bit is_bound_to_device();
         return binding_owned;
+    endfunction
+
+    function bit is_bound_to_fabric();
+        return is_bound_to_device();
     endfunction
 
     function dpu_dut_caps snapshot_bound_dut_caps();
@@ -105,7 +136,7 @@ class virtio_resource_client extends uvm_object;
     // triplet and completed its transport-visible discovery setup.
     function bit mark_device_ready(output string why);
         if (bound_resource_manager == null) begin
-            why = "virtio resource client has not been bound to Fabric";
+            why = "virtio resource client has not been bound to a device";
             return 0;
         end
         if (!bound_resource_manager.mark_function_device_ready(

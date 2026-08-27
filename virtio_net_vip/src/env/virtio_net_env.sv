@@ -39,6 +39,10 @@ class virtio_net_env extends uvm_env;
     // ===== DPU Fabric function topology =====
     dpu_fabric_env             fabric;
     virtio_pf_instance         pf_instances[];
+    virtio_function_instance   function_instances[];
+    protected dpu_device_snapshot device_snapshot;
+    protected dpu_resource_manager device_resource_manager;
+    protected bit              snapshot_topology;
     protected bit              fabric_topology;
     protected bit              configuration_valid;
     local dpu_dut_caps         effective_dut_caps;
@@ -77,6 +81,90 @@ class virtio_net_env extends uvm_env;
         configuration_valid = 0;
         effective_dut_caps = null;
         protocol_event_vif_index = 0;
+        snapshot_topology = 0;
+    endfunction
+
+    protected function bit build_snapshot_topology(output string why);
+        dpu_service_key_t service_keys[$];
+        dpu_service_key_t grouped_services[$][$];
+        dpu_function_key_t group_keys[$];
+        dpu_function_key_t owner;
+        dpu_function_key_t parent_key;
+        int unsigned group_index;
+        bit found;
+        int unsigned vf_count;
+        int unsigned function_count;
+
+        why = "";
+        device_snapshot.list_services(DPU_SERVICE_VIO_NET, service_keys);
+        foreach (service_keys[index]) begin
+            if (!device_snapshot.get_service_owner(service_keys[index], owner, why))
+                return 0;
+            parent_key = owner;
+            parent_key.kind = DPU_FUNCTION_PF;
+            parent_key.vf_id = 0;
+            found = 0;
+            foreach (group_keys[candidate]) begin
+                if (dpu_same_function_key(group_keys[candidate], parent_key)) begin
+                    group_index = candidate;
+                    found = 1;
+                    break;
+                end
+            end
+            if (!found) begin
+                group_index = group_keys.size();
+                group_keys.push_back(parent_key);
+            end
+            grouped_services[group_index].push_back(service_keys[index]);
+        end
+
+        pf_instances = new[group_keys.size()];
+        foreach (group_keys[index]) begin
+            pf_instances[index] = virtio_pf_instance::type_id::create(
+                $sformatf("pf_%0d_%0d", group_keys[index].host_id,
+                          group_keys[index].pf_id), this);
+            if (!pf_instances[index].configure_services(
+                    group_keys[index], device_snapshot,
+                    grouped_services[index], device_resource_manager, why)) begin
+                return 0;
+            end
+        end
+        function_count = 0;
+        foreach (pf_instances[index]) begin
+            virtio_function_instance grouped_functions[$];
+
+            pf_instances[index].collect_functions(grouped_functions);
+            function_count += grouped_functions.size();
+        end
+        function_instances = new[function_count];
+        function_count = 0;
+        foreach (pf_instances[index]) begin
+            virtio_function_instance grouped_functions[$];
+
+            pf_instances[index].collect_functions(grouped_functions);
+            foreach (grouped_functions[function_index]) begin
+                function_instances[function_count] = grouped_functions[function_index];
+                function_count++;
+            end
+        end
+
+        vf_count = 0;
+        foreach (function_instances[index]) begin
+            if (function_instances[index].function_kind == DPU_FUNCTION_VF)
+                vf_count++;
+        end
+        vf_instances = new[vf_count];
+        vf_count = 0;
+        foreach (function_instances[index]) begin
+            if (function_instances[index].function_kind == DPU_FUNCTION_VF) begin
+                if (!$cast(vf_instances[vf_count], function_instances[index])) begin
+                    why = "snapshot VIO VF function did not construct a VF instance";
+                    return 0;
+                end
+                vf_count++;
+            end
+        end
+        return 1;
     endfunction
 
     function dpu_dut_caps snapshot_effective_dut_caps();
@@ -206,15 +294,46 @@ class virtio_net_env extends uvm_env;
             return;
         end
 
-        // Validate config
-        if (!cfg.validate()) begin
-            `uvm_fatal("VIRTIO_ENV",
-                "Invalid virtio-net configuration; refusing to build environment")
-            return;
+        snapshot_topology = uvm_config_db#(dpu_device_snapshot)::get(
+            this, "", "dpu_device_snapshot", device_snapshot
+        );
+        if (snapshot_topology) begin
+            if ((device_snapshot == null) || !device_snapshot.is_frozen()) begin
+                `uvm_fatal("VIRTIO_ENV",
+                    "published device snapshot is null or not frozen")
+                return;
+            end
+            if (!uvm_config_db#(dpu_resource_manager)::get(
+                    this, "", "dpu_resource_manager", device_resource_manager) ||
+                (device_resource_manager == null)) begin
+                `uvm_fatal("VIRTIO_ENV",
+                    "published device resource manager is missing")
+                return;
+            end
+            if (!cfg.validate_against_snapshot(device_snapshot, why)) begin
+                `uvm_fatal("VIRTIO_ENV", $sformatf(
+                    "VIO behavior does not match the published device snapshot: %s", why))
+                return;
+            end
+            effective_dut_caps = device_snapshot.snapshot_dut_caps();
+            if (effective_dut_caps == null) begin
+                `uvm_fatal("VIRTIO_ENV",
+                    "published device snapshot has no DUT capabilities")
+                return;
+            end
         end
-        effective_dut_caps = dpu_dut_caps::type_id::create(
-            "effective_dut_caps");
-        effective_dut_caps.copy_from(cfg.dut_caps);
+        else begin
+            // Temporary compatibility path for callers not yet parented by a
+            // device environment.  Snapshot children never enter this path.
+            if (!cfg.validate()) begin
+                `uvm_fatal("VIRTIO_ENV",
+                    "Invalid virtio-net configuration; refusing to build environment")
+                return;
+            end
+            effective_dut_caps = dpu_dut_caps::type_id::create(
+                "effective_dut_caps");
+            effective_dut_caps.copy_from(cfg.dut_caps);
+        end
         configuration_valid = 1;
 
         `uvm_info("VIRTIO_ENV",
@@ -236,8 +355,16 @@ class virtio_net_env extends uvm_env;
         perf_mon.bw_limit_enable = cfg.bw_limit_enable;
         perf_mon.bw_limit_mbps   = cfg.bw_limit_mbps;
 
-        fabric_topology = cfg.uses_fabric_topology();
-        if (fabric_topology) begin
+        fabric_topology = !snapshot_topology && cfg.uses_fabric_topology();
+        if (snapshot_topology) begin
+            if (!build_snapshot_topology(why)) begin
+                configuration_valid = 0;
+                `uvm_fatal("VIRTIO_ENV", $sformatf(
+                    "could not construct VIO functions from device snapshot: %s", why))
+                return;
+            end
+        end
+        else if (fabric_topology) begin
             fabric = dpu_fabric_env::type_id::create("fabric", this);
             build_fabric_topology();
             vf_instances = new[0];
@@ -288,12 +415,41 @@ class virtio_net_env extends uvm_env;
 
     virtual function void connect_phase(uvm_phase phase);
         virtio_driver_config_t driver_cfg;
+        string why;
 
         super.connect_phase(phase);
         if (!configuration_valid)
             return;
 
-        if (fabric_topology) begin
+        if (snapshot_topology) begin
+            if (pf_instances.size() != 0) begin
+                pf_mgr = pf_instances[0].pf_manager;
+                pf_mgr.wait_pol = wait_pol;
+            end
+            foreach (function_instances[function_index]) begin
+                if (!cfg.get_service_config(
+                        function_instances[function_index].service_key,
+                        effective_dut_caps.max_vio_net_qpairs_per_device,
+                        driver_cfg, why)) begin
+                    configuration_valid = 0;
+                    `uvm_fatal("VIRTIO_ENV", $sformatf(
+                        "could not resolve VIO behavior for snapshot function: %s", why))
+                    return;
+                end
+                function_instances[function_index].drv_cfg = driver_cfg;
+                if (scb != null) begin
+                    function_instances[function_index].driver_agent.monitor.txn_ap.connect(
+                        scb.txn_imp
+                    );
+                end
+                if (cov != null) begin
+                    function_instances[function_index].driver_agent.monitor.txn_ap.connect(
+                        cov.analysis_imp
+                    );
+                end
+            end
+        end
+        else if (fabric_topology) begin
             if (!configure_fabric_resources()) begin
                 configuration_valid = 0;
                 return;
@@ -319,17 +475,19 @@ class virtio_net_env extends uvm_env;
             end
         end
 
-        // Wire shared components into the compatibility VF view.
-        foreach (vf_instances[i]) begin
-            // Set VF config from env config
-            driver_cfg = cfg.get_vf_config(i);
-            driver_cfg.max_vio_net_qpairs_per_device =
-                effective_dut_caps.max_vio_net_qpairs_per_device;
-            vf_instances[i].drv_cfg = driver_cfg;
+        if (!snapshot_topology) begin
+            // Wire shared components into the compatibility VF view.
+            foreach (vf_instances[i]) begin
+                // Set VF config from env config
+                driver_cfg = cfg.get_vf_config(i);
+                driver_cfg.max_vio_net_qpairs_per_device =
+                    effective_dut_caps.max_vio_net_qpairs_per_device;
+                vf_instances[i].drv_cfg = driver_cfg;
 
-            // Note: wire_shared() needs pcie_rc_seqr which comes from
-            // the PCIe TL env. This connection happens in the test's
-            // connect_phase after both envs exist.
+                // Note: wire_shared() needs pcie_rc_seqr which comes from
+                // the PCIe TL env. This connection happens in the test's
+                // connect_phase after both envs exist.
+            end
         end
 
         // Wire virtual sequencer
@@ -347,14 +505,17 @@ class virtio_net_env extends uvm_env;
         conc_ctrl.wait_pol     = wait_pol;
 
         // Wire the compatibility PF manager alias.
-        pf_mgr.vf_instances = vf_instances;
+        if (pf_mgr != null)
+            pf_mgr.vf_instances = vf_instances;
 
         // Connect monitor analysis ports to scoreboard/coverage
-        foreach (vf_instances[i]) begin
-            if (scb != null)
-                vf_instances[i].driver_agent.monitor.txn_ap.connect(scb.txn_imp);
-            if (cov != null)
-                vf_instances[i].driver_agent.monitor.txn_ap.connect(cov.analysis_imp);
+        if (!snapshot_topology) begin
+            foreach (vf_instances[i]) begin
+                if (scb != null)
+                    vf_instances[i].driver_agent.monitor.txn_ap.connect(scb.txn_imp);
+                if (cov != null)
+                    vf_instances[i].driver_agent.monitor.txn_ap.connect(cov.analysis_imp);
+            end
         end
 
     endfunction
@@ -390,7 +551,11 @@ class virtio_net_env extends uvm_env;
             return 0;
         end
 
-        if (fabric_topology) begin
+        if (snapshot_topology) begin
+            foreach (function_instances[function_index])
+                active_functions.push_back(function_instances[function_index]);
+        end
+        else if (fabric_topology) begin
             foreach (pf_instances[pf_index]) begin
                 active_functions.push_back(
                     pf_instances[pf_index].pf_function);
