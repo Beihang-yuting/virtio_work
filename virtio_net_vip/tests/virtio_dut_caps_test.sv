@@ -635,31 +635,9 @@ class virtio_dut_caps_bind_probe_env extends virtio_net_env;
     endfunction
 endclass
 
-class virtio_dut_caps_configure_failure_function extends
-    virtio_function_instance;
-    `uvm_component_utils(virtio_dut_caps_configure_failure_function)
-
-    function new(string name, uvm_component parent);
-        super.new(name, parent);
-    endfunction
-
-    virtual function bit configure_function(
-        input dpu_function_kind_e kind,
-        input dpu_function_key_t key,
-        input bit [15:0] device_bdf,
-        input dpu_bar_pair_lease_t bars[$],
-        input dpu_resource_manager manager = null,
-        input uvm_object pcie_ctx = null
-    );
-        return 0;
-    endfunction
-endclass
-
 class virtio_dut_caps_test extends uvm_test;
     `uvm_component_utils(virtio_dut_caps_test)
 
-    dpu_fabric_env fabric;
-    dpu_fabric_env_config fabric_cfg;
     dpu_resource_manager manager;
     dpu_device_env manager_device_env;
     dpu_function_key_t valid_pf;
@@ -713,9 +691,6 @@ class virtio_dut_caps_test extends uvm_test;
     virtio_dut_caps_bind_probe_env helper_fatal_env;
     virtio_net_env_config helper_fatal_cfg;
     dpu_device_env helper_fatal_device_env;
-    virtio_pf_instance activation_pf_probe;
-    virtio_pf_instance activation_vf_probe;
-    virtio_pf_instance build_failure_pf;
     virtio_function_instance fatal_binding_function;
     virtio_function_instance null_driver_binding_function;
     virtio_function_instance mq_binding_function;
@@ -902,8 +877,6 @@ class virtio_dut_caps_test extends uvm_test;
 
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
-        fabric_cfg = dpu_fabric_env_config::type_id::create("fabric_cfg");
-        fabric = dpu_fabric_env::type_id::create("fabric", this);
         manager_device_env = make_device_env_fixture(
             "manager_device_env", 1, 1);
 
@@ -943,13 +916,6 @@ class virtio_dut_caps_test extends uvm_test;
             "phase_window_cfg");
         phase_window_cfg.scb_enable = 0;
         phase_window_cfg.cov_enable = 0;
-        // Task 9 transitional negative: these fields remain physically
-        // present until Task 10, but snapshot topology must ignore them.
-        phase_window_cfg.dut_caps.max_hosts = 2;
-        phase_window_cfg.dut_caps.max_pfs_per_host = 4;
-        phase_window_cfg.dut_caps.max_vfs_per_pf = 16;
-        phase_window_cfg.dut_caps.vio_global_qpair_count = 2048;
-        phase_window_cfg.dut_caps.max_vio_net_qpairs_per_device = 32;
         phase_window_device_env = make_device_env_fixture(
             "phase_window_device_env", 1, 1, 1, 4);
         uvm_config_db#(uvm_active_passive_enum)::set(
@@ -1154,29 +1120,6 @@ class virtio_dut_caps_test extends uvm_test;
             "helper_fatal_env", helper_fatal_device_env);
 
         uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "activation_pf_probe.*.driver_agent", "is_active",
-            UVM_PASSIVE);
-        activation_pf_probe = virtio_pf_instance::type_id::create(
-            "activation_pf_probe", this);
-        activation_pf_probe.configure_topology(0, 0, 0, 16'h0600);
-        uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "activation_vf_probe.*.driver_agent", "is_active",
-            UVM_PASSIVE);
-        activation_vf_probe = virtio_pf_instance::type_id::create(
-            "activation_vf_probe", this);
-        activation_vf_probe.configure_topology(0, 0, 1, 16'h0610);
-        uvm_factory::get().set_inst_override_by_type(
-            virtio_function_instance::get_type(),
-            virtio_dut_caps_configure_failure_function::get_type(),
-            "uvm_test_top.build_failure_pf.pf_function");
-        uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "build_failure_pf.*.driver_agent", "is_active",
-            UVM_PASSIVE);
-        build_failure_pf = virtio_pf_instance::type_id::create(
-            "build_failure_pf", this);
-        build_failure_pf.configure_topology(0, 0, 0, 16'h0630);
-
-        uvm_config_db#(uvm_active_passive_enum)::set(
             this, "mq_binding_function.driver_agent", "is_active", UVM_PASSIVE);
         uvm_config_db#(uvm_active_passive_enum)::set(
             this, "malicious_binding_function.driver_agent", "is_active",
@@ -1256,7 +1199,6 @@ class virtio_dut_caps_test extends uvm_test;
         dpu_dut_caps client_caps;
         dpu_dut_caps env_caps;
         dpu_resource_class_id_t qpair_class_id;
-        dpu_bar_pair_lease_t bars[$];
         dpu_resource_lease_t leases[$];
         string why;
         bit profile_accepted_two;
@@ -1300,9 +1242,7 @@ class virtio_dut_caps_test extends uvm_test;
                     production_function.driver_agent.fsm.
                         max_supported_mq_pairs()))
         end
-        if (!phase_manager.activate_function(
-                phase_window_env.pf_instances[0].pf_key, bars, why) ||
-            !phase_window_env.pf_instances[0].pf_function.resource_client.
+        if (!phase_window_env.pf_instances[0].pf_function.resource_client.
                 mark_device_ready(why)) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
                 "phase-window PF could not become device-ready: %s", why))
@@ -1374,114 +1314,15 @@ class virtio_dut_caps_test extends uvm_test;
                 "phase-window defensive-copy mutation changed the device owner")
     endtask
 
-    // Break caught: snapshot topology reads any of the still-present legacy
-    // VIO-config DUT-capability fields instead of the frozen device owner.
-    // Task 10 deletes those fields and must remove or migrate this deliberate
-    // transitional hostile-write test with them.
-    task assert_hostile_vio_config_cannot_override_device_owner();
-        dpu_device_snapshot owner_snapshot;
-        dpu_resource_manager owner_manager;
-        dpu_dut_caps owner_caps;
-        dpu_dut_caps manager_caps;
-        dpu_dut_caps env_caps;
-        dpu_dut_caps peer_caps;
-        virtio_function_instance peer_function;
-
-        if ((phase_window_cfg.dut_caps.max_hosts != 2) ||
-            (phase_window_cfg.dut_caps.max_pfs_per_host != 4) ||
-            (phase_window_cfg.dut_caps.max_vfs_per_pf != 16) ||
-            (phase_window_cfg.dut_caps.vio_global_qpair_count != 2048) ||
-            (phase_window_cfg.dut_caps.max_vio_net_qpairs_per_device != 32)) begin
-            `uvm_fatal("DUT_CAPS",
-                "hostile VIO-config capability fixture was not preserved")
-        end
-
-        owner_snapshot = phase_window_device_env.get_snapshot();
-        owner_manager = phase_window_device_env.get_resource_manager();
-        if ((owner_snapshot == null) || !owner_snapshot.is_frozen() ||
-            (owner_manager == null) || !owner_manager.is_snapshot_seeded()) begin
-            `uvm_fatal("DUT_CAPS",
-                "hostile VIO-config probe has no frozen device owner")
-        end
-
-        owner_caps = owner_snapshot.snapshot_dut_caps();
-        manager_caps = owner_manager.snapshot_dut_caps();
-        env_caps = phase_window_env.snapshot_effective_dut_caps();
-        if ((owner_caps == null) || (owner_caps.max_hosts != 1) ||
-            (owner_caps.max_pfs_per_host != 1) ||
-            (owner_caps.max_vfs_per_pf != 1) ||
-            (owner_caps.vio_global_qpair_count != 4) ||
-            (owner_caps.max_vio_net_qpairs_per_device != 1) ||
-            (manager_caps == null) || (manager_caps.max_hosts != 1) ||
-            (manager_caps.max_pfs_per_host != 1) ||
-            (manager_caps.max_vfs_per_pf != 1) ||
-            (manager_caps.vio_global_qpair_count != 4) ||
-            (manager_caps.max_vio_net_qpairs_per_device != 1) ||
-            (env_caps == null) || (env_caps.max_hosts != 1) ||
-            (env_caps.max_pfs_per_host != 1) ||
-            (env_caps.max_vfs_per_pf != 1) ||
-            (env_caps.vio_global_qpair_count != 4) ||
-            (env_caps.max_vio_net_qpairs_per_device != 1) ||
-            (phase_window_env.dyn_reconfig.max_supported_qpairs() != 1)) begin
-            `uvm_fatal("DUT_CAPS",
-                {"hostile VIO config overrode the device snapshot, manager, ",
-                 "environment, or dynamic reconfiguration"})
-        end
-
-        if ((phase_window_env.pf_instances.size() != 1) ||
-            (phase_window_env.pf_instances[0].vf_functions.size() != 1)) begin
-            `uvm_fatal("DUT_CAPS",
-                "hostile VIO-config probe did not construct its peer VF")
-        end
-        peer_function = phase_window_env.pf_instances[0].vf_functions[0];
-        peer_caps = peer_function.resource_client.snapshot_bound_dut_caps();
-        if ((peer_function.resource_client.resource_manager != owner_manager) ||
-            (peer_caps == null) || (peer_caps.max_hosts != 1) ||
-            (peer_caps.max_pfs_per_host != 1) ||
-            (peer_caps.max_vfs_per_pf != 1) ||
-            (peer_caps.vio_global_qpair_count != 4) ||
-            (peer_caps.max_vio_net_qpairs_per_device != 1) ||
-            (peer_function.drv_cfg.max_vio_net_qpairs_per_device != 1) ||
-            (peer_function.driver_agent.fsm == null) ||
-            (peer_function.driver_agent.fsm.max_supported_mq_pairs() != 1)) begin
-            `uvm_fatal("DUT_CAPS",
-                "hostile VIO config changed another VIO function")
-        end
-    endtask
-
-    function dpu_resource_manager make_fatal_bind_manager(input string name);
-        dpu_resource_manager bind_manager;
-        dpu_resource_fabric_authority authority;
-        dpu_dut_caps caps;
-        dpu_resource_class_id_t class_id;
-        string why;
-
-        bind_manager = dpu_resource_manager::type_id::create(name);
-        authority = bind_manager.claim_fabric_registry_authority();
-        caps = dpu_dut_caps::type_id::create({name, "_caps"});
-        if ((authority == null) ||
-            !bind_manager.fabric_configure_dut_caps(authority, caps, why) ||
-            !bind_manager.fabric_configure_mmio_aperture(
-                authority, 64'h0002_0000_0000_0000,
-                64'h0002_0100_0000_0000, why) ||
-            !bind_manager.fabric_register_resource_class(
-                authority, "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
-                caps.vio_global_qpair_count,
-                caps.max_vio_net_qpairs_per_device, class_id, why) ||
-            !bind_manager.fabric_seal_resource_classes(authority, why)) begin
-            `uvm_fatal("DUT_CAPS", $sformatf(
-                "fatal bind manager setup failed: %s", why))
-        end
-        return bind_manager;
-    endfunction
-
     task assert_function_bind_fatal_returns();
         dpu_resource_manager manager_a;
         dpu_resource_manager manager_b;
         dpu_function_key_t key_a;
         dpu_function_key_t key_b;
-        dpu_bar_pair_lease_t bars[$];
-        dpu_bar_pair_lease_t no_bars[$];
+        dpu_pcie_function_id_t pcie_a;
+        dpu_pcie_function_id_t pcie_b;
+        dpu_bar_pair_lease_t bars_a[$];
+        dpu_bar_pair_lease_t bars_b[$];
         virtio_dut_caps_transport_config_spy transport_spy;
         virtio_dut_caps_expected_exact_fatal catcher;
         virtio_dut_caps_expected_exact_fatal null_manager_catcher;
@@ -1490,21 +1331,29 @@ class virtio_dut_caps_test extends uvm_test;
         bit identity_preserved;
         bit configuration_succeeded;
 
-        manager_a = make_fatal_bind_manager("fatal_bind_manager_a");
-        manager_b = make_fatal_bind_manager("fatal_bind_manager_b");
+        manager_a = manager_device_env.get_resource_manager();
+        manager_b = propagated_caps_device_env.get_resource_manager();
         key_a = make_key(0, 0, DPU_FUNCTION_PF, 0);
-        key_b = make_key(1, 0, DPU_FUNCTION_PF, 0);
-        if (!manager_a.register_function(key_a, why) ||
-            !manager_a.activate_function(key_a, bars, why)) begin
+        key_b = make_key(0, 1, DPU_FUNCTION_PF, 0);
+        if ((manager_a == null) || !manager_a.is_snapshot_seeded() ||
+            (manager_b == null) || !manager_b.is_snapshot_seeded() ||
+            !manager_device_env.get_snapshot().get_pcie_id(
+                key_a, pcie_a, why) ||
+            !manager_device_env.get_snapshot().list_bars(
+                key_a, bars_a, why) ||
+            !propagated_caps_device_env.get_snapshot().get_pcie_id(
+                key_b, pcie_b, why) ||
+            !propagated_caps_device_env.get_snapshot().list_bars(
+                key_b, bars_b, why)) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
-                "function fatal-return probe could not activate binding A: %s",
+                "function fatal-return probe could not resolve device bindings: %s",
                 why))
         end
         transport_spy = virtio_dut_caps_transport_config_spy::type_id::create(
             "fatal_bind_transport_spy");
         fatal_binding_function.transport = transport_spy;
         configuration_succeeded = fatal_binding_function.configure_function(
-            DPU_FUNCTION_PF, key_a, 16'h0500, bars, manager_a);
+            DPU_FUNCTION_PF, key_a, pcie_a.bdf, bars_a, manager_a);
         if (!configuration_succeeded ||
             (transport_spy.configure_fabric_count != 1) ||
             (fatal_binding_function.resource_client.resource_manager !=
@@ -1514,13 +1363,13 @@ class virtio_dut_caps_test extends uvm_test;
         end
 
         expected_message =
-            {"could not bind Fabric resources for 1:0:0:0: ",
-             "virtio resource client binding ownership cannot be reassigned"};
+            {"could not bind device resources for 0:1:0:0: ",
+             "virtio resource client device binding ownership cannot be reassigned"};
         catcher = new("function_bind_return_catcher",
             fatal_binding_function, "FUNCTION_INSTANCE", expected_message);
         uvm_report_cb::add(null, catcher);
         configuration_succeeded = fatal_binding_function.configure_function(
-            DPU_FUNCTION_PF, key_b, 16'h0501, no_bars, manager_b);
+            DPU_FUNCTION_PF, key_b, pcie_b.bdf, bars_b, manager_b);
         uvm_report_cb::delete(null, catcher);
 
         if ((catcher.caught_count != 1) || configuration_succeeded ||
@@ -1537,11 +1386,11 @@ class virtio_dut_caps_test extends uvm_test;
             (fatal_binding_function.function_key.pf_id != key_a.pf_id) ||
             (fatal_binding_function.function_key.kind != key_a.kind) ||
             (fatal_binding_function.function_key.vf_id != key_a.vf_id) ||
-            (fatal_binding_function.bdf != 16'h0500) ||
-            (transport_spy.bdf != 16'h0500) ||
-            (transport_spy.notify_mgr.function_bdf != 16'h0500) ||
-            (transport_spy.bar.requester_id != 16'h0500) ||
-            (fatal_binding_function.vq_mgr.bdf != 16'h0500)) begin
+            (fatal_binding_function.bdf != pcie_a.bdf) ||
+            (transport_spy.bdf != pcie_a.bdf) ||
+            (transport_spy.notify_mgr.function_bdf != pcie_a.bdf) ||
+            (transport_spy.bar.requester_id != pcie_a.bdf) ||
+            (fatal_binding_function.vq_mgr.bdf != pcie_a.bdf)) begin
             `uvm_fatal("DUT_CAPS",
                 {"demoted function bind fatal changed owner/transport ",
                  "identity, authority, or Fabric configuration"})
@@ -1555,13 +1404,12 @@ class virtio_dut_caps_test extends uvm_test;
                 why))
         end
         expected_message =
-            {"could not bind Fabric resources for 1:0:0:0: ",
-             "virtio resource client binding ownership cannot be cleared"};
+            "function configuration requires its snapshot-seeded device manager";
         null_manager_catcher = new("function_null_manager_return_catcher",
             fatal_binding_function, "FUNCTION_INSTANCE", expected_message);
         uvm_report_cb::add(null, null_manager_catcher);
         configuration_succeeded = fatal_binding_function.configure_function(
-            DPU_FUNCTION_PF, key_b, 16'h0501, no_bars, null);
+            DPU_FUNCTION_PF, key_b, pcie_b.bdf, bars_b, null);
         uvm_report_cb::delete(null, null_manager_catcher);
 
         identity_preserved =
@@ -1572,11 +1420,11 @@ class virtio_dut_caps_test extends uvm_test;
             (fatal_binding_function.function_key.pf_id == key_a.pf_id) &&
             (fatal_binding_function.function_key.kind == key_a.kind) &&
             (fatal_binding_function.function_key.vf_id == key_a.vf_id) &&
-            (fatal_binding_function.bdf == 16'h0500) &&
-            (transport_spy.bdf == 16'h0500) &&
-            (transport_spy.notify_mgr.function_bdf == 16'h0500) &&
-            (transport_spy.bar.requester_id == 16'h0500) &&
-            (fatal_binding_function.vq_mgr.bdf == 16'h0500);
+            (fatal_binding_function.bdf == pcie_a.bdf) &&
+            (transport_spy.bdf == pcie_a.bdf) &&
+            (transport_spy.notify_mgr.function_bdf == pcie_a.bdf) &&
+            (transport_spy.bar.requester_id == pcie_a.bdf) &&
+            (fatal_binding_function.vq_mgr.bdf == pcie_a.bdf);
         // Cleanup authority belongs to the private client binding, not this
         // compatibility mirror, which may be stale or explicitly cleared.
         fatal_binding_function.resource_manager = null;
@@ -1588,67 +1436,6 @@ class virtio_dut_caps_test extends uvm_test;
                  "client cleanup: identity=%0d pending=%0d"},
                 identity_preserved, fatal_binding_function.resource_client.
                     has_pending_qpair_cleanup()))
-        end
-    endtask
-
-    // The deleted env_apply/env_get/env_pf/env_vf probes exercised only the
-    // transitional runtime Fabric-authoring path.  Snapshot manager seeding
-    // and publication are covered by
-    // dpu_device_resolver_test::test_snapshot_manager_seeding_is_atomic and
-    // dpu_resource_manager_test::run_phase.  Invalid/absent PF/VF ownership
-    // and VF16 rejection are covered by dpu_device_resolver_test's function
-    // topology tests and dpu_resource_manager_test::run_phase.  Atomic
-    // service dependency rejection is covered by
-    // virtio_monitor_routing_test::check_manager_dependencies_are_preflighted.
-    task assert_pf_activation_fatal_returns();
-        dpu_resource_manager probe_manager;
-        virtio_dut_caps_expected_exact_fatal catcher;
-        bit configuration_succeeded;
-
-        probe_manager = make_fatal_bind_manager(
-            "pf_activation_fatal_manager");
-        catcher = new("pf_activation_return_catcher", activation_pf_probe,
-            "PF_INSTANCE",
-            {"PF activation failed for host 0 PF 0: ",
-             "function is not registered"});
-        uvm_report_cb::add(null, catcher);
-        configuration_succeeded =
-            activation_pf_probe.configure_fabric_resources(probe_manager);
-        uvm_report_cb::delete(null, catcher);
-        if ((catcher.caught_count != 1) || configuration_succeeded ||
-            activation_pf_probe.pf_function.transport.is_fabric_managed()) begin
-            `uvm_fatal("DUT_CAPS",
-                "demoted PF activation fatal continued function configuration")
-        end
-    endtask
-
-    task assert_vf_activation_fatal_returns();
-        dpu_resource_manager probe_manager;
-        virtio_dut_caps_expected_exact_fatal catcher;
-        string why;
-        bit configuration_succeeded;
-
-        probe_manager = make_fatal_bind_manager(
-            "vf_activation_fatal_manager");
-        if (!probe_manager.register_function(
-            activation_vf_probe.pf_key, why)) begin
-            `uvm_fatal("DUT_CAPS", $sformatf(
-                "VF activation probe could not register its PF: %s", why))
-        end
-        catcher = new("vf_activation_return_catcher", activation_vf_probe,
-            "PF_INSTANCE",
-            {"VF activation failed for host 0 PF 0 VF 0: ",
-             "function is not registered"});
-        uvm_report_cb::add(null, catcher);
-        configuration_succeeded =
-            activation_vf_probe.configure_fabric_resources(probe_manager);
-        uvm_report_cb::delete(null, catcher);
-        if ((catcher.caught_count != 1) || configuration_succeeded ||
-            !activation_vf_probe.pf_function.transport.is_fabric_managed() ||
-            activation_vf_probe.vf_functions[0].transport.
-                is_fabric_managed()) begin
-            `uvm_fatal("DUT_CAPS",
-                "demoted VF activation fatal continued function configuration")
         end
     endtask
 
@@ -1774,24 +1561,18 @@ class virtio_dut_caps_test extends uvm_test;
         end
     endtask
 
-    task assert_pf_build_failure_stops_later_phases();
-        if ((build_failure_pf.pf_function == null) ||
-            (build_failure_pf.pf_manager != null)) begin
-            `uvm_fatal("DUT_CAPS",
-                "PF build failure did not preserve an inert partial component")
-        end
-    endtask
-
     task assert_real_dut_capability_defaults();
+        dpu_dut_caps default_caps;
         dpu_dut_caps invalid_caps;
         dpu_dut_caps zero_caps;
         string why;
 
-        if ((fabric_cfg.dut_caps.max_hosts != 2) ||
-            (fabric_cfg.dut_caps.max_pfs_per_host != 4) ||
-            (fabric_cfg.dut_caps.max_vfs_per_pf != 16) ||
-            (fabric_cfg.dut_caps.vio_global_qpair_count != 2048) ||
-            (fabric_cfg.dut_caps.max_vio_net_qpairs_per_device != 32)) begin
+        default_caps = dpu_dut_caps::type_id::create("default_caps");
+        if ((default_caps.max_hosts != 2) ||
+            (default_caps.max_pfs_per_host != 4) ||
+            (default_caps.max_vfs_per_pf != 16) ||
+            (default_caps.vio_global_qpair_count != 2048) ||
+            (default_caps.max_vio_net_qpairs_per_device != 32)) begin
             `uvm_fatal("DUT_CAPS", "default real-DUT capability profile is incorrect")
         end
 
@@ -1810,29 +1591,6 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS", $sformatf(
                 "zero host capability returned an inaccurate reason: %s", why))
         end
-    endtask
-
-    task assert_config_rejected_once(
-        input virtio_net_env_config cfg,
-        input string expected_message,
-        input string accepted_fatal_message,
-        ref int unsigned total_caught
-    );
-        virtio_dut_caps_expected_cfg_error catcher;
-
-        catcher = new({cfg.get_name(), "_catcher"}, expected_message);
-        uvm_report_cb::add(null, catcher);
-        if (cfg.validate())
-            `uvm_fatal("DUT_CAPS", accepted_fatal_message)
-        uvm_report_cb::delete(null, catcher);
-
-        if ((catcher.caught_count != 1) ||
-            (catcher.last_message != expected_message)) begin
-            `uvm_fatal("DUT_CAPS", $sformatf(
-                "%s produced %0d matching ENV_CFG reports; expected exactly one: %s",
-                cfg.get_name(), catcher.caught_count, expected_message))
-        end
-        total_caught += catcher.caught_count;
     endtask
 
     task assert_service_keyed_vio_behavior();
@@ -1980,7 +1738,6 @@ class virtio_dut_caps_test extends uvm_test;
     task assert_env_propagates_caps_to_fabric();
         dpu_resource_manager propagated_manager;
         dpu_dut_caps snapshot;
-        dpu_bar_pair_lease_t bars[$];
         virtio_resource_client clients[3];
         string why;
 
@@ -2015,10 +1772,7 @@ class virtio_dut_caps_test extends uvm_test;
             if (clients[index] == null)
                 `uvm_fatal("DUT_CAPS", $sformatf(
                     "PF%0d did not receive a Fabric resource client", index))
-            if (!propagated_manager.activate_function(
-                    propagated_caps_env.pf_instances[index].pf_key,
-                    bars, why) ||
-                !clients[index].mark_device_ready(why))
+            if (!clients[index].mark_device_ready(why))
                 `uvm_fatal("DUT_CAPS", $sformatf(
                     "PF%0d could not become device-ready: %s", index, why))
         end
@@ -3707,7 +3461,6 @@ class virtio_dut_caps_test extends uvm_test;
                 "device fixture did not publish its snapshot-seeded manager")
     endtask
     task assert_vio_local_qpair_limit();
-        dpu_bar_pair_lease_t bars[$];
         dpu_resource_manager original_manager;
         dpu_resource_manager missing_class_manager;
         dpu_function_key_t original_key;
@@ -3719,11 +3472,6 @@ class virtio_dut_caps_test extends uvm_test;
         virtio_resource_client vf_client;
         virtio_dut_caps_snapshot_mutator mutable_vf_client;
         string why;
-
-        if (!manager.activate_function(valid_pf, bars, why))
-            `uvm_fatal("DUT_CAPS", $sformatf("valid PF activation failed: %s", why))
-        if (!manager.activate_function(valid_vf, bars, why))
-            `uvm_fatal("DUT_CAPS", $sformatf("valid VF activation failed: %s", why))
 
         pf_client = virtio_resource_client::type_id::create("pf_client");
         mutable_vf_client = virtio_dut_caps_snapshot_mutator::type_id::create(
@@ -3938,14 +3686,8 @@ class virtio_dut_caps_test extends uvm_test;
                 assert_function_bind_fatal_returns();
             else if (fatal_continuation_case == "function_null_driver")
                 assert_public_bind_null_driver_agent_returns();
-            else if (fatal_continuation_case == "pf_activate")
-                assert_pf_activation_fatal_returns();
-            else if (fatal_continuation_case == "vf_activate")
-                assert_vf_activation_fatal_returns();
             else if (fatal_continuation_case == "env_function")
                 assert_env_function_configuration_failure_returns();
-            else if (fatal_continuation_case == "pf_build")
-                assert_pf_build_failure_stops_later_phases();
             else
                 `uvm_fatal("DUT_CAPS", $sformatf(
                     "unknown fatal continuation case: %s",
@@ -3954,12 +3696,8 @@ class virtio_dut_caps_test extends uvm_test;
             return;
         end
         assert_env_capability_phase_snapshot();
-        assert_hostile_vio_config_cannot_override_device_owner();
         assert_function_bind_fatal_returns();
-        assert_pf_activation_fatal_returns();
-        assert_vf_activation_fatal_returns();
         assert_env_function_configuration_failure_returns();
-        assert_pf_build_failure_stops_later_phases();
         assert_real_dut_capability_defaults();
         assert_service_keyed_vio_behavior();
         assert_env_propagates_caps_to_fabric();

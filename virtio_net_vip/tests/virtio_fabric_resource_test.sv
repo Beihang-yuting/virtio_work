@@ -101,26 +101,6 @@ class virtio_fabric_cfg_tlp_capture_driver extends uvm_driver #(pcie_tl_tlp);
     endtask
 endclass : virtio_fabric_cfg_tlp_capture_driver
 
-// Counts a specific report without changing its severity.  It proves the
-// mailbox probe does not retain the obsolete BAR_RESERVED behavior.
-class virtio_bar_report_counter extends uvm_report_catcher;
-    string report_id;
-    int unsigned caught_count;
-
-    function new(string name, string expected_report_id);
-        super.new(name);
-        report_id = expected_report_id;
-        caught_count = 0;
-    endfunction
-
-    function action_e catch();
-        if (get_id() == report_id) begin
-            caught_count++;
-        end
-        return THROW;
-    endfunction
-endclass : virtio_bar_report_counter
-
 // Scoped negative-path catcher.  Production failures remain fatal outside
 // these narrow test calls; each helper also verifies that its expected report
 // was actually produced.
@@ -157,18 +137,78 @@ class virtio_fabric_resource_test extends uvm_test;
     `uvm_component_utils(virtio_fabric_resource_test)
 
     typedef struct {
+        dpu_pcie_domain_key_t domain;
         bit [63:0] base;
         bit [63:0] size;
     } bar_range_t;
 
-    virtio_net_env_config cfg;
-    virtio_net_env        env;
-    virtio_vf_instance    compatibility_vf;
+    virtio_test_device_builder device_builder;
+    dpu_device_env_config      device_cfg;
+    dpu_device_env             device_env;
+    dpu_device_snapshot        device_snapshot;
+    virtio_net_env_config      cfg;
+    virtio_net_env             env;
     uvm_sequencer #(pcie_tl_tlp) fabric_cfg_tlp_seqr;
     virtio_fabric_cfg_tlp_capture_driver fabric_cfg_tlp_capture;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
+    endfunction
+
+    protected function dpu_function_cfg author_vio_function(
+        input dpu_function_cfg function_cfg
+    );
+        device_builder.add_real_dut_bars(function_cfg);
+        void'(device_builder.add_vio_service(function_cfg, 0));
+        return function_cfg;
+    endfunction
+
+    protected function void pin_real_dut_bars(
+        input virtio_test_device_builder builder,
+        input dpu_function_cfg function_cfg,
+        input bit [63:0] device_base,
+        input bit [63:0] mailbox_base,
+        input bit [63:0] msix_base
+    );
+        bit [63:0] bases[3];
+
+        bases[0] = device_base;
+        bases[1] = mailbox_base;
+        bases[2] = msix_base;
+        builder.add_real_dut_bars(function_cfg);
+        foreach (function_cfg.bars[index]) begin
+            function_cfg.bars[index].placement = DPU_ALLOC_PINNED;
+            function_cfg.bars[index].pinned_base = bases[index];
+        end
+    endfunction
+
+    protected function automatic dpu_function_key_t make_function_key(
+        input int unsigned host_id,
+        input int unsigned parent_id,
+        input dpu_function_kind_e kind,
+        input int unsigned child_id
+    );
+        dpu_function_key_t key;
+
+        key.host_id = host_id;
+        key.pf_id = parent_id;
+        key.kind = kind;
+        key.vf_id = child_id;
+        return key;
+    endfunction
+
+    protected function void append_expected_function(
+        ref dpu_function_key_t keys[$],
+        ref bit [15:0] bdfs[$],
+        input int unsigned host_id,
+        input int unsigned parent_id,
+        input dpu_function_kind_e kind,
+        input int unsigned child_id,
+        input bit [15:0] bdf
+    );
+        keys.push_back(make_function_key(
+            host_id, parent_id, kind, child_id));
+        bdfs.push_back(bdf);
     endfunction
 
     protected function bit ranges_overlap(
@@ -475,12 +515,22 @@ class virtio_fabric_resource_test extends uvm_test;
         ref bar_range_t all_bars[$]
     );
         bar_range_t current;
+        dpu_pcie_function_id_t pcie_id;
+        string why;
+
+        if (!device_snapshot.get_pcie_id(
+                function_instance.function_key, pcie_id, why)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "could not resolve function domain for BAR uniqueness: %s", why))
+        end
 
         foreach (function_instance.bar_pairs[index]) begin
+            current.domain = pcie_id.domain;
             current.base = function_instance.bar_pairs[index].base;
             current.size = function_instance.bar_pairs[index].size;
             foreach (all_bars[prior]) begin
-                if (ranges_overlap(current.base, current.size,
+                if (dpu_same_domain_key(current.domain, all_bars[prior].domain) &&
+                    ranges_overlap(current.base, current.size,
                                    all_bars[prior].base, all_bars[prior].size)) begin
                     `uvm_fatal("FABRIC_RESOURCE", $sformatf(
                         "BAR%0d overlaps an already active function BAR",
@@ -576,8 +626,9 @@ class virtio_fabric_resource_test extends uvm_test;
 
     task discover_fabric_function(input virtio_function_instance function_instance);
         virtio_fabric_cfg_stub_accessor config_stub;
-        virtio_bar_report_counter bar_reserved_reports;
-        bit functional_access_allowed;
+        virtio_expected_bar_report_catcher msix_only_error;
+        bit mailbox_access_allowed;
+        bit msix_functional_access_allowed;
 
         config_stub = virtio_fabric_cfg_stub_accessor::type_id::create(
             $sformatf("cfg_stub_%0d_%0d_%0d_%0d",
@@ -599,52 +650,307 @@ class virtio_fabric_resource_test extends uvm_test;
         assert_fabric_bar_config_writes(function_instance, config_stub);
         assert_bar_layout(function_instance);
 
-        // Catches a production regression that leaves the configured BAR2
-        // mailbox inaccessible or emits the obsolete BAR_RESERVED report.
-        bar_reserved_reports = new($sformatf("bar_reserved_reports_%0d_%0d_%0d_%0d",
+        mailbox_access_allowed = config_stub.probe_functional_bar_access(2);
+        if (!mailbox_access_allowed) begin
+            `uvm_fatal("FABRIC_RESOURCE",
+                "configured BAR2 mailbox was not functionally accessible")
+        end
+
+        msix_only_error = new($sformatf("msix_only_error_%0d_%0d_%0d_%0d",
             function_instance.function_key.host_id,
             function_instance.function_key.pf_id,
             function_instance.function_key.kind,
-            function_instance.function_key.vf_id), "BAR_RESERVED");
-        uvm_report_cb::add(null, bar_reserved_reports);
-        functional_access_allowed = config_stub.probe_functional_bar_access(2);
-        uvm_report_cb::delete(null, bar_reserved_reports);
-        if (!functional_access_allowed || (bar_reserved_reports.caught_count != 0)) begin
+            function_instance.function_key.vf_id), "BAR_MSIX_ONLY", UVM_ERROR);
+        uvm_report_cb::add(null, msix_only_error);
+        msix_functional_access_allowed =
+            config_stub.probe_functional_bar_access(4);
+        uvm_report_cb::delete(null, msix_only_error);
+        if (msix_functional_access_allowed ||
+            (msix_only_error.caught_count != 1)) begin
             `uvm_fatal("FABRIC_RESOURCE",
-                "configured BAR2 mailbox was not functionally accessible")
+                "BAR4 functional access was not rejected as MSI-X-only")
+        end
+    endtask
+
+    task assert_same_domain_collisions_rejected();
+        virtio_test_device_builder collision_builder;
+        dpu_function_cfg first_function;
+        dpu_function_cfg clone_function;
+        dpu_device_resolver resolver;
+        dpu_device_snapshot rejected_snapshot;
+        string why;
+
+        collision_builder = virtio_test_device_builder::type_id::create(
+            "same_bdf_collision_builder");
+        void'(collision_builder.add_host_domain(
+            0, 0, 16'h0200, 16'h02ff,
+            64'h0000_0004_0000_0000, 64'h0000_0005_0000_0000));
+        first_function = collision_builder.add_pf(
+            0, 0, 0, DPU_ALLOC_PINNED, 16'h0220);
+        clone_function = collision_builder.add_pf(
+            0, 1, 0, DPU_ALLOC_PINNED, 16'h0220);
+        pin_real_dut_bars(collision_builder, first_function,
+            64'h0000_0004_0000_0000, 64'h0000_0004_0200_0000,
+            64'h0000_0004_0201_0000);
+        pin_real_dut_bars(collision_builder, clone_function,
+            64'h0000_0004_0000_0000, 64'h0000_0004_0200_0000,
+            64'h0000_0004_0201_0000);
+        void'(collision_builder.add_vio_service(first_function, 0));
+        void'(collision_builder.add_vio_service(clone_function, 0));
+        collision_builder.select_af(first_function);
+        resolver = dpu_device_resolver::type_id::create(
+            "same_bdf_collision_resolver");
+        if (resolver.resolve(
+                collision_builder.device_cfg, rejected_snapshot, why) ||
+            (rejected_snapshot != null) ||
+            !string_contains(why, "same-domain duplicate BDF")) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "same-domain BDF clone was not rejected atomically: %s", why))
+        end
+
+        collision_builder = virtio_test_device_builder::type_id::create(
+            "same_bar_collision_builder");
+        void'(collision_builder.add_host_domain(
+            0, 0, 16'h0200, 16'h02ff,
+            64'h0000_0004_0000_0000, 64'h0000_0005_0000_0000));
+        first_function = collision_builder.add_pf(
+            0, 0, 0, DPU_ALLOC_PINNED, 16'h0220);
+        clone_function = collision_builder.add_pf(
+            0, 1, 0, DPU_ALLOC_PINNED, 16'h0221);
+        pin_real_dut_bars(collision_builder, first_function,
+            64'h0000_0004_0000_0000, 64'h0000_0004_0200_0000,
+            64'h0000_0004_0201_0000);
+        pin_real_dut_bars(collision_builder, clone_function,
+            64'h0000_0004_0000_0000, 64'h0000_0004_0200_0000,
+            64'h0000_0004_0201_0000);
+        void'(collision_builder.add_vio_service(first_function, 0));
+        void'(collision_builder.add_vio_service(clone_function, 0));
+        collision_builder.select_af(first_function);
+        resolver = dpu_device_resolver::type_id::create(
+            "same_bar_collision_resolver");
+        rejected_snapshot = null;
+        why = "";
+        if (resolver.resolve(
+                collision_builder.device_cfg, rejected_snapshot, why) ||
+            (rejected_snapshot != null) ||
+            !string_contains(why, "same-domain BAR overlap")) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "same-domain BAR clone was not rejected atomically: %s", why))
+        end
+    endtask
+
+    task assert_snapshot_order_and_reverse_lookup();
+        dpu_function_key_t expected_keys[$];
+        dpu_function_key_t actual_keys[$];
+        bit [15:0] expected_bdfs[$];
+        dpu_pcie_function_id_t pcie_id;
+        dpu_function_key_t reverse_key;
+        dpu_bar_pair_lease_t bar;
+        dpu_bar_pair_lease_t instance_bar;
+        dpu_bar_address_match_t match;
+        string why;
+
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_PF, 0, 16'h0100);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 0, 16'h0101);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 1, 16'h0102);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 2, 16'h0103);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 3, 16'h0104);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 4, 16'h0105);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 5, 16'h0106);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 6, 16'h0107);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 7, 16'h0108);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 8, 16'h0109);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 9, 16'h010a);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 10, 16'h010b);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 11, 16'h010c);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 12, 16'h010d);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 13, 16'h010e);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 14, 16'h010f);
+        append_expected_function(expected_keys, expected_bdfs, 0, 0, DPU_FUNCTION_VF, 15, 16'h0110);
+        append_expected_function(expected_keys, expected_bdfs, 0, 1, DPU_FUNCTION_PF, 0, 16'h0111);
+        append_expected_function(expected_keys, expected_bdfs, 0, 1, DPU_FUNCTION_VF, 0, 16'h0112);
+        append_expected_function(expected_keys, expected_bdfs, 0, 1, DPU_FUNCTION_VF, 1, 16'h0113);
+        append_expected_function(expected_keys, expected_bdfs, 1, 0, DPU_FUNCTION_PF, 0, 16'h0100);
+        append_expected_function(expected_keys, expected_bdfs, 1, 0, DPU_FUNCTION_VF, 0, 16'h0101);
+        append_expected_function(expected_keys, expected_bdfs, 1, 0, DPU_FUNCTION_VF, 1, 16'h0102);
+        append_expected_function(expected_keys, expected_bdfs, 1, 0, DPU_FUNCTION_VF, 2, 16'h0103);
+        append_expected_function(expected_keys, expected_bdfs, 1, 1, DPU_FUNCTION_PF, 0, 16'h0104);
+        append_expected_function(expected_keys, expected_bdfs, 1, 1, DPU_FUNCTION_VF, 0, 16'h0105);
+
+        device_snapshot.list_functions(actual_keys);
+        if (actual_keys.size() != expected_keys.size()) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "snapshot listed %0d functions, expected %0d",
+                actual_keys.size(), expected_keys.size()))
+        end
+        foreach (expected_keys[index]) begin
+            if (!dpu_same_function_key(actual_keys[index], expected_keys[index])) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "canonical function order mismatch at index %0d: actual=%s expected=%s",
+                    index, dpu_function_key_name(actual_keys[index]),
+                    dpu_function_key_name(expected_keys[index])))
+            end
+            if (!device_snapshot.get_pcie_id(expected_keys[index], pcie_id, why)) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "AUTO mapping missing at canonical index %0d: %s", index, why))
+            end
+            if (pcie_id.bdf != expected_bdfs[index]) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "AUTO BDF mismatch at index %0d: actual=0x%04h expected=0x%04h",
+                    index, pcie_id.bdf, expected_bdfs[index]))
+            end
+            if (!device_snapshot.find_function(pcie_id, reverse_key, why)) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "reverse BDF lookup missing at canonical index %0d: %s",
+                    index, why))
+            end
+            if (!dpu_same_function_key(reverse_key, expected_keys[index])) begin
+                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                    "reverse BDF lookup mismatch at index %0d: actual=%s expected=%s",
+                    index, dpu_function_key_name(reverse_key),
+                    dpu_function_key_name(expected_keys[index])))
+            end
+            foreach (env.function_instances[function_index]) begin
+                if (dpu_same_function_key(
+                        env.function_instances[function_index].function_key,
+                        expected_keys[index]) &&
+                    (env.function_instances[function_index].bdf != pcie_id.bdf)) begin
+                    `uvm_fatal("FABRIC_RESOURCE",
+                        "VIO function BDF differs from frozen snapshot")
+                end
+            end
+            foreach (env.function_instances[function_index]) begin
+                if (!dpu_same_function_key(
+                        env.function_instances[function_index].function_key,
+                        expected_keys[index]))
+                    continue;
+                foreach (env.function_instances[function_index].bar_pairs[bar_index]) begin
+                    instance_bar =
+                        env.function_instances[function_index].bar_pairs[bar_index];
+                    if (!device_snapshot.get_bar(
+                            expected_keys[index], instance_bar.role, bar, why) ||
+                        (bar.role != instance_bar.role) ||
+                        (bar.even_bar_id != instance_bar.even_bar_id) ||
+                        (bar.base != instance_bar.base) ||
+                        (bar.size != instance_bar.size) ||
+                        !device_snapshot.resolve_bar_address(
+                            pcie_id.domain, bar.base + 64'h20, match, why) ||
+                        !dpu_same_function_key(match.function_key,
+                                               expected_keys[index]) ||
+                        (match.role != bar.role) ||
+                        (match.bar_base != bar.base) ||
+                        (match.bar_size != bar.size) ||
+                        (match.offset != 64'h20)) begin
+                        `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                            "snapshot BAR forward/reverse mismatch at index %0d: %s",
+                            index, why))
+                    end
+                end
+            end
+        end
+    endtask
+
+    task assert_independent_domain_numeric_reuse();
+        dpu_function_key_t host0_key;
+        dpu_function_key_t host1_key;
+        dpu_pcie_function_id_t host0_pcie;
+        dpu_pcie_function_id_t host1_pcie;
+        dpu_bar_pair_lease_t host0_bar;
+        dpu_bar_pair_lease_t host1_bar;
+        dpu_bar_address_match_t match;
+        string why;
+
+        host0_key = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
+        host1_key = make_function_key(1, 0, DPU_FUNCTION_PF, 0);
+        if (!device_snapshot.get_pcie_id(host0_key, host0_pcie, why) ||
+            !device_snapshot.get_pcie_id(host1_key, host1_pcie, why) ||
+            (host0_pcie.bdf != host1_pcie.bdf) ||
+            dpu_same_domain_key(host0_pcie.domain, host1_pcie.domain)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "independent domains did not reuse the same numeric BDF: %s", why))
+        end
+        if (!device_snapshot.get_bar(
+                host0_key, DPU_BAR_DEVICE_MEMORY, host0_bar, why) ||
+            !device_snapshot.get_bar(
+                host1_key, DPU_BAR_DEVICE_MEMORY, host1_bar, why) ||
+            (host0_bar.base != host1_bar.base) ||
+            !device_snapshot.resolve_bar_address(
+                host0_pcie.domain, host0_bar.base, match, why) ||
+            !dpu_same_function_key(match.function_key, host0_key) ||
+            !device_snapshot.resolve_bar_address(
+                host1_pcie.domain, host1_bar.base, match, why) ||
+            !dpu_same_function_key(match.function_key, host1_key)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "independent domains did not route reused numeric BARs: %s", why))
         end
     endtask
 
     virtual function void build_phase(uvm_phase phase);
+        dpu_function_cfg selected_af;
+        dpu_function_cfg reused_domain_pf;
+
         super.build_phase(phase);
+        device_builder = virtio_test_device_builder::type_id::create(
+            "device_builder");
+        void'(device_builder.add_host_domain(
+            0, 0, 16'h0100, 16'h01ff,
+            64'h0000_0002_0000_0000, 64'h0000_0003_0000_0000));
+        void'(device_builder.add_host_domain(
+            1, 0, 16'h0100, 16'h01ff,
+            64'h0000_0002_0000_0000, 64'h0000_0003_0000_0000));
 
+        selected_af = device_builder.add_pf(
+            0, 0, 0, DPU_ALLOC_PINNED, 16'h0100);
+        pin_real_dut_bars(device_builder, selected_af,
+            64'h0000_0002_0000_0000, 64'h0000_0002_0200_0000,
+            64'h0000_0002_0201_0000);
+        void'(device_builder.add_vio_service(selected_af, 0));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 0, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 1, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 2, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 3, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 4, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 5, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 6, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 7, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 8, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 9, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 10, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 11, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 12, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 13, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 14, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 0, 15, 0)));
+        void'(author_vio_function(device_builder.add_pf(0, 1, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 1, 0, 0)));
+        void'(author_vio_function(device_builder.add_vf(0, 1, 1, 0)));
+        reused_domain_pf = device_builder.add_pf(
+            1, 0, 0, DPU_ALLOC_PINNED, 16'h0100);
+        pin_real_dut_bars(device_builder, reused_domain_pf,
+            64'h0000_0002_0000_0000, 64'h0000_0002_0200_0000,
+            64'h0000_0002_0201_0000);
+        void'(device_builder.add_vio_service(reused_domain_pf, 0));
+        void'(author_vio_function(device_builder.add_vf(1, 0, 0, 0)));
+        void'(author_vio_function(device_builder.add_vf(1, 0, 1, 0)));
+        void'(author_vio_function(device_builder.add_vf(1, 0, 2, 0)));
+        void'(author_vio_function(device_builder.add_pf(1, 1, 0)));
+        void'(author_vio_function(device_builder.add_vf(1, 1, 0, 0)));
+        device_builder.select_af(selected_af);
+
+        device_cfg = device_builder.make_env_config();
         cfg = virtio_net_env_config::type_id::create("cfg");
-        cfg.num_hosts = 2;
-        cfg.num_pfs_per_host = new[cfg.num_hosts];
-        cfg.num_pfs_per_host[0] = 2;
-        cfg.num_pfs_per_host[1] = 2;
-        cfg.num_vfs_per_pf = new[cfg.num_hosts];
-        foreach (cfg.num_vfs_per_pf[host_id]) begin
-            cfg.num_vfs_per_pf[host_id] = new[cfg.num_pfs_per_host[host_id]];
-        end
-        cfg.num_vfs_per_pf[0][0] = DPU_MAX_VFS_PER_PF;
-        cfg.num_vfs_per_pf[0][1] = 2;
-        cfg.num_vfs_per_pf[1][0] = 3;
-        cfg.num_vfs_per_pf[1][1] = 1;
-
-        uvm_config_db#(virtio_net_env_config)::set(this, "env", "cfg", cfg);
+        cfg.default_num_pairs = 1;
+        uvm_config_db#(dpu_device_env_config)::set(
+            this, "device_env", "cfg", device_cfg);
+        device_env = dpu_device_env::type_id::create("device_env", this);
+        uvm_config_db#(virtio_net_env_config)::set(
+            this, "device_env.env", "cfg", cfg);
         uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "env.*.driver_agent", "is_active", UVM_PASSIVE);
-        uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "compatibility_vf.driver_agent", "is_active", UVM_PASSIVE);
-        env = virtio_net_env::type_id::create("env", this);
-        compatibility_vf = virtio_vf_instance::type_id::create(
-            "compatibility_vf", this
-        );
+            this, "device_env.env.*.driver_agent", "is_active", UVM_PASSIVE);
+        env = virtio_net_env::type_id::create("env", device_env);
         fabric_cfg_tlp_seqr = new("fabric_cfg_tlp_seqr", this);
         fabric_cfg_tlp_capture = virtio_fabric_cfg_tlp_capture_driver::type_id::create(
-            "fabric_cfg_tlp_capture", this
-        );
+            "fabric_cfg_tlp_capture", this);
     endfunction
 
     virtual function void connect_phase(uvm_phase phase);
@@ -655,16 +961,11 @@ class virtio_fabric_resource_test extends uvm_test;
     endfunction
 
     virtual task run_phase(uvm_phase phase);
-        int unsigned expected_vfs[];
         int unsigned global_rx_qids[$];
-        bit [15:0] all_bdfs[$];
         bar_range_t all_bars[$];
         int unsigned stale_global_rx_qid;
         string why;
         virtio_function_instance function_view;
-        dpu_function_key_t compatibility_vf_key;
-        dpu_function_key_t invalid_pf_key;
-        dpu_bar_pair_lease_t no_bars[$];
         bit function_configuration_succeeded;
 
         phase.raise_objection(this);
@@ -676,49 +977,12 @@ class virtio_fabric_resource_test extends uvm_test;
         assert_fabric_bar_hardening_rejections();
         assert_fabric_bar_config_tlp_serialization();
 
-        // A legacy VF wrapper must remain substitutable for a generic
-        // function while retaining immutable VF identity.  The assignment is
-        // intentionally compile-time coverage for the inheritance direction.
-        function_view = compatibility_vf;
-        if (function_view.function_kind != DPU_FUNCTION_VF) begin
-            `uvm_fatal("FABRIC_RESOURCE",
-                "compatibility virtio_vf_instance did not force VF identity")
-        end
-
-        // A severity override used by a negative-path test must not let the
-        // VF wrapper fall through and reconfigure itself as a PF.
-        compatibility_vf_key.host_id = 0;
-        compatibility_vf_key.pf_id = 0;
-        compatibility_vf_key.kind = DPU_FUNCTION_VF;
-        compatibility_vf_key.vf_id = 0;
-        function_configuration_succeeded = compatibility_vf.configure_function(
-            DPU_FUNCTION_VF, compatibility_vf_key, 16'h0400, no_bars
-        );
-        if (!function_configuration_succeeded)
-            `uvm_fatal("FABRIC_RESOURCE",
-                "compatibility VF rejected a valid VF configuration")
-        invalid_pf_key = compatibility_vf_key;
-        invalid_pf_key.kind = DPU_FUNCTION_PF;
-        invalid_pf_key.vf_id = 0;
-        compatibility_vf.set_report_severity_id_override(
-            UVM_FATAL, "VF_INSTANCE", UVM_INFO
-        );
-        function_configuration_succeeded = compatibility_vf.configure_function(
-            DPU_FUNCTION_PF, invalid_pf_key, 16'h0401, no_bars
-        );
-        if (function_configuration_succeeded ||
-            (compatibility_vf.function_kind != DPU_FUNCTION_VF) ||
-            !compatibility_vf.transport.is_vf ||
-            (compatibility_vf.function_key.kind != DPU_FUNCTION_VF)) begin
-            `uvm_fatal("FABRIC_RESOURCE",
-                "compatibility VF accepted a PF function configuration")
-        end
-
-        expected_vfs = new[4];
-        expected_vfs[0] = DPU_MAX_VFS_PER_PF;
-        expected_vfs[1] = 2;
-        expected_vfs[2] = 3;
-        expected_vfs[3] = 1;
+        device_snapshot = device_env.get_snapshot();
+        if ((device_snapshot == null) || !device_snapshot.is_frozen())
+            `uvm_fatal("FABRIC_RESOURCE", "device environment did not publish a frozen snapshot")
+        assert_same_domain_collisions_rejected();
+        assert_snapshot_order_and_reverse_lookup();
+        assert_independent_domain_numeric_reuse();
 
         if ((env.pf_instances.size() != 4) ||
             (env.vf_instances.size() != 22)) begin
@@ -748,23 +1012,9 @@ class virtio_fabric_resource_test extends uvm_test;
         end
 
         foreach (env.pf_instances[pf_index]) begin
-            if ((env.pf_instances[pf_index].host_id != (pf_index / 2)) ||
-                (env.pf_instances[pf_index].pf_id != (pf_index % 2))) begin
-                `uvm_fatal("FABRIC_RESOURCE",
-                    "flattened PF array lost its host/PF coordinates")
-            end
-            if (env.pf_instances[pf_index].num_vfs != expected_vfs[pf_index]) begin
-                `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                    "PF %0d VF count does not match the requested topology", pf_index))
-            end
             if (env.pf_instances[pf_index].pf_function.transport.is_vf) begin
                 `uvm_fatal("FABRIC_RESOURCE", "PF function was modeled as a VF")
             end
-            foreach (all_bdfs[known_bdf]) begin
-                if (all_bdfs[known_bdf] == env.pf_instances[pf_index].pf_bdf)
-                    `uvm_fatal("FABRIC_RESOURCE", "PF BDF is not unique")
-            end
-            all_bdfs.push_back(env.pf_instances[pf_index].pf_bdf);
             assert_bar_layout(env.pf_instances[pf_index].pf_function);
             assert_unique_bars(env.pf_instances[pf_index].pf_function, all_bars);
             if (env.pf_instances[pf_index].pf_function.resource_client.reserve_qpairs(
@@ -780,13 +1030,6 @@ class virtio_fabric_resource_test extends uvm_test;
                 if (!env.pf_instances[pf_index].vf_functions[vf_index].transport.is_vf) begin
                     `uvm_fatal("FABRIC_RESOURCE", "VF function lost its VF identity")
                 end
-                foreach (all_bdfs[known_bdf]) begin
-                    if (all_bdfs[known_bdf] ==
-                        env.pf_instances[pf_index].vf_bdfs[vf_index]) begin
-                        `uvm_fatal("FABRIC_RESOURCE", "VF BDF is not unique")
-                    end
-                end
-                all_bdfs.push_back(env.pf_instances[pf_index].vf_bdfs[vf_index]);
                 assert_bar_layout(env.pf_instances[pf_index].vf_functions[vf_index]);
                 assert_unique_bars(env.pf_instances[pf_index].vf_functions[vf_index],
                                    all_bars);
@@ -800,14 +1043,6 @@ class virtio_fabric_resource_test extends uvm_test;
                 assert_unique_qpair(env.pf_instances[pf_index].vf_functions[vf_index],
                                     global_rx_qids);
             end
-        end
-
-        if ((env.pf_instances[0].vf_bdfs[DPU_MAX_VFS_PER_PF - 1] >=
-             env.pf_instances[1].pf_bdf) ||
-            (env.pf_instances[1].pf_bdf !=
-             (env.pf_instances[0].pf_bdf + DPU_MAX_VFS_PER_PF + 1))) begin
-            `uvm_fatal("FABRIC_RESOURCE",
-                "maximum VF BDF range overlaps the adjacent PF BDF block")
         end
 
         if (global_rx_qids.size() != 26) begin

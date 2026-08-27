@@ -28,16 +28,6 @@ class virtio_vf_instance extends virtio_function_instance;
         return super.configure_function(
             kind, key, device_bdf, bars, manager, pcie_ctx);
     endfunction
-
-    virtual function bit configure_fabric_function(
-        input dpu_function_key_t key,
-        input dpu_bar_pair_lease_t bars[$],
-        input dpu_resource_manager manager
-    );
-        return configure_function(
-            DPU_FUNCTION_VF, key, bdf, bars, manager, pcie_ctx_ref
-        );
-    endfunction
 endclass : virtio_vf_instance
 
 `endif // VIRTIO_VF_INSTANCE_SV

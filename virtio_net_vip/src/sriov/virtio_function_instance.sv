@@ -7,7 +7,7 @@
 class virtio_function_instance extends uvm_component;
     `uvm_component_utils(virtio_function_instance)
 
-    // Identity and Fabric-owned placement.
+    // Identity and snapshot-owned placement.
     int unsigned            vf_index;
     bit [15:0]              bdf;
     dpu_function_key_t      function_key;
@@ -35,8 +35,6 @@ class virtio_function_instance extends uvm_component;
 
     vf_state_e             state = VF_CREATED;
     virtio_driver_config_t drv_cfg;
-    protected bit [63:0]   legacy_bar_base;
-    protected bit          legacy_bar_base_valid;
     local virtio_auto_fsm  pending_pcie_fsm;
     local virtio_atomic_ops pending_pcie_ops;
     local bit              pcie_bind_prepared;
@@ -44,7 +42,6 @@ class virtio_function_instance extends uvm_component;
     function new(string name, uvm_component parent);
         super.new(name, parent);
         function_kind = DPU_FUNCTION_PF;
-        legacy_bar_base_valid = 0;
         pending_pcie_fsm = null;
         pending_pcie_ops = null;
         pcie_bind_prepared = 0;
@@ -79,36 +76,16 @@ class virtio_function_instance extends uvm_component;
                 kind, key.kind))
             return 0;
         end
-        if ((resource_client != null) &&
-            resource_client.is_bound_to_device() && (manager == null)) begin
-            if ((resource_client.resource_manager != null) &&
-                resource_client.resource_manager.is_snapshot_seeded()) begin
-                why =
-                    "virtio resource client device binding ownership cannot be cleared";
-                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                    "could not bind device resources for %0d:%0d:%0d:%0d: %s",
-                    key.host_id, key.pf_id, key.kind, key.vf_id, why))
-            end
-            else begin
-                why = "virtio resource client binding ownership cannot be cleared";
-                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                    "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
-                    key.host_id, key.pf_id, key.kind, key.vf_id, why))
-            end
+        if ((manager == null) || !manager.is_snapshot_seeded() ||
+            !manager.contains_function(key)) begin
+            `uvm_fatal("FUNCTION_INSTANCE",
+                "function configuration requires its snapshot-seeded device manager")
             return 0;
         end
         if ((manager != null) && (resource_client != null)) begin
-            if (manager.is_snapshot_seeded()) begin
-                if (!resource_client.bind_to_device(manager, key, why)) begin
-                    `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                        "could not bind device resources for %0d:%0d:%0d:%0d: %s",
-                        key.host_id, key.pf_id, key.kind, key.vf_id, why))
-                    return 0;
-                end
-            end
-            else if (!resource_client.bind_to_fabric(manager, key, why)) begin
+            if (!resource_client.bind_to_device(manager, key, why)) begin
                 `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                    "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
+                    "could not bind device resources for %0d:%0d:%0d:%0d: %s",
                     key.host_id, key.pf_id, key.kind, key.vf_id, why))
                 return 0;
             end
@@ -122,29 +99,6 @@ class virtio_function_instance extends uvm_component;
         pcie_ctx_ref = pcie_ctx;
         apply_function_configuration();
         return 1;
-    endfunction
-
-    // Legacy flat-VF callers configure a local BAR0 rather than Fabric BAR
-    // leases.  A compatibility VF wrapper fixes function_kind to VF.
-    virtual function void configure(
-        input int unsigned configured_vf_index,
-        input bit [15:0] device_bdf,
-        input bit [63:0] bar_base,
-        input uvm_object pcie_ctx
-    );
-        vf_index = configured_vf_index;
-        bdf = device_bdf;
-        pcie_ctx_ref = pcie_ctx;
-        legacy_bar_base = bar_base;
-        legacy_bar_base_valid = 1;
-        apply_function_configuration();
-    endfunction
-
-    virtual function void configure_bar_pairs(
-        input dpu_bar_pair_lease_t bars[$]
-    );
-        bar_pairs = bars;
-        apply_function_configuration();
     endfunction
 
     // Side-effect-free half of PCIe binding.  The environment preflights all
@@ -539,23 +493,12 @@ class virtio_function_instance extends uvm_component;
         vq_mgr.bdf = bdf;
         if (bar_pairs.size() != 0)
             transport.bar.configure_fabric_bar_pairs(bar_pairs);
-        else if (legacy_bar_base_valid)
-            transport.bar.bar_base[0] = legacy_bar_base;
 
         if (resource_manager == null)
             return;
-        if (resource_manager.is_snapshot_seeded()) begin
-            if (!resource_client.bind_to_device(resource_manager, function_key, why)) begin
-                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                    "could not bind device resources for %0d:%0d:%0d:%0d: %s",
-                    function_key.host_id, function_key.pf_id, function_key.kind,
-                    function_key.vf_id, why))
-                return;
-            end
-        end
-        else if (!resource_client.bind_to_fabric(resource_manager, function_key, why)) begin
+        if (!resource_client.bind_to_device(resource_manager, function_key, why)) begin
             `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                "could not bind Fabric resources for %0d:%0d:%0d:%0d: %s",
+                "could not bind device resources for %0d:%0d:%0d:%0d: %s",
                 function_key.host_id, function_key.pf_id, function_key.kind,
                 function_key.vf_id, why))
             return;

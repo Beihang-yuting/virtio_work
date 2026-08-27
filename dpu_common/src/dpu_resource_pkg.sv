@@ -26,8 +26,6 @@ package dpu_resource_pkg;
   `include "dpu_resource_manager.sv"
   `include "dpu_device_bootstrap_plan_builder.sv"
   `include "dpu_device_env.sv"
-  `include "dpu_fabric_env.sv"
-
 endpackage : dpu_resource_pkg
 
 `endif // DPU_RESOURCE_PKG_SV

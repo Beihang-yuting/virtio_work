@@ -132,8 +132,8 @@ class dpu_snapshot_publication_probe extends uvm_component;
         undeclared.pf_id = 1;
         undeclared.kind = DPU_FUNCTION_PF;
         undeclared.vf_id = 0;
-        if (manager.register_function(undeclared, why))
-            `uvm_fatal("DEVICE_ENV_TEST", "manager registered undeclared function")
+        if (manager.contains_function(undeclared))
+            `uvm_fatal("DEVICE_ENV_TEST", "manager contains undeclared function")
     endfunction
 endclass : dpu_snapshot_publication_probe
 

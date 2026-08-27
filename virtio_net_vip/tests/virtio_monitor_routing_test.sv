@@ -137,13 +137,12 @@ class virtio_monitor_routing_test extends uvm_test;
         super.new(name, parent);
     endfunction
 
-    // Break caught: bind_to_device accepts a legacy manager merely because
-    // that manager happens to contain the function and qpair class.
+    // Break caught: bind_to_device accepts a manager that was not seeded from
+    // the frozen global device snapshot.
     protected function bit check_device_bind_requires_snapshot_seed();
         dpu_resource_manager manager;
         virtio_resource_client client;
         dpu_function_key_t key;
-        dpu_resource_class_id_t class_id;
         string why;
 
         key.host_id = 0;
@@ -152,15 +151,6 @@ class virtio_monitor_routing_test extends uvm_test;
         key.vf_id = 0;
         manager = dpu_resource_manager::type_id::create(
             "fix1_legacy_device_bind_manager");
-        if (!manager.register_function(key, why) ||
-            !manager.register_resource_class(
-                "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
-                2048, 32, class_id, why) ||
-            !manager.seal_resource_classes(why)) begin
-            `uvm_fatal("FIX1_SETUP", $sformatf(
-                "could not build legacy device-bind probe manager: %s", why))
-            return 0;
-        end
         client = virtio_resource_client::type_id::create(
             "fix1_legacy_device_bind_client");
         if (client.bind_to_device(manager, key, why) ||
@@ -276,10 +266,8 @@ class virtio_monitor_routing_test extends uvm_test;
         dpu_resource_manager missing_qpair_manager;
         dpu_resource_manager legacy_manager;
         dpu_function_key_t parent_key;
-        dpu_function_key_t function_keys[$];
         dpu_service_key_t service_keys[$];
         dpu_resource_pool_config_t no_profiles[$];
-        dpu_resource_class_id_t class_id;
         virtio_service_preflight_probe qpair_probe;
         virtio_service_preflight_probe seed_probe;
         string why;
@@ -309,22 +297,6 @@ class virtio_monitor_routing_test extends uvm_test;
 
         legacy_manager = dpu_resource_manager::type_id::create(
             "fix1_unseeded_group_manager");
-        snapshot.list_functions(function_keys);
-        foreach (function_keys[index]) begin
-            if (!legacy_manager.register_function(function_keys[index], why)) begin
-                `uvm_fatal("FIX1_SETUP", $sformatf(
-                    "could not register legacy probe function: %s", why))
-                return 0;
-            end
-        end
-        if (!legacy_manager.register_resource_class(
-                "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
-                2048, 32, class_id, why) ||
-            !legacy_manager.seal_resource_classes(why)) begin
-            `uvm_fatal("FIX1_SETUP", $sformatf(
-                "could not configure legacy group manager: %s", why))
-            return 0;
-        end
         seed_probe = virtio_service_preflight_probe::type_id::create(
             "fix1_unseeded_group_probe", this);
         configured = seed_probe.configure_services(

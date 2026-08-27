@@ -244,29 +244,6 @@ class dpu_resource_manager_test extends uvm_test;
         end
     endtask
 
-    task assert_registration_and_activation_guards();
-        dpu_resource_manager guard_manager;
-        dpu_function_key_t parent_key;
-        dpu_function_key_t orphan_vf_key;
-        dpu_bar_pair_lease_t bars[$];
-        string why;
-
-        guard_manager = dpu_resource_manager::type_id::create("guard_manager");
-        parent_key = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
-        orphan_vf_key = make_function_key(0, 0, DPU_FUNCTION_VF, 0);
-
-        if (guard_manager.register_function(orphan_vf_key, why)) begin
-            `uvm_fatal("DPU_RESOURCE", "VF registration succeeded without its PF parent")
-        end
-        if (!guard_manager.register_function(parent_key, why)) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "guard PF registration failed: %s", why))
-        end
-        if (guard_manager.activate_function(parent_key, bars, why)) begin
-            `uvm_fatal("DPU_RESOURCE", "activation succeeded before resource profiles sealed")
-        end
-    endtask
-
     task assert_global_qpair_capacity(
         dpu_resource_manager manager,
         dpu_resource_class_id_t qpair_class_id,
@@ -274,7 +251,6 @@ class dpu_resource_manager_test extends uvm_test;
     );
         dpu_function_key_t key;
         dpu_function_key_t overflow_key;
-        dpu_bar_pair_lease_t bars[$];
         dpu_resource_lease_t leases[$];
         int unsigned global_id;
         string why;
@@ -282,14 +258,6 @@ class dpu_resource_manager_test extends uvm_test;
         for (int unsigned host_id = 0; host_id < DPU_MAX_HOSTS; host_id++) begin
             for (int unsigned pf_id = 0; pf_id < DPU_MAX_PFS_PER_HOST; pf_id++) begin
                 key = make_function_key(host_id, pf_id, DPU_FUNCTION_PF, 0);
-                if (!manager.activate_function(key, bars, why)) begin
-                    `uvm_fatal("DPU_RESOURCE", $sformatf(
-                        "PF activation failed for host %0d PF %0d: %s",
-                        host_id, pf_id, why))
-                end
-                if (bars.size() != 0)
-                    `uvm_fatal("DPU_RESOURCE",
-                        "snapshot-seeded manager synthesized BAR leases")
                 if (manager.acquire_leases(
                     key, qpair_class_id, 0, 1, leases, why
                 )) begin
@@ -333,10 +301,6 @@ class dpu_resource_manager_test extends uvm_test;
         end
 
         overflow_key = make_function_key(0, 0, DPU_FUNCTION_VF, 0);
-        if (!manager.activate_function(overflow_key, bars, why)) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "overflow VF activation failed: %s", why))
-        end
         if (!manager.mark_function_device_ready(overflow_key, why)) begin
             `uvm_fatal("DPU_RESOURCE", $sformatf(
                 "overflow VF readiness failed: %s", why))
@@ -428,8 +392,6 @@ class dpu_resource_manager_test extends uvm_test;
         phase.raise_objection(this);
 
         assert_canonical_device_identities_and_bar_profiles();
-        assert_registration_and_activation_guards();
-
         if (!uvm_config_db#(dpu_resource_manager)::get(
             this, "device_env.protocol_client", "dpu_resource_manager", manager
         )) begin
@@ -443,12 +405,8 @@ class dpu_resource_manager_test extends uvm_test;
         if (child_manager != manager) begin
             `uvm_fatal("DPU_RESOURCE", "device env child scopes received different managers")
         end
-        if (manager.configure_mmio_aperture(
-            64'h0001_1000_0000_0000, 64'h0001_1010_0000_0000
-        )) begin
-            `uvm_fatal("DPU_RESOURCE",
-                "snapshot-seeded manager accepted MMIO aperture ownership")
-        end
+        if (!manager.is_snapshot_seeded())
+            `uvm_fatal("DPU_RESOURCE", "device manager was not snapshot-seeded")
         if (!manager.lookup_resource_class(
             "virtio.qpair", qpair_class_id, why
         )) begin
@@ -457,14 +415,12 @@ class dpu_resource_manager_test extends uvm_test;
         end
 
         key = make_function_key(3, 12, DPU_FUNCTION_VF, 0);
-        if (manager.register_function(key, why)) begin
-            `uvm_fatal("DPU_RESOURCE", "manager registered a function absent from snapshot")
-        end
+        if (manager.contains_function(key))
+            `uvm_fatal("DPU_RESOURCE", "manager contains a function absent from snapshot")
 
         key = make_function_key(0, 0, DPU_FUNCTION_VF, 16);
-        if (manager.validate_vf_key(key, why)) begin
-            `uvm_fatal("DPU_RESOURCE", "VF key with vf_id == 16 unexpectedly validated")
-        end
+        if (manager.contains_function(key))
+            `uvm_fatal("DPU_RESOURCE", "manager contains out-of-range snapshot VF")
 
         assert_global_qpair_capacity(
             manager, qpair_class_id, 2048

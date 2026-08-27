@@ -5,8 +5,7 @@
 // DPU generic resource manager
 //
 // Snapshot-seeded managers own generic resource classes and lease state for
-// functions declared by the global device snapshot.  The legacy Fabric path
-// remains only for intermediate maintained callers.
+// functions declared by the global device snapshot.
 // =============================================================================
 
 class dpu_resource_function_state;
@@ -14,19 +13,12 @@ class dpu_resource_function_state;
     bit                activated;
     bit                device_ready;
     bit                frozen;
-    dpu_bar_pair_lease_t bars[$];
     dpu_resource_lease_t leases[$];
 
     function new(dpu_function_key_t function_key);
         key = function_key;
     endfunction
 endclass : dpu_resource_function_state
-
-
-// The Fabric environment claims this capability before publishing a manager to
-// config_db. Clients cannot obtain this manager-owned handle afterwards.
-class dpu_resource_fabric_authority;
-endclass : dpu_resource_fabric_authority
 
 
 class dpu_resource_registry_authority;
@@ -49,35 +41,20 @@ class dpu_resource_manager extends uvm_object;
     ][int unsigned];
 
     protected dpu_resource_class_id_t next_resource_class_id;
-    protected int unsigned            activated_function_count;
     protected bit                     resource_classes_sealed;
     protected dpu_resource_registry_authority registry_authority;
     protected bit                            registry_authority_claimed;
     protected bit                            snapshot_configured;
-    protected dpu_resource_fabric_authority fabric_registry_authority;
-    protected bit                           fabric_registry_authority_claimed;
     protected dpu_dut_caps                  dut_caps;
-
-    protected bit        aperture_configured;
-    protected bit [63:0] aperture_base;
-    protected bit [63:0] aperture_limit;
-    protected bit [63:0] next_bar_address;
 
     function new(string name = "dpu_resource_manager");
         super.new(name);
         dut_caps = dpu_dut_caps::type_id::create("dut_caps");
         next_resource_class_id = 0;
-        activated_function_count = 0;
         resource_classes_sealed = 0;
         registry_authority = new();
         registry_authority_claimed = 0;
         snapshot_configured = 0;
-        fabric_registry_authority = new();
-        fabric_registry_authority_claimed = 0;
-        aperture_configured = 0;
-        aperture_base = '0;
-        aperture_limit = '0;
-        next_bar_address = '0;
     endfunction
 
     protected function string function_key_name(
@@ -207,56 +184,7 @@ class dpu_resource_manager extends uvm_object;
         return 0;
     endfunction
 
-    protected function bit allocate_bar_pair(
-        input dpu_bar_role_e role,
-        input int unsigned even_bar_id,
-        input bit [63:0] size,
-        input bit [63:0] cursor,
-        output dpu_bar_pair_lease_t bar,
-        output bit [63:0] next_cursor,
-        output string why
-    );
-        bit [63:0] alignment_offset;
-        bit [63:0] aligned_base;
-
-        why = "";
-        next_cursor = cursor;
-        alignment_offset = cursor & (size - 1);
-        aligned_base = cursor;
-        if (alignment_offset != 0) begin
-            aligned_base = cursor + (size - alignment_offset);
-            if (aligned_base < cursor) begin
-                why = "BAR alignment overflowed the 64-bit aperture";
-                return 0;
-            end
-        end
-
-        if ((aligned_base > aperture_limit) ||
-            ((aperture_limit - aligned_base) < size)) begin
-            why = "MMIO aperture does not have enough aligned space for BAR pair";
-            return 0;
-        end
-
-        bar.role = role;
-        bar.even_bar_id = even_bar_id;
-        bar.base = aligned_base;
-        bar.size = size;
-        next_cursor = aligned_base + size;
-        return 1;
-    endfunction
-
-    function bit validate_vf_key(
-        input dpu_function_key_t key,
-        output string why
-    );
-        if (key.kind !== DPU_FUNCTION_VF) begin
-            why = "validate_vf_key requires a VF function key";
-            return 0;
-        end
-        return validate_function_key(key, why);
-    endfunction
-
-    function bit register_function(
+    protected function bit seed_function(
         input dpu_function_key_t key,
         output string why
     );
@@ -264,10 +192,6 @@ class dpu_resource_manager extends uvm_object;
         string parent_key_name;
         dpu_function_key_t parent_key;
 
-        if (registry_authority_claimed) begin
-            why = "function registration requires the device registry authority";
-            return 0;
-        end
         if (!validate_function_key(key, why))
             return 0;
 
@@ -293,61 +217,14 @@ class dpu_resource_manager extends uvm_object;
         end
 
         function_states[key_name] = new(key);
+        function_states[key_name].activated = 1;
         why = "";
         return 1;
-    endfunction
-
-    protected function bit configure_mmio_aperture_internal(
-        input bit [63:0] base,
-        input bit [63:0] limit,
-        output string why
-    );
-        if (base >= limit) begin
-            why = "MMIO aperture base must be below its limit";
-            return 0;
-        end
-        if (aperture_configured) begin
-            why = "MMIO aperture is already configured";
-            return 0;
-        end
-
-        aperture_configured = 1;
-        aperture_base = base;
-        aperture_limit = limit;
-        next_bar_address = base;
-        why = "";
-        return 1;
-    endfunction
-
-    function bit configure_mmio_aperture(
-        input bit [63:0] base,
-        input bit [63:0] limit
-    );
-        string ignored_why;
-
-        if (fabric_registry_authority_claimed || registry_authority_claimed)
-            return 0;
-        return configure_mmio_aperture_internal(base, limit, ignored_why);
-    endfunction
-
-    function bit has_activated_functions();
-        return (activated_function_count != 0);
-    endfunction
-
-    // Fabric claims this one-shot capability before publishing the manager in
-    // config_db. A client can name the capability type but cannot obtain this
-    // manager-owned handle after that claim.
-    function dpu_resource_fabric_authority claim_fabric_registry_authority();
-        if (fabric_registry_authority_claimed || registry_authority_claimed)
-            return null;
-        fabric_registry_authority_claimed = 1;
-        return fabric_registry_authority;
     endfunction
 
     function dpu_resource_registry_authority claim_registry_authority();
-        if (registry_authority_claimed || fabric_registry_authority_claimed ||
-            (function_states.num() != 0) || (class_id_by_name.num() != 0) ||
-            resource_classes_sealed || aperture_configured)
+        if (registry_authority_claimed || (function_states.num() != 0) ||
+            (class_id_by_name.num() != 0) || resource_classes_sealed)
             return null;
         registry_authority_claimed = 1;
         return registry_authority;
@@ -386,7 +263,7 @@ class dpu_resource_manager extends uvm_object;
         candidate.dut_caps.copy_from(caps);
         snapshot.list_functions(function_keys);
         foreach (function_keys[index]) begin
-            if (!candidate.register_function(function_keys[index], why))
+            if (!candidate.seed_function(function_keys[index], why))
                 return 0;
         end
         foreach (profiles[index]) begin
@@ -406,34 +283,8 @@ class dpu_resource_manager extends uvm_object;
         class_allocated_count = candidate.class_allocated_count;
         active_global_ids.delete();
         next_resource_class_id = candidate.next_resource_class_id;
-        activated_function_count = 0;
         resource_classes_sealed = candidate.resource_classes_sealed;
         snapshot_configured = 1;
-        return 1;
-    endfunction
-
-    function bit fabric_configure_dut_caps(
-        input dpu_resource_fabric_authority authority,
-        input dpu_dut_caps cfg,
-        output string why
-    );
-        if (!fabric_registry_authority_claimed || (authority == null) ||
-            (authority != fabric_registry_authority)) begin
-            why = "DUT capability configuration requires the Fabric authority";
-            return 0;
-        end
-        if (cfg == null) begin
-            why = "DUT capability configuration is null";
-            return 0;
-        end
-        if (function_states.num() != 0) begin
-            why = "DUT capabilities cannot change after function registration";
-            return 0;
-        end
-        if (!cfg.validate(why))
-            return 0;
-        dut_caps.copy_from(cfg);
-        why = "";
         return 1;
     endfunction
 
@@ -442,20 +293,6 @@ class dpu_resource_manager extends uvm_object;
         snapshot = dpu_dut_caps::type_id::create("dut_caps_snapshot");
         snapshot.copy_from(dut_caps);
         return snapshot;
-    endfunction
-
-    function bit fabric_configure_mmio_aperture(
-        input dpu_resource_fabric_authority authority,
-        input bit [63:0] base,
-        input bit [63:0] limit,
-        output string why
-    );
-        if (!fabric_registry_authority_claimed || (authority == null) ||
-            (authority != fabric_registry_authority)) begin
-            why = "MMIO aperture configuration requires the Fabric authority";
-            return 0;
-        end
-        return configure_mmio_aperture_internal(base, limit, why);
     endfunction
 
     protected function bit register_resource_class_internal(
@@ -507,44 +344,6 @@ class dpu_resource_manager extends uvm_object;
         return 1;
     endfunction
 
-    function bit register_resource_class(
-        input string name,
-        input dpu_resource_kind_e kind,
-        input int unsigned capacity,
-        input int unsigned max_per_function,
-        output dpu_resource_class_id_t class_id,
-        output string why
-    );
-        class_id = '0;
-        if (fabric_registry_authority_claimed || registry_authority_claimed) begin
-            why = "resource-class registration requires the owning environment";
-            return 0;
-        end
-        return register_resource_class_internal(
-            name, kind, capacity, max_per_function, class_id, why
-        );
-    endfunction
-
-    function bit fabric_register_resource_class(
-        input dpu_resource_fabric_authority authority,
-        input string name,
-        input dpu_resource_kind_e kind,
-        input int unsigned capacity,
-        input int unsigned max_per_function,
-        output dpu_resource_class_id_t class_id,
-        output string why
-    );
-        class_id = '0;
-        if (!fabric_registry_authority_claimed || (authority == null) ||
-            (authority != fabric_registry_authority)) begin
-            why = "resource-class registration requires the Fabric authority";
-            return 0;
-        end
-        return register_resource_class_internal(
-            name, kind, capacity, max_per_function, class_id, why
-        );
-    endfunction
-
     function bit lookup_resource_class(
         input string name,
         output dpu_resource_class_id_t class_id,
@@ -574,101 +373,6 @@ class dpu_resource_manager extends uvm_object;
 
     protected function bit seal_resource_classes_internal(output string why);
         resource_classes_sealed = 1;
-        why = "";
-        return 1;
-    endfunction
-
-    function bit seal_resource_classes(output string why);
-        if (fabric_registry_authority_claimed || registry_authority_claimed) begin
-            why = "resource-class sealing requires the owning environment";
-            return 0;
-        end
-        return seal_resource_classes_internal(why);
-    endfunction
-
-    function bit fabric_seal_resource_classes(
-        input dpu_resource_fabric_authority authority,
-        output string why
-    );
-        if (!fabric_registry_authority_claimed || (authority == null) ||
-            (authority != fabric_registry_authority)) begin
-            why = "resource-class sealing requires the Fabric authority";
-            return 0;
-        end
-        return seal_resource_classes_internal(why);
-    endfunction
-
-    function bit activate_function(
-        input dpu_function_key_t key,
-        ref dpu_bar_pair_lease_t bars[$],
-        output string why
-    );
-        dpu_resource_function_state state;
-        dpu_bar_pair_lease_t bar;
-        dpu_bar_pair_lease_t proposed_bars[$];
-        bit [63:0] cursor;
-        bit [63:0] device_bar_size;
-        bit [63:0] mailbox_bar_size;
-        bit [63:0] msix_bar_size;
-
-        bars.delete();
-        if (!lookup_function_state(key, state, why))
-            return 0;
-        if (state.activated) begin
-            why = "function is already activated";
-            return 0;
-        end
-        if (state.frozen) begin
-            why = "function is frozen";
-            return 0;
-        end
-        if (!resource_classes_sealed) begin
-            why = "resource classes must be sealed before function activation";
-            return 0;
-        end
-        if (snapshot_configured) begin
-            state.activated = 1;
-            state.device_ready = 0;
-            activated_function_count++;
-            why = "";
-            return 1;
-        end
-        if (!aperture_configured) begin
-            why = "MMIO aperture has not been configured";
-            return 0;
-        end
-
-        if (key.kind == DPU_FUNCTION_PF) begin
-            device_bar_size = 64'h0000_0000_0200_0000;
-            mailbox_bar_size = 64'h0000_0000_0001_0000;
-            msix_bar_size = 64'h0000_0000_0001_0000;
-        end
-        else begin
-            device_bar_size = 64'h0000_0000_0000_4000;
-            mailbox_bar_size = 64'h0000_0000_0000_4000;
-            msix_bar_size = 64'h0000_0000_0000_8000;
-        end
-
-        cursor = next_bar_address;
-        if (!allocate_bar_pair(DPU_BAR_DEVICE_MEMORY, 0, device_bar_size,
-                               cursor, bar, cursor, why))
-            return 0;
-        proposed_bars.push_back(bar);
-        if (!allocate_bar_pair(DPU_BAR_MAILBOX, 2, mailbox_bar_size,
-                               cursor, bar, cursor, why))
-            return 0;
-        proposed_bars.push_back(bar);
-        if (!allocate_bar_pair(DPU_BAR_MSIX, 4, msix_bar_size,
-                               cursor, bar, cursor, why))
-            return 0;
-        proposed_bars.push_back(bar);
-
-        state.bars = proposed_bars;
-        state.activated = 1;
-        state.device_ready = 0;
-        activated_function_count++;
-        next_bar_address = cursor;
-        bars = state.bars;
         why = "";
         return 1;
     endfunction
