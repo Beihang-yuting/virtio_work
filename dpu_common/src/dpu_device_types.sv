@@ -48,6 +48,13 @@ typedef struct {
     bit [63:0] size;
     bit [63:0] alignment;
 } dpu_bar_profile_t;
+typedef struct {
+    dpu_function_key_t function_key;
+    dpu_bar_role_e role;
+    bit [63:0] bar_base;
+    bit [63:0] bar_size;
+    bit [63:0] offset;
+} dpu_bar_address_match_t;
 
 function automatic string dpu_function_key_name(input dpu_function_key_t key);
     return $sformatf("h%0d.pf%0d.k%0d.vf%0d", key.host_id, key.pf_id,
@@ -57,6 +64,26 @@ endfunction
 function automatic string dpu_service_key_name(input dpu_service_key_t key);
     return $sformatf("%s.svc%0d.i%0d", dpu_function_key_name(key.function_key),
                      key.service_kind, key.service_instance_id);
+endfunction
+
+function automatic string dpu_pcie_domain_key_name(
+    input dpu_pcie_domain_key_t key
+);
+    return $sformatf("h%0d.s%0d", key.host_id, key.segment_id);
+endfunction
+
+function automatic string dpu_pcie_function_id_name(
+    input dpu_pcie_function_id_t pcie_id
+);
+    return $sformatf("%s.b%04h", dpu_pcie_domain_key_name(pcie_id.domain),
+                     pcie_id.bdf);
+endfunction
+
+function automatic string dpu_function_bar_key_name(
+    input dpu_function_key_t key,
+    input dpu_bar_role_e role
+);
+    return $sformatf("%s.bar_role%0d", dpu_function_key_name(key), role);
 endfunction
 
 function automatic bit dpu_same_function_key(

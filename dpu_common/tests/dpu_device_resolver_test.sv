@@ -170,6 +170,18 @@ class dpu_device_resolver_test extends uvm_test;
         return clone;
     endfunction
 
+    function automatic dpu_device_cfg make_single_pf_cfg();
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        while (cfg.hosts.size() > 1)
+            cfg.hosts.delete(cfg.hosts.size() - 1);
+        while (cfg.functions.size() > 1)
+            cfg.functions.delete(cfg.functions.size() - 1);
+        cfg.af_request.requester = cfg.functions[0].key;
+        return cfg;
+    endfunction
+
     function automatic void expect_valid(
         input dpu_device_resolver resolver,
         input dpu_device_cfg cfg
@@ -209,6 +221,101 @@ class dpu_device_resolver_test extends uvm_test;
         if (!contains(why, expected))
             `uvm_fatal("RESOLVER_TEST",
                 $sformatf("expected diagnostic '%s', got '%s'", expected, why))
+    endfunction
+
+    function automatic void expect_resolved(
+        input dpu_device_resolver resolver,
+        input dpu_device_cfg cfg,
+        output dpu_device_snapshot snapshot
+    );
+        string why;
+
+        snapshot = null;
+        if (!resolver.resolve(cfg, snapshot, why))
+            `uvm_fatal("RESOLVER_TEST", {"valid resolution rejected: ", why})
+        if ((snapshot == null) || !snapshot.is_frozen())
+            `uvm_fatal("RESOLVER_TEST", "resolver did not publish a frozen snapshot")
+    endfunction
+
+    function automatic void expect_resolution_invalid(
+        input dpu_device_resolver resolver,
+        input dpu_device_cfg cfg,
+        input string expected
+    );
+        dpu_device_snapshot snapshot;
+        string why;
+
+        snapshot = null;
+        if (resolver.resolve(cfg, snapshot, why))
+            `uvm_fatal("RESOLVER_TEST",
+                {"configuration unexpectedly resolved: ", expected})
+        if (snapshot != null)
+            `uvm_fatal("RESOLVER_TEST", "failed resolution published a snapshot")
+        if (!contains(why, expected))
+            `uvm_fatal("RESOLVER_TEST",
+                $sformatf("expected resolution diagnostic '%s', got '%s'",
+                          expected, why))
+    endfunction
+
+    function automatic void expect_pcie_id(
+        input dpu_device_snapshot snapshot,
+        input dpu_function_key_t key,
+        input int unsigned host_id,
+        input int unsigned segment_id,
+        input bit [15:0] bdf
+    );
+        dpu_pcie_function_id_t pcie_id;
+        string why;
+
+        if (!snapshot.get_pcie_id(key, pcie_id, why))
+            `uvm_fatal("RESOLVER_TEST", {"missing PCIe ID: ", why})
+        if ((pcie_id.domain.host_id != host_id) ||
+            (pcie_id.domain.segment_id != segment_id) ||
+            (pcie_id.bdf != bdf))
+            `uvm_fatal("RESOLVER_TEST",
+                $sformatf("unexpected PCIe ID for %s: h%0d.s%0d.b%04h",
+                          dpu_function_key_name(key), pcie_id.domain.host_id,
+                          pcie_id.domain.segment_id, pcie_id.bdf))
+    endfunction
+
+    function automatic void expect_bar(
+        input dpu_device_snapshot snapshot,
+        input dpu_function_key_t key,
+        input dpu_bar_role_e role,
+        input int unsigned even_bar_id,
+        input bit [63:0] base,
+        input bit [63:0] size
+    );
+        dpu_bar_pair_lease_t bar;
+        string why;
+
+        if (!snapshot.get_bar(key, role, bar, why))
+            `uvm_fatal("RESOLVER_TEST", {"missing BAR: ", why})
+        if ((bar.role != role) || (bar.even_bar_id != even_bar_id) ||
+            (bar.base != base) || (bar.size != size))
+            `uvm_fatal("RESOLVER_TEST",
+                $sformatf("unexpected BAR for %s role %0d: BAR%0d %016h/%016h",
+                          dpu_function_key_name(key), role, bar.even_bar_id,
+                          bar.base, bar.size))
+    endfunction
+
+    function automatic void set_pf_bar_profile(
+        input dpu_device_cfg cfg,
+        input dpu_bar_role_e role,
+        input int unsigned even_bar_id,
+        input bit [63:0] size,
+        input bit [63:0] alignment
+    );
+        foreach (cfg.dut_caps.bar_profiles[index]) begin
+            if ((cfg.dut_caps.bar_profiles[index].kind == DPU_FUNCTION_PF) &&
+                (cfg.dut_caps.bar_profiles[index].role == role)) begin
+                cfg.dut_caps.bar_profiles[index].even_bar_id = even_bar_id;
+                cfg.dut_caps.bar_profiles[index].size = size;
+                cfg.dut_caps.bar_profiles[index].alignment = alignment;
+                return;
+            end
+        end
+        `uvm_fatal("RESOLVER_TEST", "missing PF BAR profile in fixture")
     endfunction
 
     // Catches a regression where the validator rejects a legal sparse topology.
@@ -388,6 +495,385 @@ class dpu_device_resolver_test extends uvm_test;
                        "BAR request role/pair does not match the DUT profile h1.pf3.k1.vf7");
     endfunction
 
+    // Catches AUTO allocation running before PINNED allocation, non-canonical
+    // function ordering, or domain-less BDF/BAR uniqueness maps.
+    function void test_deterministic_domain_aware_allocation(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg cfg_a;
+        dpu_device_cfg cfg_b;
+        dpu_device_snapshot snapshot_a;
+        dpu_device_snapshot snapshot_b;
+        dpu_function_key_t keys[$];
+        dpu_function_key_t reverse_key;
+        dpu_pcie_function_id_t pcie_id;
+        dpu_bar_address_match_t match;
+        dpu_bar_pair_lease_t bar;
+        dpu_bdf_range_t low_bdf_range;
+        string why;
+
+        cfg_a = make_valid_cfg();
+        low_bdf_range.first_bdf = 16'h0010;
+        low_bdf_range.last_bdf = 16'h0013;
+        foreach (cfg_a.hosts[host_index]) begin
+            dpu_mmio_window_cfg low_window;
+
+            cfg_a.hosts[host_index].pcie_domains[0].bdf_ranges[0].first_bdf =
+                16'h0020;
+            cfg_a.hosts[host_index].pcie_domains[0].bdf_ranges[0].last_bdf =
+                16'h0023;
+            cfg_a.hosts[host_index].pcie_domains[0].bdf_ranges.push_back(
+                low_bdf_range);
+            cfg_a.hosts[host_index].pcie_domains[0].mmio_windows[0].base =
+                64'h0000_0002_0000_0000;
+            cfg_a.hosts[host_index].pcie_domains[0].mmio_windows[0].limit =
+                64'h0000_0003_0000_0000;
+            low_window = dpu_mmio_window_cfg::type_id::create("low_window");
+            low_window.base = 64'h0000_0001_0000_0000;
+            low_window.limit = 64'h0000_0002_0000_0000;
+            low_window.allowed_roles.push_back(DPU_BAR_DEVICE_MEMORY);
+            low_window.allowed_roles.push_back(DPU_BAR_MAILBOX);
+            low_window.allowed_roles.push_back(DPU_BAR_MSIX);
+            cfg_a.hosts[host_index].pcie_domains[0].mmio_windows.push_back(
+                low_window);
+        end
+        cfg_a.hosts[1].pcie_domains[0].reserved_bdfs.push_back(16'h0011);
+        cfg_a.functions[2].bdf_mode = DPU_ALLOC_PINNED;
+        cfg_a.functions[2].pinned_bdf = 16'h0010;
+        cfg_a.functions[2].bars[0].placement = DPU_ALLOC_PINNED;
+        cfg_a.functions[2].bars[0].pinned_base = 64'h0000_0001_0000_0000;
+
+        cfg_b = clone_cfg(cfg_a);
+        cfg_b.hosts.reverse();
+        cfg_b.functions.reverse();
+        foreach (cfg_b.hosts[host_index]) begin
+            cfg_b.hosts[host_index].pcie_domains[0].bdf_ranges.reverse();
+            cfg_b.hosts[host_index].pcie_domains[0].mmio_windows.reverse();
+        end
+        foreach (cfg_b.functions[index])
+            cfg_b.functions[index].bars.reverse();
+
+        expect_resolved(resolver, cfg_a, snapshot_a);
+        expect_resolved(resolver, cfg_b, snapshot_b);
+
+        expect_pcie_id(snapshot_a, cfg_a.functions[0].key, 0, 0, 16'h0010);
+        expect_pcie_id(snapshot_a, cfg_a.functions[1].key, 1, 1, 16'h0012);
+        expect_pcie_id(snapshot_a, cfg_a.functions[2].key, 1, 1, 16'h0010);
+        expect_pcie_id(snapshot_a, cfg_a.functions[3].key, 1, 1, 16'h0013);
+        expect_pcie_id(snapshot_b, cfg_a.functions[0].key, 0, 0, 16'h0010);
+        expect_pcie_id(snapshot_b, cfg_a.functions[1].key, 1, 1, 16'h0012);
+        expect_pcie_id(snapshot_b, cfg_a.functions[2].key, 1, 1, 16'h0010);
+        expect_pcie_id(snapshot_b, cfg_a.functions[3].key, 1, 1, 16'h0013);
+
+        expect_bar(snapshot_a, cfg_a.functions[0].key,
+                   DPU_BAR_DEVICE_MEMORY, 0,
+                   64'h0000_0001_0000_0000, 64'h0000_0000_0200_0000);
+        expect_bar(snapshot_a, cfg_a.functions[2].key,
+                   DPU_BAR_DEVICE_MEMORY, 0,
+                   64'h0000_0001_0000_0000, 64'h0000_0000_0200_0000);
+        expect_bar(snapshot_a, cfg_a.functions[1].key,
+                   DPU_BAR_DEVICE_MEMORY, 0,
+                   64'h0000_0001_0200_0000, 64'h0000_0000_0200_0000);
+        expect_bar(snapshot_b, cfg_a.functions[1].key,
+                   DPU_BAR_DEVICE_MEMORY, 0,
+                   64'h0000_0001_0200_0000, 64'h0000_0000_0200_0000);
+
+        snapshot_a.list_functions(keys);
+        if ((keys.size() != 4) ||
+            !dpu_same_function_key(keys[0], cfg_a.functions[0].key) ||
+            !dpu_same_function_key(keys[1], cfg_a.functions[1].key) ||
+            !dpu_same_function_key(keys[2], cfg_a.functions[2].key) ||
+            !dpu_same_function_key(keys[3], cfg_a.functions[3].key))
+            `uvm_fatal("RESOLVER_TEST", "function list is not canonical")
+
+        if (!snapshot_a.get_pcie_id(cfg_a.functions[2].key, pcie_id, why) ||
+            !snapshot_a.find_function(pcie_id, reverse_key, why) ||
+            !dpu_same_function_key(reverse_key, cfg_a.functions[2].key))
+            `uvm_fatal("RESOLVER_TEST", "forward/reverse BDF queries disagree")
+        if (!snapshot_a.resolve_bar_address(
+                pcie_id.domain, 64'h0000_0001_0000_1234, match, why) ||
+            !dpu_same_function_key(match.function_key, cfg_a.functions[2].key) ||
+            (match.role != DPU_BAR_DEVICE_MEMORY) ||
+            (match.bar_base != 64'h0000_0001_0000_0000) ||
+            (match.bar_size != 64'h0000_0000_0200_0000) ||
+            (match.offset != 64'h0000_0000_0000_1234))
+            `uvm_fatal("RESOLVER_TEST", "BAR reverse lookup disagrees with lease")
+        if (!snapshot_a.get_bar(cfg_a.functions[2].key,
+                                DPU_BAR_DEVICE_MEMORY, bar, why) ||
+            (bar.base != match.bar_base) || (bar.size != match.bar_size))
+            `uvm_fatal("RESOLVER_TEST", "BAR forward/reverse queries disagree")
+    endfunction
+
+    // Catches an AUTO BAR allocator that does not align window bases or scan
+    // past a reserved interval to the next legal aligned address.
+    function void test_auto_bar_lowest_aligned_after_reservation(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg cfg;
+        dpu_device_snapshot snapshot;
+        dpu_address_range_t reservation;
+
+        cfg = make_valid_cfg();
+        cfg.hosts[0].pcie_domains[0].mmio_windows[0].base =
+            64'h0000_0001_0001_0000;
+        reservation.base = 64'h0000_0001_0200_0000;
+        reservation.limit = 64'h0000_0001_0400_0000;
+        cfg.hosts[0].pcie_domains[0].reserved_mmio_ranges.push_back(reservation);
+        expect_resolved(resolver, cfg, snapshot);
+        expect_bar(snapshot, cfg.functions[0].key, DPU_BAR_DEVICE_MEMORY, 0,
+                   64'h0000_0001_0400_0000, 64'h0000_0000_0200_0000);
+    endfunction
+
+    // Catches omission of reserved-BDF rejection for exact requests.
+    function void test_pinned_bdf_reserved(input dpu_device_resolver resolver);
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        cfg.hosts[0].pcie_domains[0].reserved_bdfs.push_back(16'h0010);
+        cfg.functions[0].bdf_mode = DPU_ALLOC_PINNED;
+        cfg.functions[0].pinned_bdf = 16'h0010;
+        expect_resolution_invalid(resolver, cfg, "reserved BDF");
+    endfunction
+
+    // Catches omission of configured-range checking for exact BDF requests.
+    function void test_pinned_bdf_out_of_range(input dpu_device_resolver resolver);
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        cfg.functions[0].bdf_mode = DPU_ALLOC_PINNED;
+        cfg.functions[0].pinned_bdf = 16'h0100;
+        expect_resolution_invalid(resolver, cfg, "outside configured BDF ranges");
+    endfunction
+
+    // Catches a BDF reverse index that silently overwrites a same-domain owner.
+    function void test_pinned_bdf_same_domain_duplicate(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        cfg.functions[1].bdf_mode = DPU_ALLOC_PINNED;
+        cfg.functions[1].pinned_bdf = 16'h0020;
+        cfg.functions[2].bdf_mode = DPU_ALLOC_PINNED;
+        cfg.functions[2].pinned_bdf = 16'h0020;
+        expect_resolution_invalid(resolver, cfg, "duplicate BDF");
+    endfunction
+
+    // Catches AUTO BDF wraparound or allocation outside declared ranges.
+    function void test_auto_bdf_exhaustion(input dpu_device_resolver resolver);
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        cfg.hosts[1].pcie_domains[0].bdf_ranges[0].last_bdf = 16'h0011;
+        cfg.hosts[1].pcie_domains[0].reserved_bdfs.push_back(16'h0011);
+        expect_resolution_invalid(resolver, cfg, "BDF space exhausted");
+    endfunction
+
+    // Catches acceptance of an odd or out-of-range 64-bit BAR pair.
+    function void test_bar_pair_shape(input dpu_device_resolver resolver);
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        cfg.functions[0].bars[0].even_bar_id = 1;
+        expect_resolution_invalid(resolver, cfg, "role/pair");
+        cfg = make_valid_cfg();
+        cfg.functions[0].bars[0].even_bar_id = 6;
+        expect_resolution_invalid(resolver, cfg, "role/pair");
+    endfunction
+
+    // Catches acceptance of a correctly paired request labeled with the wrong role.
+    function void test_bar_role_pair_mismatch_on_resolve(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        cfg.functions[0].bars[0].role = DPU_BAR_MAILBOX;
+        expect_resolution_invalid(resolver, cfg, "role/pair");
+    endfunction
+
+    // Catches acceptance of a PINNED BAR base that violates its alignment.
+    function void test_pinned_bar_misaligned(input dpu_device_resolver resolver);
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        cfg.functions[0].bars[0].placement = DPU_ALLOC_PINNED;
+        cfg.functions[0].bars[0].pinned_base = 64'h0000_0001_0001_0000;
+        expect_resolution_invalid(resolver, cfg, "misaligned BAR base");
+    endfunction
+
+    // Catches omission of domain-qualified MMIO reservation checks.
+    function void test_pinned_bar_reserved(input dpu_device_resolver resolver);
+        dpu_device_cfg cfg;
+        dpu_address_range_t reservation;
+
+        cfg = make_valid_cfg();
+        reservation.base = 64'h0000_0001_0000_0000;
+        reservation.limit = 64'h0000_0001_0200_0000;
+        cfg.hosts[0].pcie_domains[0].reserved_mmio_ranges.push_back(reservation);
+        cfg.functions[0].bars[0].placement = DPU_ALLOC_PINNED;
+        cfg.functions[0].bars[0].pinned_base = reservation.base;
+        expect_resolution_invalid(resolver, cfg, "reserved MMIO");
+    endfunction
+
+    // Catches a same-domain BAR reverse index that silently overwrites overlap.
+    function void test_pinned_bar_same_domain_overlap(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        cfg.functions[1].bars[0].placement = DPU_ALLOC_PINNED;
+        cfg.functions[1].bars[0].pinned_base = 64'h0000_0001_0000_0000;
+        cfg.functions[2].bars[0].placement = DPU_ALLOC_PINNED;
+        cfg.functions[2].bars[0].pinned_base = 64'h0000_0001_0000_0000;
+        expect_resolution_invalid(resolver, cfg, "BAR overlap");
+    endfunction
+
+    // Catches allocation outside a compatible MMIO window.
+    function void test_auto_bar_exhaustion(input dpu_device_resolver resolver);
+        dpu_device_cfg cfg;
+
+        cfg = make_valid_cfg();
+        cfg.hosts[0].pcie_domains[0].mmio_windows[0].limit =
+            64'h0000_0001_0100_0000;
+        expect_resolution_invalid(resolver, cfg, "BAR space exhausted");
+    endfunction
+
+    // Catches zero, non-power-of-two, or wrapping BAR interval arithmetic.
+    function void test_bar_arithmetic_guards(input dpu_device_resolver resolver);
+        dpu_device_cfg cfg;
+
+        cfg = make_single_pf_cfg();
+        set_pf_bar_profile(cfg, DPU_BAR_DEVICE_MEMORY, 0, '0,
+                           64'h0000_0000_0001_0000);
+        cfg.functions[0].bars[0].size = '0;
+        cfg.functions[0].bars[0].alignment = 64'h0000_0000_0001_0000;
+        expect_resolution_invalid(resolver, cfg, "size and alignment must be nonzero");
+
+        cfg = make_single_pf_cfg();
+        set_pf_bar_profile(cfg, DPU_BAR_DEVICE_MEMORY, 0,
+                           64'h0000_0000_0001_0000,
+                           64'h0000_0000_0000_3000);
+        cfg.functions[0].bars[0].size = 64'h0000_0000_0001_0000;
+        cfg.functions[0].bars[0].alignment = 64'h0000_0000_0000_3000;
+        expect_resolution_invalid(resolver, cfg, "alignment must be a power of two");
+
+        cfg = make_single_pf_cfg();
+        set_pf_bar_profile(cfg, DPU_BAR_DEVICE_MEMORY, 0,
+                           64'h0000_0000_0001_0000,
+                           64'h0000_0000_0001_0000);
+        cfg.functions[0].bars[0].size = 64'h0000_0000_0001_0000;
+        cfg.functions[0].bars[0].alignment = 64'h0000_0000_0001_0000;
+        cfg.functions[0].bars[0].placement = DPU_ALLOC_PINNED;
+        cfg.functions[0].bars[0].pinned_base = 64'hffff_ffff_ffff_0000;
+        cfg.hosts[0].pcie_domains[0].mmio_windows[0].base =
+            64'hffff_ffff_ffff_0000;
+        cfg.hosts[0].pcie_domains[0].mmio_windows[0].limit =
+            64'hffff_ffff_ffff_ffff;
+        expect_resolution_invalid(resolver, cfg, "BAR address overflow");
+    endfunction
+
+    // Catches snapshots that expose owned handles, accept mutation after
+    // publication, or allow queries before freeze.
+    function void test_snapshot_immutability_and_service_queries(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg cfg;
+        dpu_device_snapshot snapshot;
+        dpu_device_snapshot unpublished;
+        dpu_dut_caps caps_copy;
+        dpu_dut_caps caps_again;
+        dpu_service_key_t services[$];
+        dpu_service_key_t added_service;
+        dpu_function_key_t owner;
+        dpu_function_key_t af_key;
+        dpu_bar_pair_lease_t af_bar0;
+        dpu_bar_pair_lease_t bars[$];
+        dpu_bar_pair_lease_t stored_bar;
+        dpu_pcie_function_id_t ignored_id;
+        string why;
+
+        cfg = make_valid_cfg();
+        expect_resolved(resolver, cfg, snapshot);
+        snapshot.list_services(DPU_SERVICE_VIO_NET, services);
+        if ((services.size() != 1) ||
+            !dpu_same_function_key(services[0].function_key,
+                                   cfg.functions[3].key) ||
+            !snapshot.get_service_owner(services[0], owner, why) ||
+            !dpu_same_function_key(owner, cfg.functions[3].key))
+            `uvm_fatal("RESOLVER_TEST", "service ownership/list query mismatch")
+        if (!snapshot.get_expected_af(af_key, af_bar0, why) ||
+            !dpu_same_function_key(af_key, cfg.functions[1].key) ||
+            (af_bar0.role != DPU_BAR_DEVICE_MEMORY) ||
+            (af_bar0.even_bar_id != 0))
+            `uvm_fatal("RESOLVER_TEST", "expected AF query mismatch")
+
+        if (!snapshot.list_bars(cfg.functions[3].key, bars, why) ||
+            (bars.size() != 3) ||
+            (bars[0].role != DPU_BAR_DEVICE_MEMORY) ||
+            (bars[1].role != DPU_BAR_MAILBOX) ||
+            (bars[2].role != DPU_BAR_MSIX) ||
+            (bars[0].base != 64'h0000_0001_0204_0000))
+            `uvm_fatal("RESOLVER_TEST", "BAR list is not canonical or literal")
+        bars[0].base = '0;
+        if (!snapshot.get_bar(cfg.functions[3].key, DPU_BAR_DEVICE_MEMORY,
+                              stored_bar, why) ||
+            (stored_bar.base != 64'h0000_0001_0204_0000))
+            `uvm_fatal("RESOLVER_TEST", "snapshot BAR list was not defensive")
+
+        caps_copy = snapshot.snapshot_dut_caps();
+        caps_copy.max_hosts = 4;
+        caps_copy.bar_profiles[0].size = 64'h1;
+        caps_again = snapshot.snapshot_dut_caps();
+        if ((caps_again.max_hosts != 2) ||
+            (caps_again.bar_profiles[0].size != 64'h0000_0000_0200_0000))
+            `uvm_fatal("RESOLVER_TEST", "snapshot leaked mutable capability state")
+
+        added_service.function_key = cfg.functions[0].key;
+        added_service.service_kind = DPU_SERVICE_VBLK;
+        added_service.service_instance_id = 7;
+        if (snapshot.add_service(added_service, why))
+            `uvm_fatal("RESOLVER_TEST", "frozen snapshot accepted mutation")
+        services.delete();
+        snapshot.list_services(DPU_SERVICE_VBLK, services);
+        if (services.size() != 0)
+            `uvm_fatal("RESOLVER_TEST", "rejected mutation changed snapshot")
+
+        unpublished = dpu_device_snapshot::type_id::create("unpublished");
+        if (unpublished.get_pcie_id(cfg.functions[0].key, ignored_id, why))
+            `uvm_fatal("RESOLVER_TEST", "unfrozen snapshot allowed a query")
+    endfunction
+
+    // Catches failure paths that retain a partial new snapshot or mutate a
+    // previously published snapshot through shared authoring state.
+    function void test_failed_resolve_is_atomic(
+        input dpu_device_resolver resolver
+    );
+        dpu_device_cfg good_cfg;
+        dpu_device_cfg bad_cfg;
+        dpu_device_snapshot first_snapshot;
+        dpu_device_snapshot failed_snapshot;
+        dpu_pcie_function_id_t pcie_id;
+        string why;
+
+        good_cfg = make_valid_cfg();
+        expect_resolved(resolver, good_cfg, first_snapshot);
+        bad_cfg = clone_cfg(good_cfg);
+        bad_cfg.hosts[0].pcie_domains[0].reserved_bdfs.push_back(16'h0010);
+        bad_cfg.functions[0].bdf_mode = DPU_ALLOC_PINNED;
+        bad_cfg.functions[0].pinned_bdf = 16'h0010;
+        failed_snapshot = first_snapshot;
+        if (resolver.resolve(bad_cfg, failed_snapshot, why))
+            `uvm_fatal("RESOLVER_TEST", "invalid second resolve passed")
+        if (failed_snapshot != null)
+            `uvm_fatal("RESOLVER_TEST", "failed second resolve retained output")
+        if (!first_snapshot.get_pcie_id(good_cfg.functions[0].key,
+                                        pcie_id, why) ||
+            (pcie_id.bdf != 16'h0010))
+            `uvm_fatal("RESOLVER_TEST", "failed resolve changed old snapshot")
+    endfunction
+
     virtual task run_phase(uvm_phase phase);
         dpu_device_resolver resolver;
 
@@ -406,6 +892,21 @@ class dpu_device_resolver_test extends uvm_test;
         test_af_requester_must_be_declared_pf0(resolver);
         test_bar_request_duplicate_role(resolver);
         test_bar_request_role_pair_profile_mismatch(resolver);
+        test_deterministic_domain_aware_allocation(resolver);
+        test_auto_bar_lowest_aligned_after_reservation(resolver);
+        test_pinned_bdf_reserved(resolver);
+        test_pinned_bdf_out_of_range(resolver);
+        test_pinned_bdf_same_domain_duplicate(resolver);
+        test_auto_bdf_exhaustion(resolver);
+        test_bar_pair_shape(resolver);
+        test_bar_role_pair_mismatch_on_resolve(resolver);
+        test_pinned_bar_misaligned(resolver);
+        test_pinned_bar_reserved(resolver);
+        test_pinned_bar_same_domain_overlap(resolver);
+        test_auto_bar_exhaustion(resolver);
+        test_bar_arithmetic_guards(resolver);
+        test_snapshot_immutability_and_service_queries(resolver);
+        test_failed_resolve_is_atomic(resolver);
         phase.drop_objection(this);
     endtask
 endclass : dpu_device_resolver_test
