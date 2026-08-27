@@ -3,6 +3,7 @@
 
 import uvm_pkg::*;
 `include "uvm_macros.svh"
+import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
 
 // This transport reports a chosen device-reset completion without requiring
@@ -222,6 +223,11 @@ endclass : virtio_pf_lifecycle_conc_timeout_catcher
 class virtio_pf_lifecycle_reset_test extends uvm_test;
     `uvm_component_utils(virtio_pf_lifecycle_reset_test)
 
+    dpu_device_env                    device_env;
+    virtio_test_device_builder        device_builder;
+    dpu_device_env_config             device_cfg;
+    virtio_net_env_config             cfg;
+    virtio_net_env                    env;
     virtio_function_instance          pf_function;
     virtio_pf_lifecycle_blocking_vf   concurrency_normal_vf;
     virtio_pf_lifecycle_blocking_vf   concurrency_timeout_vf;
@@ -231,9 +237,25 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
     endfunction
 
     virtual function void build_phase(uvm_phase phase);
+        dpu_function_cfg pf_cfg;
+
         super.build_phase(phase);
+        device_builder = virtio_test_device_builder::type_id::create(
+            "device_builder");
+        void'(device_builder.add_host_domain(0, 0));
+        pf_cfg = device_builder.add_pf(0, 0, 0);
+        device_builder.add_real_dut_bars(pf_cfg);
+        void'(device_builder.add_vio_service(pf_cfg, 0));
+        device_builder.select_af(pf_cfg);
+        device_cfg = device_builder.make_env_config();
+
+        cfg = virtio_net_env_config::type_id::create("cfg");
+        cfg.scb_enable = 0;
+        cfg.cov_enable = 0;
         uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "pf_function.driver_agent", "is_active", UVM_PASSIVE
+            this,
+            "device_env.env.pf_0_0.pf_function.driver_agent",
+            "is_active", UVM_PASSIVE
         );
         uvm_config_db#(uvm_active_passive_enum)::set(
             this, "concurrency_normal_vf.driver_agent", "is_active", UVM_PASSIVE
@@ -241,19 +263,24 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         uvm_config_db#(uvm_active_passive_enum)::set(
             this, "concurrency_timeout_vf.driver_agent", "is_active", UVM_PASSIVE
         );
-        pf_function = virtio_function_instance::type_id::create(
-            "pf_function", this
-        );
         concurrency_normal_vf = virtio_pf_lifecycle_blocking_vf::type_id::create(
             "concurrency_normal_vf", this
         );
         concurrency_timeout_vf = virtio_pf_lifecycle_blocking_vf::type_id::create(
             "concurrency_timeout_vf", this
         );
+        uvm_config_db#(dpu_device_env_config)::set(
+            this, "device_env", "cfg", device_cfg);
+        device_env = dpu_device_env::type_id::create("device_env", this);
+        uvm_config_db#(virtio_net_env_config)::set(
+            this, "device_env.env", "cfg", cfg);
+        env = virtio_net_env::type_id::create("env", device_env);
     endfunction
 
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
+
+        pf_function = env.pf_instances[0].pf_function;
 
         test_verified_reset_quiesces_and_requires_reinitialization();
         test_verified_reset_retires_pending_normal_dma();

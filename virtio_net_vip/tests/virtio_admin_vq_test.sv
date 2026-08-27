@@ -3,6 +3,7 @@
 
 import uvm_pkg::*;
 `include "uvm_macros.svh"
+import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
 
 // This transport keeps the Admin VQ test in-process: it records the notify
@@ -183,8 +184,13 @@ endclass : virtio_admin_vq_expected_error_catcher
 class virtio_admin_vq_test extends uvm_test;
     `uvm_component_utils(virtio_admin_vq_test)
 
-    virtio_vf_instance vf;
-    virtio_pf_manager  pf_mgr;
+    dpu_device_env             device_env;
+    virtio_test_device_builder device_builder;
+    dpu_device_env_config      device_cfg;
+    virtio_net_env_config      cfg;
+    virtio_net_env             env;
+    virtio_vf_instance         vf;
+    virtio_pf_manager          pf_mgr;
     virtio_admin_vq_test_reset_owner last_reset_owner;
 
     function new(string name, uvm_component parent);
@@ -192,18 +198,49 @@ class virtio_admin_vq_test extends uvm_test;
     endfunction
 
     virtual function void build_phase(uvm_phase phase);
+        dpu_function_cfg pf_cfg;
+        dpu_function_cfg vf_cfg;
+
         super.build_phase(phase);
-        // This fixture uses the VF only as an Admin-command target.  Keep
-        // its agent passive so it does not create an unbound active driver.
+        device_builder = virtio_test_device_builder::type_id::create(
+            "device_builder");
+        void'(device_builder.add_host_domain(0, 0));
+        pf_cfg = device_builder.add_pf(0, 0, 0);
+        vf_cfg = device_builder.add_vf(0, 0, 0, 0);
+        device_builder.add_real_dut_bars(pf_cfg);
+        device_builder.add_real_dut_bars(vf_cfg);
+        void'(device_builder.add_vio_service(pf_cfg, 0));
+        void'(device_builder.add_vio_service(vf_cfg, 0));
+        device_builder.select_af(pf_cfg);
+        device_cfg = device_builder.make_env_config();
+
+        cfg = virtio_net_env_config::type_id::create("cfg");
+        cfg.scb_enable = 0;
+        cfg.cov_enable = 0;
+        // The snapshot VF is only an Admin-command target.  Keep both
+        // declared function agents passive; this unit test supplies its own
+        // controlled Admin transport rather than a PCIe environment.
         uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "admin_vf.driver_agent", "is_active", UVM_PASSIVE
-        );
-        vf = virtio_vf_instance::type_id::create("admin_vf", this);
+            this,
+            "device_env.env.pf_0_0.pf_function.driver_agent",
+            "is_active", UVM_PASSIVE);
+        uvm_config_db#(uvm_active_passive_enum)::set(
+            this,
+            "device_env.env.pf_0_0.vf_function_0.driver_agent",
+            "is_active", UVM_PASSIVE);
+        uvm_config_db#(dpu_device_env_config)::set(
+            this, "device_env", "cfg", device_cfg);
+        device_env = dpu_device_env::type_id::create("device_env", this);
+        uvm_config_db#(virtio_net_env_config)::set(
+            this, "device_env.env", "cfg", cfg);
+        env = virtio_net_env::type_id::create("env", device_env);
         pf_mgr = virtio_pf_manager::type_id::create("admin_pf_mgr");
     endfunction
 
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
+
+        vf = env.pf_instances[0].vf_functions[0];
 
         test_success_completion_and_cleanup();
         test_admin_transport_mismatch_has_no_submission();

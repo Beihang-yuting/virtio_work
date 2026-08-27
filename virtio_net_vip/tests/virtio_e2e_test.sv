@@ -3,6 +3,7 @@
 
 import uvm_pkg::*;
 `include "uvm_macros.svh"
+import dpu_resource_pkg::*;
 import pcie_tl_pkg::*;
 import virtio_net_pkg::*;
 
@@ -233,12 +234,15 @@ class virtio_e2e_test extends uvm_test;
 
     // ===== Environments =====
     pcie_tl_env           pcie_env;
+    dpu_device_env        device_env;
     virtio_net_env        virtio_env;
     virtio_tlm_completion_adapter tlm_adapter;
 
     // ===== Configs =====
-    pcie_tl_env_config    pcie_cfg;
-    virtio_net_env_config virtio_cfg;
+    pcie_tl_env_config         pcie_cfg;
+    virtio_test_device_builder device_builder;
+    dpu_device_env_config      device_cfg;
+    virtio_net_env_config      virtio_cfg;
 
     protected bit [63:0] e2e_host_allocations[$];
 
@@ -296,6 +300,8 @@ class virtio_e2e_test extends uvm_test;
     // ========================================================================
 
     virtual function void build_phase(uvm_phase phase);
+        dpu_function_cfg pf_cfg;
+
         super.build_phase(phase);
 
         // Install the reusable TLM completion bridge before PCIe creates its
@@ -324,9 +330,18 @@ class virtio_e2e_test extends uvm_test;
         uvm_config_db #(pcie_tl_env_config)::set(this, "pcie_env", "cfg", pcie_cfg);
         pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
 
-        // ----- Virtio env config -----
+        // ----- Explicit device snapshot and Virtio behavior config -----
+        device_builder = virtio_test_device_builder::type_id::create(
+            "device_builder");
+        void'(device_builder.add_host_domain(0, 0, 16'h0100));
+        pf_cfg = device_builder.add_pf(
+            0, 0, 0, DPU_ALLOC_PINNED, 16'h0100);
+        device_builder.add_real_dut_bars(pf_cfg);
+        void'(device_builder.add_vio_service(pf_cfg, 0));
+        device_builder.select_af(pf_cfg);
+        device_cfg = device_builder.make_env_config();
+
         virtio_cfg = virtio_net_env_config::type_id::create("virtio_cfg");
-        virtio_cfg.num_vfs              = 0;
         virtio_cfg.default_num_pairs    = 1;
         virtio_cfg.default_queue_size   = 256;
         virtio_cfg.default_vq_type      = VQ_SPLIT;
@@ -339,10 +354,13 @@ class virtio_e2e_test extends uvm_test;
         virtio_cfg.iommu_strict         = 1;
         virtio_cfg.scb_enable           = 1;
         virtio_cfg.cov_enable           = 0;
-        virtio_cfg.pf_bdf              = 16'h0100;
-
-        uvm_config_db #(virtio_net_env_config)::set(this, "virtio_env", "cfg", virtio_cfg);
-        virtio_env = virtio_net_env::type_id::create("virtio_env", this);
+        uvm_config_db#(dpu_device_env_config)::set(
+            this, "device_env", "cfg", device_cfg);
+        device_env = dpu_device_env::type_id::create("device_env", this);
+        uvm_config_db#(virtio_net_env_config)::set(
+            this, "device_env.virtio_env", "cfg", virtio_cfg);
+        virtio_env = virtio_net_env::type_id::create(
+            "virtio_env", device_env);
 
     endfunction
 
@@ -768,15 +786,13 @@ class virtio_e2e_test extends uvm_test;
     // ========================================================================
 
     protected task phase1_setup_transport();
-        virtio_vf_instance vf;
         virtio_pci_transport xport;
         bit [31:0] num_queues_word;
         bit [7:0] status;
 
         `uvm_info("E2E_TEST", "----- Phase 1: Transport Setup -----", UVM_LOW)
 
-        vf = virtio_env.vf_instances[0];
-        xport = vf.transport;
+        xport = virtio_env.function_instances[0].transport;
 
         // Directly set BAR0 base address (skip enumeration)
         xport.bar.bar_base[0] = BAR0_BASE;
@@ -785,9 +801,6 @@ class virtio_e2e_test extends uvm_test;
         xport.bar.bar_base[NOTIFY_BAR] = BAR2_BASE;
         xport.bar.bar_size[NOTIFY_BAR] = BAR2_SIZE;
         xport.bar.bar_type[NOTIFY_BAR] = 3'b000;  // 32-bit MMIO
-        xport.bar.requester_id = virtio_cfg.pf_bdf;
-        xport.bdf = virtio_cfg.pf_bdf;
-
         // Run capability discovery via PCIe Config Read TLPs
         xport.cap_mgr.bar_ref = xport.bar;
         xport.cap_mgr.discover_capabilities();
@@ -1045,7 +1058,6 @@ class virtio_e2e_test extends uvm_test;
     // ========================================================================
 
     protected task phase2_virtio_init();
-        virtio_vf_instance vf;
         virtio_pci_transport xport;
         virtio_atomic_ops ops;
         bit [63:0] negotiated;
@@ -1055,9 +1067,8 @@ class virtio_e2e_test extends uvm_test;
 
         `uvm_info("E2E_TEST", "----- Phase 2: Virtio Initialization -----", UVM_LOW)
 
-        vf = virtio_env.vf_instances[0];
-        xport = vf.transport;
-        ops = vf.driver_agent.ops;
+        xport = virtio_env.function_instances[0].transport;
+        ops = virtio_env.function_instances[0].driver_agent.ops;
 
         // Step 1: Device Reset
         `uvm_info("E2E_TEST", "Step 1: Device Reset", UVM_MEDIUM)
@@ -1169,7 +1180,6 @@ class virtio_e2e_test extends uvm_test;
     // ========================================================================
 
     protected task phase3_dataplane();
-        virtio_vf_instance vf;
         virtio_pci_transport xport;
         virtio_atomic_ops ops;
         int unsigned tx_qid;
@@ -1179,9 +1189,8 @@ class virtio_e2e_test extends uvm_test;
 
         `uvm_info("E2E_TEST", "----- Phase 3: Dataplane -----", UVM_LOW)
 
-        vf = virtio_env.vf_instances[0];
-        xport = vf.transport;
-        ops = vf.driver_agent.ops;
+        xport = virtio_env.function_instances[0].transport;
+        ops = virtio_env.function_instances[0].driver_agent.ops;
         bar_base_addr = BAR0_BASE;
 
         // Step 1: Setup queues

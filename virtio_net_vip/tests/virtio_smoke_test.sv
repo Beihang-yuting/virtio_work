@@ -29,7 +29,7 @@ class virtio_smoke_test extends virtio_e2e_test;
         phase1_setup_transport();
         phase2_virtio_init();
 
-        xport = virtio_env.vf_instances[0].transport;
+        xport = virtio_env.function_instances[0].transport;
         xport.write_device_status(DEV_STATUS_RESET);
         xport.read_device_status(status);
         assert (status == DEV_STATUS_RESET)

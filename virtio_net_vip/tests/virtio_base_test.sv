@@ -3,6 +3,7 @@
 
 import uvm_pkg::*;
 `include "uvm_macros.svh"
+import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
 
 // ============================================================================
@@ -20,26 +21,43 @@ import virtio_net_pkg::*;
 class virtio_base_test extends uvm_test;
     `uvm_component_utils(virtio_base_test)
 
-    virtio_net_env          env;
-    virtio_net_env_config   cfg;
+    dpu_device_env             device_env;
+    virtio_test_device_builder device_builder;
+    dpu_device_env_config      device_cfg;
+    virtio_net_env_config      cfg;
+    virtio_net_env             env;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
 
     virtual function void build_phase(uvm_phase phase);
+        dpu_function_cfg pf_cfg;
+
         super.build_phase(phase);
+
+        device_builder = virtio_test_device_builder::type_id::create(
+            "device_builder");
+        void'(device_builder.add_host_domain(0, 0));
+        pf_cfg = device_builder.add_pf(0, 0, 0);
+        device_builder.add_real_dut_bars(pf_cfg);
+        void'(device_builder.add_vio_service(pf_cfg, 0));
+        device_builder.select_af(pf_cfg);
 
         cfg = virtio_net_env_config::type_id::create("cfg");
         configure_default(cfg);
+        device_cfg = device_builder.make_env_config();
 
-        uvm_config_db #(virtio_net_env_config)::set(this, "env", "cfg", cfg);
-        env = virtio_net_env::type_id::create("env", this);
+        uvm_config_db#(dpu_device_env_config)::set(
+            this, "device_env", "cfg", device_cfg);
+        device_env = dpu_device_env::type_id::create("device_env", this);
+        uvm_config_db#(virtio_net_env_config)::set(
+            this, "device_env.env", "cfg", cfg);
+        env = virtio_net_env::type_id::create("env", device_env);
     endfunction
 
     // Override in subclasses to customize config before env build
     virtual function void configure_default(virtio_net_env_config cfg);
-        cfg.num_vfs              = 0;           // pure PF mode
         cfg.default_num_pairs    = 1;
         cfg.default_queue_size   = 256;
         cfg.default_vq_type      = VQ_SPLIT;
@@ -59,9 +77,16 @@ class virtio_base_test extends uvm_test;
         cfg.cov_enable = 1;
     endfunction
 
-    // Convenience: set VF count
-    function void set_num_vfs(int unsigned n);
-        cfg.num_vfs = n;
+    // Test-only convenience: explicitly declare VF VIO services before the
+    // device and protocol children enter their build phases.
+    function void add_vio_vfs(int unsigned n);
+        for (int unsigned vf_id = 0; vf_id < n; vf_id++) begin
+            dpu_function_cfg vf_cfg;
+
+            vf_cfg = device_builder.add_vf(0, 0, vf_id, 0);
+            device_builder.add_real_dut_bars(vf_cfg);
+            void'(device_builder.add_vio_service(vf_cfg, 0));
+        end
     endfunction
 
 endclass : virtio_base_test
