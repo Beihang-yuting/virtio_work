@@ -4,6 +4,7 @@ VIRTIO_MAINTAINED_TESTS=(
   dpu_resource_manager_test
   dpu_reg_plan_test
   dpu_device_resolver_test
+  dpu_placement_test
   dpu_device_bootstrap_plan_test
   virtio_dut_caps_test
   virtio_fabric_resource_test
@@ -37,7 +38,7 @@ _validate_virtio_test_manifest() {
     seen["$test_name"]=1
   done
 
-  for required in dpu_device_resolver_test dpu_device_bootstrap_plan_test; do
+  for required in dpu_device_resolver_test dpu_placement_test dpu_device_bootstrap_plan_test; do
     count=0
     for test_name in "${VIRTIO_MAINTAINED_TESTS[@]}"; do
       [[ "$test_name" == "$required" ]] && count=$((count + 1))

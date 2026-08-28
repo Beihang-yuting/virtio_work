@@ -499,7 +499,8 @@ class dpu_resource_manager extends uvm_object;
         end
 
         for (int unsigned offset = 0; offset < count; offset++) begin
-            lease.owner = key;
+            lease.owner.kind = DPU_RESOURCE_OWNER_FUNCTION;
+            lease.owner.function_key = key;
             lease.local_id = first_local_id + offset;
             lease.class_id = class_id;
             lease.global_id = global_ids[offset];

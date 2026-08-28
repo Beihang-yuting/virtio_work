@@ -27,7 +27,7 @@ typedef enum int unsigned {
 typedef int unsigned dpu_resource_class_id_t;
 
 typedef struct {
-  dpu_function_key_t owner;
+  dpu_resource_owner_t owner;
   int unsigned local_id;
   dpu_resource_class_id_t class_id;
   int unsigned global_id;

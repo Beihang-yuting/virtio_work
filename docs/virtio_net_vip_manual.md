@@ -1607,7 +1607,7 @@ make regression
 
 `scripts/test_manifest.sh` 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的
 单一事实源。该入口按清单顺序运行 `dpu_resource_manager_test`、
-`dpu_reg_plan_test`、`dpu_device_resolver_test`、
+`dpu_reg_plan_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
 `dpu_device_bootstrap_plan_test`、`virtio_dut_caps_test`、
 `virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、
 `virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、

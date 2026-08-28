@@ -5,6 +5,7 @@ dpu_common/tests/dpu_resource_manager_test.sv
 dpu_common/tests/dpu_reg_plan_test.sv
 // scripts/test_manifest.sh guards these focused test sources at exact-once.
 dpu_common/tests/dpu_device_resolver_test.sv
+dpu_common/tests/dpu_placement_test.sv
 dpu_common/tests/dpu_device_bootstrap_plan_test.sv
 virtio_net_vip/tests/virtio_unit_test.sv
 virtio_net_vip/tests/virtio_fabric_resource_test.sv
