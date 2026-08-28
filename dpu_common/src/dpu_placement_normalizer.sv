@@ -518,9 +518,13 @@ class dpu_placement_normalizer extends uvm_object;
                      (ordered_requests[request_index].qpair_overrides[override_index].local_mode != DPU_ASSIGN_PREFERRED)) ||
                     ((ordered_requests[request_index].qpair_overrides[override_index].global_mode != DPU_ASSIGN_AUTO) &&
                      (ordered_requests[request_index].qpair_overrides[override_index].global_mode != DPU_ASSIGN_PINNED) &&
-                     (ordered_requests[request_index].qpair_overrides[override_index].global_mode != DPU_ASSIGN_PREFERRED))) begin
+                     (ordered_requests[request_index].qpair_overrides[override_index].global_mode != DPU_ASSIGN_PREFERRED)) ||
+                    ((ordered_requests[request_index].qpair_overrides[override_index].local_mode != DPU_ASSIGN_AUTO) &&
+                     (ordered_requests[request_index].qpair_overrides[override_index].requested_local_pair_id > 31)) ||
+                    ((ordered_requests[request_index].qpair_overrides[override_index].global_mode != DPU_ASSIGN_AUTO) &&
+                     (ordered_requests[request_index].qpair_overrides[override_index].requested_global_qpair_id > 2047))) begin
                     set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_INVALID_REQUEST,
-                                "qpair override is null, out of range, or has an invalid mode",
+                                "qpair override is null, out of range, or has an invalid mode or ID",
                                 ordered_requests[request_index].request_id, 1);
                     if (ordered_requests[request_index].qpair_overrides[override_index] != null)
                         diagnostic.set_pair_context(ordered_requests[request_index].qpair_overrides[override_index].request_pair_index);

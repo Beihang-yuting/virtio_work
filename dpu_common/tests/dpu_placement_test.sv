@@ -525,6 +525,32 @@ class dpu_placement_test extends uvm_test;
             (diagnostic.error_code != DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED) ||
             !diagnostic.has_request_id)
             `uvm_fatal("PLACEMENT", "ALL_ELIGIBLE demand below candidate count was accepted")
+
+        placement_cfg = make_placement_cfg();
+        request = make_request(34, 1, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        request.qpair_overrides.push_back(make_override(0, DPU_ASSIGN_AUTO,
+            make_function_key(0, 0, DPU_FUNCTION_PF, 0), DPU_ASSIGN_PINNED, 32,
+            DPU_ASSIGN_AUTO, 0));
+        placement_cfg.vio_requests.push_back(request);
+        if (normalizer.normalize(source_cfg, placement_cfg, normalized_cfg, plan, diagnostic) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_INVALID_REQUEST) ||
+            !diagnostic.has_request_id || (diagnostic.request_id != 34) ||
+            !diagnostic.has_pair_index || (diagnostic.request_pair_index != 0))
+            `uvm_fatal("PLACEMENT", "local qpair intent above 31 missed structured diagnostic")
+
+        placement_cfg = make_placement_cfg();
+        request = make_request(35, 1, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        request.qpair_overrides.push_back(make_override(0, DPU_ASSIGN_AUTO,
+            make_function_key(0, 0, DPU_FUNCTION_PF, 0), DPU_ASSIGN_AUTO, 0,
+            DPU_ASSIGN_PREFERRED, 2048));
+        placement_cfg.vio_requests.push_back(request);
+        if (normalizer.normalize(source_cfg, placement_cfg, normalized_cfg, plan, diagnostic) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_INVALID_REQUEST) ||
+            !diagnostic.has_request_id || (diagnostic.request_id != 35) ||
+            !diagnostic.has_pair_index || (diagnostic.request_pair_index != 0))
+            `uvm_fatal("PLACEMENT", "global qpair intent above 2047 missed structured diagnostic")
     endfunction
 endclass : dpu_placement_test
 
