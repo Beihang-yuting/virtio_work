@@ -14,9 +14,11 @@ class virtio_vf_resource_pool extends uvm_object;
     `uvm_object_utils(virtio_vf_resource_pool)
 
     protected virtio_local_queue_mapping_t queue_map[$];
+    protected dpu_resource_snapshot bound_resource_snapshot;
 
     function new(string name = "virtio_vf_resource_pool");
         super.new(name);
+        bound_resource_snapshot = null;
     endfunction
 
     protected function bit same_service(
@@ -39,6 +41,11 @@ class virtio_vf_resource_pool extends uvm_object;
         why = "";
         if ((resource_snapshot == null) || !resource_snapshot.is_frozen()) begin
             why = "queue view requires a frozen resource snapshot";
+            return 0;
+        end
+        if ((bound_resource_snapshot != null) &&
+            (bound_resource_snapshot != resource_snapshot)) begin
+            why = "queue view cannot be rebound to a different resource snapshot";
             return 0;
         end
         resource_snapshot.list_vio_bindings_for_service(service_key, bindings);
@@ -67,6 +74,9 @@ class virtio_vf_resource_pool extends uvm_object;
             imported.push_back(mapping);
         end
 
+        // An exact reimport from the pinned snapshot is idempotent. Any
+        // differing mapping for an existing service is rejected before the
+        // pool is mutated.
         existing_count = 0;
         foreach (queue_map[index]) begin
             if (!same_service(queue_map[index].service_key, service_key))
@@ -87,8 +97,51 @@ class virtio_vf_resource_pool extends uvm_object;
             end
             return 1;
         end
+
+        // Validate the complete candidate against itself and the existing
+        // pool before committing any queue. These checks keep every forward
+        // and reverse lookup one-to-one across all services.
+        foreach (imported[left]) begin
+            for (int right = left + 1; right < imported.size(); right++) begin
+                if (imported[left].global_qid == imported[right].global_qid) begin
+                    why = "queue view has an ambiguous global reverse mapping";
+                    return 0;
+                end
+                if (same_service(imported[left].service_key,
+                                 imported[right].service_key) &&
+                    (imported[left].local_qid == imported[right].local_qid)) begin
+                    why = "queue view has a duplicate service/local mapping";
+                    return 0;
+                end
+                if (imported[left].queue_name == imported[right].queue_name) begin
+                    why = "queue view has a duplicate queue name";
+                    return 0;
+                end
+            end
+            foreach (queue_map[existing_index]) begin
+                if (imported[left].global_qid ==
+                    queue_map[existing_index].global_qid) begin
+                    why = "queue view global qid makes reverse lookup ambiguous";
+                    return 0;
+                end
+                if (same_service(imported[left].service_key,
+                                 queue_map[existing_index].service_key) &&
+                    (imported[left].local_qid ==
+                     queue_map[existing_index].local_qid)) begin
+                    why = "queue view has a duplicate service/local mapping";
+                    return 0;
+                end
+                if (imported[left].queue_name ==
+                    queue_map[existing_index].queue_name) begin
+                    why = "queue view has a duplicate queue name";
+                    return 0;
+                end
+            end
+        end
         foreach (imported[index])
             queue_map.push_back(imported[index]);
+        if (bound_resource_snapshot == null)
+            bound_resource_snapshot = resource_snapshot;
         return 1;
     endfunction
 

@@ -11,11 +11,35 @@ class virtio_vf_instance extends virtio_function_instance;
     endfunction
 
     virtual function bit configure_from_service(
+        input dpu_device_snapshot device_snapshot,
+        input dpu_resource_snapshot resource_snapshot,
+        input dpu_service_key_t service_key,
+        input dpu_resource_manager manager,
+        input uvm_object pcie_ctx = null
+    );
+        dpu_function_key_t owner;
+        string why;
+
+        if ((device_snapshot == null) || !device_snapshot.is_frozen() ||
+            !device_snapshot.get_service_owner(service_key, owner, why)) begin
+            `uvm_fatal("VF_INSTANCE",
+                "VF instance requires a frozen snapshot-declared service")
+            return 0;
+        end
+        if (owner.kind != DPU_FUNCTION_VF) begin
+            `uvm_fatal("VF_INSTANCE",
+                "virtio_vf_instance requires a VF-owned service")
+            return 0;
+        end
+        return super.configure_from_service(
+            device_snapshot, resource_snapshot, service_key, manager, pcie_ctx);
+    endfunction
+
+    virtual function bit configure_from_service_legacy(
         input dpu_device_snapshot snapshot,
         input dpu_service_key_t service,
         input dpu_resource_manager manager,
-        input uvm_object pcie_ctx = null,
-        input dpu_resource_snapshot resource_snapshot = null
+        input uvm_object pcie_ctx = null
     );
         dpu_function_key_t owner;
         string why;
@@ -31,8 +55,8 @@ class virtio_vf_instance extends virtio_function_instance;
                 "virtio_vf_instance requires a VF-owned service")
             return 0;
         end
-        return super.configure_from_service(
-            snapshot, service, manager, pcie_ctx, resource_snapshot);
+        return super.configure_from_service_legacy(
+            snapshot, service, manager, pcie_ctx);
     endfunction
 endclass : virtio_vf_instance
 

@@ -48,11 +48,36 @@ class virtio_pf_instance extends uvm_component;
 
     function bit configure_services(
         input dpu_function_key_t parent_pf_key,
+        input dpu_device_snapshot device_snapshot,
+        input dpu_resource_snapshot resource_snapshot,
+        input dpu_service_key_t service_keys[$],
+        input dpu_resource_manager manager,
+        output string why
+    );
+        return configure_services_internal(
+            parent_pf_key, device_snapshot, resource_snapshot, service_keys,
+            manager, why, 0);
+    endfunction
+
+    function bit configure_services_legacy(
+        input dpu_function_key_t parent_pf_key,
         input dpu_device_snapshot snapshot,
         input dpu_service_key_t service_keys[$],
         input dpu_resource_manager manager,
+        output string why
+    );
+        return configure_services_internal(
+            parent_pf_key, snapshot, null, service_keys, manager, why, 1);
+    endfunction
+
+    protected function bit configure_services_internal(
+        input dpu_function_key_t parent_pf_key,
+        input dpu_device_snapshot snapshot,
+        input dpu_resource_snapshot resource_snapshot,
+        input dpu_service_key_t service_keys[$],
+        input dpu_resource_manager manager,
         output string why,
-        input dpu_resource_snapshot resource_snapshot = null
+        input bit use_legacy_manager_resources
     );
         dpu_function_key_t owner;
         dpu_pcie_function_id_t pcie_id;
@@ -93,8 +118,8 @@ class virtio_pf_instance extends uvm_component;
             why = "VIO service group manager belongs to a different snapshot";
             return 0;
         end
-        if ((resource_snapshot != null) &&
-            (!resource_snapshot.is_frozen() ||
+        if (!use_legacy_manager_resources &&
+            ((resource_snapshot == null) || !resource_snapshot.is_frozen() ||
              !resource_snapshot.references_device_snapshot(snapshot) ||
              !manager.is_seeded_from_snapshots(snapshot, resource_snapshot))) begin
             why = "VIO service group requires its exact frozen resource snapshot";
@@ -162,7 +187,7 @@ class virtio_pf_instance extends uvm_component;
             end
             if (!snapshot.get_service_owner(service_keys[index], owner, why))
                 return 0;
-            if (resource_snapshot != null) begin
+            if (!use_legacy_manager_resources) begin
                 resource_snapshot.list_vio_bindings_for_service(
                     service_keys[index], service_bindings);
                 if (service_bindings.size() == 0) begin
@@ -234,11 +259,20 @@ class virtio_pf_instance extends uvm_component;
                 end
                 pf_function = virtio_function_instance::type_id::create(
                     "pf_function", this);
-                if (!pf_function.configure_from_service(
-                        snapshot, service_keys[index], manager, null,
-                        resource_snapshot)) begin
-                    why = "could not configure resolved PF VIO function";
-                    return 0;
+                if (use_legacy_manager_resources) begin
+                    if (!pf_function.configure_from_service_legacy(
+                            snapshot, service_keys[index], manager)) begin
+                        why = "could not configure resolved PF VIO function";
+                        return 0;
+                    end
+                end
+                else begin
+                    if (!pf_function.configure_from_service(
+                            snapshot, resource_snapshot,
+                            service_keys[index], manager)) begin
+                        why = "could not configure resolved PF VIO function";
+                        return 0;
+                    end
                 end
             end
             else begin
@@ -251,15 +285,24 @@ class virtio_pf_instance extends uvm_component;
                 vf_keys[vf_index] = owner;
                 vf_functions[vf_index] = virtio_vf_instance::type_id::create(
                     $sformatf("vf_function_%0d", owner.vf_id), this);
-                if (!vf_functions[vf_index].configure_from_service(
-                        snapshot, service_keys[index], manager, null,
-                        resource_snapshot)) begin
-                    why = "could not configure resolved VF VIO function";
-                    return 0;
+                if (use_legacy_manager_resources) begin
+                    if (!vf_functions[vf_index].configure_from_service_legacy(
+                            snapshot, service_keys[index], manager)) begin
+                        why = "could not configure resolved VF VIO function";
+                        return 0;
+                    end
+                end
+                else begin
+                    if (!vf_functions[vf_index].configure_from_service(
+                            snapshot, resource_snapshot,
+                            service_keys[index], manager)) begin
+                        why = "could not configure resolved VF VIO function";
+                        return 0;
+                    end
                 end
             end
         end
-        if (resource_snapshot != null) begin
+        if (!use_legacy_manager_resources) begin
             foreach (service_keys[index]) begin
                 if (!pf_manager.resource_pool.import_service_bindings(
                         service_keys[index], resource_snapshot, why)) begin

@@ -7,6 +7,28 @@ import dpu_resource_pkg::*;
 import pcie_tl_pkg::*;
 import virtio_net_pkg::*;
 
+class virtio_monitor_corruptible_resource_snapshot extends dpu_resource_snapshot;
+    `uvm_object_utils(virtio_monitor_corruptible_resource_snapshot)
+
+    function new(string name = "virtio_monitor_corruptible_resource_snapshot");
+        super.new(name);
+    endfunction
+
+    function bit force_service_global_pair(
+        input dpu_service_key_t service_key,
+        input int unsigned global_pair_id
+    );
+        foreach (m_bindings[index]) begin
+            if (dpu_service_key_name(m_bindings[index].service_key) ==
+                dpu_service_key_name(service_key)) begin
+                m_bindings[index].global_qpair_id = global_pair_id;
+                return 1;
+            end
+        end
+        return 0;
+    endfunction
+endclass : virtio_monitor_corruptible_resource_snapshot
+
 // Captures the semantic events emitted by an individual virtio function.
 // Keeping one collector per function makes the routing contract observable:
 // a shared PCIe monitor stream must reach exactly its addressed function.
@@ -101,6 +123,32 @@ class virtio_service_preflight_probe extends virtio_pf_instance;
     virtual function void connect_phase(uvm_phase phase);
     endfunction
 endclass : virtio_service_preflight_probe
+
+// Exposes the real main-environment topology builder without running the
+// rest of the environment build. An empty exact resource snapshot must be a
+// hard failure, never an implicit legacy allocation selector.
+class virtio_resource_topology_probe extends virtio_net_env;
+    `uvm_component_utils(virtio_resource_topology_probe)
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+    endfunction
+
+    function bit configure_and_build(
+        input dpu_device_snapshot exact_device_snapshot,
+        input dpu_resource_snapshot exact_resource_snapshot,
+        input dpu_resource_manager exact_manager,
+        output string why
+    );
+        device_snapshot = exact_device_snapshot;
+        resource_snapshot = exact_resource_snapshot;
+        device_resource_manager = exact_manager;
+        return build_snapshot_topology(why);
+    endfunction
+endclass : virtio_resource_topology_probe
 
 // Exercises the public virtio_net_env PCIe binding with two Fabric functions.
 // A TLP emitted on the external endpoint monitor is addressed only by the PF
@@ -315,6 +363,80 @@ class virtio_monitor_routing_test extends uvm_test;
         return 1;
     endfunction
 
+    protected function bit make_empty_resource_pair(
+        input string label,
+        input dpu_device_snapshot snapshot,
+        input dpu_device_env_config env_cfg,
+        output dpu_resource_snapshot empty_resource,
+        output dpu_resource_manager manager
+    );
+        dpu_normalized_placement_plan plan;
+        dpu_placement_diagnostic diagnostic;
+        dpu_resource_registry_authority authority;
+        string why;
+
+        plan = dpu_normalized_placement_plan::type_id::create(
+            {label, "_empty_plan"});
+        plan.effective_global_capacity = env_cfg.resource_profiles[0].capacity;
+        plan.effective_device_capacity =
+            env_cfg.resource_profiles[0].max_per_function;
+        plan.set_profiles(env_cfg.resource_profiles);
+        if (!plan.freeze(why)) begin
+            `uvm_fatal("FIX1_SETUP", {"could not freeze empty plan: ", why})
+            return 0;
+        end
+        empty_resource = dpu_resource_snapshot::type_id::create(
+            {label, "_empty_resource"});
+        diagnostic = dpu_placement_diagnostic::type_id::create(
+            {label, "_empty_diagnostic"});
+        if (!empty_resource.set_normalized_plan(plan, diagnostic) ||
+            !empty_resource.freeze(snapshot, diagnostic)) begin
+            `uvm_fatal("FIX1_SETUP",
+                {"could not freeze empty resource snapshot: ", diagnostic.message})
+            return 0;
+        end
+        manager = dpu_resource_manager::type_id::create({label, "_manager"});
+        authority = manager.claim_registry_authority();
+        if ((authority == null) || !manager.configure_from_snapshots(
+                authority, snapshot, empty_resource, why)) begin
+            `uvm_fatal("FIX1_SETUP",
+                {"could not seed empty snapshot pair: ", why})
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    // Break caught: the main environment sees an exact empty resource
+    // snapshot and silently routes VIO services through legacy allocation.
+    protected function bit check_empty_resource_snapshot_is_rejected();
+        dpu_device_snapshot snapshot;
+        dpu_resource_snapshot empty_resource;
+        dpu_device_env_config env_cfg;
+        dpu_resource_manager manager;
+        dpu_function_key_t parent_key;
+        dpu_service_key_t service_keys[$];
+        virtio_resource_topology_probe probe;
+        string why;
+
+        if (!resolve_probe_snapshot(
+                "fix_round1_empty_resource", 1, snapshot, env_cfg,
+                parent_key, service_keys) ||
+            !make_empty_resource_pair(
+                "fix_round1_empty_resource", snapshot, env_cfg,
+                empty_resource, manager)) begin
+            return 0;
+        end
+        probe = virtio_resource_topology_probe::type_id::create(
+            "fix_round1_empty_resource_probe", this);
+        if (probe.configure_and_build(snapshot, empty_resource, manager, why) ||
+            (probe.pf_instances.size() != 0)) begin
+            `uvm_error("FIX_ROUND1_EMPTY_RESOURCE",
+                "main VIO environment accepted an exact empty resource snapshot")
+            return 0;
+        end
+        return 1;
+    endfunction
+
     // Break caught: a later service fails BAR validation after the earlier PF
     // child has already been constructed.
     protected function bit check_late_bar_failure_is_atomic();
@@ -337,7 +459,7 @@ class virtio_monitor_routing_test extends uvm_test;
         end
         probe = virtio_service_preflight_probe::type_id::create(
             "fix1_missing_vf_bar_probe", this);
-        configured = probe.configure_services(
+        configured = probe.configure_services_legacy(
             parent_key, snapshot, service_keys, manager, why);
         if (configured || (probe.pf_function != null) ||
             (probe.vf_functions.size() != 0)) begin
@@ -376,7 +498,7 @@ class virtio_monitor_routing_test extends uvm_test;
         qpair_probe = virtio_service_preflight_probe::type_id::create(
             "fix1_missing_qpair_probe", this);
         passed = 1;
-        configured = qpair_probe.configure_services(
+        configured = qpair_probe.configure_services_legacy(
             parent_key, snapshot, service_keys, missing_qpair_manager, why);
         if (configured || (qpair_probe.pf_function != null) ||
             (qpair_probe.vf_functions.size() != 0)) begin
@@ -390,7 +512,7 @@ class virtio_monitor_routing_test extends uvm_test;
             "fix1_unseeded_group_manager");
         seed_probe = virtio_service_preflight_probe::type_id::create(
             "fix1_unseeded_group_probe", this);
-        configured = seed_probe.configure_services(
+        configured = seed_probe.configure_services_legacy(
             parent_key, snapshot, service_keys, legacy_manager, why);
         if (configured || (seed_probe.pf_function != null) ||
             (seed_probe.vf_functions.size() != 0)) begin
@@ -421,6 +543,8 @@ class virtio_monitor_routing_test extends uvm_test;
         fix1_checks_passed = check_late_bar_failure_is_atomic() &&
                              fix1_checks_passed;
         fix1_checks_passed = check_manager_dependencies_are_preflighted() &&
+                             fix1_checks_passed;
+        fix1_checks_passed = check_empty_resource_snapshot_is_rejected() &&
                              fix1_checks_passed;
         if (!fix1_checks_passed) begin
             `uvm_fatal("FIX1_RED",
@@ -470,6 +594,8 @@ class virtio_monitor_routing_test extends uvm_test;
 
         device_builder = virtio_test_device_builder::type_id::create(
             "device_builder");
+        dpu_resource_snapshot::type_id::set_type_override(
+            virtio_monitor_corruptible_resource_snapshot::get_type());
         void'(device_builder.add_host_domain(0, 0, 16'h0100, 16'h03ff,
             64'h0000_0002_0000_0000, 64'h0000_0003_0000_0000));
         void'(device_builder.add_host_domain(1, 0, 16'h0100, 16'h03ff,
@@ -745,10 +871,69 @@ class virtio_monitor_routing_test extends uvm_test;
             `uvm_fatal("ROUTING_TEST",
                 "runtime reset mutated immutable sparse placement")
         end
+        test_resource_pool_snapshot_and_collision_rejection(pf, vf);
         assert_domain_reused_transport_path(pf, reused_pf);
 
         `uvm_info("ROUTING_TEST", "External PCIe monitor routing PASSED", UVM_NONE)
         phase.drop_objection(this);
+    endtask
+
+    // Breaks caught: a pool can be rebound to a second resource snapshot, or
+    // can partially append a service whose global qid makes reverse lookup
+    // ambiguous with an already imported service.
+    protected task test_resource_pool_snapshot_and_collision_rejection(
+        input virtio_function_instance pf,
+        input virtio_function_instance vf
+    );
+        dpu_configuration_resolver resolver;
+        dpu_device_snapshot alternate_device;
+        dpu_resource_snapshot alternate_resource;
+        dpu_placement_diagnostic diagnostic;
+        virtio_vf_resource_pool pool;
+        virtio_monitor_corruptible_resource_snapshot corruptible;
+        int unsigned original_count;
+        int unsigned global_qid;
+        string why;
+
+        resolver = dpu_configuration_resolver::type_id::create(
+            "pool_alternate_resolver");
+        if (!resolver.resolve(
+                device_env_cfg.device_cfg, device_env_cfg.placement_cfg,
+                alternate_device, alternate_resource, diagnostic)) begin
+            `uvm_fatal("ROUTING_TEST",
+                {"could not build alternate snapshot pair: ", diagnostic.message})
+        end
+        pool = virtio_vf_resource_pool::type_id::create("snapshot_owner_pool");
+        if (!pool.import_service_bindings(
+                pf.service_key, device_env.get_resource_snapshot(), why)) begin
+            `uvm_fatal("ROUTING_TEST", {"initial pool import failed: ", why})
+        end
+        original_count = pool.get_total_queues();
+        if (pool.import_service_bindings(
+                pf.service_key, alternate_resource, why) ||
+            (pool.get_total_queues() != original_count) ||
+            !pool.local_to_global_for_service(pf.service_key, 6, global_qid) ||
+            (global_qid != 66)) begin
+            `uvm_fatal("ROUTING_TEST",
+                "pool accepted a different resource snapshot or mutated state")
+        end
+
+        pool = virtio_vf_resource_pool::type_id::create("collision_pool");
+        if (!pool.import_service_bindings(
+                pf.service_key, device_env.get_resource_snapshot(), why) ||
+            !$cast(corruptible, device_env.get_resource_snapshot()) ||
+            !corruptible.force_service_global_pair(vf.service_key, 30)) begin
+            `uvm_fatal("ROUTING_TEST",
+                "could not prepare cross-service collision probe")
+        end
+        original_count = pool.get_total_queues();
+        if (pool.import_service_bindings(
+                vf.service_key, device_env.get_resource_snapshot(), why) ||
+            (pool.get_total_queues() != original_count) ||
+            pool.local_to_global_for_service(vf.service_key, 0, global_qid)) begin
+            `uvm_fatal("ROUTING_TEST",
+                "pool accepted an ambiguous global qid or partially mutated")
+        end
     endtask
 
     // The production transport and accessor must preserve endpoint identity

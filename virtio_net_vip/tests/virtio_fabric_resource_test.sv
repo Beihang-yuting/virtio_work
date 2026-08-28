@@ -1004,8 +1004,8 @@ class virtio_fabric_resource_test extends uvm_test;
         original_bdf = function_view.bdf;
         original_bars = function_view.bar_pairs;
         if (!function_view.configure_from_service(
-                device_snapshot, function_view.service_key,
-                function_view.resource_manager, null, resource_snapshot)) begin
+                device_snapshot, resource_snapshot,
+                function_view.service_key, function_view.resource_manager)) begin
             `uvm_fatal("FABRIC_RESOURCE",
                 "idempotent snapshot/service function binding was rejected")
         end
@@ -1034,8 +1034,8 @@ class virtio_fabric_resource_test extends uvm_test;
             "FUNCTION_INSTANCE", UVM_FATAL);
         uvm_report_cb::add(null, catcher);
         configuration_succeeded = function_view.configure_from_service(
-            forged_snapshot, function_view.service_key,
-            function_view.resource_manager, null, resource_snapshot);
+            forged_snapshot, resource_snapshot, function_view.service_key,
+            function_view.resource_manager);
         uvm_report_cb::delete(null, catcher);
 
         bars_preserved =
@@ -1215,6 +1215,10 @@ class virtio_fabric_resource_test extends uvm_test;
         env.pf_instances[0].pf_function.on_flr();
         assert_sparse_snapshot_mapping(
             env.pf_instances[0].pf_function, "FLR");
+        env.pf_instances[0].pf_function.reinit_after_flr(
+            env.pf_instances[0].pf_function.drv_cfg);
+        assert_sparse_snapshot_mapping(
+            env.pf_instances[0].pf_function, "reinit_after_flr");
         discover_fabric_function(env.pf_instances[0].pf_function);
         assert_sparse_snapshot_mapping(
             env.pf_instances[0].pf_function, "reinitialization");

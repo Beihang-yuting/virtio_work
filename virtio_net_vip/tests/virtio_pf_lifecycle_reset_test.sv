@@ -272,6 +272,9 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         uvm_config_db#(dpu_device_env_config)::set(
             this, "device_env", "cfg", device_cfg);
         device_env = dpu_device_env::type_id::create("device_env", this);
+        uvm_config_db#(bit)::set(
+            this, "device_env.env",
+            "TEMPORARY_VIO_RESOURCE_COMPATIBILITY", 1);
         uvm_config_db#(virtio_net_env_config)::set(
             this, "device_env.env", "cfg", cfg);
         env = virtio_net_env::type_id::create("env", device_env);

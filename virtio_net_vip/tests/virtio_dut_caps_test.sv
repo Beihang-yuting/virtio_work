@@ -888,6 +888,8 @@ class virtio_dut_caps_test extends uvm_test;
 
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
+        uvm_config_db#(bit)::set(
+            this, "*", "TEMPORARY_VIO_RESOURCE_COMPATIBILITY", 1);
         manager_device_env = make_device_env_fixture(
             "manager_device_env", 1, 1);
 
@@ -1362,7 +1364,7 @@ class virtio_dut_caps_test extends uvm_test;
         transport_spy = virtio_dut_caps_transport_config_spy::type_id::create(
             "fatal_bind_transport_spy");
         fatal_binding_function.transport = transport_spy;
-        configuration_succeeded = fatal_binding_function.configure_from_service(
+        configuration_succeeded = fatal_binding_function.configure_from_service_legacy(
             snapshot_a, service_a, manager_a);
         if (!configuration_succeeded ||
             (transport_spy.configure_fabric_count != 1) ||
@@ -1378,7 +1380,7 @@ class virtio_dut_caps_test extends uvm_test;
         catcher = new("function_bind_return_catcher",
             fatal_binding_function, "FUNCTION_INSTANCE", expected_message);
         uvm_report_cb::add(null, catcher);
-        configuration_succeeded = fatal_binding_function.configure_from_service(
+        configuration_succeeded = fatal_binding_function.configure_from_service_legacy(
             snapshot_b, service_b, manager_b);
         uvm_report_cb::delete(null, catcher);
 
@@ -1418,7 +1420,7 @@ class virtio_dut_caps_test extends uvm_test;
         null_manager_catcher = new("function_null_manager_return_catcher",
             fatal_binding_function, "FUNCTION_INSTANCE", expected_message);
         uvm_report_cb::add(null, null_manager_catcher);
-        configuration_succeeded = fatal_binding_function.configure_from_service(
+        configuration_succeeded = fatal_binding_function.configure_from_service_legacy(
             snapshot_a, service_a, null);
         uvm_report_cb::delete(null, null_manager_catcher);
 
@@ -1488,7 +1490,7 @@ class virtio_dut_caps_test extends uvm_test;
             {"function configuration ownership cannot be reassigned to a ",
              "different device snapshot"});
         uvm_report_cb::add(null, catcher);
-        configuration_succeeded = failing_function.configure_from_service(
+        configuration_succeeded = failing_function.configure_from_service_legacy(
             candidate_snapshot, candidate_service, candidate_manager);
         uvm_report_cb::delete(null, catcher);
 

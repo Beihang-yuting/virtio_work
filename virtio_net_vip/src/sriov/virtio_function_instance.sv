@@ -62,15 +62,40 @@ class virtio_function_instance extends uvm_component;
         apply_function_configuration();
     endfunction
 
-    // Resolve all identity and placement from one frozen, service-keyed device
-    // snapshot. Callers cannot provide raw BDF/BAR values, and an established
-    // function binding cannot move to a different snapshot.
+    // The primary entry point always consumes the exact frozen resource
+    // snapshot. Legacy manager-backed allocation is available only through the
+    // explicitly named compatibility wrapper below.
     virtual function bit configure_from_service(
+        input dpu_device_snapshot device_snapshot,
+        input dpu_resource_snapshot resource_snapshot,
+        input dpu_service_key_t service_key,
+        input dpu_resource_manager manager,
+        input uvm_object pcie_ctx = null
+    );
+        return configure_from_service_internal(
+            device_snapshot, resource_snapshot, service_key, manager, pcie_ctx, 0);
+    endfunction
+
+    virtual function bit configure_from_service_legacy(
         input dpu_device_snapshot snapshot,
         input dpu_service_key_t service,
         input dpu_resource_manager manager,
-        input uvm_object pcie_ctx = null,
-        input dpu_resource_snapshot resource_snapshot = null
+        input uvm_object pcie_ctx = null
+    );
+        return configure_from_service_internal(
+            snapshot, null, service, manager, pcie_ctx, 1);
+    endfunction
+
+    // Resolve all identity and placement from one frozen, service-keyed device
+    // snapshot. Callers cannot provide raw BDF/BAR values, and an established
+    // function binding cannot move to a different snapshot.
+    protected function bit configure_from_service_internal(
+        input dpu_device_snapshot snapshot,
+        input dpu_resource_snapshot resource_snapshot,
+        input dpu_service_key_t service,
+        input dpu_resource_manager manager,
+        input uvm_object pcie_ctx,
+        input bit use_legacy_manager_resources
     );
         dpu_function_key_t key;
         dpu_pcie_function_id_t pcie_id;
@@ -121,8 +146,8 @@ class virtio_function_instance extends uvm_component;
                 "function configuration requires its snapshot-seeded device manager")
             return 0;
         end
-        if ((resource_snapshot != null) &&
-            (!resource_snapshot.is_frozen() ||
+        if (!use_legacy_manager_resources &&
+            ((resource_snapshot == null) || !resource_snapshot.is_frozen() ||
              !resource_snapshot.references_device_snapshot(snapshot) ||
              !manager.is_seeded_from_snapshots(snapshot, resource_snapshot))) begin
             `uvm_fatal("FUNCTION_INSTANCE",
@@ -130,7 +155,7 @@ class virtio_function_instance extends uvm_component;
             return 0;
         end
         if (resource_client != null) begin
-            if ((resource_snapshot != null) &&
+            if (!use_legacy_manager_resources &&
                 !resource_client.bind_to_service(
                     snapshot, resource_snapshot, service, why)) begin
                 `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
@@ -138,7 +163,7 @@ class virtio_function_instance extends uvm_component;
                     dpu_service_key_name(service), why))
                 return 0;
             end
-            if ((resource_snapshot == null) &&
+            if (use_legacy_manager_resources &&
                 !resource_client.bind_to_device(manager, key, why)) begin
                 `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                     "could not bind device resources for %0d:%0d:%0d:%0d: %s",
