@@ -200,6 +200,109 @@ class dpu_service_decl extends uvm_object;
 endclass : dpu_service_decl
 
 
+function automatic bit dpu_service_kind_is_eligible(
+    input dpu_service_kind_e kinds[$],
+    input dpu_service_kind_e service_kind
+);
+    foreach (kinds[index]) begin
+        if (kinds[index] == service_kind)
+            return 1;
+    end
+    return 0;
+endfunction
+
+
+class dpu_vf_template_cfg extends uvm_object;
+    `uvm_object_utils(dpu_vf_template_cfg)
+
+    int unsigned vf_id;
+    dpu_pcie_domain_key_t domain_key;
+    dpu_allocation_mode_e bdf_mode;
+    bit [15:0] pinned_bdf;
+    dpu_bar_request bars[$];
+    dpu_service_kind_e eligible_service_kinds[$];
+
+    function new(string name = "dpu_vf_template_cfg");
+        super.new(name);
+        vf_id = 0;
+        bdf_mode = DPU_ALLOC_AUTO;
+        pinned_bdf = '0;
+    endfunction
+
+    function void copy_from(input dpu_vf_template_cfg rhs);
+        dpu_bar_request bar_copy;
+
+        vf_id = rhs.vf_id;
+        domain_key = rhs.domain_key;
+        bdf_mode = rhs.bdf_mode;
+        pinned_bdf = rhs.pinned_bdf;
+        bars.delete();
+        foreach (rhs.bars[index]) begin
+            if (rhs.bars[index] == null) begin
+                bars.push_back(null);
+            end else begin
+                bar_copy = dpu_bar_request::type_id::create(
+                    $sformatf("%s_bar_%0d", get_name(), index));
+                bar_copy.copy_from(rhs.bars[index]);
+                bars.push_back(bar_copy);
+            end
+        end
+        eligible_service_kinds = rhs.eligible_service_kinds;
+    endfunction
+
+    virtual function void do_copy(uvm_object rhs);
+        dpu_vf_template_cfg typed_rhs;
+
+        super.do_copy(rhs);
+        if (!$cast(typed_rhs, rhs)) begin
+            `uvm_error("DPU_CFG_COPY", "VF template copy received incompatible object")
+            return;
+        end
+        copy_from(typed_rhs);
+    endfunction
+endclass : dpu_vf_template_cfg
+
+
+class dpu_vf_pool_cfg extends uvm_object;
+    `uvm_object_utils(dpu_vf_pool_cfg)
+
+    dpu_function_key_t parent_pf;
+    dpu_vf_template_cfg vf_templates[$];
+
+    function new(string name = "dpu_vf_pool_cfg");
+        super.new(name);
+    endfunction
+
+    function void copy_from(input dpu_vf_pool_cfg rhs);
+        dpu_vf_template_cfg template_copy;
+
+        parent_pf = rhs.parent_pf;
+        vf_templates.delete();
+        foreach (rhs.vf_templates[index]) begin
+            if (rhs.vf_templates[index] == null) begin
+                vf_templates.push_back(null);
+            end else begin
+                template_copy = dpu_vf_template_cfg::type_id::create(
+                    $sformatf("%s_template_%0d", get_name(), index));
+                template_copy.copy_from(rhs.vf_templates[index]);
+                vf_templates.push_back(template_copy);
+            end
+        end
+    endfunction
+
+    virtual function void do_copy(uvm_object rhs);
+        dpu_vf_pool_cfg typed_rhs;
+
+        super.do_copy(rhs);
+        if (!$cast(typed_rhs, rhs)) begin
+            `uvm_error("DPU_CFG_COPY", "VF pool copy received incompatible object")
+            return;
+        end
+        copy_from(typed_rhs);
+    endfunction
+endclass : dpu_vf_pool_cfg
+
+
 class dpu_function_cfg extends uvm_object;
     `uvm_object_utils(dpu_function_cfg)
 
@@ -209,6 +312,7 @@ class dpu_function_cfg extends uvm_object;
     bit [15:0] pinned_bdf;
     dpu_bar_request bars[$];
     dpu_service_decl services[$];
+    dpu_service_kind_e eligible_service_kinds[$];
 
     function new(string name = "dpu_function_cfg");
         super.new(name);
@@ -246,6 +350,7 @@ class dpu_function_cfg extends uvm_object;
                 services.push_back(service_copy);
             end
         end
+        eligible_service_kinds = rhs.eligible_service_kinds;
     endfunction
 
     virtual function void do_copy(uvm_object rhs);
@@ -296,6 +401,7 @@ class dpu_device_cfg extends uvm_object;
     dpu_dut_caps dut_caps;
     dpu_host_cfg hosts[$];
     dpu_function_cfg functions[$];
+    dpu_vf_pool_cfg vf_pools[$];
     dpu_af_request af_request;
 
     function new(string name = "dpu_device_cfg");
@@ -307,6 +413,7 @@ class dpu_device_cfg extends uvm_object;
     function void copy_from(input dpu_device_cfg rhs);
         dpu_host_cfg host_copy;
         dpu_function_cfg function_copy;
+        dpu_vf_pool_cfg pool_copy;
 
         if (rhs.dut_caps == null) begin
             dut_caps = null;
@@ -334,6 +441,17 @@ class dpu_device_cfg extends uvm_object;
                     $sformatf("%s_function_%0d", get_name(), index));
                 function_copy.copy_from(rhs.functions[index]);
                 functions.push_back(function_copy);
+            end
+        end
+        vf_pools.delete();
+        foreach (rhs.vf_pools[index]) begin
+            if (rhs.vf_pools[index] == null) begin
+                vf_pools.push_back(null);
+            end else begin
+                pool_copy = dpu_vf_pool_cfg::type_id::create(
+                    $sformatf("%s_vf_pool_%0d", get_name(), index));
+                pool_copy.copy_from(rhs.vf_pools[index]);
+                vf_pools.push_back(pool_copy);
             end
         end
         if (rhs.af_request == null) begin

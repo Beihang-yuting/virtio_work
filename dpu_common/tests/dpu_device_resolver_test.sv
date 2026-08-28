@@ -576,8 +576,22 @@ class dpu_device_resolver_test extends uvm_test;
     function void test_copy_from_is_deep(input dpu_device_resolver resolver);
         dpu_device_cfg source;
         dpu_device_cfg clone;
+        dpu_vf_pool_cfg pool;
+        dpu_vf_template_cfg template;
 
         source = make_valid_cfg();
+        source.functions[3].eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
+        source.functions[3].eligible_service_kinds.push_back(DPU_SERVICE_RDMA);
+        pool = dpu_vf_pool_cfg::type_id::create("pf3_pool");
+        pool.parent_pf = source.functions[2].key;
+        template = dpu_vf_template_cfg::type_id::create("vf8_template");
+        template.vf_id = 8;
+        template.domain_key = source.functions[2].domain_key;
+        template.bdf_mode = DPU_ALLOC_AUTO;
+        template.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
+        template.bars.push_back(make_bar(DPU_FUNCTION_VF, DPU_BAR_DEVICE_MEMORY));
+        pool.vf_templates.push_back(template);
+        source.vf_pools.push_back(pool);
         clone = clone_cfg(source);
         clone.dut_caps.max_hosts = 3;
         clone.hosts[0].host_id = 3;
@@ -585,6 +599,12 @@ class dpu_device_resolver_test extends uvm_test;
             64'h0000_0003_0000_0000;
         clone.functions[3].bars[0].size = 64'h0000_0000_0000_1000;
         clone.functions[3].services[0].service_instance_id = 9;
+        clone.functions[3].eligible_service_kinds[0] = DPU_SERVICE_VBLK;
+        clone.vf_pools[0].vf_templates[0].vf_id = 9;
+        clone.vf_pools[0].vf_templates[0].bars[0].size =
+            64'h0000_0000_0000_1000;
+        clone.vf_pools[0].vf_templates[0].eligible_service_kinds[0] =
+            DPU_SERVICE_RDMA;
         clone.af_request.requester.host_id = 0;
         if ((source.dut_caps.max_hosts != 2) ||
             (source.hosts[0].host_id != 0) ||
@@ -592,6 +612,12 @@ class dpu_device_resolver_test extends uvm_test;
              64'h0000_0001_0000_0000) ||
             (source.functions[3].bars[0].size != 64'h0000_0000_0000_4000) ||
             (source.functions[3].services[0].service_instance_id != 0) ||
+            (source.functions[3].eligible_service_kinds[0] != DPU_SERVICE_VIO_NET) ||
+            (source.vf_pools[0].vf_templates[0].vf_id != 8) ||
+            (source.vf_pools[0].vf_templates[0].bars[0].size !=
+             64'h0000_0000_0000_4000) ||
+            (source.vf_pools[0].vf_templates[0].eligible_service_kinds[0] !=
+             DPU_SERVICE_VIO_NET) ||
             (source.af_request.requester.host_id != 1))
             `uvm_fatal("RESOLVER_TEST", "device config copy shares owned children")
         expect_valid(resolver, source);
