@@ -46,6 +46,11 @@ class dpu_resource_manager extends uvm_object;
     protected bit                            registry_authority_claimed;
     protected bit                            snapshot_configured;
     protected dpu_device_snapshot            configured_snapshot;
+    protected dpu_resource_snapshot          configured_resource_snapshot;
+    protected dpu_resource_lease_t           service_leases_by_name[string][$];
+    protected int unsigned                   service_local_to_global_qpair[
+        string
+    ][dpu_resource_class_id_t][int unsigned];
     protected dpu_dut_caps                  dut_caps;
 
     function new(string name = "dpu_resource_manager");
@@ -57,6 +62,7 @@ class dpu_resource_manager extends uvm_object;
         registry_authority_claimed = 0;
         snapshot_configured = 0;
         configured_snapshot = null;
+        configured_resource_snapshot = null;
     endfunction
 
     protected function string function_key_name(
@@ -314,6 +320,175 @@ class dpu_resource_manager extends uvm_object;
         return 1;
     endfunction
 
+    // The resource snapshot is the VIO qpair authority. Build all imported
+    // state in a private candidate so no failed import can publish state.
+    function bit configure_from_snapshots(
+        input dpu_resource_registry_authority authority,
+        input dpu_device_snapshot device_snapshot,
+        input dpu_resource_snapshot resource_snapshot,
+        output string why
+    );
+        dpu_resource_manager candidate;
+        dpu_dut_caps caps;
+        dpu_function_key_t function_keys[$];
+        dpu_resource_pool_config_t profiles[$];
+        dpu_vio_qpair_binding_t bindings[$];
+        dpu_resource_class_id_t qpair_class_id;
+        dpu_resource_class_id_t class_id;
+
+        why = "";
+        if (!registry_authority_claimed || (authority == null) ||
+            (authority != registry_authority)) begin
+            why = "snapshot configuration requires the device registry authority";
+            return 0;
+        end
+        if (snapshot_configured) begin
+            why = "resource manager has already been configured from snapshots";
+            return 0;
+        end
+        if ((device_snapshot == null) || !device_snapshot.is_frozen() ||
+            (resource_snapshot == null) || !resource_snapshot.is_frozen() ||
+            !resource_snapshot.references_device_snapshot(device_snapshot)) begin
+            why = "resource snapshot is not frozen against the supplied device snapshot";
+            return 0;
+        end
+        caps = device_snapshot.snapshot_dut_caps();
+        if ((caps == null) || !caps.validate(why))
+            return 0;
+
+        candidate = new({get_name(), "_snapshots_candidate"});
+        candidate.dut_caps.copy_from(caps);
+        device_snapshot.list_functions(function_keys);
+        foreach (function_keys[index]) begin
+            if (!candidate.seed_function(function_keys[index], why))
+                return 0;
+        end
+        resource_snapshot.list_resource_profiles(profiles);
+        foreach (profiles[index]) begin
+            if (profiles[index].name == "virtio.qpair") begin
+                if (profiles[index].capacity > caps.vio_global_qpair_count) begin
+                    why = $sformatf(
+                        {"virtio.qpair capacity %0d exceeds snapshot ",
+                         "vio_global_qpair_count %0d"},
+                        profiles[index].capacity, caps.vio_global_qpair_count);
+                    return 0;
+                end
+                if (profiles[index].max_per_function >
+                    caps.max_vio_net_qpairs_per_device) begin
+                    why = $sformatf(
+                        {"virtio.qpair max_per_function %0d exceeds snapshot ",
+                         "max_vio_net_qpairs_per_device %0d"},
+                        profiles[index].max_per_function,
+                        caps.max_vio_net_qpairs_per_device);
+                    return 0;
+                end
+            end
+            if (!candidate.register_resource_class_internal(
+                    profiles[index].name, profiles[index].kind,
+                    profiles[index].capacity, profiles[index].max_per_function,
+                    class_id, why))
+                return 0;
+        end
+        if (!candidate.lookup_resource_class("virtio.qpair", qpair_class_id,
+                                             why)) begin
+            why = "resource snapshot has VIO bindings without a virtio.qpair profile";
+            return 0;
+        end
+        if (candidate.resource_profiles_by_id[qpair_class_id].kind !=
+            DPU_RESOURCE_KIND_QUEUE) begin
+            why = "virtio.qpair profile is not a queue resource class";
+            return 0;
+        end
+        resource_snapshot.list_vio_bindings(bindings);
+        foreach (bindings[index]) begin
+            dpu_function_key_t owner_key;
+            dpu_resource_function_state state;
+            dpu_resource_pool_config_t profile;
+            dpu_resource_lease_t lease;
+            string service_name;
+            int unsigned class_count;
+            int unsigned function_count;
+
+            if (bindings[index].service_key.service_kind != DPU_SERVICE_VIO_NET) begin
+                why = "resource snapshot binding is not VIO-net owned";
+                return 0;
+            end
+            if (!device_snapshot.get_service_owner(bindings[index].service_key,
+                                                   owner_key, why) ||
+                !dpu_same_function_key(owner_key,
+                                       bindings[index].service_key.function_key)) begin
+                why = {"resource snapshot binding has no matching device service: ",
+                       dpu_service_key_name(bindings[index].service_key)};
+                return 0;
+            end
+            if (!candidate.lookup_function_state(
+                    bindings[index].service_key.function_key, state, why))
+                return 0;
+            profile = candidate.resource_profiles_by_id[qpair_class_id];
+            if (bindings[index].global_qpair_id >= profile.capacity) begin
+                why = "VIO qpair global ID exceeds imported profile capacity";
+                return 0;
+            end
+            if (candidate.active_global_ids[qpair_class_id].exists(
+                    bindings[index].global_qpair_id)) begin
+                why = "VIO qpair global ID is duplicated in resource snapshot";
+                return 0;
+            end
+            service_name = dpu_service_key_name(bindings[index].service_key);
+            if (candidate.service_local_to_global_qpair[service_name][
+                    qpair_class_id].exists(bindings[index].local_pair_id)) begin
+                why = "VIO qpair local ID is duplicated for service";
+                return 0;
+            end
+            class_count = candidate.allocated_count(qpair_class_id);
+            if (class_count >= profile.capacity) begin
+                why = "VIO qpair resource-class capacity is exhausted";
+                return 0;
+            end
+            function_count = candidate.function_class_lease_count(
+                state, qpair_class_id);
+            if ((function_count >= profile.max_per_function) ||
+                (candidate.service_leases_by_name[service_name].size() >=
+                 profile.max_per_function)) begin
+                why = "VIO qpair per-service or per-function quota is exhausted";
+                return 0;
+            end
+
+            lease.owner.kind = DPU_RESOURCE_OWNER_SERVICE;
+            lease.owner.function_key = bindings[index].service_key.function_key;
+            lease.owner.service_key = bindings[index].service_key;
+            lease.local_id = bindings[index].local_pair_id;
+            lease.class_id = qpair_class_id;
+            lease.global_id = bindings[index].global_qpair_id;
+            lease.frozen = 1;
+            state.leases.push_back(lease);
+            state.frozen = 1;
+            candidate.service_leases_by_name[service_name].push_back(lease);
+            candidate.service_local_to_global_qpair[service_name][qpair_class_id][
+                lease.local_id] = lease.global_id;
+            candidate.active_global_ids[qpair_class_id][lease.global_id] = 1;
+            candidate.class_allocated_count[qpair_class_id] = class_count + 1;
+        end
+        if (!candidate.seal_resource_classes_internal(why))
+            return 0;
+
+        dut_caps.copy_from(candidate.dut_caps);
+        function_states = candidate.function_states;
+        class_id_by_name = candidate.class_id_by_name;
+        resource_profiles_by_id = candidate.resource_profiles_by_id;
+        class_allocated_count = candidate.class_allocated_count;
+        active_global_ids = candidate.active_global_ids;
+        service_leases_by_name = candidate.service_leases_by_name;
+        service_local_to_global_qpair = candidate.service_local_to_global_qpair;
+        next_resource_class_id = candidate.next_resource_class_id;
+        resource_classes_sealed = candidate.resource_classes_sealed;
+        configured_snapshot = device_snapshot;
+        configured_resource_snapshot = resource_snapshot;
+        snapshot_configured = 1;
+        why = "";
+        return 1;
+    endfunction
+
     function dpu_dut_caps snapshot_dut_caps();
         dpu_dut_caps snapshot;
         snapshot = dpu_dut_caps::type_id::create("dut_caps_snapshot");
@@ -400,6 +575,61 @@ class dpu_resource_manager extends uvm_object;
     function bit is_seeded_from_snapshot(input dpu_device_snapshot snapshot);
         return snapshot_configured && (snapshot != null) &&
                (configured_snapshot == snapshot);
+    endfunction
+
+    function bit is_seeded_from_snapshots(
+        input dpu_device_snapshot device_snapshot,
+        input dpu_resource_snapshot resource_snapshot
+    );
+        return snapshot_configured && (device_snapshot != null) &&
+               (resource_snapshot != null) &&
+               (configured_snapshot == device_snapshot) &&
+               (configured_resource_snapshot == resource_snapshot);
+    endfunction
+
+    function bit local_pair_to_global_qpair(
+        input dpu_service_key_t service_key,
+        input dpu_resource_class_id_t class_id,
+        input int unsigned local_pair_id,
+        output int unsigned global_qpair_id
+    );
+        string service_name;
+
+        global_qpair_id = '0;
+        service_name = dpu_service_key_name(service_key);
+        if (!service_local_to_global_qpair.exists(service_name) ||
+            !service_local_to_global_qpair[service_name].exists(class_id) ||
+            !service_local_to_global_qpair[service_name][class_id].exists(
+                local_pair_id))
+            return 0;
+        global_qpair_id = service_local_to_global_qpair[service_name][class_id][
+            local_pair_id];
+        return 1;
+    endfunction
+
+    function void list_service_leases(
+        input dpu_service_key_t service_key,
+        ref dpu_resource_lease_t leases[$]
+    );
+        dpu_resource_lease_t swap;
+        string service_name;
+
+        leases.delete();
+        service_name = dpu_service_key_name(service_key);
+        if (!service_leases_by_name.exists(service_name))
+            return;
+        leases = service_leases_by_name[service_name];
+        for (int left = 0; left < leases.size(); left++) begin
+            for (int right = left + 1; right < leases.size(); right++) begin
+                if ((leases[right].local_id < leases[left].local_id) ||
+                    ((leases[right].local_id == leases[left].local_id) &&
+                     (leases[right].class_id < leases[left].class_id))) begin
+                    swap = leases[left];
+                    leases[left] = leases[right];
+                    leases[right] = swap;
+                end
+            end
+        end
     endfunction
 
     protected function bit seal_resource_classes_internal(output string why);

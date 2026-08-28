@@ -5,47 +5,24 @@ import uvm_pkg::*;
 `include "uvm_macros.svh"
 import dpu_resource_pkg::*;
 
-// ============================================================================
-// dpu_resource_manager_test
-//
-// Defines the generic lease boundary for the snapshot-seeded resource manager:
-// 4 hosts x 16 PFs plus 60 x 16 VFs consume all 1024 function identities.
-// ============================================================================
-
+// Snapshot imports retain the full DUT function inventory, while VIO qpair
+// ownership remains service-scoped and immutable.
 class dpu_resource_manager_test extends uvm_test;
     `uvm_component_utils(dpu_resource_manager_test)
 
-    dpu_device_env device_env;
-    dpu_device_env_config device_env_cfg;
+    dpu_device_snapshot device_snapshot;
+    dpu_resource_snapshot resource_snapshot;
+    dpu_service_key_t service_key;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
 
-    virtual function void build_phase(uvm_phase phase);
-        dpu_resource_pool_config_t qpair_profile;
-
-        super.build_phase(phase);
-        device_env_cfg = dpu_device_env_config::type_id::create("device_env_cfg");
-        device_env_cfg.device_cfg = make_capacity_device_cfg();
-        qpair_profile = make_resource_profile(
-            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE, 2048, 32
-        );
-        device_env_cfg.resource_profiles.push_back(qpair_profile);
-        uvm_config_db#(dpu_device_env_config)::set(
-            this, "device_env", "cfg", device_env_cfg
-        );
-        device_env = dpu_device_env::type_id::create("device_env", this);
-    endfunction
-
     function automatic dpu_function_key_t make_function_key(
-        int unsigned host_id,
-        int unsigned pf_id,
-        dpu_function_kind_e kind,
-        int unsigned vf_id
+        input int unsigned host_id, input int unsigned pf_id,
+        input dpu_function_kind_e kind, input int unsigned vf_id
     );
         dpu_function_key_t key;
-
         key.host_id = host_id;
         key.pf_id = pf_id;
         key.kind = kind;
@@ -53,26 +30,10 @@ class dpu_resource_manager_test extends uvm_test;
         return key;
     endfunction
 
-    function automatic dpu_resource_pool_config_t make_resource_profile(
-        string name,
-        dpu_resource_kind_e kind,
-        int unsigned capacity,
-        int unsigned max_per_function
-    );
-        dpu_resource_pool_config_t profile;
-
-        profile.name = name;
-        profile.kind = kind;
-        profile.capacity = capacity;
-        profile.max_per_function = max_per_function;
-        return profile;
-    endfunction
-
     function automatic dpu_function_cfg make_function_cfg(
         input dpu_function_key_t key
     );
         dpu_function_cfg function_cfg;
-
         function_cfg = dpu_function_cfg::type_id::create("function_cfg");
         function_cfg.key = key;
         function_cfg.domain_key.host_id = key.host_id;
@@ -85,6 +46,7 @@ class dpu_resource_manager_test extends uvm_test;
         dpu_device_cfg cfg;
         dpu_function_cfg function_cfg;
         dpu_bar_request af_bar;
+        dpu_service_decl vio_service;
 
         cfg = dpu_device_cfg::type_id::create("capacity_cfg");
         cfg.dut_caps.max_hosts = DPU_MAX_HOSTS;
@@ -115,8 +77,7 @@ class dpu_resource_manager_test extends uvm_test;
             for (int unsigned pf_id = 0;
                  pf_id < DPU_MAX_PFS_PER_HOST; pf_id++) begin
                 function_cfg = make_function_cfg(make_function_key(
-                    host_id, pf_id, DPU_FUNCTION_PF, 0
-                ));
+                    host_id, pf_id, DPU_FUNCTION_PF, 0));
                 if ((host_id == 0) && (pf_id == 0)) begin
                     af_bar = dpu_bar_request::type_id::create("af_bar");
                     af_bar.role = DPU_BAR_DEVICE_MEMORY;
@@ -125,427 +86,218 @@ class dpu_resource_manager_test extends uvm_test;
                     af_bar.alignment = 64'h0000_0000_0200_0000;
                     af_bar.placement = DPU_ALLOC_AUTO;
                     function_cfg.bars.push_back(af_bar);
+                    vio_service = dpu_service_decl::type_id::create("vio_service");
+                    vio_service.service_kind = DPU_SERVICE_VIO_NET;
+                    vio_service.service_instance_id = 0;
+                    function_cfg.services.push_back(vio_service);
                 end
                 cfg.functions.push_back(function_cfg);
             end
         end
-        for (int unsigned function_index = 0;
-             function_index < 60; function_index++) begin
+        for (int unsigned function_index = 0; function_index < 60;
+             function_index++) begin
             int unsigned host_id;
             int unsigned pf_id;
-
             host_id = function_index / DPU_MAX_PFS_PER_HOST;
             pf_id = function_index % DPU_MAX_PFS_PER_HOST;
-            for (int unsigned vf_id = 0;
-                 vf_id < DPU_MAX_VFS_PER_PF; vf_id++) begin
+            for (int unsigned vf_id = 0; vf_id < DPU_MAX_VFS_PER_PF; vf_id++)
                 cfg.functions.push_back(make_function_cfg(make_function_key(
-                    host_id, pf_id, DPU_FUNCTION_VF, vf_id
-                )));
-            end
+                    host_id, pf_id, DPU_FUNCTION_VF, vf_id)));
         end
         cfg.af_request.mode = DPU_AF_SELECTED;
-        cfg.af_request.requester = make_function_key(
-            0, 0, DPU_FUNCTION_PF, 0
-        );
+        cfg.af_request.requester = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
         return cfg;
     endfunction
 
-    task assert_canonical_device_identities_and_bar_profiles();
-        dpu_function_key_t function_key;
-        dpu_function_key_t different_function_key;
-        dpu_pcie_domain_key_t domain_key;
-        dpu_pcie_domain_key_t different_domain_key;
-        dpu_service_key_t service_key;
-        dpu_bar_profile_t profile;
-        dpu_dut_caps source_caps;
-        dpu_dut_caps copied_caps;
-        dpu_dut_caps duplicate_caps;
+    function automatic dpu_resource_snapshot make_resource_snapshot(
+        input dpu_device_snapshot snapshot,
+        input dpu_service_key_t owner,
+        input int unsigned profile_capacity = 2048,
+        input int unsigned profile_per_function = 32,
+        input bit freeze_snapshot = 1
+    );
+        dpu_normalized_placement_plan plan;
+        dpu_normalized_vio_request request;
+        dpu_normalized_vio_pair_t pair;
+        dpu_vio_participant_target_t target;
+        dpu_resource_pool_config_t profile;
+        dpu_vio_qpair_binding_t binding;
+        dpu_resource_snapshot result;
+        dpu_placement_diagnostic diagnostic;
         string why;
 
-        // Catches a production regression that drops one of the canonical
-        // function identity fields from the name or equality comparison.
-        function_key = make_function_key(1, 2, DPU_FUNCTION_VF, 3);
-        different_function_key = make_function_key(1, 2, DPU_FUNCTION_VF, 4);
-        if ((dpu_function_key_name(function_key) != "h1.pf2.k1.vf3") ||
-            !dpu_same_function_key(function_key, function_key) ||
-            dpu_same_function_key(function_key, different_function_key)) begin
-            `uvm_fatal("DPU_DEVICE_TYPES", "function key helpers lost identity")
-        end
-        domain_key.host_id = 1;
-        domain_key.segment_id = 7;
-        different_domain_key = domain_key;
-        different_domain_key.segment_id = 8;
-        if (!dpu_same_domain_key(domain_key, domain_key) ||
-            dpu_same_domain_key(domain_key, different_domain_key)) begin
-            `uvm_fatal("DPU_DEVICE_TYPES", "domain key helper lost identity")
-        end
-        service_key.function_key = function_key;
-        service_key.service_kind = DPU_SERVICE_RDMA;
-        service_key.service_instance_id = 5;
-        if (dpu_service_key_name(service_key) != "h1.pf2.k1.vf3.svc1.i5") begin
-            `uvm_fatal("DPU_DEVICE_TYPES", "service key name lost identity")
-        end
+        plan = dpu_normalized_placement_plan::type_id::create("manager_plan");
+        plan.effective_global_capacity = 2048;
+        plan.effective_device_capacity = 32;
+        profile.name = "virtio.qpair";
+        profile.class_id = 0;
+        profile.kind = DPU_RESOURCE_KIND_QUEUE;
+        profile.capacity = profile_capacity;
+        profile.max_per_function = profile_per_function;
+        plan.set_profiles('{profile});
+        request = dpu_normalized_vio_request::type_id::create("manager_request");
+        request.request_id = 77;
+        request.service_instance_id = owner.service_instance_id;
+        request.total_qpairs = 2;
+        request.device_policy = DPU_VIO_DEVICE_FIXED;
+        request.ordering = DPU_PLACEMENT_CANONICAL;
+        request.canonical_candidates.push_back(owner.function_key);
+        request.effective_candidates.push_back(owner.function_key);
+        target.request_id = request.request_id;
+        target.service_key = owner;
+        target.qpair_count = 2;
+        request.targets.push_back(target);
+        pair.request_pair_index = 0;
+        pair.service_key = owner;
+        pair.local_mode = DPU_ASSIGN_PINNED;
+        pair.requested_local_pair_id = 17;
+        pair.global_mode = DPU_ASSIGN_PINNED;
+        pair.requested_global_qpair_id = 91;
+        request.pairs.push_back(pair);
+        pair.request_pair_index = 1;
+        pair.requested_local_pair_id = 3;
+        pair.requested_global_qpair_id = 7;
+        request.pairs.push_back(pair);
+        if (!plan.add_request(request, why) || !plan.freeze(why))
+            `uvm_fatal("DPU_RESOURCE", {"cannot make resource plan: ", why})
+        result = dpu_resource_snapshot::type_id::create("manager_resource_snapshot");
+        diagnostic = dpu_placement_diagnostic::type_id::create("manager_diag");
+        binding.request_id = 77;
+        binding.service_key = owner;
+        binding.request_pair_index = 0;
+        binding.local_pair_id = 17;
+        binding.rx_local_virtqueue_id = 34;
+        binding.tx_local_virtqueue_id = 35;
+        binding.global_qpair_id = 91;
+        if (!result.set_normalized_plan(plan, diagnostic) ||
+            !result.add_vio_binding(binding, diagnostic))
+            `uvm_fatal("DPU_RESOURCE", diagnostic.message)
+        binding.request_pair_index = 1;
+        binding.local_pair_id = 3;
+        binding.rx_local_virtqueue_id = 6;
+        binding.tx_local_virtqueue_id = 7;
+        binding.global_qpair_id = 7;
+        if (!result.add_vio_binding(binding, diagnostic))
+            `uvm_fatal("DPU_RESOURCE", diagnostic.message)
+        if (freeze_snapshot && !result.freeze(snapshot, diagnostic))
+            `uvm_fatal("DPU_RESOURCE", diagnostic.message)
+        return result;
+    endfunction
 
-        // Catches a production regression that changes a default BAR role,
-        // BAR ID, size, alignment, copy isolation, or duplicate validation.
-        source_caps = dpu_dut_caps::type_id::create("source_caps");
-        if (!source_caps.lookup_bar_profile(
-            DPU_FUNCTION_PF, DPU_BAR_DEVICE_MEMORY, profile, why) ||
-            (profile.even_bar_id != 0) ||
-            (profile.size != 64'h0000_0000_0200_0000) ||
-            (profile.alignment != 64'h0000_0000_0200_0000)) begin
-            `uvm_fatal("DPU_CAPS", {"missing PF device-memory profile: ", why})
-        end
-        if (!source_caps.lookup_bar_profile(
-            DPU_FUNCTION_PF, DPU_BAR_MAILBOX, profile, why) ||
-            (profile.even_bar_id != 2) ||
-            (profile.size != 64'h0000_0000_0001_0000) ||
-            (profile.alignment != 64'h0000_0000_0001_0000)) begin
-            `uvm_fatal("DPU_CAPS", {"missing PF mailbox profile: ", why})
-        end
-        if (!source_caps.lookup_bar_profile(
-            DPU_FUNCTION_PF, DPU_BAR_MSIX, profile, why) ||
-            (profile.even_bar_id != 4) ||
-            (profile.size != 64'h0000_0000_0001_0000) ||
-            (profile.alignment != 64'h0000_0000_0001_0000)) begin
-            `uvm_fatal("DPU_CAPS", {"missing PF MSI-X profile: ", why})
-        end
-        if (!source_caps.lookup_bar_profile(
-            DPU_FUNCTION_VF, DPU_BAR_DEVICE_MEMORY, profile, why) ||
-            (profile.even_bar_id != 0) ||
-            (profile.size != 64'h0000_0000_0000_4000) ||
-            (profile.alignment != 64'h0000_0000_0000_4000)) begin
-            `uvm_fatal("DPU_CAPS", {"missing VF device-memory profile: ", why})
-        end
-        if (!source_caps.lookup_bar_profile(
-            DPU_FUNCTION_VF, DPU_BAR_MAILBOX, profile, why) ||
-            (profile.even_bar_id != 2) ||
-            (profile.size != 64'h0000_0000_0000_4000) ||
-            (profile.alignment != 64'h0000_0000_0000_4000)) begin
-            `uvm_fatal("DPU_CAPS", {"missing VF mailbox profile: ", why})
-        end
-        if (!source_caps.lookup_bar_profile(
-            DPU_FUNCTION_VF, DPU_BAR_MSIX, profile, why) ||
-            (profile.even_bar_id != 4) ||
-            (profile.size != 64'h0000_0000_0000_8000) ||
-            (profile.alignment != 64'h0000_0000_0000_8000)) begin
-            `uvm_fatal("DPU_CAPS", {"missing VF MSI-X profile: ", why})
-        end
-        copied_caps = dpu_dut_caps::type_id::create("copied_caps");
-        copied_caps.copy_from(source_caps);
-        source_caps.bar_profiles[0].size = '0;
-        if (copied_caps.bar_profiles[0].size != 64'h0000_0000_0200_0000) begin
-            `uvm_fatal("DPU_CAPS", "BAR profile copy aliases its source")
-        end
-        duplicate_caps = dpu_dut_caps::type_id::create("duplicate_caps");
-        duplicate_caps.bar_profiles.push_back(duplicate_caps.bar_profiles[0]);
-        if (duplicate_caps.validate(why)) begin
-            `uvm_fatal("DPU_CAPS", "duplicate BAR profile unexpectedly validated")
-        end
-    endtask
-
-    task assert_global_qpair_capacity(
-        dpu_resource_manager manager,
-        dpu_resource_class_id_t qpair_class_id,
-        int unsigned qpair_capacity
+    function void assert_unconfigured(
+        input dpu_resource_manager manager,
+        input dpu_function_key_t key,
+        input string name
     );
-        dpu_function_key_t key;
-        dpu_function_key_t overflow_key;
-        dpu_resource_lease_t leases[$];
-        int unsigned global_id;
-        string why;
-
-        for (int unsigned host_id = 0; host_id < DPU_MAX_HOSTS; host_id++) begin
-            for (int unsigned pf_id = 0; pf_id < DPU_MAX_PFS_PER_HOST; pf_id++) begin
-                key = make_function_key(host_id, pf_id, DPU_FUNCTION_PF, 0);
-                if (manager.acquire_leases(
-                    key, qpair_class_id, 0, 1, leases, why
-                )) begin
-                    `uvm_fatal("DPU_RESOURCE", $sformatf(
-                        "QP lease succeeded before readiness for host %0d PF %0d",
-                        host_id, pf_id))
-                end
-                if (!manager.mark_function_device_ready(key, why)) begin
-                    `uvm_fatal("DPU_RESOURCE", $sformatf(
-                        "PF readiness failed for host %0d PF %0d: %s",
-                        host_id, pf_id, why))
-                end
-                if ((host_id == 0) && (pf_id == 0)) begin
-                    if (!manager.acquire_leases(
-                        key, qpair_class_id, 0, 1, leases, why
-                    )) begin
-                        `uvm_fatal("DPU_RESOURCE", $sformatf(
-                            "first PF QP lease failed: %s", why))
-                    end
-                    if (manager.acquire_leases(
-                        key, qpair_class_id, 0, 1, leases, why
-                    )) begin
-                        `uvm_fatal("DPU_RESOURCE",
-                            "duplicate local QP ID unexpectedly succeeded")
-                    end
-                    if (!manager.acquire_leases(
-                        key, qpair_class_id, 1, 31, leases, why
-                    )) begin
-                        `uvm_fatal("DPU_RESOURCE", $sformatf(
-                            "remaining first-PF QP leases failed: %s", why))
-                    end
-                end
-                else if (!manager.acquire_leases(
-                    key, qpair_class_id, 0, 32, leases, why
-                )) begin
-                    `uvm_fatal("DPU_RESOURCE", $sformatf(
-                        "QP lease failed for host %0d PF %0d: %s",
-                        host_id, pf_id, why))
-                end
-            end
-        end
-
-        overflow_key = make_function_key(0, 0, DPU_FUNCTION_VF, 0);
-        if (!manager.mark_function_device_ready(overflow_key, why)) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "overflow VF readiness failed: %s", why))
-        end
-        if (manager.acquire_leases(
-            overflow_key, qpair_class_id, 0, 32'hffff_ffff, leases, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE",
-                "overflow VF unexpectedly acquired an enormous QP range")
-        end
-        if (why != "resource-class per-function quota would be exceeded") begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "enormous QP range did not reject by quota: %s", why))
-        end
-        if (manager.acquire_leases(
-            overflow_key, qpair_class_id, 0, 1, leases, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", "the 2,049th QP lease unexpectedly succeeded")
-        end
-
-        key = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
-        if (!manager.local_to_global(key, qpair_class_id, 0, global_id)) begin
-            `uvm_fatal("DPU_RESOURCE", "PF local QP ID did not resolve globally")
-        end
-        if (global_id != 0) begin
-            `uvm_fatal("DPU_RESOURCE", "first PF QP lease did not retain global ID zero")
-        end
-        if (manager.acquire_leases(
-            key, qpair_class_id, 0, 1, leases, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE",
-                "quota-exhausted PF unexpectedly reacquired local QP ID zero")
-        end
-        if (why != "local resource ID is already leased by this function") begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "duplicate local QP ID was masked by another rejection: %s", why))
-        end
-        if (manager.acquire_leases(
-            key, qpair_class_id, 32, 1, leases, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", "per-function QP quota unexpectedly exceeded")
-        end
-        if (!manager.freeze_function(key, why)) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "PF freeze failed: %s", why))
-        end
-        if (manager.acquire_leases(
-            key, qpair_class_id, 32, 1, leases, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", "frozen PF unexpectedly acquired a QP lease")
-        end
-        if (manager.release_leases(key, qpair_class_id, why)) begin
-            `uvm_fatal("DPU_RESOURCE", "frozen PF unexpectedly released QP leases")
-        end
-        if (!manager.restore_function(key, why)) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "PF restore failed: %s", why))
-        end
-        if (!manager.release_leases(key, qpair_class_id, why)) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "PF QP release failed: %s", why))
-        end
-        if (!manager.acquire_leases(
-            overflow_key, qpair_class_id, 0, 1, leases, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "QP lease did not recover after release: %s", why))
-        end
-        if (!manager.local_to_global(
-            overflow_key, qpair_class_id, 0, global_id
-        )) begin
-            `uvm_fatal("DPU_RESOURCE",
-                "recovered VF QP lease has no global ID")
-        end
-        if (global_id >= qpair_capacity) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "recovered VF QP global ID %0d exceeds the QP pool capacity %0d",
-                global_id, qpair_capacity))
-        end
-    endtask
-
-    // Breaks caught: snapshot seeding accepts a virtio.qpair scenario profile
-    // that claims more global or per-function queues than the frozen DUT
-    // capabilities.  Failed seeds must leave no functions/classes published,
-    // while deliberately smaller scenario quotas remain legal.
-    task assert_snapshot_qpair_profile_caps(
-        input dpu_device_snapshot snapshot
-    );
-        dpu_dut_caps caps;
-        dpu_resource_manager capacity_manager;
-        dpu_resource_manager per_function_manager;
-        dpu_resource_manager smaller_manager;
-        dpu_resource_registry_authority capacity_authority;
-        dpu_resource_registry_authority per_function_authority;
-        dpu_resource_registry_authority smaller_authority;
-        dpu_resource_pool_config_t profiles[$];
-        dpu_function_key_t function_keys[$];
         dpu_resource_class_id_t class_id;
-        int unsigned missed_rejections;
-        string expected_why;
+        string why;
+        if (manager.contains_function(key) ||
+            manager.lookup_resource_class("virtio.qpair", class_id, why))
+            `uvm_fatal("DPU_RESOURCE", {name, " published partial import state"})
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+        dpu_device_resolver resolver;
+        dpu_service_key_t services[$];
         string why;
 
-        caps = snapshot.snapshot_dut_caps();
-        snapshot.list_functions(function_keys);
-        if ((caps == null) || (function_keys.size() == 0)) begin
-            `uvm_fatal("DPU_RESOURCE",
-                "qpair profile cap test requires a populated frozen snapshot")
-        end
-        missed_rejections = 0;
-
-        capacity_manager = dpu_resource_manager::type_id::create(
-            "excessive_qpair_capacity_manager");
-        capacity_authority = capacity_manager.claim_registry_authority();
-        profiles.push_back(make_resource_profile(
-            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
-            caps.vio_global_qpair_count + 1,
-            caps.max_vio_net_qpairs_per_device));
-        expected_why = $sformatf(
-            {"virtio.qpair capacity %0d exceeds snapshot ",
-             "vio_global_qpair_count %0d"},
-            profiles[0].capacity, caps.vio_global_qpair_count);
-        if (capacity_manager.configure_from_snapshot(
-            capacity_authority, snapshot, profiles, why)) begin
-            missed_rejections++;
-        end
-        else begin
-            if (why != expected_why) begin
-                `uvm_fatal("DPU_RESOURCE", $sformatf(
-                    "expected precise capacity diagnostic '%s', got '%s'",
-                    expected_why, why))
-            end
-            if (capacity_manager.is_snapshot_seeded() ||
-                capacity_manager.contains_function(function_keys[0]) ||
-                capacity_manager.lookup_resource_class(
-                    "virtio.qpair", class_id, why)) begin
-                `uvm_fatal("DPU_RESOURCE",
-                    "excessive qpair capacity partially seeded the manager")
-            end
-        end
-
-        profiles.delete();
-        per_function_manager = dpu_resource_manager::type_id::create(
-            "excessive_qpair_per_function_manager");
-        per_function_authority =
-            per_function_manager.claim_registry_authority();
-        profiles.push_back(make_resource_profile(
-            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
-            caps.vio_global_qpair_count,
-            caps.max_vio_net_qpairs_per_device + 1));
-        expected_why = $sformatf(
-            {"virtio.qpair max_per_function %0d exceeds snapshot ",
-             "max_vio_net_qpairs_per_device %0d"},
-            profiles[0].max_per_function,
-            caps.max_vio_net_qpairs_per_device);
-        if (per_function_manager.configure_from_snapshot(
-            per_function_authority, snapshot, profiles, why)) begin
-            missed_rejections++;
-        end
-        else begin
-            if (why != expected_why) begin
-                `uvm_fatal("DPU_RESOURCE", $sformatf(
-                    {"expected precise per-function diagnostic '%s', ",
-                     "got '%s'"}, expected_why, why))
-            end
-            if (per_function_manager.is_snapshot_seeded() ||
-                per_function_manager.contains_function(function_keys[0]) ||
-                per_function_manager.lookup_resource_class(
-                    "virtio.qpair", class_id, why)) begin
-                `uvm_fatal("DPU_RESOURCE",
-                    "excessive per-function qpair quota partially seeded the manager")
-            end
-        end
-
-        profiles.delete();
-        smaller_manager = dpu_resource_manager::type_id::create(
-            "smaller_qpair_profile_manager");
-        smaller_authority = smaller_manager.claim_registry_authority();
-        profiles.push_back(make_resource_profile(
-            "virtio.qpair", DPU_RESOURCE_KIND_QUEUE,
-            caps.vio_global_qpair_count - 1,
-            caps.max_vio_net_qpairs_per_device - 1));
-        if (!smaller_manager.configure_from_snapshot(
-                smaller_authority, snapshot, profiles, why) ||
-            !smaller_manager.is_seeded_from_snapshot(snapshot) ||
-            !smaller_manager.lookup_resource_class(
-                "virtio.qpair", class_id, why)) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "smaller qpair scenario quota was rejected: %s", why))
-        end
-
-        if (missed_rejections != 0) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                {"snapshot qpair profile cap validation missed %0d ",
-                 "excessive profiles"}, missed_rejections))
-        end
-    endtask
+        super.build_phase(phase);
+        resolver = dpu_device_resolver::type_id::create("manager_device_resolver");
+        if (!resolver.resolve(make_capacity_device_cfg(), device_snapshot, why))
+            `uvm_fatal("DPU_RESOURCE", {"device resolution failed: ", why})
+        device_snapshot.list_services(DPU_SERVICE_VIO_NET, services);
+        if (services.size() != 1)
+            `uvm_fatal("DPU_RESOURCE", "resolved device lost its VIO service")
+        service_key = services[0];
+        resource_snapshot = make_resource_snapshot(device_snapshot, service_key);
+    endfunction
 
     virtual task run_phase(uvm_phase phase);
         dpu_resource_manager manager;
-        dpu_resource_manager child_manager;
-        dpu_function_key_t key;
+        dpu_resource_manager wrong_manager;
+        dpu_resource_manager failed_manager;
+        dpu_resource_registry_authority authority;
+        dpu_resource_registry_authority wrong_authority;
         dpu_resource_class_id_t qpair_class_id;
+        dpu_resource_lease_t leases[$];
+        dpu_function_key_t keys[$];
+        dpu_resource_snapshot unfrozen_resource;
+        dpu_resource_snapshot expanded_resource;
+        dpu_device_snapshot mismatched_device;
+        dpu_device_resolver resolver;
+        int unsigned global_id;
         string why;
 
         phase.raise_objection(this);
+        device_snapshot.list_functions(keys);
+        if (keys.size() != DPU_MAX_FUNCTIONS)
+            `uvm_fatal("DPU_RESOURCE", "resolved snapshot lost 1024-function coverage")
 
-        assert_canonical_device_identities_and_bar_profiles();
-        if (!uvm_config_db#(dpu_resource_manager)::get(
-            this, "device_env.protocol_client", "dpu_resource_manager", manager
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", "device env did not publish its resource manager")
-        end
-        if (!uvm_config_db#(dpu_resource_manager)::get(
-            this, "device_env.another_client", "dpu_resource_manager", child_manager
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", "device env did not publish its manager to child scope")
-        end
-        if (child_manager != manager) begin
-            `uvm_fatal("DPU_RESOURCE", "device env child scopes received different managers")
-        end
-        if (!manager.is_snapshot_seeded())
-            `uvm_fatal("DPU_RESOURCE", "device manager was not snapshot-seeded")
-        if (!manager.lookup_resource_class(
-            "virtio.qpair", qpair_class_id, why
-        )) begin
-            `uvm_fatal("DPU_RESOURCE", $sformatf(
-                "device QP profile lookup failed: %s", why))
-        end
+        manager = dpu_resource_manager::type_id::create("snapshot_manager");
+        authority = manager.claim_registry_authority();
+        if ((authority == null) || !manager.configure_from_snapshots(
+                authority, device_snapshot, resource_snapshot, why))
+            `uvm_fatal("DPU_RESOURCE", {"snapshot import failed: ", why})
+        if (!manager.is_seeded_from_snapshots(device_snapshot, resource_snapshot))
+            `uvm_fatal("DPU_RESOURCE", "manager lost exact snapshot identity")
+        if (!manager.lookup_resource_class("virtio.qpair", qpair_class_id, why) ||
+            !manager.local_pair_to_global_qpair(service_key, qpair_class_id, 17,
+                                                global_id) || (global_id != 91))
+            `uvm_fatal("DPU_RESOURCE", {"manager query disagrees with snapshot: ", why})
+        manager.list_service_leases(service_key, leases);
+        if ((leases.size() != 2) || (leases[0].local_id != 3) ||
+            (leases[1].local_id != 17) || !leases[0].frozen || !leases[1].frozen ||
+            (leases[0].owner.kind != DPU_RESOURCE_OWNER_SERVICE) ||
+            (dpu_service_key_name(leases[1].owner.service_key) !=
+             dpu_service_key_name(service_key)))
+            `uvm_fatal("DPU_RESOURCE", "imported service leases lost frozen ownership")
+        leases[0].global_id = 0;
+        manager.list_service_leases(service_key, leases);
+        if (leases[0].global_id != 7)
+            `uvm_fatal("DPU_RESOURCE", "service lease query leaked mutable state")
+        if (manager.configure_from_snapshots(authority, device_snapshot,
+                                             resource_snapshot, why) ||
+            !manager.is_seeded_from_snapshots(device_snapshot, resource_snapshot))
+            `uvm_fatal("DPU_RESOURCE", "second snapshot import changed manager state")
 
-        key = make_function_key(3, 12, DPU_FUNCTION_VF, 0);
-        if (manager.contains_function(key))
-            `uvm_fatal("DPU_RESOURCE", "manager contains a function absent from snapshot")
+        wrong_manager = dpu_resource_manager::type_id::create("wrong_manager");
+        wrong_authority = wrong_manager.claim_registry_authority();
+        failed_manager = dpu_resource_manager::type_id::create("wrong_authority_manager");
+        failed_manager.claim_registry_authority();
+        if (failed_manager.configure_from_snapshots(wrong_authority, device_snapshot,
+                                                    resource_snapshot, why))
+            `uvm_fatal("DPU_RESOURCE", "wrong registry authority imported snapshots")
+        assert_unconfigured(failed_manager, keys[0], "wrong authority");
 
-        key = make_function_key(0, 0, DPU_FUNCTION_VF, 16);
-        if (manager.contains_function(key))
-            `uvm_fatal("DPU_RESOURCE", "manager contains out-of-range snapshot VF")
+        failed_manager = dpu_resource_manager::type_id::create("unfrozen_manager");
+        authority = failed_manager.claim_registry_authority();
+        unfrozen_resource = make_resource_snapshot(device_snapshot, service_key,
+                                                   2048, 32, 0);
+        if (failed_manager.configure_from_snapshots(authority, device_snapshot,
+                                                    unfrozen_resource, why))
+            `uvm_fatal("DPU_RESOURCE", "unfrozen resource snapshot imported")
+        assert_unconfigured(failed_manager, keys[0], "unfrozen snapshot");
 
-        assert_global_qpair_capacity(
-            manager, qpair_class_id, 2048
-        );
-        assert_snapshot_qpair_profile_caps(device_env.get_snapshot());
+        failed_manager = dpu_resource_manager::type_id::create("expanded_manager");
+        authority = failed_manager.claim_registry_authority();
+        expanded_resource = make_resource_snapshot(device_snapshot, service_key,
+                                                   2049, 32);
+        if (failed_manager.configure_from_snapshots(authority, device_snapshot,
+                                                    expanded_resource, why))
+            `uvm_fatal("DPU_RESOURCE", "profile expansion imported")
+        assert_unconfigured(failed_manager, keys[0], "profile expansion");
 
+        resolver = dpu_device_resolver::type_id::create("mismatch_resolver");
+        if (!resolver.resolve(make_capacity_device_cfg(), mismatched_device, why))
+            `uvm_fatal("DPU_RESOURCE", {"mismatch device resolution failed: ", why})
+        failed_manager = dpu_resource_manager::type_id::create("mismatch_manager");
+        authority = failed_manager.claim_registry_authority();
+        if (failed_manager.configure_from_snapshots(authority, mismatched_device,
+                                                    resource_snapshot, why))
+            `uvm_fatal("DPU_RESOURCE", "mismatched snapshots imported")
+        assert_unconfigured(failed_manager, keys[0], "mismatched snapshots");
         phase.drop_objection(this);
     endtask
-
 endclass : dpu_resource_manager_test
 
 `endif // DPU_RESOURCE_MANAGER_TEST_SV

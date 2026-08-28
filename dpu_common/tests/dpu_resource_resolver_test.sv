@@ -627,6 +627,7 @@ class dpu_resource_resolver_test extends uvm_test;
         dpu_vio_qpair_binding_t binding;
         dpu_vio_qpair_binding_t observed;
         dpu_vio_qpair_binding_t bindings[$];
+        dpu_resource_pool_config_t profiles[$];
         dpu_normalized_vio_request request;
         dpu_normalized_vio_request request_again;
         int unsigned reservation_ids[$];
@@ -785,6 +786,12 @@ class dpu_resource_resolver_test extends uvm_test;
         resource_snapshot.list_reserved_global_qpair_ids(reservation_ids);
         if ((reservation_ids.size() != 1) || (reservation_ids[0] != 4))
             `uvm_fatal("RESOURCE_SNAPSHOT", "reservation query leaked mutable state")
+        resource_snapshot.list_resource_profiles(profiles);
+        profiles[0].capacity = 1;
+        resource_snapshot.list_resource_profiles(profiles);
+        if ((profiles.size() != 1) || (profiles[0].name != "virtio.qpair") ||
+            (profiles[0].capacity != 128) || (profiles[0].max_per_function != 32))
+            `uvm_fatal("RESOURCE_SNAPSHOT", "profile list leaked mutable state")
         if (!resource_snapshot.references_device_snapshot(device_snapshot))
             `uvm_fatal("RESOURCE_SNAPSHOT", "device snapshot identity was not retained")
         if (resource_snapshot.add_vio_binding(binding, diagnostic))
