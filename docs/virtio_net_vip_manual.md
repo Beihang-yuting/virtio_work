@@ -1608,13 +1608,13 @@ make regression
 `scripts/test_manifest.sh` 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的
 单一事实源。该入口按清单顺序运行 `dpu_resource_manager_test`、
 `dpu_reg_plan_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
-`dpu_device_bootstrap_plan_test`、`virtio_dut_caps_test`、
+`dpu_resource_resolver_test`、`dpu_device_bootstrap_plan_test`、`virtio_dut_caps_test`、
 `virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、
 `virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、
 `virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、
 `virtio_e2e_test`、`virtio_full_integration_test`、
 `virtio_pf_lifecycle_reset_test`、`virtio_monitor_routing_test`、
-`virtio_dual_test`、`virtio_smoke_test` 和 `virtio_traffic_test`，共 22 项。该入口
+`virtio_dual_test`、`virtio_smoke_test` 和 `virtio_traffic_test`，共 23 项。该入口
 要求 `make check-deps` 先通过；无 VCS 环境时它应在编译前报告 VCS 依赖错误。
 
 ### 6.2 编写测试
