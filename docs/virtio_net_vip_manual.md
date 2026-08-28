@@ -1483,13 +1483,18 @@ device 满足 demand，`DPU_VIO_DEVICE_FIXED` 仅使用 `fixed_devices`，
 `DPU_COUNT_AT_LEAST` 则指定它至少拥有的数量；`qpair_overrides` 可分别对 owner、
 local pair ID 与 global qpair ID 使用 `DPU_ASSIGN_AUTO`、`DPU_ASSIGN_PINNED` 或
 `DPU_ASSIGN_PREFERRED`。normalizer 在 device resolution 前检查这些约束，将选择
-展开为 explicit service-owned bindings；conflict 不会产生部分 published state。
+展开为 explicit service-owned bindings；`DPU_ASSIGN_PINNED` conflict 必须失败，
+`DPU_ASSIGN_PREFERRED` conflict 回退为 `DPU_ASSIGN_AUTO`，而 AUTO global qpair ID
+总是选择最低的 unreserved free ID。任何 failure 都不会产生部分 published state。
 
 三种 ID namespace 有不同所有者：`request_id` 只识别 placement request，
 `service_instance_id` 结合 function key 识别 VIO service，`local_pair_id` 只在
 一个 service 内唯一；`global_qpair_id` 是 Fabric-wide snapshot identity，范围为
 `0..2047`。一个 global qpair ID 描述一组 RX/TX queues，不为两个方向分别 author
-global allocation。默认硬件限制为每个 device 32 pairs、全局 2048 pairs，所以
+global allocation。当前 real-DUT profile 要求 `service_instance_id == 0`，每个 PF/VF
+至多一个 VIO-net service。sparse local pair ID 合法；local pair ID `p` 的 RX local
+virtqueue ID 是 `2*p`，TX local virtqueue ID 是 `2*p+1`。默认硬件限制为每个 device
+32 pairs、全局 2048 pairs，所以
 `total_qpairs=100` 至少需要四个 32-pair eligible devices。`virtio.qpair` profile
 可低于 snapshot capability，不能提高它。
 

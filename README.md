@@ -391,12 +391,16 @@ demand 的最少 eligible devices，`FIXED` 只使用 `fixed_devices`，
 `EXACT` 固定该 device 的 qpair count，或以 `AT_LEAST` 设置最小 count；每个
 pair override 可为 owner、local pair ID 或 global qpair ID 选择 `AUTO`、
 `PINNED` 或 `PREFERRED`。canonical ordering 是稳定的键序，seeded-random ordering
-只在显式 seed 下可复现。
+只在显式 seed 下可复现。`PINNED` assignment 的冲突必须失败；`PREFERRED`
+冲突会回退为 `AUTO`。自动 global qpair ID 总是选择最低的未预留 free ID。
 
 三个 ID namespace 不可混用：`request_id` 识别 authoring request，
 `service_instance_id` 与 function key 共同形成 service key，`local_pair_id`
 只在该 service/device 内唯一；`global_qpair_id` 是 snapshot 中跨 Fabric 的
 `0..2047` ID。每个 qpair 同时表示 RX/TX pair，不为方向另取 Fabric global ID。
+当前 real-DUT profile 要求 `service_instance_id == 0`，每个 PF/VF 至多拥有一个
+VIO-net service。sparse local pair ID 合法；若 local pair ID 为 `p`，其 RX local
+virtqueue ID 为 `2*p`，TX local virtqueue ID 为 `2*p+1`。
 默认 real-DUT 上限为每个 device 32 pairs、全局 2048 pairs；profile 可以缩小，
 不能扩大 snapshot capability，因此 100 pairs 至少需要四个 eligible 32-pair
 devices。
