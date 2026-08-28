@@ -6,9 +6,6 @@ class dpu_device_env_config extends uvm_object;
 
     dpu_device_cfg device_cfg;
     dpu_resource_placement_cfg placement_cfg;
-    // Shared-filelist callers use these profiles only through the marked
-    // no-request branch below, until the Task 11 hard cut.
-    dpu_resource_pool_config_t resource_profiles[$];
     dpu_reg_executor executor;
 
     function new(string name = "dpu_device_env_config");
@@ -41,7 +38,6 @@ class dpu_device_env extends uvm_env;
 
     virtual function void build_phase(uvm_phase phase);
         dpu_device_env_config cfg;
-        dpu_device_resolver resolver;
         dpu_configuration_resolver configuration_resolver;
         dpu_device_snapshot candidate_snapshot;
         dpu_resource_snapshot candidate_resource_snapshot;
@@ -71,57 +67,7 @@ class dpu_device_env extends uvm_env;
             `uvm_fatal("DPU_DEVICE_ENV", "device environment placement configuration is null")
             return;
         end
-        if (cfg.placement_cfg.vio_requests.size() == 0) begin
-            dpu_normalized_placement_plan candidate_plan;
-            dpu_placement_diagnostic diagnostic;
-            dpu_resource_pool_config_t legacy_qpair_profile;
-            int unsigned qpair_profile_count;
-
-            // TEMPORARY_PLACEMENT_MIGRATION_PATH
-            resolver = dpu_device_resolver::type_id::create("dpu_device_resolver");
-            if (!resolver.resolve(cfg.device_cfg, candidate_snapshot, why)) begin
-                `uvm_fatal("DPU_DEVICE_ENV", {"device resolution failed: ", why})
-                return;
-            end
-            qpair_profile_count = 0;
-            foreach (cfg.resource_profiles[index]) begin
-                if (cfg.resource_profiles[index].name == "virtio.qpair") begin
-                    legacy_qpair_profile = cfg.resource_profiles[index];
-                    qpair_profile_count++;
-                end
-            end
-            if (qpair_profile_count != 1) begin
-                `uvm_fatal("DPU_DEVICE_ENV",
-                           "legacy profiles must contain exactly one virtio.qpair profile")
-                return;
-            end
-            candidate_plan = dpu_normalized_placement_plan::type_id::create(
-                "legacy_normalized_placement_plan");
-            candidate_plan.effective_global_capacity = legacy_qpair_profile.capacity;
-            candidate_plan.effective_device_capacity =
-                legacy_qpair_profile.max_per_function;
-            candidate_plan.set_profiles(cfg.resource_profiles);
-            if (!candidate_plan.freeze(why)) begin
-                `uvm_fatal("DPU_DEVICE_ENV", {"legacy placement plan freeze failed: ", why})
-                return;
-            end
-            candidate_resource_snapshot = dpu_resource_snapshot::type_id::create(
-                "legacy_resource_snapshot");
-            diagnostic = dpu_placement_diagnostic::type_id::create(
-                "legacy_placement_diagnostic");
-            if (!candidate_resource_snapshot.set_normalized_plan(
-                    candidate_plan, diagnostic) ||
-                !candidate_resource_snapshot.freeze(candidate_snapshot, diagnostic)) begin
-                `uvm_fatal("DPU_DEVICE_ENV", {"legacy resource resolution failed: ",
-                           diagnostic.message})
-                return;
-            end
-            if (!candidate_manager.configure_from_snapshots(
-                    authority, candidate_snapshot, candidate_resource_snapshot, why)) begin
-                `uvm_fatal("DPU_DEVICE_ENV", {"resource manager seeding failed: ", why})
-                return;
-            end
-        end else begin
+        begin
             dpu_placement_diagnostic diagnostic;
 
             configuration_resolver = dpu_configuration_resolver::type_id::create(

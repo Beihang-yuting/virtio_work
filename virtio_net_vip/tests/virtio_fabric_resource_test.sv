@@ -167,15 +167,12 @@ class virtio_fabric_resource_test extends uvm_test;
     protected function void author_snapshot_qpair_placement(
         input dpu_function_key_t sparse_owner
     );
-        dpu_resource_pool_config_t profile;
         dpu_vio_placement_request request;
         dpu_vio_device_constraint count_rule;
         dpu_vio_qpair_override override;
         int unsigned sparse_locals[3] = '{0, 3, 17};
         int unsigned sparse_globals[3] = '{100, 103, 117};
 
-        profile = device_cfg.resource_profiles[0];
-        device_cfg.placement_cfg.profiles.push_back(profile);
         request = dpu_vio_placement_request::type_id::create(
             "fabric_snapshot_qpair_request");
         request.request_id = 1000;
@@ -613,11 +610,9 @@ class virtio_fabric_resource_test extends uvm_test;
         int unsigned observed_rx;
 
         if (!function_instance.resource_client.is_bound_to_service() ||
-            (function_instance.resource_client.resource_manager != null) ||
-            (function_instance.resource_client.qpair_class_id != '0) ||
-            (function_instance.resource_client.qpair_leases.size() != 0)) begin
+            (function_instance.resource_client.qpair_mapping_count() != 3)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "%s snapshot client retained legacy manager/class/lease state",
+                "%s snapshot client did not retain exactly three immutable mappings",
                 lifecycle))
         end
         if (!function_instance.resource_client.local_qid_to_global_qid(
@@ -780,8 +775,6 @@ class virtio_fabric_resource_test extends uvm_test;
         pin_real_dut_bars(collision_builder, clone_function,
             64'h0000_0004_0000_0000, 64'h0000_0004_0200_0000,
             64'h0000_0004_0201_0000);
-        void'(collision_builder.add_vio_service(first_function, 0));
-        void'(collision_builder.add_vio_service(clone_function, 0));
         collision_builder.select_af(first_function);
         resolver = dpu_device_resolver::type_id::create(
             "same_bdf_collision_resolver");
@@ -808,8 +801,6 @@ class virtio_fabric_resource_test extends uvm_test;
         pin_real_dut_bars(collision_builder, clone_function,
             64'h0000_0004_0000_0000, 64'h0000_0004_0200_0000,
             64'h0000_0004_0201_0000);
-        void'(collision_builder.add_vio_service(first_function, 0));
-        void'(collision_builder.add_vio_service(clone_function, 0));
         collision_builder.select_af(first_function);
         resolver = dpu_device_resolver::type_id::create(
             "same_bar_collision_resolver");
@@ -990,8 +981,11 @@ class virtio_fabric_resource_test extends uvm_test;
     task assert_snapshot_function_binding_is_immutable();
         virtio_test_device_builder forged_builder;
         dpu_function_cfg forged_pf;
-        dpu_device_resolver resolver;
+        dpu_configuration_resolver resolver;
         dpu_device_snapshot forged_snapshot;
+        dpu_resource_snapshot forged_resource_snapshot;
+        dpu_placement_diagnostic diagnostic;
+        dpu_function_key_t forged_devices[$];
         virtio_function_instance function_view;
         virtio_expected_bar_report_catcher catcher;
         dpu_bar_pair_lease_t original_bars[$];
@@ -1020,21 +1014,27 @@ class virtio_fabric_resource_test extends uvm_test;
         pin_real_dut_bars(forged_builder, forged_pf,
             64'h0000_0006_0000_0000, 64'h0000_0006_0200_0000,
             64'h0000_0006_0201_0000);
-        void'(forged_builder.add_vio_service(forged_pf, 0));
+        void'(forged_builder.allow_vio_service(forged_pf));
+        forged_devices.push_back(forged_pf.key);
+        void'(forged_builder.add_fixed_vio_request(
+            0, forged_devices, 1));
         forged_builder.select_af(forged_pf);
-        resolver = dpu_device_resolver::type_id::create(
+        resolver = dpu_configuration_resolver::type_id::create(
             "forged_function_binding_resolver");
         if (!resolver.resolve(
-                forged_builder.device_cfg, forged_snapshot, why)) begin
+                forged_builder.device_cfg, forged_builder.placement_cfg,
+                forged_snapshot, forged_resource_snapshot, diagnostic)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "could not resolve forged function snapshot: %s", why))
+                "could not resolve forged function snapshot: %s",
+                diagnostic.message))
         end
 
         catcher = new("snapshot_function_reassignment_catcher",
             "FUNCTION_INSTANCE", UVM_FATAL);
         uvm_report_cb::add(null, catcher);
         configuration_succeeded = function_view.configure_from_service(
-            forged_snapshot, resource_snapshot, function_view.service_key,
+            forged_snapshot, forged_resource_snapshot,
+            function_view.service_key,
             function_view.resource_manager);
         uvm_report_cb::delete(null, catcher);
 

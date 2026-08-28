@@ -200,6 +200,7 @@ class virtio_admin_vq_test extends uvm_test;
     virtual function void build_phase(uvm_phase phase);
         dpu_function_cfg pf_cfg;
         dpu_function_cfg vf_cfg;
+        dpu_function_key_t vio_devices[$];
 
         super.build_phase(phase);
         device_builder = virtio_test_device_builder::type_id::create(
@@ -209,8 +210,11 @@ class virtio_admin_vq_test extends uvm_test;
         vf_cfg = device_builder.add_vf(0, 0, 0, 0);
         device_builder.add_real_dut_bars(pf_cfg);
         device_builder.add_real_dut_bars(vf_cfg);
-        void'(device_builder.add_vio_service(pf_cfg, 0));
-        void'(device_builder.add_vio_service(vf_cfg, 0));
+        void'(device_builder.allow_vio_service(pf_cfg));
+        void'(device_builder.allow_vio_service(vf_cfg));
+        vio_devices.push_back(pf_cfg.key);
+        vio_devices.push_back(vf_cfg.key);
+        void'(device_builder.add_fixed_vio_request(0, vio_devices, 2));
         device_builder.select_af(pf_cfg);
         device_cfg = device_builder.make_env_config();
 
@@ -231,9 +235,6 @@ class virtio_admin_vq_test extends uvm_test;
         uvm_config_db#(dpu_device_env_config)::set(
             this, "device_env", "cfg", device_cfg);
         device_env = dpu_device_env::type_id::create("device_env", this);
-        uvm_config_db#(bit)::set(
-            this, "device_env.env",
-            "TEMPORARY_VIO_RESOURCE_COMPATIBILITY", 1);
         uvm_config_db#(virtio_net_env_config)::set(
             this, "device_env.env", "cfg", cfg);
         env = virtio_net_env::type_id::create("env", device_env);

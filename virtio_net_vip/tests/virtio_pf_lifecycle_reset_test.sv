@@ -238,6 +238,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
 
     virtual function void build_phase(uvm_phase phase);
         dpu_function_cfg pf_cfg;
+        dpu_function_key_t vio_devices[$];
 
         super.build_phase(phase);
         device_builder = virtio_test_device_builder::type_id::create(
@@ -245,7 +246,9 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         void'(device_builder.add_host_domain(0, 0));
         pf_cfg = device_builder.add_pf(0, 0, 0);
         device_builder.add_real_dut_bars(pf_cfg);
-        void'(device_builder.add_vio_service(pf_cfg, 0));
+        void'(device_builder.allow_vio_service(pf_cfg));
+        vio_devices.push_back(pf_cfg.key);
+        void'(device_builder.add_fixed_vio_request(0, vio_devices, 1));
         device_builder.select_af(pf_cfg);
         device_cfg = device_builder.make_env_config();
 
@@ -272,9 +275,6 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         uvm_config_db#(dpu_device_env_config)::set(
             this, "device_env", "cfg", device_cfg);
         device_env = dpu_device_env::type_id::create("device_env", this);
-        uvm_config_db#(bit)::set(
-            this, "device_env.env",
-            "TEMPORARY_VIO_RESOURCE_COMPATIBILITY", 1);
         uvm_config_db#(virtio_net_env_config)::set(
             this, "device_env.env", "cfg", cfg);
         env = virtio_net_env::type_id::create("env", device_env);

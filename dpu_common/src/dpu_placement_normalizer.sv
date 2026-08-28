@@ -403,12 +403,12 @@ class dpu_placement_normalizer extends uvm_object;
                 end
             end
         end
-        if (ordered_requests.size() != 0) begin
-            foreach (placement_cfg.profiles[index]) begin
-                if (placement_cfg.profiles[index].name == "virtio.qpair") begin
-                    profile = placement_cfg.profiles[index]; profile_count++;
-                end
+        foreach (placement_cfg.profiles[index]) begin
+            if (placement_cfg.profiles[index].name == "virtio.qpair") begin
+                profile = placement_cfg.profiles[index]; profile_count++;
             end
+        end
+        if ((ordered_requests.size() != 0) || (profile_count != 0)) begin
             if ((profile_count != 1) || (profile.kind != DPU_RESOURCE_KIND_QUEUE) ||
                 (profile.capacity == 0) || (profile.max_per_function == 0) ||
                 (profile.capacity > device_cfg.dut_caps.vio_global_qpair_count) ||
@@ -420,7 +420,7 @@ class dpu_placement_normalizer extends uvm_object;
         normalized_device_cfg = dpu_device_cfg::type_id::create("normalized_device_cfg");
         normalized_device_cfg.copy_from(device_cfg);
         normalized_plan = dpu_normalized_placement_plan::type_id::create("normalized_placement_plan");
-        if (ordered_requests.size() == 0) begin
+        if (profile_count == 0) begin
             normalized_plan.effective_global_capacity = 0;
             normalized_plan.effective_device_capacity = 0;
         end else begin

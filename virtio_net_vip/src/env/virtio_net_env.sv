@@ -43,7 +43,6 @@ class virtio_net_env extends uvm_env;
     protected dpu_resource_snapshot resource_snapshot;
     protected dpu_resource_manager device_resource_manager;
     protected bit              configuration_valid;
-    protected bit              temporary_resource_compatibility;
     local dpu_dut_caps         effective_dut_caps;
 
     // ===== VF instances enumerated from declared VIO services =====
@@ -78,7 +77,6 @@ class virtio_net_env extends uvm_env;
     function new(string name, uvm_component parent);
         super.new(name, parent);
         configuration_valid = 0;
-        temporary_resource_compatibility = 0;
         effective_dut_caps = null;
         protocol_event_vif_index = 0;
     endfunction
@@ -93,9 +91,7 @@ class virtio_net_env extends uvm_env;
         bit found;
         int unsigned vf_count;
         int unsigned function_count;
-        dpu_vio_qpair_binding_t all_bindings[$];
         dpu_vio_qpair_binding_t service_bindings[$];
-        bit use_legacy_manager_resources;
 
         why = "";
         device_snapshot.list_services(DPU_SERVICE_VIO_NET, service_keys);
@@ -103,17 +99,12 @@ class virtio_net_env extends uvm_env;
             why = "frozen device snapshot declares no VIO services";
             return 0;
         end
-        resource_snapshot.list_vio_bindings(all_bindings);
-        use_legacy_manager_resources =
-            temporary_resource_compatibility && (all_bindings.size() == 0);
-        if (!use_legacy_manager_resources) begin
-            foreach (service_keys[index]) begin
-                resource_snapshot.list_vio_bindings_for_service(
-                    service_keys[index], service_bindings);
-                if (service_bindings.size() == 0) begin
-                    why = "published VIO service has no resource-snapshot bindings";
-                    return 0;
-                end
+        foreach (service_keys[index]) begin
+            resource_snapshot.list_vio_bindings_for_service(
+                service_keys[index], service_bindings);
+            if (service_bindings.size() == 0) begin
+                why = "published VIO service has no resource-snapshot bindings";
+                return 0;
             end
         end
         foreach (service_keys[index]) begin
@@ -142,18 +133,10 @@ class virtio_net_env extends uvm_env;
             pf_instances[index] = virtio_pf_instance::type_id::create(
                 $sformatf("pf_%0d_%0d", group_keys[index].host_id,
                           group_keys[index].pf_id), this);
-            if (use_legacy_manager_resources) begin
-                if (!pf_instances[index].configure_services_legacy(
-                        group_keys[index], device_snapshot,
-                        grouped_services[index], device_resource_manager, why))
-                    return 0;
-            end
-            else begin
-                if (!pf_instances[index].configure_services(
-                        group_keys[index], device_snapshot, resource_snapshot,
-                        grouped_services[index], device_resource_manager, why))
-                    return 0;
-            end
+            if (!pf_instances[index].configure_services(
+                    group_keys[index], device_snapshot, resource_snapshot,
+                    grouped_services[index], device_resource_manager, why))
+                return 0;
         end
         function_count = 0;
         foreach (pf_instances[index]) begin
@@ -221,10 +204,6 @@ class virtio_net_env extends uvm_env;
             `uvm_fatal("VIRTIO_ENV", "No virtio_net_env_config found in config_db")
             return;
         end
-        void'(uvm_config_db#(bit)::get(
-            this, "", "TEMPORARY_VIO_RESOURCE_COMPATIBILITY",
-            temporary_resource_compatibility));
-
         if (!uvm_config_db#(dpu_device_snapshot)::get(
                 this, "", "dpu_device_snapshot", device_snapshot) ||
             (device_snapshot == null) || !device_snapshot.is_frozen()) begin

@@ -13,10 +13,21 @@ class virtio_test_device_builder extends uvm_object;
     `uvm_object_utils(virtio_test_device_builder)
 
     dpu_device_cfg device_cfg;
+    dpu_resource_placement_cfg placement_cfg;
 
     function new(string name = "virtio_test_device_builder");
+        dpu_resource_pool_config_t qpair_profile;
+
         super.new(name);
         device_cfg = dpu_device_cfg::type_id::create({name, "_device_cfg"});
+        placement_cfg = dpu_resource_placement_cfg::type_id::create(
+            {name, "_placement_cfg"});
+        qpair_profile.name = "virtio.qpair";
+        qpair_profile.class_id = '0;
+        qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
+        qpair_profile.capacity = 2048;
+        qpair_profile.max_per_function = 32;
+        placement_cfg.profiles.push_back(qpair_profile);
     endfunction
 
     function dpu_pcie_domain_cfg add_host_domain(
@@ -116,23 +127,39 @@ class virtio_test_device_builder extends uvm_object;
                             bdf_mode, pinned_bdf);
     endfunction
 
-    function dpu_service_key_t add_vio_service(
-        input dpu_function_cfg function_cfg,
-        input int unsigned service_instance_id = 0
+    function dpu_service_key_t allow_vio_service(
+        input dpu_function_cfg function_cfg
     );
-        dpu_service_decl service;
-        dpu_service_key_t service_key;
+        dpu_service_key_t key;
 
-        service = dpu_service_decl::type_id::create(
-            $sformatf("%s_vio_%0d", function_cfg.get_name(),
-                      service_instance_id));
-        service.service_kind = DPU_SERVICE_VIO_NET;
-        service.service_instance_id = service_instance_id;
-        function_cfg.services.push_back(service);
-        service_key.function_key = function_cfg.key;
-        service_key.service_kind = DPU_SERVICE_VIO_NET;
-        service_key.service_instance_id = service_instance_id;
-        return service_key;
+        if (!dpu_service_kind_is_eligible(
+                function_cfg.eligible_service_kinds, DPU_SERVICE_VIO_NET)) begin
+            function_cfg.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
+        end
+        key.function_key = function_cfg.key;
+        key.service_kind = DPU_SERVICE_VIO_NET;
+        key.service_instance_id = 0;
+        return key;
+    endfunction
+
+    function dpu_vio_placement_request add_fixed_vio_request(
+        input int unsigned request_id,
+        input dpu_function_key_t devices[$],
+        input int unsigned total_qpairs
+    );
+        dpu_vio_placement_request request;
+
+        request = dpu_vio_placement_request::type_id::create(
+            $sformatf("vio_request_%0d", request_id));
+        request.request_id = request_id;
+        request.service_instance_id = 0;
+        request.total_qpairs = total_qpairs;
+        request.candidate_kind = DPU_VIO_CANDIDATE_PF_AND_VF;
+        request.device_policy = DPU_VIO_DEVICE_FIXED;
+        request.ordering = DPU_PLACEMENT_CANONICAL;
+        request.fixed_devices = devices;
+        placement_cfg.vio_requests.push_back(request);
+        return request;
     endfunction
 
     function void add_real_dut_bars(input dpu_function_cfg function_cfg);
@@ -170,17 +197,11 @@ class virtio_test_device_builder extends uvm_object;
 
     function dpu_device_env_config make_env_config();
         dpu_device_env_config env_cfg;
-        dpu_resource_pool_config_t qpair_profile;
 
         env_cfg = dpu_device_env_config::type_id::create(
             {get_name(), "_env_cfg"});
         env_cfg.device_cfg.copy_from(device_cfg);
-        qpair_profile.name = "virtio.qpair";
-        qpair_profile.class_id = '0;
-        qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
-        qpair_profile.capacity = 2048;
-        qpair_profile.max_per_function = 32;
-        env_cfg.resource_profiles.push_back(qpair_profile);
+        env_cfg.placement_cfg.copy_from(placement_cfg);
         return env_cfg;
     endfunction
 endclass : virtio_test_device_builder

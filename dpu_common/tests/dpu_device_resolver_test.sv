@@ -122,7 +122,7 @@ class dpu_snapshot_publication_probe extends uvm_component;
         if (keys.size() != 4)
             `uvm_fatal("DEVICE_ENV_TEST", "snapshot omitted declared functions")
         foreach (keys[index]) begin
-            if (!manager.restore_function(keys[index], why))
+            if (!manager.contains_function(keys[index]))
                 `uvm_fatal("DEVICE_ENV_TEST", {"manager omitted snapshot function: ", why})
         end
 
@@ -160,8 +160,8 @@ class dpu_snapshot_publication_probe extends uvm_component;
     endfunction
 endclass : dpu_snapshot_publication_probe
 
-class dpu_legacy_snapshot_publication_probe extends uvm_component;
-    `uvm_component_utils(dpu_legacy_snapshot_publication_probe)
+class dpu_secondary_snapshot_publication_probe extends uvm_component;
+    `uvm_component_utils(dpu_secondary_snapshot_publication_probe)
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -175,60 +175,74 @@ class dpu_legacy_snapshot_publication_probe extends uvm_component;
 
         super.build_phase(phase);
         if (!$cast(owner, get_parent()))
-            `uvm_fatal("DEVICE_ENV_TEST", "legacy publication probe has no device-env parent")
+            `uvm_fatal("DEVICE_ENV_TEST", "secondary publication probe has no device-env parent")
         if (!uvm_config_db#(dpu_device_snapshot)::get(
                 this, "", "dpu_device_snapshot", snapshot) ||
             (snapshot == null) || (snapshot != owner.get_snapshot()))
-            `uvm_fatal("DEVICE_ENV_TEST", "legacy child did not receive exact device snapshot")
+            `uvm_fatal("DEVICE_ENV_TEST", "secondary child did not receive exact device snapshot")
         if (!uvm_config_db#(dpu_resource_snapshot)::get(
                 this, "", "dpu_resource_snapshot", resource_snapshot) ||
             (resource_snapshot == null) || !resource_snapshot.is_frozen() ||
             (resource_snapshot != owner.get_resource_snapshot()) ||
             !resource_snapshot.references_device_snapshot(snapshot))
-            `uvm_fatal("DEVICE_ENV_TEST", "legacy child did not receive exact frozen resource snapshot")
+            `uvm_fatal("DEVICE_ENV_TEST", "secondary child did not receive exact frozen resource snapshot")
         if (!uvm_config_db#(dpu_resource_manager)::get(
                 this, "", "dpu_resource_manager", manager) ||
             (manager == null) ||
             !manager.is_seeded_from_snapshots(snapshot, resource_snapshot))
-            `uvm_fatal("DEVICE_ENV_TEST", "legacy manager was not seeded from published pair")
+            `uvm_fatal("DEVICE_ENV_TEST", "secondary manager was not seeded from published pair")
     endfunction
-endclass : dpu_legacy_snapshot_publication_probe
+endclass : dpu_secondary_snapshot_publication_probe
 
 class dpu_device_resolver_test extends uvm_test;
     `uvm_component_utils(dpu_device_resolver_test)
 
     dpu_device_env_config device_env_cfg;
     dpu_device_env device_env;
-    dpu_device_env_config legacy_device_env_cfg;
-    dpu_device_env legacy_device_env;
+    dpu_device_env_config secondary_device_env_cfg;
+    dpu_device_env secondary_device_env;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
 
-    virtual function void build_phase(uvm_phase phase);
+    function automatic dpu_device_env_config make_device_env_fixture(
+        input string name,
+        input int unsigned request_id
+    );
+        dpu_device_env_config cfg;
         dpu_resource_pool_config_t qpair_profile;
         dpu_vio_placement_request request;
 
-        super.build_phase(phase);
-        device_env_cfg = dpu_device_env_config::type_id::create("device_env_cfg");
-        device_env_cfg.device_cfg = make_valid_cfg();
-        device_env_cfg.device_cfg.functions[3].services.delete();
-        device_env_cfg.device_cfg.functions[3].eligible_service_kinds.push_back(
+        cfg = dpu_device_env_config::type_id::create(name);
+        cfg.device_cfg = make_valid_cfg();
+        // Preserve the direct resolver's generic RDMA service but move VIO
+        // authoring to eligibility plus explicit placement demand.
+        cfg.device_cfg.functions[3].services.delete(0);
+        cfg.device_cfg.functions[3].eligible_service_kinds.push_back(
             DPU_SERVICE_VIO_NET);
         qpair_profile.name = "virtio.qpair";
         qpair_profile.class_id = '0;
         qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
         qpair_profile.capacity = 2048;
         qpair_profile.max_per_function = 32;
-        device_env_cfg.placement_cfg.profiles.push_back(qpair_profile);
-        request = dpu_vio_placement_request::type_id::create("env_request");
-        request.request_id = 71;
+        cfg.placement_cfg.profiles.push_back(qpair_profile);
+        request = dpu_vio_placement_request::type_id::create(
+            $sformatf("env_request_%0d", request_id));
+        request.request_id = request_id;
+        request.service_instance_id = 0;
         request.total_qpairs = 2;
         request.candidate_kind = DPU_VIO_CANDIDATE_VF_ONLY;
         request.device_policy = DPU_VIO_DEVICE_FIXED;
-        request.fixed_devices.push_back(device_env_cfg.device_cfg.functions[3].key);
-        device_env_cfg.placement_cfg.vio_requests.push_back(request);
+        request.ordering = DPU_PLACEMENT_CANONICAL;
+        request.fixed_devices.push_back(cfg.device_cfg.functions[3].key);
+        cfg.placement_cfg.vio_requests.push_back(request);
+        return cfg;
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        device_env_cfg = make_device_env_fixture("device_env_cfg", 71);
         uvm_config_db#(dpu_device_env_config)::set(
             this, "device_env", "cfg", device_env_cfg
         );
@@ -237,18 +251,16 @@ class dpu_device_resolver_test extends uvm_test;
             "publication_probe", device_env
         );
 
-        legacy_device_env_cfg = dpu_device_env_config::type_id::create(
-            "legacy_device_env_cfg");
-        legacy_device_env_cfg.device_cfg = make_valid_cfg();
-        legacy_device_env_cfg.resource_profiles.push_back(qpair_profile);
+        secondary_device_env_cfg = make_device_env_fixture(
+            "secondary_device_env_cfg", 72);
         uvm_config_db#(dpu_device_env_config)::set(
-            this, "legacy_device_env", "cfg", legacy_device_env_cfg
+            this, "secondary_device_env", "cfg", secondary_device_env_cfg
         );
-        legacy_device_env = dpu_device_env::type_id::create(
-            "legacy_device_env", this
+        secondary_device_env = dpu_device_env::type_id::create(
+            "secondary_device_env", this
         );
-        dpu_legacy_snapshot_publication_probe::type_id::create(
-            "legacy_publication_probe", legacy_device_env
+        dpu_secondary_snapshot_publication_probe::type_id::create(
+            "secondary_publication_probe", secondary_device_env
         );
     endfunction
 
@@ -1427,45 +1439,36 @@ class dpu_device_resolver_test extends uvm_test;
         dpu_resource_manager manager;
         dpu_resource_registry_authority authority;
         dpu_device_snapshot snapshot;
-        dpu_resource_pool_config_t profiles[$];
-        dpu_resource_pool_config_t profile;
+        dpu_device_snapshot mismatched_snapshot;
+        dpu_resource_snapshot resource_snapshot;
         dpu_function_key_t keys[$];
         dpu_resource_class_id_t class_id;
         string why;
 
         snapshot = device_env.get_snapshot();
+        resource_snapshot = device_env.get_resource_snapshot();
+        mismatched_snapshot = secondary_device_env.get_snapshot();
         manager = dpu_resource_manager::type_id::create("atomic_manager");
         authority = manager.claim_registry_authority();
         if (authority == null)
             `uvm_fatal("DEVICE_ENV_TEST", "could not claim snapshot authority")
 
-        profile.name = "valid.profile";
-        profile.class_id = '0;
-        profile.kind = DPU_RESOURCE_KIND_QUEUE;
-        profile.capacity = 8;
-        profile.max_per_function = 2;
-        profiles.push_back(profile);
-        profile.name = "invalid.profile";
-        profile.capacity = 0;
-        profiles.push_back(profile);
-        if (manager.configure_from_snapshot(authority, snapshot, profiles, why))
-            `uvm_fatal("DEVICE_ENV_TEST", "invalid snapshot seed unexpectedly succeeded")
+        if (manager.configure_from_snapshots(
+                authority, mismatched_snapshot, resource_snapshot, why))
+            `uvm_fatal("DEVICE_ENV_TEST", "mismatched snapshot pair unexpectedly seeded")
         snapshot.list_functions(keys);
-        if ((keys.size() == 0) || manager.restore_function(keys[0], why))
+        if ((keys.size() == 0) || manager.contains_function(keys[0]))
             `uvm_fatal("DEVICE_ENV_TEST", "failed seed retained function registration")
-        if (manager.lookup_resource_class("valid.profile", class_id, why))
+        if (manager.lookup_resource_class("virtio.qpair", class_id, why))
             `uvm_fatal("DEVICE_ENV_TEST", "failed seed retained profile registration")
 
-        profiles.delete();
-        profile.name = "virtio.qpair";
-        profile.capacity = 2048;
-        profile.max_per_function = 32;
-        profiles.push_back(profile);
-        if (!manager.configure_from_snapshot(authority, snapshot, profiles, why))
+        if (!manager.configure_from_snapshots(
+                authority, snapshot, resource_snapshot, why))
             `uvm_fatal("DEVICE_ENV_TEST", {"snapshot seed failed: ", why})
         if (!manager.lookup_resource_class("virtio.qpair", class_id, why))
             `uvm_fatal("DEVICE_ENV_TEST", {"seed omitted qpair profile: ", why})
-        if (manager.configure_from_snapshot(authority, snapshot, profiles, why))
+        if (manager.configure_from_snapshots(
+                authority, snapshot, resource_snapshot, why))
             `uvm_fatal("DEVICE_ENV_TEST", "manager accepted second snapshot seed")
     endfunction
 

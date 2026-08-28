@@ -62,9 +62,9 @@ class virtio_function_instance extends uvm_component;
         apply_function_configuration();
     endfunction
 
-    // The primary entry point always consumes the exact frozen resource
-    // snapshot. Legacy manager-backed allocation is available only through the
-    // explicitly named compatibility wrapper below.
+    // Resolve all identity and placement from one frozen, service-keyed device
+    // snapshot. Callers cannot provide raw BDF/BAR values, and an established
+    // function binding cannot move to a different snapshot.
     virtual function bit configure_from_service(
         input dpu_device_snapshot device_snapshot,
         input dpu_resource_snapshot resource_snapshot,
@@ -72,110 +72,85 @@ class virtio_function_instance extends uvm_component;
         input dpu_resource_manager manager,
         input uvm_object pcie_ctx = null
     );
-        return configure_from_service_internal(
-            device_snapshot, resource_snapshot, service_key, manager, pcie_ctx, 0);
-    endfunction
-
-    virtual function bit configure_from_service_legacy(
-        input dpu_device_snapshot snapshot,
-        input dpu_service_key_t service,
-        input dpu_resource_manager manager,
-        input uvm_object pcie_ctx = null
-    );
-        return configure_from_service_internal(
-            snapshot, null, service, manager, pcie_ctx, 1);
-    endfunction
-
-    // Resolve all identity and placement from one frozen, service-keyed device
-    // snapshot. Callers cannot provide raw BDF/BAR values, and an established
-    // function binding cannot move to a different snapshot.
-    protected function bit configure_from_service_internal(
-        input dpu_device_snapshot snapshot,
-        input dpu_resource_snapshot resource_snapshot,
-        input dpu_service_key_t service,
-        input dpu_resource_manager manager,
-        input uvm_object pcie_ctx,
-        input bit use_legacy_manager_resources
-    );
         dpu_function_key_t key;
         dpu_pcie_function_id_t pcie_id;
         dpu_bar_pair_lease_t bars[$];
         dpu_bar_pair_lease_t bar;
         string why;
 
-        if ((snapshot == null) || !snapshot.is_frozen()) begin
+        if ((device_snapshot == null) || !device_snapshot.is_frozen()) begin
             `uvm_fatal("FUNCTION_INSTANCE",
                 "function configuration requires a frozen device snapshot")
             return 0;
         end
-        if (service.service_kind != DPU_SERVICE_VIO_NET) begin
+        if (service_key.service_kind != DPU_SERVICE_VIO_NET) begin
             `uvm_fatal("FUNCTION_INSTANCE",
                 "function configuration requires a VIO-net service key")
             return 0;
         end
-        if (!snapshot.get_service_owner(service, key, why) ||
-            !snapshot.get_pcie_id(key, pcie_id, why) ||
-            !snapshot.get_bar(key, DPU_BAR_DEVICE_MEMORY, bar, why)) begin
+        if (!device_snapshot.get_service_owner(service_key, key, why) ||
+            !device_snapshot.get_pcie_id(key, pcie_id, why) ||
+            !device_snapshot.get_bar(key, DPU_BAR_DEVICE_MEMORY, bar, why)) begin
             `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                 "could not resolve snapshot VIO function: %s", why))
             return 0;
         end
         bars.push_back(bar);
-        if (!snapshot.get_bar(key, DPU_BAR_MAILBOX, bar, why)) begin
+        if (!device_snapshot.get_bar(key, DPU_BAR_MAILBOX, bar, why)) begin
             `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                 "could not resolve snapshot VIO function: %s", why))
             return 0;
         end
         bars.push_back(bar);
-        if (!snapshot.get_bar(key, DPU_BAR_MSIX, bar, why)) begin
+        if (!device_snapshot.get_bar(key, DPU_BAR_MSIX, bar, why)) begin
             `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                 "could not resolve snapshot VIO function: %s", why))
             return 0;
         end
         bars.push_back(bar);
         if ((configuration_snapshot != null) &&
-            (configuration_snapshot != snapshot)) begin
+            (configuration_snapshot != device_snapshot)) begin
             `uvm_fatal("FUNCTION_INSTANCE",
                 {"function configuration ownership cannot be reassigned to a ",
                  "different device snapshot"})
             return 0;
         end
-        if ((manager == null) || !manager.is_seeded_from_snapshot(snapshot) ||
+        if ((resource_snapshot == null) || !resource_snapshot.is_frozen() ||
+            !resource_snapshot.references_device_snapshot(device_snapshot) ||
+            (manager == null) ||
+            !manager.is_seeded_from_snapshots(
+                device_snapshot, resource_snapshot) ||
             !manager.contains_function(key)) begin
             `uvm_fatal("FUNCTION_INSTANCE",
-                "function configuration requires its snapshot-seeded device manager")
+                {"function configuration requires its exact frozen resource ",
+                 "snapshot and pair-seeded manager"})
             return 0;
         end
-        if (!use_legacy_manager_resources &&
-            ((resource_snapshot == null) || !resource_snapshot.is_frozen() ||
-             !resource_snapshot.references_device_snapshot(snapshot) ||
-             !manager.is_seeded_from_snapshots(snapshot, resource_snapshot))) begin
+        if ((configuration_resource_snapshot != null) &&
+            ((configuration_resource_snapshot != resource_snapshot) ||
+             (dpu_service_key_name(this.service_key) !=
+              dpu_service_key_name(service_key)) ||
+             ((resource_manager != null) && (resource_manager != manager)) ||
+             (pcie_ctx_ref != pcie_ctx))) begin
             `uvm_fatal("FUNCTION_INSTANCE",
-                "function configuration requires its exact frozen resource snapshot")
+                {"function configuration ownership cannot be reassigned to a ",
+                 "different resource snapshot, service, manager, or PCIe context"})
             return 0;
         end
         if (resource_client != null) begin
-            if (!use_legacy_manager_resources &&
-                !resource_client.bind_to_service(
-                    snapshot, resource_snapshot, service, why)) begin
+            if (!resource_client.bind_to_service(
+                    device_snapshot, resource_snapshot, service_key, why)) begin
                 `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                     "could not import service resources for %s: %s",
-                    dpu_service_key_name(service), why))
-                return 0;
-            end
-            if (use_legacy_manager_resources &&
-                !resource_client.bind_to_device(manager, key, why)) begin
-                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                    "could not bind device resources for %0d:%0d:%0d:%0d: %s",
-                    key.host_id, key.pf_id, key.kind, key.vf_id, why))
+                    dpu_service_key_name(service_key), why))
                 return 0;
             end
         end
-        configuration_snapshot = snapshot;
+        configuration_snapshot = device_snapshot;
         configuration_resource_snapshot = resource_snapshot;
         function_kind = key.kind;
         function_key = key;
-        service_key = service;
+        this.service_key = service_key;
         bdf = pcie_id.bdf;
         this.pcie_id = pcie_id;
         pcie_id_valid = 1;
@@ -529,20 +504,16 @@ class virtio_function_instance extends uvm_component;
             driver_agent.fsm.stop_dataplane();
         if (driver_agent.ops != null)
             driver_agent.ops.device_reset();
-        if ((resource_client != null) && resource_client.is_bound_to_service())
+        if (resource_client != null)
             resource_client.reset_runtime_state();
-        else
-            release_fabric_qpairs("shutdown");
         state = VF_DISABLED;
     endtask
 
     virtual function void on_flr();
         vq_mgr.detach_all_queues();
         dataplane.cleanup_all();
-        if ((resource_client != null) && resource_client.is_bound_to_service())
+        if (resource_client != null)
             resource_client.reset_runtime_state();
-        else
-            release_fabric_qpairs("FLR");
         state = VF_FLR;
     endfunction
 
@@ -593,43 +564,17 @@ class virtio_function_instance extends uvm_component;
         if (bar_pairs.size() != 0)
             transport.bar.configure_fabric_bar_pairs(bar_pairs);
 
-        if (configuration_resource_snapshot != null) begin
-            if (!resource_client.bind_to_service(
-                    configuration_snapshot, configuration_resource_snapshot,
-                    service_key, why)) begin
-                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                    "could not import service resources for %s: %s",
-                    dpu_service_key_name(service_key), why))
-                return;
-            end
-            transport.configure_fabric_managed(resource_client);
+        if (configuration_resource_snapshot == null)
             return;
-        end
-        if (resource_manager == null)
-            return;
-        if (!resource_client.bind_to_device(resource_manager, function_key, why)) begin
+        if (!resource_client.bind_to_service(
+                configuration_snapshot, configuration_resource_snapshot,
+                service_key, why)) begin
             `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                "could not bind device resources for %0d:%0d:%0d:%0d: %s",
-                function_key.host_id, function_key.pf_id, function_key.kind,
-                function_key.vf_id, why))
+                "could not import service resources for %s: %s",
+                dpu_service_key_name(service_key), why))
             return;
         end
         transport.configure_fabric_managed(resource_client);
-    endfunction
-
-    protected function void release_fabric_qpairs(input string lifecycle);
-        string why;
-
-        if ((resource_client == null) ||
-            !resource_client.has_pending_qpair_cleanup()) begin
-            return;
-        end
-        if (!resource_client.release_qpairs(why)) begin
-            `uvm_error("FUNCTION_INSTANCE", $sformatf(
-                "%s could not release Fabric QP leases for %0d:%0d:%0d:%0d: %s",
-                lifecycle, function_key.host_id, function_key.pf_id,
-                function_key.kind, function_key.vf_id, why))
-        end
     endfunction
 endclass : virtio_function_instance
 

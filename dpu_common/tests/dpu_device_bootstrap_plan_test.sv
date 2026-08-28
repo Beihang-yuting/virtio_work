@@ -167,7 +167,7 @@ class dpu_device_bootstrap_plan_test extends uvm_test;
         profile.kind = DPU_RESOURCE_KIND_QUEUE;
         profile.capacity = 64;
         profile.max_per_function = 32;
-        cfg.resource_profiles.push_back(profile);
+        cfg.placement_cfg.profiles.push_back(profile);
         return cfg;
     endfunction
 

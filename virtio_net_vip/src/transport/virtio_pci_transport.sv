@@ -856,7 +856,7 @@ class virtio_pci_transport extends uvm_object;
                 "Fabric capability discovery rejected BAR roles: %s", why))
         end
         fabric_capability_discovered = 1;
-        if (!fabric_resource_client.mark_device_ready(why)) begin
+        if (!fabric_resource_client.mark_runtime_ready(why)) begin
             `uvm_fatal("TRANSPORT", $sformatf(
                 "Fabric device-ready transition failed after discovery: %s", why))
         end

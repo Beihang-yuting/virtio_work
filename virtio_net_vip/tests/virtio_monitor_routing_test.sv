@@ -235,15 +235,12 @@ class virtio_monitor_routing_test extends uvm_test;
     protected function void author_snapshot_qpair_placement(
         input dpu_function_key_t sparse_owner
     );
-        dpu_resource_pool_config_t profile;
         dpu_vio_placement_request request;
         dpu_vio_device_constraint count_rule;
         dpu_vio_qpair_override override;
         int unsigned sparse_locals[3] = '{0, 3, 17};
         int unsigned sparse_globals[3] = '{30, 33, 47};
 
-        profile = device_env_cfg.resource_profiles[0];
-        device_env_cfg.placement_cfg.profiles.push_back(profile);
         request = dpu_vio_placement_request::type_id::create(
             "routing_snapshot_qpair_request");
         request.request_id = 2000;
@@ -276,28 +273,49 @@ class virtio_monitor_routing_test extends uvm_test;
         device_env_cfg.placement_cfg.vio_requests.push_back(request);
     endfunction
 
-    // Break caught: bind_to_device accepts a manager that was not seeded from
-    // the frozen global device snapshot.
-    protected function bit check_device_bind_requires_snapshot_seed();
-        dpu_resource_manager manager;
+    // Breaks caught: the client accepts a null, unfrozen, or cross-paired
+    // resource snapshot and publishes partial binding state.
+    protected function bit check_service_bind_requires_exact_pair();
         virtio_resource_client client;
-        dpu_function_key_t key;
+        dpu_device_snapshot snapshot;
+        dpu_device_snapshot alternate_snapshot;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_resource_snapshot alternate_resource_snapshot;
+        dpu_resource_snapshot unfrozen_resource_snapshot;
+        dpu_device_env_config env_cfg;
+        dpu_device_env_config alternate_env_cfg;
+        dpu_resource_manager manager;
+        dpu_resource_manager alternate_manager;
+        dpu_function_key_t parent_key;
+        dpu_function_key_t alternate_parent_key;
+        dpu_service_key_t service_keys[$];
+        dpu_service_key_t alternate_service_keys[$];
         string why;
 
-        key.host_id = 0;
-        key.pf_id = 0;
-        key.kind = DPU_FUNCTION_PF;
-        key.vf_id = 0;
-        manager = dpu_resource_manager::type_id::create(
-            "fix1_legacy_device_bind_manager");
+        if (!resolve_probe_snapshot(
+                "exact_pair_probe", 1, snapshot, resource_snapshot, env_cfg,
+                manager, parent_key, service_keys) ||
+            !resolve_probe_snapshot(
+                "alternate_pair_probe", 1, alternate_snapshot,
+                alternate_resource_snapshot, alternate_env_cfg,
+                alternate_manager, alternate_parent_key,
+                alternate_service_keys)) begin
+            return 0;
+        end
         client = virtio_resource_client::type_id::create(
-            "fix1_legacy_device_bind_client");
-        if (client.bind_to_device(manager, key, why) ||
-            client.is_bound_to_device() ||
-            (client.resource_manager != null)) begin
-            `uvm_error("FIX1_DEVICE_BIND",
-                {"bind_to_device accepted a non-snapshot manager or retained ",
-                 "owned binding state"})
+            "exact_pair_probe_client");
+        unfrozen_resource_snapshot = dpu_resource_snapshot::type_id::create(
+            "unfrozen_resource_snapshot");
+        if (client.bind_to_service(
+                null, resource_snapshot, service_keys[0], why) ||
+            client.bind_to_service(
+                snapshot, unfrozen_resource_snapshot, service_keys[0], why) ||
+            client.bind_to_service(
+                snapshot, alternate_resource_snapshot,
+                service_keys[0], why) ||
+            client.is_bound_to_service()) begin
+            `uvm_error("EXACT_PAIR_BIND",
+                "resource client accepted an invalid pair or retained state")
             return 0;
         end
         return 1;
@@ -307,14 +325,19 @@ class virtio_monitor_routing_test extends uvm_test;
         input string label,
         input bit add_vf_bars,
         output dpu_device_snapshot snapshot,
+        output dpu_resource_snapshot resource_snapshot,
         output dpu_device_env_config env_cfg,
+        output dpu_resource_manager manager,
         output dpu_function_key_t parent_key,
         ref dpu_service_key_t service_keys[$]
     );
         virtio_test_device_builder builder;
         dpu_function_cfg pf_cfg;
         dpu_function_cfg vf_cfg;
-        dpu_device_resolver resolver;
+        dpu_function_key_t fixed_devices[$];
+        dpu_configuration_resolver resolver;
+        dpu_placement_diagnostic diagnostic;
+        dpu_resource_registry_authority authority;
         string why;
 
         builder = virtio_test_device_builder::type_id::create(
@@ -328,38 +351,33 @@ class virtio_monitor_routing_test extends uvm_test;
         builder.add_real_dut_bars(pf_cfg);
         if (add_vf_bars)
             builder.add_real_dut_bars(vf_cfg);
-        void'(builder.add_vio_service(pf_cfg, 0));
-        void'(builder.add_vio_service(vf_cfg, 0));
+        void'(builder.allow_vio_service(pf_cfg));
+        void'(builder.allow_vio_service(vf_cfg));
+        fixed_devices.push_back(pf_cfg.key);
+        fixed_devices.push_back(vf_cfg.key);
+        void'(builder.add_fixed_vio_request(0, fixed_devices, 2));
         builder.select_af(pf_cfg);
         env_cfg = builder.make_env_config();
-        resolver = dpu_device_resolver::type_id::create({label, "_resolver"});
-        if (!resolver.resolve(env_cfg.device_cfg, snapshot, why)) begin
+        resolver = dpu_configuration_resolver::type_id::create(
+            {label, "_resolver"});
+        if (!resolver.resolve(
+                env_cfg.device_cfg, env_cfg.placement_cfg, snapshot,
+                resource_snapshot, diagnostic)) begin
             `uvm_fatal("FIX1_SETUP", $sformatf(
-                "could not resolve %s snapshot: %s", label, why))
+                "could not resolve %s snapshot pair: %s",
+                label, diagnostic.message))
+            return 0;
+        end
+        manager = dpu_resource_manager::type_id::create({label, "_manager"});
+        authority = manager.claim_registry_authority();
+        if ((authority == null) || !manager.configure_from_snapshots(
+                authority, snapshot, resource_snapshot, why)) begin
+            `uvm_fatal("FIX1_SETUP", $sformatf(
+                "could not import %s snapshot pair: %s", label, why))
             return 0;
         end
         snapshot.list_services(DPU_SERVICE_VIO_NET, service_keys);
         parent_key = pf_cfg.key;
-        return 1;
-    endfunction
-
-    protected function bit seed_probe_manager(
-        input string label,
-        input dpu_device_snapshot snapshot,
-        input dpu_resource_pool_config_t profiles[$],
-        output dpu_resource_manager manager
-    );
-        dpu_resource_registry_authority authority;
-        string why;
-
-        manager = dpu_resource_manager::type_id::create({label, "_manager"});
-        authority = manager.claim_registry_authority();
-        if ((authority == null) || !manager.configure_from_snapshot(
-                authority, snapshot, profiles, why)) begin
-            `uvm_fatal("FIX1_SETUP", $sformatf(
-                "could not seed %s manager: %s", label, why))
-            return 0;
-        end
         return 1;
     endfunction
 
@@ -377,10 +395,11 @@ class virtio_monitor_routing_test extends uvm_test;
 
         plan = dpu_normalized_placement_plan::type_id::create(
             {label, "_empty_plan"});
-        plan.effective_global_capacity = env_cfg.resource_profiles[0].capacity;
+        plan.effective_global_capacity =
+            env_cfg.placement_cfg.profiles[0].capacity;
         plan.effective_device_capacity =
-            env_cfg.resource_profiles[0].max_per_function;
-        plan.set_profiles(env_cfg.resource_profiles);
+            env_cfg.placement_cfg.profiles[0].max_per_function;
+        plan.set_profiles(env_cfg.placement_cfg.profiles);
         if (!plan.freeze(why)) begin
             `uvm_fatal("FIX1_SETUP", {"could not freeze empty plan: ", why})
             return 0;
@@ -410,8 +429,10 @@ class virtio_monitor_routing_test extends uvm_test;
     // snapshot and silently routes VIO services through legacy allocation.
     protected function bit check_empty_resource_snapshot_is_rejected();
         dpu_device_snapshot snapshot;
+        dpu_resource_snapshot resolved_resource;
         dpu_resource_snapshot empty_resource;
         dpu_device_env_config env_cfg;
+        dpu_resource_manager resolved_manager;
         dpu_resource_manager manager;
         dpu_function_key_t parent_key;
         dpu_service_key_t service_keys[$];
@@ -419,8 +440,8 @@ class virtio_monitor_routing_test extends uvm_test;
         string why;
 
         if (!resolve_probe_snapshot(
-                "fix_round1_empty_resource", 1, snapshot, env_cfg,
-                parent_key, service_keys) ||
+                "fix_round1_empty_resource", 1, snapshot, resolved_resource,
+                env_cfg, resolved_manager, parent_key, service_keys) ||
             !make_empty_resource_pair(
                 "fix_round1_empty_resource", snapshot, env_cfg,
                 empty_resource, manager)) begin
@@ -441,6 +462,7 @@ class virtio_monitor_routing_test extends uvm_test;
     // child has already been constructed.
     protected function bit check_late_bar_failure_is_atomic();
         dpu_device_snapshot snapshot;
+        dpu_resource_snapshot resource_snapshot;
         dpu_device_env_config env_cfg;
         dpu_resource_manager manager;
         dpu_function_key_t parent_key;
@@ -450,17 +472,15 @@ class virtio_monitor_routing_test extends uvm_test;
         bit configured;
 
         if (!resolve_probe_snapshot(
-                "fix1_missing_vf_bar", 0, snapshot, env_cfg,
-                parent_key, service_keys) ||
-            !seed_probe_manager(
-                "fix1_missing_vf_bar", snapshot,
-                env_cfg.resource_profiles, manager)) begin
+                "fix1_missing_vf_bar", 0, snapshot, resource_snapshot,
+                env_cfg, manager, parent_key, service_keys)) begin
             return 0;
         end
         probe = virtio_service_preflight_probe::type_id::create(
             "fix1_missing_vf_bar_probe", this);
-        configured = probe.configure_services_legacy(
-            parent_key, snapshot, service_keys, manager, why);
+        configured = probe.configure_services(
+            parent_key, snapshot, resource_snapshot,
+            service_keys, manager, why);
         if (configured || (probe.pf_function != null) ||
             (probe.vf_functions.size() != 0)) begin
             `uvm_error("FIX1_SERVICE_ATOMIC",
@@ -475,50 +495,55 @@ class virtio_monitor_routing_test extends uvm_test;
     // authority dependencies have been validated.
     protected function bit check_manager_dependencies_are_preflighted();
         dpu_device_snapshot snapshot;
+        dpu_device_snapshot alternate_snapshot;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_resource_snapshot alternate_resource_snapshot;
         dpu_device_env_config env_cfg;
-        dpu_resource_manager missing_qpair_manager;
-        dpu_resource_manager legacy_manager;
+        dpu_device_env_config alternate_env_cfg;
+        dpu_resource_manager manager;
+        dpu_resource_manager alternate_manager;
         dpu_function_key_t parent_key;
+        dpu_function_key_t alternate_parent_key;
         dpu_service_key_t service_keys[$];
-        dpu_resource_pool_config_t no_profiles[$];
-        virtio_service_preflight_probe qpair_probe;
-        virtio_service_preflight_probe seed_probe;
+        dpu_service_key_t alternate_service_keys[$];
+        virtio_service_preflight_probe null_manager_probe;
+        virtio_service_preflight_probe mismatch_probe;
         string why;
         bit configured;
         bit passed;
 
         if (!resolve_probe_snapshot(
-                "fix1_manager_preflight", 1, snapshot, env_cfg,
-                parent_key, service_keys) ||
-            !seed_probe_manager(
-                "fix1_missing_qpair", snapshot,
-                no_profiles, missing_qpair_manager)) begin
+                "fix1_manager_preflight", 1, snapshot, resource_snapshot,
+                env_cfg, manager, parent_key, service_keys) ||
+            !resolve_probe_snapshot(
+                "fix1_manager_preflight_alternate", 1, alternate_snapshot,
+                alternate_resource_snapshot, alternate_env_cfg,
+                alternate_manager, alternate_parent_key,
+                alternate_service_keys)) begin
             return 0;
         end
-        qpair_probe = virtio_service_preflight_probe::type_id::create(
-            "fix1_missing_qpair_probe", this);
+        null_manager_probe = virtio_service_preflight_probe::type_id::create(
+            "fix1_null_manager_probe", this);
         passed = 1;
-        configured = qpair_probe.configure_services_legacy(
-            parent_key, snapshot, service_keys, missing_qpair_manager, why);
-        if (configured || (qpair_probe.pf_function != null) ||
-            (qpair_probe.vf_functions.size() != 0)) begin
-            `uvm_error("FIX1_QPAIR_PREFLIGHT",
-                {"missing virtio.qpair was not rejected before all PF/VF ",
-                 "child construction"})
+        configured = null_manager_probe.configure_services(
+            parent_key, snapshot, resource_snapshot,
+            service_keys, null, why);
+        if (configured || (null_manager_probe.pf_function != null) ||
+            (null_manager_probe.vf_functions.size() != 0)) begin
+            `uvm_error("EXACT_NULL_MANAGER_PREFLIGHT",
+                "null manager was not rejected before PF/VF construction")
             passed = 0;
         end
 
-        legacy_manager = dpu_resource_manager::type_id::create(
-            "fix1_unseeded_group_manager");
-        seed_probe = virtio_service_preflight_probe::type_id::create(
-            "fix1_unseeded_group_probe", this);
-        configured = seed_probe.configure_services_legacy(
-            parent_key, snapshot, service_keys, legacy_manager, why);
-        if (configured || (seed_probe.pf_function != null) ||
-            (seed_probe.vf_functions.size() != 0)) begin
-            `uvm_error("FIX1_SEED_PREFLIGHT",
-                {"unseeded manager was not rejected before all PF/VF child ",
-                 "construction"})
+        mismatch_probe = virtio_service_preflight_probe::type_id::create(
+            "fix1_mismatched_manager_probe", this);
+        configured = mismatch_probe.configure_services(
+            parent_key, snapshot, resource_snapshot,
+            service_keys, alternate_manager, why);
+        if (configured || (mismatch_probe.pf_function != null) ||
+            (mismatch_probe.vf_functions.size() != 0)) begin
+            `uvm_error("EXACT_MISMATCH_PREFLIGHT",
+                "mismatched manager was not rejected before PF/VF construction")
             passed = 0;
         end
         return passed;
@@ -539,7 +564,7 @@ class virtio_monitor_routing_test extends uvm_test;
 
         super.build_phase(phase);
 
-        fix1_checks_passed = check_device_bind_requires_snapshot_seed();
+        fix1_checks_passed = check_service_bind_requires_exact_pair();
         fix1_checks_passed = check_late_bar_failure_is_atomic() &&
                              fix1_checks_passed;
         fix1_checks_passed = check_manager_dependencies_are_preflighted() &&
