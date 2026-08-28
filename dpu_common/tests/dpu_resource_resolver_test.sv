@@ -194,6 +194,7 @@ class dpu_resource_resolver_test extends uvm_test;
         dpu_pcie_function_id_t vf_pcie;
         dpu_bar_pair_lease_t vf_bar;
         dpu_service_key_t services[$];
+        dpu_function_key_t binding_owner;
         dpu_vio_participant_target_t participants[$];
         dpu_vio_qpair_binding_t participant_bindings[$];
         dpu_vio_qpair_binding_t all_bindings[$];
@@ -218,6 +219,11 @@ class dpu_resource_resolver_test extends uvm_test;
             !resource_snapshot.get_vio_binding(30, 0, request30) ||
             (request10.global_qpair_id >= request20.global_qpair_id))
             `uvm_fatal("CONFIG_RESOLVER", "request IDs did not determine AUTO global allocation order")
+        if (!device_snapshot.get_service_owner(request10.service_key,
+                                               binding_owner, why) ||
+            !dpu_same_function_key(binding_owner,
+                                   request10.service_key.function_key))
+            `uvm_fatal("CONFIG_RESOLVER", "request binding service owner disagrees with device snapshot")
         resource_snapshot.list_vio_participants(participants);
         resource_snapshot.list_vio_bindings(all_bindings);
         request10_count = 0;

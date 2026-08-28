@@ -83,11 +83,15 @@ class dpu_snapshot_publication_probe extends uvm_component;
     virtual function void build_phase(uvm_phase phase);
         dpu_device_env owner;
         dpu_device_snapshot snapshot;
+        dpu_resource_snapshot resource_snapshot;
         dpu_resource_manager manager;
         dpu_dut_caps copied_caps;
         dpu_dut_caps copied_caps_again;
         dpu_function_key_t keys[$];
         dpu_function_key_t undeclared;
+        dpu_function_key_t service_owner;
+        dpu_service_key_t services[$];
+        dpu_vio_qpair_binding_t bindings[$];
         dpu_resource_class_id_t class_id;
         string why;
 
@@ -97,6 +101,11 @@ class dpu_snapshot_publication_probe extends uvm_component;
         if (!uvm_config_db#(dpu_device_snapshot)::get(
                 this, "", "dpu_device_snapshot", snapshot))
             `uvm_fatal("DEVICE_ENV_TEST", "device env did not publish snapshot")
+        if (!uvm_config_db#(dpu_resource_snapshot)::get(
+                this, "", "dpu_resource_snapshot", resource_snapshot) ||
+            (resource_snapshot == null) || !resource_snapshot.is_frozen() ||
+            (resource_snapshot != owner.get_resource_snapshot()))
+            `uvm_fatal("DEVICE_ENV_TEST", "child did not receive exact resource snapshot")
         if (!uvm_config_db#(dpu_resource_manager)::get(
                 this, "", "dpu_resource_manager", manager))
             `uvm_fatal("DEVICE_ENV_TEST", "device env did not publish manager")
@@ -106,6 +115,8 @@ class dpu_snapshot_publication_probe extends uvm_component;
         if ((manager == null) || (manager != owner.get_resource_manager()) ||
             (owner.get_state() != DPU_DEVICE_RESOLVED))
             `uvm_fatal("DEVICE_ENV_TEST", "child did not receive resolved exact manager")
+        if (!manager.is_seeded_from_snapshots(snapshot, resource_snapshot))
+            `uvm_fatal("DEVICE_ENV_TEST", "manager was not seeded from published pair")
 
         snapshot.list_functions(keys);
         if (keys.size() != 4)
@@ -128,6 +139,18 @@ class dpu_snapshot_publication_probe extends uvm_component;
 
         if (!manager.lookup_resource_class("virtio.qpair", class_id, why))
             `uvm_fatal("DEVICE_ENV_TEST", {"manager omitted qpair profile: ", why})
+        snapshot.list_services(DPU_SERVICE_VIO_NET, services);
+        resource_snapshot.list_vio_bindings(bindings);
+        if ((services.size() != 1) || (bindings.size() != 2))
+            `uvm_fatal("DEVICE_ENV_TEST", "placement did not materialize one service with two bindings")
+        foreach (bindings[index]) begin
+            if (!snapshot.get_service_owner(bindings[index].service_key,
+                                            service_owner, why) ||
+                !dpu_same_function_key(service_owner,
+                                       bindings[index].service_key.function_key) ||
+                !dpu_same_function_key(service_owner, services[0].function_key))
+                `uvm_fatal("DEVICE_ENV_TEST", {"binding service owner disagrees with device snapshot: ", why})
+        end
         undeclared.host_id = 0;
         undeclared.pf_id = 1;
         undeclared.kind = DPU_FUNCTION_PF;
@@ -149,16 +172,27 @@ class dpu_device_resolver_test extends uvm_test;
 
     virtual function void build_phase(uvm_phase phase);
         dpu_resource_pool_config_t qpair_profile;
+        dpu_vio_placement_request request;
 
         super.build_phase(phase);
         device_env_cfg = dpu_device_env_config::type_id::create("device_env_cfg");
         device_env_cfg.device_cfg = make_valid_cfg();
+        device_env_cfg.device_cfg.functions[3].services.delete();
+        device_env_cfg.device_cfg.functions[3].eligible_service_kinds.push_back(
+            DPU_SERVICE_VIO_NET);
         qpair_profile.name = "virtio.qpair";
         qpair_profile.class_id = '0;
         qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
         qpair_profile.capacity = 2048;
         qpair_profile.max_per_function = 32;
-        device_env_cfg.resource_profiles.push_back(qpair_profile);
+        device_env_cfg.placement_cfg.profiles.push_back(qpair_profile);
+        request = dpu_vio_placement_request::type_id::create("env_request");
+        request.request_id = 71;
+        request.total_qpairs = 2;
+        request.candidate_kind = DPU_VIO_CANDIDATE_VF_ONLY;
+        request.device_policy = DPU_VIO_DEVICE_FIXED;
+        request.fixed_devices.push_back(device_env_cfg.device_cfg.functions[3].key);
+        device_env_cfg.placement_cfg.vio_requests.push_back(request);
         uvm_config_db#(dpu_device_env_config)::set(
             this, "device_env", "cfg", device_env_cfg
         );
@@ -1385,12 +1419,12 @@ class dpu_device_resolver_test extends uvm_test;
             `uvm_fatal("DEVICE_ENV_TEST", "manager accepted second snapshot seed")
     endfunction
 
-    function void test_snapshot_seed_copies_resource_profiles();
+    function void test_snapshot_seed_copies_placement_profiles();
         dpu_resource_class_id_t class_id;
         string why;
 
-        device_env_cfg.resource_profiles[0].name = "mutated.authoring.profile";
-        device_env_cfg.resource_profiles[0].capacity = 1;
+        device_env_cfg.placement_cfg.profiles[0].name = "mutated.authoring.profile";
+        device_env_cfg.placement_cfg.profiles[0].capacity = 1;
         if (!device_env.get_resource_manager().lookup_resource_class(
                 "virtio.qpair", class_id, why))
             `uvm_fatal("DEVICE_ENV_TEST",
@@ -1438,7 +1472,7 @@ class dpu_device_resolver_test extends uvm_test;
         test_configuration_resolver_maps_device_failure();
         test_snapshot_freeze_cross_checks_all_indexes();
         test_snapshot_manager_seeding_is_atomic();
-        test_snapshot_seed_copies_resource_profiles();
+        test_snapshot_seed_copies_placement_profiles();
         phase.drop_objection(this);
     endtask
 endclass : dpu_device_resolver_test
