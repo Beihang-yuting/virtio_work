@@ -289,23 +289,30 @@ make test TEST=virtio_unit_test
 
 ## Global DPU 配置边界
 
-`dpu_device_cfg` 是 host、PCIe domain、PF/VF、BDF/BAR request、AF 和
-service 声明的唯一可变 authoring authority。`dpu_device_env` 将它一次性
-解析为冻结的 `dpu_device_snapshot` 并发布给 protocol children；VIO 只使用
-snapshot 和完整 `dpu_service_key_t` 绑定 behavior，不再拥有任何
-host/PF/VF topology、DUT capability、BDF 或 BAR placement 字段。这是 hard cut，
-没有旧拓扑的 compatibility translator。
+`dpu_device_cfg` 与 `dpu_resource_placement_cfg` 是唯一可变的 authoring
+输入：前者声明 host、PCIe domain、显式 PF/VF、可选 VF pool、BDF/BAR request、AF
+和 VIO eligibility；后者声明 `virtio.qpair` profile、请求、选择策略、约束和
+override。`dpu_device_env` 一次性将这两个输入解析为彼此精确关联、不可变的
+`dpu_device_snapshot` 与 `dpu_resource_snapshot`，并以该 pair 创建 query-only
+resource manager。VIO 只按完整 `dpu_service_key_t` 导入自己的 frozen bindings，
+不 author topology、capability、BDF、BAR 或资源分配。
 
-下面是一个显式 host0/domain0/PF0/VF0 测试场景。
-`virtio_test_device_builder` 仅是 test-only authoring convenience，它写入公开的
-`dpu_device_cfg` 对象，不是旧配置转换器。
+以下是 README 中唯一的端到端 authoring 示例。`virtio_test_device_builder` 只是
+测试用 convenience；它只填充公开配置对象，不转换旧模型。为清晰起见示例写出
+四个 eligible VF；生产配置也可以在显式 PF 下 author `vf_pools` template，resolver
+只会从该已声明的 inventory 选择候选项。
 
 ```systemverilog
 function void configure_devices(input dpu_reg_executor injected_executor);
 virtio_test_device_builder b;
-dpu_function_cfg pf0, vf0;
-dpu_service_key_t vf0_vio;
+dpu_function_cfg pf0, vf0, vf1, vf2, vf3;
+dpu_device_env_config env_cfg;
 dpu_device_env_config global_cfg;
+dpu_resource_placement_cfg placement_cfg;
+dpu_resource_snapshot resource_snapshot;
+dpu_resource_pool_config_t qpair_profile;
+dpu_vio_placement_request vio_request;
+dpu_service_key_t vf0_vio;
 virtio_net_env_config vio_cfg;
 virtio_driver_config_t vf0_behavior;
 string why;
@@ -316,10 +323,39 @@ void'(b.add_host_domain(0, 0, 16'h0010, 16'h00ff,
                         64'h0000_0003_0000_0000));
 pf0 = b.add_pf(0, 0, 0, DPU_ALLOC_PINNED, 16'h0010);
 vf0 = b.add_vf(0, 0, 0, 0, DPU_ALLOC_PINNED, 16'h0011);
+vf1 = b.add_vf(0, 0, 1, 0, DPU_ALLOC_PINNED, 16'h0012);
+vf2 = b.add_vf(0, 0, 2, 0, DPU_ALLOC_PINNED, 16'h0013);
+vf3 = b.add_vf(0, 0, 3, 0, DPU_ALLOC_PINNED, 16'h0014);
 b.add_real_dut_bars(pf0);
 b.add_real_dut_bars(vf0);
+b.add_real_dut_bars(vf1);
+b.add_real_dut_bars(vf2);
+b.add_real_dut_bars(vf3);
 b.select_af(pf0);
-vf0_vio = b.add_vio_service(vf0, 0);
+
+// Eligibility names candidate functions; it does not predeclare a service.
+vf0_vio = b.allow_vio_service(vf0);
+void'(b.allow_vio_service(vf1));
+void'(b.allow_vio_service(vf2));
+void'(b.allow_vio_service(vf3));
+
+env_cfg = dpu_device_env_config::type_id::create("env_cfg");
+env_cfg.device_cfg.copy_from(b.device_cfg);
+placement_cfg = env_cfg.placement_cfg;
+qpair_profile.name = "virtio.qpair";
+qpair_profile.class_id = 0;
+qpair_profile.kind = DPU_RESOURCE_KIND_QUEUE;
+qpair_profile.capacity = 2048;
+qpair_profile.max_per_function = 32;
+placement_cfg.profiles.push_back(qpair_profile);
+vio_request = dpu_vio_placement_request::type_id::create("vio_request");
+vio_request.request_id = 0;
+vio_request.service_instance_id = 0;
+vio_request.total_qpairs = 100;
+vio_request.candidate_kind = DPU_VIO_CANDIDATE_VF_ONLY;
+vio_request.device_policy = DPU_VIO_DEVICE_AUTO_MINIMUM;
+vio_request.ordering = DPU_PLACEMENT_CANONICAL;
+placement_cfg.vio_requests.push_back(vio_request);
 
 vio_cfg = virtio_net_env_config::type_id::create("vio_cfg");
 vf0_behavior = vio_cfg.make_default_driver_config(32);
@@ -327,7 +363,7 @@ vf0_behavior.num_queue_pairs = 8;
 if (!vio_cfg.add_service_config(vf0_vio, vf0_behavior, why))
   `uvm_fatal("CFG", why)
 
-global_cfg = b.make_env_config();
+global_cfg = env_cfg;
 global_cfg.executor = injected_executor;
 uvm_config_db#(dpu_device_env_config)::set(
     this, "device_env", "cfg", global_cfg);
@@ -335,6 +371,10 @@ uvm_config_db#(virtio_net_env_config)::set(
     this, "device_env.env", "cfg", vio_cfg);
 endfunction
 ```
+
+After `dpu_device_env` completes `build_phase`, its `get_resource_snapshot()`
+query returns the exact frozen resource authority declared above; VIO children
+receive that same object through `uvm_config_db`.
 
 `add_real_dut_bars()` 为每个 function 显式添加三个 request：PF0 为
 BAR0/1 `DPU_BAR_DEVICE_MEMORY` 32 MiB、BAR2/3 `DPU_BAR_MAILBOX` 64 KiB、
@@ -344,12 +384,30 @@ snapshot 的 PF0 BAR0 生成，其 driver-aligned `DPU_AF_DECLARATION_ADDR`
 为 `0x1010`；有 executor 时由独立注入的 `dpu_reg_executor` 执行，没有
 executor 时报告 `NOT_EXECUTED`，不伪报硬件成功。
 
-未来的 `total_qpairs=100` 只是 normalization/placement 扩展：按每个 VIO
-设备最多 32 pairs，至少需要四个设备。Host/PF inventory 始终显式；
-未来只能从已声明的 PF VF pool 激活 VF，且 execution 仍只接收解析后的
-显式 bindings。预留选择语义为 `AUTO_MINIMUM`、`FIXED`、
-`ALL_ELIGIBLE`，partial assignment 语义为 `EXACT` 和 `AT_LEAST`；本子项目
-不实现自动 VF activation、qpair placement 或后续 DUT-table lowering。
+Placement policy is declarative and resolves before VIO construction:
+`PF_ONLY`、`VF_ONLY` 和 `PF_AND_VF` 限定候选类型；auto-minimum 选择满足
+demand 的最少 eligible devices，`FIXED` 只使用 `fixed_devices`，
+`ALL_ELIGIBLE` 使用全部 eligible devices。每个 `device_constraint` 以
+`EXACT` 固定该 device 的 qpair count，或以 `AT_LEAST` 设置最小 count；每个
+pair override 可为 owner、local pair ID 或 global qpair ID 选择 `AUTO`、
+`PINNED` 或 `PREFERRED`。canonical ordering 是稳定的键序，seeded-random ordering
+只在显式 seed 下可复现。
+
+三个 ID namespace 不可混用：`request_id` 识别 authoring request，
+`service_instance_id` 与 function key 共同形成 service key，`local_pair_id`
+只在该 service/device 内唯一；`global_qpair_id` 是 snapshot 中跨 Fabric 的
+`0..2047` ID。每个 qpair 同时表示 RX/TX pair，不为方向另取 Fabric global ID。
+默认 real-DUT 上限为每个 device 32 pairs、全局 2048 pairs；profile 可以缩小，
+不能扩大 snapshot capability，因此 100 pairs 至少需要四个 eligible 32-pair
+devices。
+
+解析成功后只查询 snapshots：`dpu_resource_snapshot` 提供按 request、
+service/local 或 global ID 的 bindings 查询，`dpu_resource_manager` 仅以精确
+snapshot pair seed 并维持只读 service lease mapping，`virtio_resource_client` 与
+`virtio_vf_resource_pool` 将该 mapping 按 service key 导入且不可改绑。FLR 只复位
+runtime state；已发布的 service、local/global qpair identity 和 snapshot pair
+保持稳定。notify、MSI-X、port/route 和 scheduler plan builders 是这些 frozen
+snapshots 的后续消费者，不是 placement authoring 或执行功能。
 
 ---
 

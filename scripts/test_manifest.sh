@@ -62,8 +62,28 @@ _validate_global_dpu_static_contracts() {
   local manifest_root builder definition_count named_use_count literal_count
   local executor_input_count executor_assignment_count
   local removed_caps_binder removed_caps_call_pattern
+  local placement_decl_count auto_policy_count resource_snapshot_count
 
   manifest_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  placement_decl_count="$(grep -c \
+    'dpu_resource_placement_cfg placement_cfg;' "$manifest_root/README.md" || true)"
+  auto_policy_count="$(grep -c \
+    'DPU_VIO_DEVICE_AUTO_MINIMUM' "$manifest_root/README.md" || true)"
+  resource_snapshot_count="$(grep -c \
+    'dpu_resource_snapshot resource_snapshot;' \
+    "$manifest_root/README.md" || true)"
+  if [[ "$placement_decl_count" -ne 1 || "$auto_policy_count" -ne 1 ||
+        "$resource_snapshot_count" -ne 1 ]]; then
+    echo "README placement example is missing or duplicated" >&2
+    return 1
+  fi
+  if grep -Eiq 'acquire[_ -]leases|release[_ -]leases|reserve[_ -]qpairs|release[_ -]qpairs|freeze[_ -]qpairs|restore[_ -]qpairs' \
+      "$manifest_root/README.md" \
+      "$manifest_root/docs/virtio_net_vip_manual.md"; then
+    echo "stale incremental qpair authoring documentation is forbidden" >&2
+    return 1
+  fi
+
   if awk '
       BEGIN { RS = "" }
       /BAR2\/3/ && tolower($0) ~ /reserved/ {

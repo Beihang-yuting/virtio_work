@@ -1220,15 +1220,16 @@ virtio 层只管理 virtio 专有状态：
 
 #### 4.9.2 VF Resource Pool
 
-管理每个 VF 的队列资源映射：
+`virtio_vf_resource_pool` 是冻结 placement binding 的只读、service-keyed queue
+view，不根据 VF 位置创建或修改资源：
 
 ```systemverilog
 typedef struct {
-    int unsigned vf_id;
+    dpu_service_key_t service_key;
     int unsigned local_qid;
     int unsigned global_qid;
     string       queue_name;
-} queue_mapping_t;
+} virtio_local_queue_mapping_t;
 ```
 
 #### 4.9.3 VF Instance
@@ -1244,39 +1245,49 @@ typedef struct {
 4. 可选: 重新初始化          -- full_init()
 ```
 
+FLR 不会重新运行 placement 或重写 frozen binding：同一个 complete service key 的
+local/global qpair identity 在 reset 前后保持不变；只有 VIO runtime transport state
+会被清理和重建。
+
 ### 4.10 环境层 (env/)
 
 #### 4.10.1 配置对象 (`virtio_net_env_config`)
 
 `virtio_net_env_config` 只拥有 VIO driver/queue/traffic/verification behavior。
-Global topology 另由 `dpu_device_cfg` 显式声明 host、domain、PF0/VF0、
-每个 function 的三个 BAR request、AF PF0 和 VIO service；
-`dpu_device_env` 解析并发布冻结的 `dpu_device_snapshot`。VIO 不包含
-host/PF/VF topology、DUT capability、BDF 或 BAR placement 字段，也不从 count
-matrix 或位置推导它们。
+Global topology 由 `dpu_device_cfg` 显式声明 host、domain、PF/VF、可选 VF pool、
+每个 function 的 BAR request、AF 和 VIO eligibility；
+`dpu_resource_placement_cfg` 同时声明 `virtio.qpair` profile 与 VIO placement
+requests。`dpu_device_env` 原子地解析这两个输入，发布精确关联且冻结的
+`dpu_device_snapshot` / `dpu_resource_snapshot` pair，并以它 seed query-only
+`dpu_resource_manager`。VIO 不包含 host/PF/VF topology、DUT capability、BDF、BAR
+或 qpair authoring 字段，也不从 count matrix 或位置推导它们。
 
 上述显式场景使用 real-DUT profile：PF0 与 VF0 各有
 BAR0/1 `DPU_BAR_DEVICE_MEMORY`、BAR2/3 `DPU_BAR_MAILBOX` 和 BAR4/5
 `DPU_BAR_MSIX`。PF0 通过 `DPU_AF_SELECTED` 被选为 AF，AF declaration 使用
-BAR0 + `DPU_AF_DECLARATION_ADDR` (`0x1010`)。VIO service declaration 生成完整
-`dpu_service_key_t` (`{function_key, service_kind, service_instance_id}`)，例如：
+BAR0 + `DPU_AF_DECLARATION_ADDR` (`0x1010`)。resolver 从 placement request 生成
+完整 `dpu_service_key_t` (`{function_key, service_kind, service_instance_id}`)；
+`virtio_net_env_config` 以这个完整 key 配置行为，例如：
 
 ```systemverilog
 dpu_service_key_t vf0_vio;
 virtio_driver_config_t behavior;
 string why;
 
-vf0_vio = builder.add_vio_service(vf0, 0);
+vf0_vio = builder.allow_vio_service(vf0);
 behavior = vio_cfg.make_default_driver_config(32);
 behavior.num_queue_pairs = 8;
 if (!vio_cfg.add_service_config(vf0_vio, behavior, why))
   `uvm_fatal("CFG", why)
 ```
 
-这个 override 由全 service key 索引，不使用 VF 队列位置。Global config
-与 VIO config 分别通过 `uvm_config_db` 传入 `dpu_device_env` 及其 VIO child；
-bootstrap plan 只读 snapshot，`dpu_reg_executor` 在 `dpu_device_env_config.executor`
-中与 plan construction 分开注入。本仓库不提供 production real-DUT executor。
+这个 override 由全 service key 索引，不使用 VF 队列位置。VIO build 只接受精确
+frozen snapshot pair 和 pair-seeded manager；`virtio_resource_client` 按 service
+导入不可变 qpair mapping，`virtio_vf_resource_pool` 提供同一 mapping 的 service-keyed
+local/global queue lookup。Global config 与 VIO config 分别通过 `uvm_config_db`
+传入 `dpu_device_env` 及其 VIO child；bootstrap plan 只读 device snapshot，
+`dpu_reg_executor` 在 `dpu_device_env_config.executor` 中与 plan construction 分开
+注入。本仓库不提供 production real-DUT executor。
 
 VIO behavior 可配置参数：
 
@@ -1457,19 +1468,37 @@ endclass
 | `VIRTIO_F_NOTIFICATION_DATA` | 38 | 完整 | `default_driver_features[38]` |
 | `VIRTIO_F_RING_RESET` | 40 | 完整 | `default_driver_features[40]` |
 
-### 5.1 预留的 total-qpair placement 边界
+### 5.1 VIO qpair placement contract
 
-`total_qpairs=100` 是后续 normalization 特性，不是当前 VIO 配置字段。
-real-DUT 每个 VIO device 最多 32 qpairs，因此 100 pairs 需要至少
-`ceil(100/32) = 4` 个设备。Host/PF inventory 仍必须显式声明；后续阶段
-可以从已声明的 PF VF pool 激活 VF，但不得根据 queue demand 合成 PF。
+`total_qpairs` 是 `dpu_vio_placement_request` 的 declarative input。候选类型为
+`DPU_VIO_CANDIDATE_PF_ONLY`、`DPU_VIO_CANDIDATE_VF_ONLY` 或
+`DPU_VIO_CANDIDATE_PF_AND_VF`；候选项必须来自已经 author 的 explicit function
+或 eligible VF-pool template。policy `DPU_VIO_DEVICE_AUTO_MINIMUM` 以最少可行
+device 满足 demand，`DPU_VIO_DEVICE_FIXED` 仅使用 `fixed_devices`，
+`DPU_VIO_DEVICE_ALL_ELIGIBLE` 使用全部 eligible candidates。`ordering` 可以是
+稳定的 `DPU_PLACEMENT_CANONICAL` 或具有显式 seed 的
+`DPU_PLACEMENT_SEEDED_RANDOM`。
 
-预留的 device selection 语义是 `AUTO_MINIMUM`、`FIXED` 和
-`ALL_ELIGIBLE`。显式 partial assignment 使用 `EXACT` 或 `AT_LEAST`：
-`EXACT` 设备不接收 remainder，`AT_LEAST` 设备可在 32-pair limit 内接收
-更多。Normalization 必须先将所有选择展开为显式 resolved bindings；
-execution 只消费这些 bindings，不执行 automatic VF activation、qpair placement
-或 local/global qid、MSI-X、notify、port、scheduler 分配。
+`device_constraints` 的 `DPU_COUNT_EXACT` 固定某 device 的 pair count，
+`DPU_COUNT_AT_LEAST` 则指定它至少拥有的数量；`qpair_overrides` 可分别对 owner、
+local pair ID 与 global qpair ID 使用 `DPU_ASSIGN_AUTO`、`DPU_ASSIGN_PINNED` 或
+`DPU_ASSIGN_PREFERRED`。normalizer 在 device resolution 前检查这些约束，将选择
+展开为 explicit service-owned bindings；conflict 不会产生部分 published state。
+
+三种 ID namespace 有不同所有者：`request_id` 只识别 placement request，
+`service_instance_id` 结合 function key 识别 VIO service，`local_pair_id` 只在
+一个 service 内唯一；`global_qpair_id` 是 Fabric-wide snapshot identity，范围为
+`0..2047`。一个 global qpair ID 描述一组 RX/TX queues，不为两个方向分别 author
+global allocation。默认硬件限制为每个 device 32 pairs、全局 2048 pairs，所以
+`total_qpairs=100` 至少需要四个 32-pair eligible devices。`virtio.qpair` profile
+可低于 snapshot capability，不能提高它。
+
+resolver 冻结 device/resource snapshots 后，manager 只从 exact pair import profile、
+reservation 和 bindings；VIO 以完整 service key 查询同一 mapping。它不在 runtime
+选择 device、改变 local/global ID 或创建新的 qpair placement。FLR 仅清理/重建
+runtime transport state，已解析的 service identity、local/global bindings 及其
+snapshot pair 保持不变。notify、MSI-X、port/route 和 scheduler builders 应消费该
+冻结结果；它们不是 placement feature。
 
 ---
 
@@ -1535,14 +1564,11 @@ real-DUT capability source。其默认 topology capability 为
 超过相应 compile-time ceiling 的值。
 
 VIO global qpair ID 域固定为 11 bits，即 `0..2047`，完整编码域提供 2048 个
-global pair 资源。一份 Fabric lease `g` 是一个 qpair 的单一 global pair
-allocation，同时代表该 pair 的 RX 和 TX，不会为两个方向各申请一份 11-bit
-global lease。当前 `virtio_resource_client` 虽保存一份 `g`，但其兼容 mapping
-仍设置 `rx_global_qid=2*g`、`tx_global_qid=2*g+1`，并通过方向选择返回其中一个
-字段；这些 directional fields 不能直接解释为 Fabric 的两份 global lease ID。
-real-DUT 目标是让 VTX 和 VRX 两个硬件 block 以方向选择共享同一个 `g`。替换
-当前 `2*g` derivation、完成 one-ID-per-qpair semantics 属于 subproject 2，
-不在当前 global DPU configuration ownership 子项目中。
+global pair 资源。一个 frozen binding 同时记录 request、完整 service key、
+local pair ID 和 global qpair ID；global ID 是一份 qpair identity，同时代表 RX/TX
+pair，不为两个方向 author 两份 Fabric allocation。`virtio_resource_client` 和
+`virtio_vf_resource_pool` 只把这个 binding 转换为其 service-keyed VIO queue view，
+不会变更 placement。
 
 每个 PF 或 VF VIO-net device 有自己的 real-DUT notify-address matching
 domain/base 和独立的 local-qpair domain；一个 device 最多拥有 32 个 local
@@ -1558,16 +1584,16 @@ real-DUT AF notify table 的 logical match 是：
 {host_id, notify_addr[60:7], local_pair_id} -> global_qpair_id
 ```
 
-本阶段只建立 function/local-pair ownership 与 limit，不生成或编程该 AF table；
-notify mapping、scheduler、route 和 VTX/VRX lowering 属于 subproject 4。
+placement 不生成或编程该 AF table。notify mapping、MSI-X、route 和 scheduler
+plan builders 在需要时读取 frozen snapshot 的 identity 与 binding；它们不是
+authoring 或 placement execution 的一部分。
 
 冻结 snapshot 中的 VIO qpair capabilities 是硬件上限，并在以下边界执行：
 
 1. 初始 `virtio_net_env_config` 将默认行为和 service-keyed override 限制在
    `max_vio_net_qpairs_per_device` 内；
 2. dynamic resize 拒绝超过 capability 的 pair 数（也拒绝 0）；
-3. VIO client 在最终 Fabric lease acquisition 时拒绝越过 capability 的 local
-   pair range；
+3. resource resolver 在冻结 binding 前拒绝越过 capability 的 local pair range；
 4. `virtio.qpair` profile 的 global `capacity` 和 `max_per_function` 分别不得超过
    snapshot 的 `vio_global_qpair_count` 和 `max_vio_net_qpairs_per_device`；profile
    可以为具体场景声明更小的 quota，但不能扩大硬件能力。
@@ -1578,9 +1604,9 @@ profile 上限会降为 16，local pair ID 范围相应变为 `0..15`；场景 p
 在这个上限内继续收窄。32 是每设备的默认 capability 和 device/model ceiling，
 并非所有参数化场景中固定不变的 quota。
 
-Fabric 拥有 `virtio.qpair` 的不透明 resource-class ID；它不是 core enum 常量。
-所有 resource profiles 必须在任何 function activation 前完成 register，并在
-注册完成后 seal registry。
+Fabric snapshot 拥有 `virtio.qpair` 的不透明 resource-class ID；它不是 core enum
+常量。pair-seeded manager import snapshot profile 与 bindings 后封存 registry，
+protocol children 只查询服务映射。
 
 当前 real-DUT profile 的 BAR 布局是三组 64-bit pair。PF 的
 BAR0/1、BAR2/3、BAR4/5 分别是 32 MiB device memory/AF registers、64 KiB
