@@ -1,7 +1,7 @@
 # VIO Qpair Resource Placement Design
 
 **Date:** 2026-08-28
-**Status:** Design approved in chat; written-spec review pending
+**Status:** Approved
 **Scope:** Declarative VIO-net qpair demand, PF/VF placement, VF template
 activation, deterministic local/global qpair allocation, and immutable resource
 publication
@@ -325,6 +325,12 @@ Global IDs resolve across all requests in stable request and pair order:
 Seeded ordering may affect participant and balancing tie choices, but never
 changes the "lowest available" rule for an automatic global ID.
 
+The qpair snapshot owns only the RX/TX virtqueues derived from selected local
+pair IDs. A consumer must not synthesize a control or Admin-VQ ID as
+`2*qpair_count`: sparse pairs such as `{0,3,17}` make that value collide with a
+real data virtqueue. Control/Admin-VQ identity and allocation remain separate
+from this subproject.
+
 ## 10. Immutable resource snapshot
 
 Each final `dpu_vio_qpair_binding` records:
@@ -507,6 +513,7 @@ This subproject does not implement:
 
 - notify, MSI-X interval/PBA, BDF-table, port, qsch, or dsch allocation or
   register programming;
+- control/Admin-VQ resource placement or local queue-ID synthesis;
 - VIO dataplane traffic or forwarding policy;
 - RDMA/VBLK resource resolution;
 - a real-DUT production executor;
