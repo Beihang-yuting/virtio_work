@@ -22,14 +22,22 @@ class dpu_resource_snapshot extends uvm_object;
         m_device_snapshot = null;
     endfunction
 
+    protected function void ensure_diagnostic(
+        output dpu_placement_diagnostic diagnostic
+    );
+        if (diagnostic == null)
+            diagnostic = dpu_placement_diagnostic::type_id::create(
+                {get_name(), "_diagnostic"});
+    endfunction
+
     protected function void set_failure(
         output dpu_placement_diagnostic diagnostic,
         input dpu_placement_error_e error_code,
         input string message
     );
-        if (diagnostic != null)
-            diagnostic.set(DPU_PLACE_STAGE_RESOURCE_RESOLUTION, error_code,
-                           message);
+        ensure_diagnostic(diagnostic);
+        diagnostic.set(DPU_PLACE_STAGE_RESOURCE_RESOLUTION, error_code,
+                       message);
     endfunction
 
     protected function string request_key(
@@ -52,8 +60,8 @@ class dpu_resource_snapshot extends uvm_object;
     endfunction
 
     protected function bit mutable(output dpu_placement_diagnostic diagnostic);
-        if (diagnostic != null)
-            diagnostic.clear();
+        ensure_diagnostic(diagnostic);
+        diagnostic.clear();
         if (m_frozen) begin
             set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
                         "resource snapshot is frozen");
@@ -209,19 +217,51 @@ class dpu_resource_snapshot extends uvm_object;
         return 1;
     endfunction
 
-    protected function bit snapshot_has_vio_service(
+    protected function bit validate_vio_service_topology(
         input dpu_device_snapshot snapshot,
-        input dpu_service_key_t service_key
+        input dpu_service_key_t service_key,
+        input int unsigned request_id,
+        input bit has_pair_index,
+        input int unsigned request_pair_index,
+        output dpu_placement_diagnostic diagnostic
     );
         dpu_service_key_t services[$];
+        int unsigned service_count;
+        bit found_service;
 
-        snapshot.list_services(DPU_SERVICE_VIO_NET, services);
-        foreach (services[index]) begin
-            if (dpu_service_key_name(services[index]) ==
-                dpu_service_key_name(service_key))
-                return 1;
+        if (service_key.service_instance_id != 0) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                        "VIO-net resource service instance must be zero");
+            diagnostic.set_request_context(request_id);
+            if (has_pair_index)
+                diagnostic.set_pair_context(request_pair_index);
+            diagnostic.set_service_context(service_key);
+            diagnostic.set_function_context(service_key.function_key);
+            return 0;
         end
-        return 0;
+        snapshot.list_services(DPU_SERVICE_VIO_NET, services);
+        service_count = 0;
+        found_service = 0;
+        foreach (services[index]) begin
+            if (dpu_same_function_key(services[index].function_key,
+                                      service_key.function_key)) begin
+                service_count++;
+                if (dpu_service_key_name(services[index]) ==
+                    dpu_service_key_name(service_key))
+                    found_service = 1;
+            end
+        end
+        if (!found_service || (service_count != 1)) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                        "participating function must expose exactly one VIO-net service");
+            diagnostic.set_request_context(request_id);
+            if (has_pair_index)
+                diagnostic.set_pair_context(request_pair_index);
+            diagnostic.set_service_context(service_key);
+            diagnostic.set_function_context(service_key.function_key);
+            return 0;
+        end
+        return 1;
     endfunction
 
     protected function bit validate_bindings(
@@ -243,6 +283,36 @@ class dpu_resource_snapshot extends uvm_object;
             set_failure(diagnostic, DPU_PLACE_ERR_INVALID_PROFILE,
                         "normalized placement plan has no effective qpair capacity");
             return 0;
+        end
+        begin
+            dpu_normalized_vio_request requests[$];
+            m_plan.list_requests(requests);
+            foreach (requests[request_index]) begin
+                int unsigned hard_device_capacity;
+
+                hard_device_capacity = (m_plan.effective_device_capacity <
+                                        DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE) ?
+                                       m_plan.effective_device_capacity :
+                                       DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
+                m_plan.list_targets(requests[request_index].request_id, targets);
+                foreach (targets[target_index]) begin
+                    if ((targets[target_index].qpair_count == 0) ||
+                        (targets[target_index].qpair_count >
+                         hard_device_capacity)) begin
+                        set_failure(diagnostic,
+                                    DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED,
+                                    "participant qpair count exceeds fixed VIO-net device ceiling");
+                        diagnostic.set_request_context(requests[request_index].request_id);
+                        diagnostic.set_service_context(targets[target_index].service_key);
+                        return 0;
+                    end
+                    if (!validate_vio_service_topology(
+                            device_snapshot, targets[target_index].service_key,
+                            requests[request_index].request_id, 0, 0,
+                            diagnostic))
+                        return 0;
+                end
+            end
         end
         foreach (m_bindings[index]) begin
             string key;
@@ -281,31 +351,44 @@ class dpu_resource_snapshot extends uvm_object;
                 return 0;
             end
             if ((m_bindings[index].service_key.service_kind != DPU_SERVICE_VIO_NET) ||
-                !snapshot_has_vio_service(device_snapshot,
-                                          m_bindings[index].service_key)) begin
-                set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
-                            "binding service is not a resolved VIO-net service");
-                diagnostic.set_service_context(m_bindings[index].service_key);
+                !validate_vio_service_topology(
+                    device_snapshot, m_bindings[index].service_key,
+                    m_bindings[index].request_id, 1,
+                    m_bindings[index].request_pair_index, diagnostic))
                 return 0;
-            end
-            if (m_bindings[index].local_pair_id >=
-                m_plan.effective_device_capacity) begin
+            if ((m_bindings[index].local_pair_id >=
+                 DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE) ||
+                (m_bindings[index].local_pair_id >=
+                 m_plan.effective_device_capacity)) begin
                 set_failure(diagnostic, DPU_PLACE_ERR_LOCAL_QID_OUT_OF_RANGE,
                             "binding local qpair ID exceeds effective device capacity");
+                diagnostic.set_request_context(m_bindings[index].request_id);
+                diagnostic.set_pair_context(m_bindings[index].request_pair_index);
+                diagnostic.set_service_context(m_bindings[index].service_key);
                 return 0;
             end
             if ((m_bindings[index].rx_local_virtqueue_id !=
                  2 * m_bindings[index].local_pair_id) ||
                 (m_bindings[index].tx_local_virtqueue_id !=
-                 (2 * m_bindings[index].local_pair_id + 1))) begin
+                 (2 * m_bindings[index].local_pair_id + 1)) ||
+                (m_bindings[index].rx_local_virtqueue_id >= 64) ||
+                (m_bindings[index].tx_local_virtqueue_id >= 64)) begin
                 set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
                             "binding local virtqueue IDs are not derived from local pair ID");
+                diagnostic.set_request_context(m_bindings[index].request_id);
+                diagnostic.set_pair_context(m_bindings[index].request_pair_index);
+                diagnostic.set_service_context(m_bindings[index].service_key);
                 return 0;
             end
-            if (m_bindings[index].global_qpair_id >=
-                m_plan.effective_global_capacity) begin
+            if ((m_bindings[index].global_qpair_id >=
+                 DPU_MAX_VIO_GLOBAL_QPAIRS) ||
+                (m_bindings[index].global_qpair_id >=
+                 m_plan.effective_global_capacity)) begin
                 set_failure(diagnostic, DPU_PLACE_ERR_GLOBAL_QID_OUT_OF_RANGE,
                             "binding global qpair ID exceeds effective global capacity");
+                diagnostic.set_request_context(m_bindings[index].request_id);
+                diagnostic.set_pair_context(m_bindings[index].request_pair_index);
+                diagnostic.set_service_context(m_bindings[index].service_key);
                 return 0;
             end
         end
@@ -442,8 +525,8 @@ class dpu_resource_snapshot extends uvm_object;
             return 0;
         m_device_snapshot = device_snapshot;
         m_frozen = 1;
-        if (diagnostic != null)
-            diagnostic.clear();
+        ensure_diagnostic(diagnostic);
+        diagnostic.clear();
         return 1;
     endfunction
 
