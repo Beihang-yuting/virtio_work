@@ -72,6 +72,52 @@ class dpu_normalized_placement_plan extends uvm_object;
         end
     endfunction
 
+    protected function int unsigned target_order(
+        input dpu_normalized_vio_request request,
+        input dpu_vio_participant_target_t target
+    );
+        foreach (request.effective_candidates[index]) begin
+            if (dpu_same_function_key(request.effective_candidates[index],
+                                      target.service_key.function_key))
+                return index;
+        end
+        return request.effective_candidates.size();
+    endfunction
+
+    protected function void sort_targets(input dpu_normalized_vio_request request);
+        dpu_vio_participant_target_t swap;
+        int unsigned left_order;
+        int unsigned right_order;
+        for (int left = 0; left < request.targets.size(); left++) begin
+            for (int right = left + 1; right < request.targets.size(); right++) begin
+                left_order = target_order(request, request.targets[left]);
+                right_order = target_order(request, request.targets[right]);
+                if ((right_order < left_order) ||
+                    ((right_order == left_order) &&
+                     (dpu_function_key_name(request.targets[right].service_key.function_key) <
+                      dpu_function_key_name(request.targets[left].service_key.function_key)))) begin
+                    swap = request.targets[left];
+                    request.targets[left] = request.targets[right];
+                    request.targets[right] = swap;
+                end
+            end
+        end
+    endfunction
+
+    protected function void sort_pairs(input dpu_normalized_vio_request request);
+        dpu_normalized_vio_pair_t swap;
+        for (int left = 0; left < request.pairs.size(); left++) begin
+            for (int right = left + 1; right < request.pairs.size(); right++) begin
+                if (request.pairs[right].request_pair_index <
+                    request.pairs[left].request_pair_index) begin
+                    swap = request.pairs[left];
+                    request.pairs[left] = request.pairs[right];
+                    request.pairs[right] = swap;
+                end
+            end
+        end
+    endfunction
+
     function bit add_request(input dpu_normalized_vio_request request,
                              output string why);
         dpu_normalized_vio_request request_copy;
@@ -93,6 +139,8 @@ class dpu_normalized_placement_plan extends uvm_object;
         request_copy = dpu_normalized_vio_request::type_id::create(
             $sformatf("%s_request_%0d", get_name(), request.request_id));
         request_copy.copy_from(request);
+        sort_targets(request_copy);
+        sort_pairs(request_copy);
         requests.push_back(request_copy);
         return 1;
     endfunction

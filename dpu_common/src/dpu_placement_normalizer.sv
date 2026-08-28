@@ -234,7 +234,7 @@ class dpu_placement_normalizer extends uvm_object;
         return candidates.size() != 0;
     endfunction
 
-    protected function void set_failure(output dpu_placement_diagnostic diagnostic,
+    protected function void set_failure(ref dpu_placement_diagnostic diagnostic,
                                         input dpu_placement_stage_e stage,
                                         input dpu_placement_error_e code,
                                         input string why,
@@ -264,9 +264,11 @@ class dpu_placement_normalizer extends uvm_object;
         int unsigned remaining;
         int unsigned pair_index;
         int unsigned best_index;
+        int unsigned total_selected_qpairs;
         string why;
 
         profile_count = 0;
+        total_selected_qpairs = 0;
 
         normalized_device_cfg = null;
         normalized_plan = null;
@@ -336,8 +338,13 @@ class dpu_placement_normalizer extends uvm_object;
         normalized_device_cfg = dpu_device_cfg::type_id::create("normalized_device_cfg");
         normalized_device_cfg.copy_from(device_cfg);
         normalized_plan = dpu_normalized_placement_plan::type_id::create("normalized_placement_plan");
-        normalized_plan.effective_global_capacity = (profile.capacity < device_cfg.dut_caps.vio_global_qpair_count) ? profile.capacity : device_cfg.dut_caps.vio_global_qpair_count;
-        normalized_plan.effective_device_capacity = (profile.max_per_function < device_cfg.dut_caps.max_vio_net_qpairs_per_device) ? profile.max_per_function : device_cfg.dut_caps.max_vio_net_qpairs_per_device;
+        if (ordered_requests.size() == 0) begin
+            normalized_plan.effective_global_capacity = 0;
+            normalized_plan.effective_device_capacity = 0;
+        end else begin
+            normalized_plan.effective_global_capacity = (profile.capacity < device_cfg.dut_caps.vio_global_qpair_count) ? profile.capacity : device_cfg.dut_caps.vio_global_qpair_count;
+            normalized_plan.effective_device_capacity = (profile.max_per_function < device_cfg.dut_caps.max_vio_net_qpairs_per_device) ? profile.max_per_function : device_cfg.dut_caps.max_vio_net_qpairs_per_device;
+        end
         normalized_plan.set_profiles(placement_cfg.profiles);
         normalized_plan.set_reservations(placement_cfg.reserved_global_qpair_ids,
                                         placement_cfg.reserved_global_qpair_ranges);
@@ -345,6 +352,12 @@ class dpu_placement_normalizer extends uvm_object;
             if ((request_index != 0) && (ordered_requests[request_index - 1].request_id == ordered_requests[request_index].request_id)) begin
                 set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_DUPLICATE_REQUEST,
                             "placement configuration has duplicate request IDs", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
+            end
+            if ((ordered_requests[request_index].candidate_kind != DPU_VIO_CANDIDATE_PF_ONLY) &&
+                (ordered_requests[request_index].candidate_kind != DPU_VIO_CANDIDATE_VF_ONLY) &&
+                (ordered_requests[request_index].candidate_kind != DPU_VIO_CANDIDATE_PF_AND_VF)) begin
+                set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_INVALID_REQUEST,
+                            "request has an unknown candidate kind", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
             end
             if ((ordered_requests[request_index].total_qpairs == 0) ||
                 (ordered_requests[request_index].service_instance_id != 0) ||
@@ -355,6 +368,14 @@ class dpu_placement_normalizer extends uvm_object;
                                  device_cfg.dut_caps, why)) begin
                 set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_INVALID_REQUEST,
                             "request is invalid or uses an unsupported Task 3 policy", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
+            end
+            if (ordered_requests[request_index].total_qpairs >
+                (normalized_plan.effective_global_capacity - total_selected_qpairs)) begin
+                set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                            DPU_PLACE_ERR_GLOBAL_QID_EXHAUSTED,
+                            "global qpair capacity cannot satisfy request demand",
+                            ordered_requests[request_index].request_id, 1);
+                normalized_device_cfg = null; normalized_plan = null; return 0;
             end
             if ((ordered_requests[request_index].device_policy != DPU_VIO_DEVICE_FIXED) &&
                 (ordered_requests[request_index].fixed_devices.size() != 0)) begin
@@ -499,6 +520,7 @@ class dpu_placement_normalizer extends uvm_object;
                 set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_INVALID_REQUEST,
                             why, normalized_request.request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
             end
+            total_selected_qpairs += normalized_request.total_qpairs;
         end
         if (!normalized_plan.freeze(why)) begin
             set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_INVALID_REQUEST,

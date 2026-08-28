@@ -114,7 +114,12 @@ class dpu_placement_test extends uvm_test;
         dpu_placement_normalizer normalizer;
         dpu_normalized_placement_plan plan;
         dpu_placement_diagnostic diagnostic;
+        dpu_normalized_vio_request unordered_request;
+        dpu_vio_participant_target_t target;
         dpu_vio_participant_target_t targets[$];
+        dpu_normalized_vio_pair_t pair;
+        dpu_normalized_vio_pair_t pairs[$];
+        string why;
         dpu_function_key_t vf7;
         bit found_vf7;
 
@@ -144,6 +149,10 @@ class dpu_placement_test extends uvm_test;
                                   plan, diagnostic))
             `uvm_fatal("PLACEMENT", diagnostic.message)
         require_targets(plan, 11, 4, 26);
+        plan.list_targets(11, targets);
+        if ((targets[1].qpair_count != 25) || (targets[2].qpair_count != 25) ||
+            (targets[3].qpair_count != 25))
+            `uvm_fatal("PLACEMENT", "101-qpair balance is not 26/25/25/25")
 
         placement_cfg = make_placement_cfg();
         request = make_request(12, 64, DPU_VIO_CANDIDATE_PF_ONLY,
@@ -199,6 +208,63 @@ class dpu_placement_test extends uvm_test;
                                   plan, diagnostic))
             `uvm_fatal("PLACEMENT", diagnostic.message)
         require_targets(plan, 15, 2, 3);
+
+        placement_cfg = make_placement_cfg();
+        placement_cfg.profiles[0].capacity = 64;
+        request = make_request(16, 100, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        placement_cfg.vio_requests.push_back(request);
+        if (normalizer.normalize(source_cfg, placement_cfg, normalized_cfg,
+                                 plan, diagnostic) || (normalized_cfg != null) ||
+            (plan != null) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_GLOBAL_QID_EXHAUSTED))
+            `uvm_fatal("PLACEMENT", "global qpair capacity overflow was accepted")
+
+        placement_cfg = make_placement_cfg();
+        request = make_request(17, 1, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        request.candidate_kind = dpu_vio_candidate_kind_e'(99);
+        placement_cfg.vio_requests.push_back(request);
+        if (normalizer.normalize(source_cfg, placement_cfg, normalized_cfg,
+                                 plan, diagnostic) || (normalized_cfg != null) ||
+            (plan != null) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_INVALID_REQUEST))
+            `uvm_fatal("PLACEMENT", "invalid candidate kind was accepted")
+
+        plan = dpu_normalized_placement_plan::type_id::create("unordered_plan");
+        unordered_request = dpu_normalized_vio_request::type_id::create(
+            "unordered_request");
+        unordered_request.request_id = 18;
+        unordered_request.effective_candidates.push_back(
+            make_function_key(0, 1, DPU_FUNCTION_PF, 0));
+        unordered_request.effective_candidates.push_back(
+            make_function_key(0, 2, DPU_FUNCTION_PF, 0));
+        target.request_id = 18;
+        target.service_key.function_key = make_function_key(0, 2, DPU_FUNCTION_PF, 0);
+        target.service_key.service_kind = DPU_SERVICE_VIO_NET;
+        target.service_key.service_instance_id = 0;
+        target.qpair_count = 1;
+        unordered_request.targets.push_back(target);
+        target.service_key.function_key = make_function_key(0, 1, DPU_FUNCTION_PF, 0);
+        unordered_request.targets.push_back(target);
+        pair.request_pair_index = 1;
+        pair.service_key = target.service_key;
+        pair.local_mode = DPU_ASSIGN_AUTO;
+        pair.global_mode = DPU_ASSIGN_AUTO;
+        pair.requested_local_pair_id = 0;
+        pair.requested_global_qpair_id = 0;
+        unordered_request.pairs.push_back(pair);
+        pair.request_pair_index = 0;
+        unordered_request.pairs.push_back(pair);
+        if (!plan.add_request(unordered_request, why) || !plan.freeze(why))
+            `uvm_fatal("PLACEMENT", why)
+        plan.list_targets(18, targets);
+        plan.list_pairs(18, pairs);
+        if (!dpu_same_function_key(targets[0].service_key.function_key,
+                                   make_function_key(0, 1, DPU_FUNCTION_PF, 0)) ||
+            (pairs[0].request_pair_index != 0) ||
+            (pairs[1].request_pair_index != 1))
+            `uvm_fatal("PLACEMENT", "normalized plan query order is not canonical")
     endfunction
 endclass : dpu_placement_test
 

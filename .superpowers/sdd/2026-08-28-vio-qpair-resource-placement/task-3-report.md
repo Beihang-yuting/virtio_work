@@ -30,3 +30,15 @@ Task 3 temporary rejection guards remain for SEEDED_RANDOM, nonempty constraints
 ## Commit
 
 See the implementation commit recorded below.
+
+## Fix round 1
+
+Added a global-capacity admission check across ascending request resolution, an explicit invalid-candidate-kind rejection, canonical target/pair sorting in the frozen-plan copy path, and complete `26/25/25/25` coverage for the 101-qpair case. Empty-request plan capacities are defined as zero. The diagnostic helper now accepts its already-created diagnostic by `ref`, which avoids VCS clearing the handle on a rejection path.
+
+RED command: `ssh ubuntu@10.11.10.53 "bash -lic 'cd /home/ubuntu/test_cosim/virtio-vio-qpair-placement && TEST=dpu_placement_test ./scripts/vcs.sh >build/strict/task3_fix_round1_red.log 2>&1'"`. It compiled and failed at `dpu_placement_test.sv(221)` with `UVM_FATAL ... global qpair capacity overflow was accepted`.
+
+Focused GREEN command: `ssh ubuntu@10.11.10.53 "bash -lic 'cd /home/ubuntu/test_cosim/virtio-vio-qpair-placement && TEST=dpu_placement_test ./scripts/vcs.sh >build/strict/task3_fix_round1_green.log 2>&1'"`, followed by `./scripts/strict_log_check.sh sim build/strict/task3_fix_round1_green.log`; VCS exit was zero, UVM errors/fatals were zero, and strict-log check passed.
+
+Full serial regression command: `ssh ubuntu@10.11.10.53 "bash -lic 'cd /home/ubuntu/test_cosim/virtio-vio-qpair-placement && ./scripts/strict_regression.sh >build/strict/task3_fix_round1_full.log 2>&1'"`. Result: `STRICT_REGRESSION PASS tests=22`.
+
+Fix-round commit: pending.
