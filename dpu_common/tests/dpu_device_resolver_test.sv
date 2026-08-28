@@ -160,11 +160,47 @@ class dpu_snapshot_publication_probe extends uvm_component;
     endfunction
 endclass : dpu_snapshot_publication_probe
 
+class dpu_legacy_snapshot_publication_probe extends uvm_component;
+    `uvm_component_utils(dpu_legacy_snapshot_publication_probe)
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+        dpu_device_env owner;
+        dpu_device_snapshot snapshot;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_resource_manager manager;
+
+        super.build_phase(phase);
+        if (!$cast(owner, get_parent()))
+            `uvm_fatal("DEVICE_ENV_TEST", "legacy publication probe has no device-env parent")
+        if (!uvm_config_db#(dpu_device_snapshot)::get(
+                this, "", "dpu_device_snapshot", snapshot) ||
+            (snapshot == null) || (snapshot != owner.get_snapshot()))
+            `uvm_fatal("DEVICE_ENV_TEST", "legacy child did not receive exact device snapshot")
+        if (!uvm_config_db#(dpu_resource_snapshot)::get(
+                this, "", "dpu_resource_snapshot", resource_snapshot) ||
+            (resource_snapshot == null) || !resource_snapshot.is_frozen() ||
+            (resource_snapshot != owner.get_resource_snapshot()) ||
+            !resource_snapshot.references_device_snapshot(snapshot))
+            `uvm_fatal("DEVICE_ENV_TEST", "legacy child did not receive exact frozen resource snapshot")
+        if (!uvm_config_db#(dpu_resource_manager)::get(
+                this, "", "dpu_resource_manager", manager) ||
+            (manager == null) ||
+            !manager.is_seeded_from_snapshots(snapshot, resource_snapshot))
+            `uvm_fatal("DEVICE_ENV_TEST", "legacy manager was not seeded from published pair")
+    endfunction
+endclass : dpu_legacy_snapshot_publication_probe
+
 class dpu_device_resolver_test extends uvm_test;
     `uvm_component_utils(dpu_device_resolver_test)
 
     dpu_device_env_config device_env_cfg;
     dpu_device_env device_env;
+    dpu_device_env_config legacy_device_env_cfg;
+    dpu_device_env legacy_device_env;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -199,6 +235,20 @@ class dpu_device_resolver_test extends uvm_test;
         device_env = dpu_device_env::type_id::create("device_env", this);
         dpu_snapshot_publication_probe::type_id::create(
             "publication_probe", device_env
+        );
+
+        legacy_device_env_cfg = dpu_device_env_config::type_id::create(
+            "legacy_device_env_cfg");
+        legacy_device_env_cfg.device_cfg = make_valid_cfg();
+        legacy_device_env_cfg.resource_profiles.push_back(qpair_profile);
+        uvm_config_db#(dpu_device_env_config)::set(
+            this, "legacy_device_env", "cfg", legacy_device_env_cfg
+        );
+        legacy_device_env = dpu_device_env::type_id::create(
+            "legacy_device_env", this
+        );
+        dpu_legacy_snapshot_publication_probe::type_id::create(
+            "legacy_publication_probe", legacy_device_env
         );
     endfunction
 

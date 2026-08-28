@@ -72,15 +72,52 @@ class dpu_device_env extends uvm_env;
             return;
         end
         if (cfg.placement_cfg.vio_requests.size() == 0) begin
+            dpu_normalized_placement_plan candidate_plan;
+            dpu_placement_diagnostic diagnostic;
+            dpu_resource_pool_config_t legacy_qpair_profile;
+            int unsigned qpair_profile_count;
+
             // TEMPORARY_PLACEMENT_MIGRATION_PATH
             resolver = dpu_device_resolver::type_id::create("dpu_device_resolver");
             if (!resolver.resolve(cfg.device_cfg, candidate_snapshot, why)) begin
                 `uvm_fatal("DPU_DEVICE_ENV", {"device resolution failed: ", why})
                 return;
             end
-            candidate_resource_snapshot = null;
-            if (!candidate_manager.configure_from_snapshot(
-                    authority, candidate_snapshot, cfg.resource_profiles, why)) begin
+            qpair_profile_count = 0;
+            foreach (cfg.resource_profiles[index]) begin
+                if (cfg.resource_profiles[index].name == "virtio.qpair") begin
+                    legacy_qpair_profile = cfg.resource_profiles[index];
+                    qpair_profile_count++;
+                end
+            end
+            if (qpair_profile_count != 1) begin
+                `uvm_fatal("DPU_DEVICE_ENV",
+                           "legacy profiles must contain exactly one virtio.qpair profile")
+                return;
+            end
+            candidate_plan = dpu_normalized_placement_plan::type_id::create(
+                "legacy_normalized_placement_plan");
+            candidate_plan.effective_global_capacity = legacy_qpair_profile.capacity;
+            candidate_plan.effective_device_capacity =
+                legacy_qpair_profile.max_per_function;
+            candidate_plan.set_profiles(cfg.resource_profiles);
+            if (!candidate_plan.freeze(why)) begin
+                `uvm_fatal("DPU_DEVICE_ENV", {"legacy placement plan freeze failed: ", why})
+                return;
+            end
+            candidate_resource_snapshot = dpu_resource_snapshot::type_id::create(
+                "legacy_resource_snapshot");
+            diagnostic = dpu_placement_diagnostic::type_id::create(
+                "legacy_placement_diagnostic");
+            if (!candidate_resource_snapshot.set_normalized_plan(
+                    candidate_plan, diagnostic) ||
+                !candidate_resource_snapshot.freeze(candidate_snapshot, diagnostic)) begin
+                `uvm_fatal("DPU_DEVICE_ENV", {"legacy resource resolution failed: ",
+                           diagnostic.message})
+                return;
+            end
+            if (!candidate_manager.configure_from_snapshots(
+                    authority, candidate_snapshot, candidate_resource_snapshot, why)) begin
                 `uvm_fatal("DPU_DEVICE_ENV", {"resource manager seeding failed: ", why})
                 return;
             end
