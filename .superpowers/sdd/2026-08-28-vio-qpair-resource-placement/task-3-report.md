@@ -41,4 +41,4 @@ Focused GREEN command: `ssh ubuntu@10.11.10.53 "bash -lic 'cd /home/ubuntu/test_
 
 Full serial regression command: `ssh ubuntu@10.11.10.53 "bash -lic 'cd /home/ubuntu/test_cosim/virtio-vio-qpair-placement && ./scripts/strict_regression.sh >build/strict/task3_fix_round1_full.log 2>&1'"`. Result: `STRICT_REGRESSION PASS tests=22`.
 
-Fix-round commit: pending.
+Fix-round commit: `d86576c6b32dd4e829f2fd479c177c974880c1dd`.
