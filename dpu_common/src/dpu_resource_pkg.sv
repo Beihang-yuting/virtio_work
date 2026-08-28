@@ -23,6 +23,8 @@ package dpu_resource_pkg;
   `include "dpu_config_orchestrator.sv"
   `include "dpu_dut_caps.sv"
   `include "dpu_device_cfg.sv"
+  `include "dpu_normalized_placement_plan.sv"
+  `include "dpu_placement_normalizer.sv"
   `include "dpu_device_snapshot.sv"
   `include "dpu_device_resolver.sv"
   `include "dpu_resource_manager.sv"
