@@ -5,6 +5,28 @@ import uvm_pkg::*;
 `include "uvm_macros.svh"
 import dpu_resource_pkg::*;
 
+class dpu_corruptible_device_snapshot extends dpu_device_snapshot;
+    `uvm_object_utils(dpu_corruptible_device_snapshot)
+
+    function new(string name = "dpu_corruptible_device_snapshot");
+        super.new(name);
+    endfunction
+
+    function void delete_service_owner(input dpu_service_key_t service_key);
+        string service_name;
+        service_name = dpu_service_key_name(service_key);
+        m_frozen = 0;
+        m_services.delete(service_name);
+        m_service_owners.delete(service_name);
+        foreach (m_service_order[index]) begin
+            if (m_service_order[index] == service_name) begin
+                m_service_order.delete(index);
+                return;
+            end
+        end
+    endfunction
+endclass : dpu_corruptible_device_snapshot
+
 class dpu_resource_resolver_test extends uvm_test;
     `uvm_component_utils(dpu_resource_resolver_test)
 
@@ -19,6 +41,213 @@ class dpu_resource_resolver_test extends uvm_test;
         key.kind = DPU_FUNCTION_PF;
         key.vf_id = 0;
         return key;
+    endfunction
+
+    function automatic dpu_bar_request make_coordinator_bar(
+        input dpu_function_kind_e kind, input dpu_bar_role_e role
+    );
+        dpu_bar_request bar;
+        bar = dpu_bar_request::type_id::create("coordinator_bar");
+        bar.role = role;
+        bar.placement = DPU_ALLOC_AUTO;
+        case (kind)
+            DPU_FUNCTION_PF: case (role)
+                DPU_BAR_DEVICE_MEMORY: begin bar.even_bar_id = 0; bar.size = 64'h0200_0000; bar.alignment = 64'h0200_0000; end
+                DPU_BAR_MAILBOX:       begin bar.even_bar_id = 2; bar.size = 64'h0001_0000; bar.alignment = 64'h0001_0000; end
+                default:                begin bar.even_bar_id = 4; bar.size = 64'h0001_0000; bar.alignment = 64'h0001_0000; end
+            endcase
+            default: case (role)
+                DPU_BAR_DEVICE_MEMORY: begin bar.even_bar_id = 0; bar.size = 64'h4000; bar.alignment = 64'h4000; end
+                DPU_BAR_MAILBOX:       begin bar.even_bar_id = 2; bar.size = 64'h4000; bar.alignment = 64'h4000; end
+                default:                begin bar.even_bar_id = 4; bar.size = 64'h8000; bar.alignment = 64'h8000; end
+            endcase
+        endcase
+        return bar;
+    endfunction
+
+    function automatic dpu_function_cfg make_coordinator_function(
+        input int unsigned pf_id, input dpu_function_kind_e kind,
+        input int unsigned vf_id
+    );
+        dpu_function_cfg function_cfg;
+        function_cfg = dpu_function_cfg::type_id::create("coordinator_function");
+        function_cfg.key.host_id = 0;
+        function_cfg.key.pf_id = pf_id;
+        function_cfg.key.kind = kind;
+        function_cfg.key.vf_id = vf_id;
+        function_cfg.domain_key.host_id = 0;
+        function_cfg.domain_key.segment_id = 0;
+        function_cfg.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
+        function_cfg.bars.push_back(make_coordinator_bar(kind, DPU_BAR_DEVICE_MEMORY));
+        function_cfg.bars.push_back(make_coordinator_bar(kind, DPU_BAR_MAILBOX));
+        function_cfg.bars.push_back(make_coordinator_bar(kind, DPU_BAR_MSIX));
+        return function_cfg;
+    endfunction
+
+    function automatic dpu_device_cfg make_coordinator_source();
+        dpu_device_cfg cfg;
+        dpu_host_cfg host;
+        dpu_pcie_domain_cfg domain;
+        dpu_bdf_range_t bdf_range;
+        dpu_mmio_window_cfg window;
+        dpu_vf_pool_cfg pool;
+        dpu_vf_template_cfg template;
+
+        cfg = dpu_device_cfg::type_id::create("coordinator_source");
+        host = dpu_host_cfg::type_id::create("coordinator_host");
+        host.host_id = 0;
+        domain = dpu_pcie_domain_cfg::type_id::create("coordinator_domain");
+        domain.key.host_id = 0;
+        domain.key.segment_id = 0;
+        bdf_range.first_bdf = 16'h0010;
+        bdf_range.last_bdf = 16'h00ff;
+        domain.bdf_ranges.push_back(bdf_range);
+        window = dpu_mmio_window_cfg::type_id::create("coordinator_window");
+        window.base = 64'h0000_0001_0000_0000;
+        window.limit = 64'h0000_0002_0000_0000;
+        window.allowed_roles = '{DPU_BAR_DEVICE_MEMORY, DPU_BAR_MAILBOX,
+                                 DPU_BAR_MSIX};
+        domain.mmio_windows.push_back(window);
+        host.pcie_domains.push_back(domain);
+        cfg.hosts.push_back(host);
+        cfg.functions.push_back(make_coordinator_function(0, DPU_FUNCTION_PF, 0));
+        cfg.functions.push_back(make_coordinator_function(1, DPU_FUNCTION_PF, 0));
+        pool = dpu_vf_pool_cfg::type_id::create("coordinator_vf_pool");
+        pool.parent_pf = cfg.functions[0].key;
+        template = dpu_vf_template_cfg::type_id::create("coordinator_vf7");
+        template.vf_id = 7;
+        template.domain_key = cfg.functions[0].domain_key;
+        template.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
+        template.bars.push_back(make_coordinator_bar(DPU_FUNCTION_VF,
+                                                      DPU_BAR_DEVICE_MEMORY));
+        template.bars.push_back(make_coordinator_bar(DPU_FUNCTION_VF,
+                                                      DPU_BAR_MAILBOX));
+        template.bars.push_back(make_coordinator_bar(DPU_FUNCTION_VF,
+                                                      DPU_BAR_MSIX));
+        pool.vf_templates.push_back(template);
+        cfg.vf_pools.push_back(pool);
+        cfg.af_request.requester = cfg.functions[0].key;
+        return cfg;
+    endfunction
+
+    function automatic dpu_resource_placement_cfg make_coordinator_placement();
+        dpu_resource_placement_cfg cfg;
+        dpu_resource_pool_config_t profile;
+        dpu_vio_placement_request request;
+        dpu_function_key_t vf7;
+
+        cfg = dpu_resource_placement_cfg::type_id::create("coordinator_placement");
+        profile.name = "virtio.qpair";
+        profile.class_id = 0;
+        profile.kind = DPU_RESOURCE_KIND_QUEUE;
+        profile.capacity = 128;
+        profile.max_per_function = 32;
+        cfg.profiles.push_back(profile);
+        request = dpu_vio_placement_request::type_id::create("request_20");
+        request.request_id = 20;
+        request.total_qpairs = 1;
+        request.candidate_kind = DPU_VIO_CANDIDATE_PF_ONLY;
+        request.device_policy = DPU_VIO_DEVICE_FIXED;
+        request.fixed_devices.push_back(make_coordinator_function(1, DPU_FUNCTION_PF, 0).key);
+        cfg.vio_requests.push_back(request);
+        request = dpu_vio_placement_request::type_id::create("request_10");
+        request.request_id = 10;
+        request.total_qpairs = 1;
+        request.candidate_kind = DPU_VIO_CANDIDATE_PF_ONLY;
+        request.device_policy = DPU_VIO_DEVICE_FIXED;
+        request.fixed_devices.push_back(make_coordinator_function(0, DPU_FUNCTION_PF, 0).key);
+        cfg.vio_requests.push_back(request);
+        vf7 = make_coordinator_function(0, DPU_FUNCTION_VF, 7).key;
+        request = dpu_vio_placement_request::type_id::create("request_30");
+        request.request_id = 30;
+        request.total_qpairs = 1;
+        request.candidate_kind = DPU_VIO_CANDIDATE_VF_ONLY;
+        request.device_policy = DPU_VIO_DEVICE_FIXED;
+        request.fixed_devices.push_back(vf7);
+        cfg.vio_requests.push_back(request);
+        return cfg;
+    endfunction
+
+    function automatic dpu_vio_qpair_override make_global_pin(
+        input int unsigned pair_index, input int unsigned global_id
+    );
+        dpu_vio_qpair_override override;
+        override = dpu_vio_qpair_override::type_id::create("global_pin");
+        override.request_pair_index = pair_index;
+        override.global_mode = DPU_ASSIGN_PINNED;
+        override.requested_global_qpair_id = global_id;
+        return override;
+    endfunction
+
+    function void test_configuration_resolver_atomicity();
+        dpu_configuration_resolver coordinator;
+        dpu_device_cfg source_cfg;
+        dpu_resource_placement_cfg placement_cfg;
+        dpu_resource_placement_cfg bad_placement;
+        dpu_device_snapshot device_snapshot;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_device_snapshot failed_device_snapshot;
+        dpu_resource_snapshot failed_resource_snapshot;
+        dpu_placement_diagnostic diagnostic;
+        dpu_vio_qpair_binding_t request10;
+        dpu_vio_qpair_binding_t request20;
+        dpu_vio_qpair_binding_t request30;
+        dpu_pcie_function_id_t vf_pcie;
+        dpu_bar_pair_lease_t vf_bar;
+        dpu_service_key_t services[$];
+        dpu_function_key_t vf7;
+        string why;
+        bit found_vf_service;
+
+        coordinator = dpu_configuration_resolver::type_id::create("coordinator");
+        source_cfg = make_coordinator_source();
+        placement_cfg = make_coordinator_placement();
+        if (!coordinator.resolve(source_cfg, placement_cfg, device_snapshot,
+                                 resource_snapshot, diagnostic))
+            `uvm_fatal("CONFIG_RESOLVER", diagnostic.message)
+        if (!device_snapshot.is_frozen() || !resource_snapshot.is_frozen() ||
+            !resource_snapshot.references_device_snapshot(device_snapshot))
+            `uvm_fatal("CONFIG_RESOLVER", "coordinator did not publish matching frozen snapshots")
+        if (!resource_snapshot.get_vio_binding(10, 0, request10) ||
+            !resource_snapshot.get_vio_binding(20, 0, request20) ||
+            !resource_snapshot.get_vio_binding(30, 0, request30) ||
+            (request10.global_qpair_id >= request20.global_qpair_id))
+            `uvm_fatal("CONFIG_RESOLVER", "request IDs did not determine AUTO global allocation order")
+        vf7 = make_coordinator_function(0, DPU_FUNCTION_VF, 7).key;
+        if (!device_snapshot.get_pcie_id(vf7, vf_pcie, why) ||
+            !device_snapshot.get_bar(vf7, DPU_BAR_DEVICE_MEMORY, vf_bar, why))
+            `uvm_fatal("CONFIG_RESOLVER", {"materialized VF omitted BDF or BAR: ", why})
+        device_snapshot.list_services(DPU_SERVICE_VIO_NET, services);
+        found_vf_service = 0;
+        foreach (services[index]) begin
+            if (dpu_same_function_key(services[index].function_key, vf7))
+                found_vf_service = 1;
+        end
+        if (!found_vf_service || (source_cfg.functions.size() != 2) ||
+            (source_cfg.functions[0].services.size() != 0) ||
+            (source_cfg.vf_pools[0].vf_templates[0].vf_id != 7))
+            `uvm_fatal("CONFIG_RESOLVER", "coordinator mutated source authoring or lost VF service")
+
+        bad_placement = dpu_resource_placement_cfg::type_id::create("bad_placement");
+        bad_placement.copy_from(placement_cfg);
+        bad_placement.vio_requests[1].total_qpairs = 2;
+        bad_placement.vio_requests[1].qpair_overrides.push_back(make_global_pin(0, 9));
+        bad_placement.vio_requests[1].qpair_overrides.push_back(make_global_pin(1, 9));
+        failed_device_snapshot = device_snapshot;
+        failed_resource_snapshot = resource_snapshot;
+        if (coordinator.resolve(source_cfg, bad_placement, failed_device_snapshot,
+                                failed_resource_snapshot, diagnostic))
+            `uvm_fatal("CONFIG_RESOLVER", "conflicting configuration resolved")
+        if ((failed_device_snapshot != null) || (failed_resource_snapshot != null) ||
+            (diagnostic.stage != DPU_PLACE_STAGE_RESOURCE_RESOLUTION) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_GLOBAL_QID_CONFLICT))
+            `uvm_fatal("CONFIG_RESOLVER", "atomic failure leaked snapshots or diagnostic")
+        if (!device_snapshot.is_frozen() || !resource_snapshot.is_frozen() ||
+            !resource_snapshot.get_vio_binding(10, 0, request10) ||
+            (request10.global_qpair_id != 0) ||
+            (placement_cfg.vio_requests[1].total_qpairs != 1) ||
+            (placement_cfg.vio_requests[1].qpair_overrides.size() != 0))
+            `uvm_fatal("CONFIG_RESOLVER", "failed candidate resolution mutated prior state")
     endfunction
 
     function automatic dpu_device_snapshot make_device_snapshot(
@@ -106,6 +335,39 @@ class dpu_resource_resolver_test extends uvm_test;
             !snapshot.add_bar(second_function, bar, why) ||
             !snapshot.add_service(second_service, why) ||
             !snapshot.set_expected_af(first_function, why) ||
+            !snapshot.freeze(why))
+            `uvm_fatal("RESOURCE_SNAPSHOT", why)
+        return snapshot;
+    endfunction
+
+    function automatic dpu_corruptible_device_snapshot
+        make_corruptible_device_snapshot(output dpu_service_key_t service_key);
+        dpu_corruptible_device_snapshot snapshot;
+        dpu_dut_caps caps;
+        dpu_function_key_t function_key;
+        dpu_pcie_function_id_t pcie_id;
+        dpu_bar_pair_lease_t bar;
+        string why;
+
+        snapshot = dpu_corruptible_device_snapshot::type_id::create(
+            "corruptible_device_snapshot");
+        caps = dpu_dut_caps::type_id::create("corruptible_device_caps");
+        function_key = make_function_key();
+        pcie_id.domain.host_id = 0;
+        pcie_id.domain.segment_id = 0;
+        pcie_id.bdf = 16'h0010;
+        bar.role = DPU_BAR_DEVICE_MEMORY;
+        bar.even_bar_id = 0;
+        bar.base = 64'h0000_0001_0000_0000;
+        bar.size = 64'h0000_0000_0200_0000;
+        service_key.function_key = function_key;
+        service_key.service_kind = DPU_SERVICE_VIO_NET;
+        service_key.service_instance_id = 0;
+        if (!snapshot.set_dut_caps(caps, why) ||
+            !snapshot.add_function(function_key, pcie_id, why) ||
+            !snapshot.add_bar(function_key, bar, why) ||
+            !snapshot.add_service(service_key, why) ||
+            !snapshot.set_expected_af(function_key, why) ||
             !snapshot.freeze(why))
             `uvm_fatal("RESOURCE_SNAPSHOT", why)
         return snapshot;
@@ -253,6 +515,19 @@ class dpu_resource_resolver_test extends uvm_test;
             (diagnostic.has_request_id != expect_request_context) ||
             (diagnostic.has_pair_index != expect_pair_context))
             `uvm_fatal("RESOURCE_RESOLVER", {name, " accepted an invalid allocation or lost diagnostic context"})
+    endfunction
+
+    function void test_deleted_service_owner_is_snapshot_mismatch();
+        dpu_corruptible_device_snapshot device_snapshot;
+        dpu_service_key_t service_key;
+        dpu_resource_resolver resolver;
+
+        device_snapshot = make_corruptible_device_snapshot(service_key);
+        device_snapshot.delete_service_owner(service_key);
+        resolver = dpu_resource_resolver::type_id::create("corruptible_resolver");
+        expect_resolve_failure("deleted_service_owner", resolver, device_snapshot,
+            make_plan(service_key), DPU_PLACE_ERR_SNAPSHOT_REFERENCE_MISMATCH,
+            0, 0);
     endfunction
 
     function automatic void expect_binding(
@@ -516,6 +791,8 @@ class dpu_resource_resolver_test extends uvm_test;
             (null_diagnostic == null) ||
             (null_diagnostic.error_code != DPU_PLACE_ERR_SNAPSHOT_REFERENCE_MISMATCH))
             `uvm_fatal("RESOURCE_SNAPSHOT", "failure did not publish a usable diagnostic")
+        test_deleted_service_owner_is_snapshot_mismatch();
+        test_configuration_resolver_atomicity();
     endfunction
 endclass : dpu_resource_resolver_test
 

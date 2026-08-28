@@ -29,6 +29,7 @@ package dpu_resource_pkg;
   `include "dpu_device_resolver.sv"
   `include "dpu_resource_snapshot.sv"
   `include "dpu_resource_resolver.sv"
+  `include "dpu_configuration_resolver.sv"
   `include "dpu_resource_manager.sv"
   `include "dpu_device_bootstrap_plan_builder.sv"
   `include "dpu_device_env.sv"

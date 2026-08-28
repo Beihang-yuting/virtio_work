@@ -1181,6 +1181,39 @@ class dpu_device_resolver_test extends uvm_test;
             `uvm_fatal("RESOLVER_TEST", "failed resolve changed old snapshot")
     endfunction
 
+    // Catches a coordinator that leaks base-resolver text as an unstable
+    // placement failure instead of preserving it under the documented code.
+    function void test_configuration_resolver_maps_device_failure();
+        dpu_configuration_resolver coordinator;
+        dpu_device_cfg cfg;
+        dpu_resource_placement_cfg placement_cfg;
+        dpu_resource_pool_config_t profile;
+        dpu_device_snapshot device_snapshot;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_placement_diagnostic diagnostic;
+
+        cfg = make_valid_cfg();
+        cfg.functions[3].services.delete();
+        cfg.af_request = null;
+        placement_cfg = dpu_resource_placement_cfg::type_id::create(
+            "device_failure_placement");
+        profile.name = "virtio.qpair";
+        profile.class_id = 0;
+        profile.kind = DPU_RESOURCE_KIND_QUEUE;
+        profile.capacity = 128;
+        profile.max_per_function = 32;
+        placement_cfg.profiles.push_back(profile);
+        coordinator = dpu_configuration_resolver::type_id::create(
+            "device_failure_coordinator");
+        if (coordinator.resolve(cfg, placement_cfg, device_snapshot,
+                                resource_snapshot, diagnostic) ||
+            (device_snapshot != null) || (resource_snapshot != null) ||
+            (diagnostic.stage != DPU_PLACE_STAGE_DEVICE_RESOLUTION) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_DEVICE_RESOLUTION_FAILED) ||
+            !contains(diagnostic.message, "no AF request"))
+            `uvm_fatal("CONFIG_RESOLVER", "base device failure lost stable placement diagnostic")
+    endfunction
+
     // Break caught: aggregate authored function count is ignored even when
     // every individual function key is within its per-host/PF/VF limits.
     // The rejected second candidate must not replace or mutate the first
@@ -1402,6 +1435,7 @@ class dpu_device_resolver_test extends uvm_test;
         test_snapshot_immutability_and_service_queries(resolver);
         test_aggregate_function_cap_is_atomic(resolver);
         test_failed_resolve_is_atomic(resolver);
+        test_configuration_resolver_maps_device_failure();
         test_snapshot_freeze_cross_checks_all_indexes();
         test_snapshot_manager_seeding_is_atomic();
         test_snapshot_seed_copies_resource_profiles();
