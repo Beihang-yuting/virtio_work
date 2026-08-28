@@ -19,6 +19,7 @@ class virtio_function_instance extends uvm_component;
     dpu_resource_manager    resource_manager;
     virtio_resource_client  resource_client;
     protected dpu_device_snapshot configuration_snapshot;
+    protected dpu_resource_snapshot configuration_resource_snapshot;
 
     // PCIe context is owned by the PCIe function manager, not this function.
     uvm_object              pcie_ctx_ref;
@@ -68,7 +69,8 @@ class virtio_function_instance extends uvm_component;
         input dpu_device_snapshot snapshot,
         input dpu_service_key_t service,
         input dpu_resource_manager manager,
-        input uvm_object pcie_ctx = null
+        input uvm_object pcie_ctx = null,
+        input dpu_resource_snapshot resource_snapshot = null
     );
         dpu_function_key_t key;
         dpu_pcie_function_id_t pcie_id;
@@ -119,8 +121,25 @@ class virtio_function_instance extends uvm_component;
                 "function configuration requires its snapshot-seeded device manager")
             return 0;
         end
+        if ((resource_snapshot != null) &&
+            (!resource_snapshot.is_frozen() ||
+             !resource_snapshot.references_device_snapshot(snapshot) ||
+             !manager.is_seeded_from_snapshots(snapshot, resource_snapshot))) begin
+            `uvm_fatal("FUNCTION_INSTANCE",
+                "function configuration requires its exact frozen resource snapshot")
+            return 0;
+        end
         if (resource_client != null) begin
-            if (!resource_client.bind_to_device(manager, key, why)) begin
+            if ((resource_snapshot != null) &&
+                !resource_client.bind_to_service(
+                    snapshot, resource_snapshot, service, why)) begin
+                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                    "could not import service resources for %s: %s",
+                    dpu_service_key_name(service), why))
+                return 0;
+            end
+            if ((resource_snapshot == null) &&
+                !resource_client.bind_to_device(manager, key, why)) begin
                 `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                     "could not bind device resources for %0d:%0d:%0d:%0d: %s",
                     key.host_id, key.pf_id, key.kind, key.vf_id, why))
@@ -128,6 +147,7 @@ class virtio_function_instance extends uvm_component;
             end
         end
         configuration_snapshot = snapshot;
+        configuration_resource_snapshot = resource_snapshot;
         function_kind = key.kind;
         function_key = key;
         service_key = service;
@@ -484,14 +504,20 @@ class virtio_function_instance extends uvm_component;
             driver_agent.fsm.stop_dataplane();
         if (driver_agent.ops != null)
             driver_agent.ops.device_reset();
-        release_fabric_qpairs("shutdown");
+        if ((resource_client != null) && resource_client.is_bound_to_service())
+            resource_client.reset_runtime_state();
+        else
+            release_fabric_qpairs("shutdown");
         state = VF_DISABLED;
     endtask
 
     virtual function void on_flr();
         vq_mgr.detach_all_queues();
         dataplane.cleanup_all();
-        release_fabric_qpairs("FLR");
+        if ((resource_client != null) && resource_client.is_bound_to_service())
+            resource_client.reset_runtime_state();
+        else
+            release_fabric_qpairs("FLR");
         state = VF_FLR;
     endfunction
 
@@ -542,6 +568,18 @@ class virtio_function_instance extends uvm_component;
         if (bar_pairs.size() != 0)
             transport.bar.configure_fabric_bar_pairs(bar_pairs);
 
+        if (configuration_resource_snapshot != null) begin
+            if (!resource_client.bind_to_service(
+                    configuration_snapshot, configuration_resource_snapshot,
+                    service_key, why)) begin
+                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                    "could not import service resources for %s: %s",
+                    dpu_service_key_name(service_key), why))
+                return;
+            end
+            transport.configure_fabric_managed(resource_client);
+            return;
+        end
         if (resource_manager == null)
             return;
         if (!resource_client.bind_to_device(resource_manager, function_key, why)) begin

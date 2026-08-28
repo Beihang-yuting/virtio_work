@@ -327,11 +327,6 @@ class virtio_pf_manager extends uvm_object;
         end
 
         // -----------------------------------------------------------------
-        // Step 2: Register queue mappings
-        // -----------------------------------------------------------------
-        resource_pool.register_vfs(num_vfs, pairs_per_vf);
-
-        // -----------------------------------------------------------------
         // Step 3: VF instances are created by the env, verify they exist
         // -----------------------------------------------------------------
         if (vf_instances.size() < num_vfs) begin
@@ -437,11 +432,6 @@ class virtio_pf_manager extends uvm_object;
             `uvm_warning("PF_MGR",
                 "disable_sriov: pcie_func_mgr_ref is null -- PCIe disable skipped")
         end
-
-        // -----------------------------------------------------------------
-        // Step 3: Clear queue mappings
-        // -----------------------------------------------------------------
-        resource_pool.unregister_all();
 
         active_vf_count = 0;
 

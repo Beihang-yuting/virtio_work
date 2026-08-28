@@ -14,7 +14,8 @@ class virtio_vf_instance extends virtio_function_instance;
         input dpu_device_snapshot snapshot,
         input dpu_service_key_t service,
         input dpu_resource_manager manager,
-        input uvm_object pcie_ctx = null
+        input uvm_object pcie_ctx = null,
+        input dpu_resource_snapshot resource_snapshot = null
     );
         dpu_function_key_t owner;
         string why;
@@ -31,7 +32,7 @@ class virtio_vf_instance extends virtio_function_instance;
             return 0;
         end
         return super.configure_from_service(
-            snapshot, service, manager, pcie_ctx);
+            snapshot, service, manager, pcie_ctx, resource_snapshot);
     endfunction
 endclass : virtio_vf_instance
 

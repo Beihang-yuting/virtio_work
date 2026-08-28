@@ -40,6 +40,7 @@ class virtio_net_env extends uvm_env;
     virtio_pf_instance         pf_instances[];
     virtio_function_instance   function_instances[];
     protected dpu_device_snapshot device_snapshot;
+    protected dpu_resource_snapshot resource_snapshot;
     protected dpu_resource_manager device_resource_manager;
     protected bit              configuration_valid;
     local dpu_dut_caps         effective_dut_caps;
@@ -90,12 +91,27 @@ class virtio_net_env extends uvm_env;
         bit found;
         int unsigned vf_count;
         int unsigned function_count;
+        dpu_vio_qpair_binding_t all_bindings[$];
+        dpu_vio_qpair_binding_t service_bindings[$];
+        bit use_resource_snapshot;
 
         why = "";
         device_snapshot.list_services(DPU_SERVICE_VIO_NET, service_keys);
         if (service_keys.size() == 0) begin
             why = "frozen device snapshot declares no VIO services";
             return 0;
+        end
+        resource_snapshot.list_vio_bindings(all_bindings);
+        use_resource_snapshot = (all_bindings.size() != 0);
+        if (use_resource_snapshot) begin
+            foreach (service_keys[index]) begin
+                resource_snapshot.list_vio_bindings_for_service(
+                    service_keys[index], service_bindings);
+                if (service_bindings.size() == 0) begin
+                    why = "published VIO service has no resource-snapshot bindings";
+                    return 0;
+                end
+            end
         end
         foreach (service_keys[index]) begin
             if (!device_snapshot.get_service_owner(service_keys[index], owner, why))
@@ -125,7 +141,8 @@ class virtio_net_env extends uvm_env;
                           group_keys[index].pf_id), this);
             if (!pf_instances[index].configure_services(
                     group_keys[index], device_snapshot,
-                    grouped_services[index], device_resource_manager, why)) begin
+                    grouped_services[index], device_resource_manager, why,
+                    use_resource_snapshot ? resource_snapshot : null)) begin
                 return 0;
             end
         end
@@ -203,12 +220,26 @@ class virtio_net_env extends uvm_env;
                 "a published frozen device snapshot is required")
             return;
         end
+        if (!uvm_config_db#(dpu_resource_snapshot)::get(
+                this, "", "dpu_resource_snapshot", resource_snapshot) ||
+            (resource_snapshot == null) || !resource_snapshot.is_frozen() ||
+            !resource_snapshot.references_device_snapshot(device_snapshot)) begin
+            `uvm_fatal("VIRTIO_ENV",
+                "an exact published frozen resource snapshot is required")
+            return;
+        end
         if (!uvm_config_db#(dpu_resource_manager)::get(
                 this, "", "dpu_resource_manager", device_resource_manager) ||
             (device_resource_manager == null) ||
             !device_resource_manager.is_snapshot_seeded()) begin
             `uvm_fatal("VIRTIO_ENV",
                 "a published snapshot-seeded device resource manager is required")
+            return;
+        end
+        if (!device_resource_manager.is_seeded_from_snapshots(
+                device_snapshot, resource_snapshot)) begin
+            `uvm_fatal("VIRTIO_ENV",
+                "published resource manager does not belong to the snapshot pair")
             return;
         end
         if (!cfg.validate_against_snapshot(device_snapshot, why)) begin

@@ -146,6 +146,7 @@ class virtio_fabric_resource_test extends uvm_test;
     dpu_device_env_config      device_cfg;
     dpu_device_env             device_env;
     dpu_device_snapshot        device_snapshot;
+    dpu_resource_snapshot      resource_snapshot;
     virtio_net_env_config      cfg;
     virtio_net_env             env;
     uvm_sequencer #(pcie_tl_tlp) fabric_cfg_tlp_seqr;
@@ -159,8 +160,52 @@ class virtio_fabric_resource_test extends uvm_test;
         input dpu_function_cfg function_cfg
     );
         device_builder.add_real_dut_bars(function_cfg);
-        void'(device_builder.add_vio_service(function_cfg, 0));
+        function_cfg.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
         return function_cfg;
+    endfunction
+
+    protected function void author_snapshot_qpair_placement(
+        input dpu_function_key_t sparse_owner
+    );
+        dpu_resource_pool_config_t profile;
+        dpu_vio_placement_request request;
+        dpu_vio_device_constraint count_rule;
+        dpu_vio_qpair_override override;
+        int unsigned sparse_locals[3] = '{0, 3, 17};
+        int unsigned sparse_globals[3] = '{100, 103, 117};
+
+        profile = device_cfg.resource_profiles[0];
+        device_cfg.placement_cfg.profiles.push_back(profile);
+        request = dpu_vio_placement_request::type_id::create(
+            "fabric_snapshot_qpair_request");
+        request.request_id = 1000;
+        request.total_qpairs = device_cfg.device_cfg.functions.size() + 2;
+        request.candidate_kind = DPU_VIO_CANDIDATE_PF_AND_VF;
+        request.device_policy = DPU_VIO_DEVICE_FIXED;
+        foreach (device_cfg.device_cfg.functions[index]) begin
+            request.fixed_devices.push_back(
+                device_cfg.device_cfg.functions[index].key);
+            count_rule = dpu_vio_device_constraint::type_id::create(
+                $sformatf("fabric_exact_qpairs_%0d", index));
+            count_rule.function_key = device_cfg.device_cfg.functions[index].key;
+            count_rule.mode = DPU_COUNT_EXACT;
+            count_rule.qpair_count = dpu_same_function_key(
+                count_rule.function_key, sparse_owner) ? 3 : 1;
+            request.device_constraints.push_back(count_rule);
+        end
+        foreach (sparse_locals[index]) begin
+            override = dpu_vio_qpair_override::type_id::create(
+                $sformatf("fabric_sparse_qpair_%0d", index));
+            override.request_pair_index = index;
+            override.owner_mode = DPU_ASSIGN_PINNED;
+            override.requested_owner = sparse_owner;
+            override.local_mode = DPU_ASSIGN_PINNED;
+            override.requested_local_pair_id = sparse_locals[index];
+            override.global_mode = DPU_ASSIGN_PINNED;
+            override.requested_global_qpair_id = sparse_globals[index];
+            request.qpair_overrides.push_back(override);
+        end
+        device_cfg.placement_cfg.vio_requests.push_back(request);
     endfunction
 
     protected function void pin_real_dut_bars(
@@ -546,12 +591,7 @@ class virtio_fabric_resource_test extends uvm_test;
         ref int unsigned global_rx_qids[$]
     );
         int unsigned global_rx_qid;
-        string why;
 
-        if (!function_instance.resource_client.reserve_qpairs(0, 1, why)) begin
-            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "could not reserve Fabric QP lease: %s", why))
-        end
         if (!function_instance.resource_client.local_qid_to_global_qid(
             0, global_rx_qid
         )) begin
@@ -564,6 +604,39 @@ class virtio_fabric_resource_test extends uvm_test;
             end
         end
         global_rx_qids.push_back(global_rx_qid);
+    endtask
+
+    task assert_sparse_snapshot_mapping(
+        input virtio_function_instance function_instance,
+        input string lifecycle
+    );
+        int unsigned observed_rx;
+
+        if (!function_instance.resource_client.is_bound_to_service() ||
+            (function_instance.resource_client.resource_manager != null) ||
+            (function_instance.resource_client.qpair_class_id != '0) ||
+            (function_instance.resource_client.qpair_leases.size() != 0)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s snapshot client retained legacy manager/class/lease state",
+                lifecycle))
+        end
+        if (!function_instance.resource_client.local_qid_to_global_qid(
+                0, observed_rx) || (observed_rx != 200)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s RX mapping did not come from snapshot", lifecycle))
+        end
+        if (!function_instance.resource_client.local_qid_to_global_qid(
+                6, observed_rx) || (observed_rx != 206)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s sparse pair 3 was replaced by a derived control queue",
+                lifecycle))
+        end
+        if (!function_instance.resource_client.local_qid_to_global_qid(
+                34, observed_rx) || (observed_rx != 234)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s sparse pair 17 mapping did not come from snapshot",
+                lifecycle))
+        end
     endtask
 
     task assert_fabric_bar_config_writes(
@@ -932,7 +1005,7 @@ class virtio_fabric_resource_test extends uvm_test;
         original_bars = function_view.bar_pairs;
         if (!function_view.configure_from_service(
                 device_snapshot, function_view.service_key,
-                function_view.resource_manager)) begin
+                function_view.resource_manager, null, resource_snapshot)) begin
             `uvm_fatal("FABRIC_RESOURCE",
                 "idempotent snapshot/service function binding was rejected")
         end
@@ -962,7 +1035,7 @@ class virtio_fabric_resource_test extends uvm_test;
         uvm_report_cb::add(null, catcher);
         configuration_succeeded = function_view.configure_from_service(
             forged_snapshot, function_view.service_key,
-            function_view.resource_manager);
+            function_view.resource_manager, null, resource_snapshot);
         uvm_report_cb::delete(null, catcher);
 
         bars_preserved =
@@ -1014,7 +1087,7 @@ class virtio_fabric_resource_test extends uvm_test;
         pin_real_dut_bars(device_builder, selected_af,
             64'h0000_0002_0000_0000, 64'h0000_0002_0200_0000,
             64'h0000_0002_0201_0000);
-        void'(device_builder.add_vio_service(selected_af, 0));
+        selected_af.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
         void'(author_vio_function(device_builder.add_vf(0, 0, 0, 0)));
         void'(author_vio_function(device_builder.add_vf(0, 0, 1, 0)));
         void'(author_vio_function(device_builder.add_vf(0, 0, 2, 0)));
@@ -1039,7 +1112,7 @@ class virtio_fabric_resource_test extends uvm_test;
         pin_real_dut_bars(device_builder, reused_domain_pf,
             64'h0000_0002_0000_0000, 64'h0000_0002_0200_0000,
             64'h0000_0002_0201_0000);
-        void'(device_builder.add_vio_service(reused_domain_pf, 0));
+        reused_domain_pf.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
         void'(author_vio_function(device_builder.add_vf(1, 0, 0, 0)));
         void'(author_vio_function(device_builder.add_vf(1, 0, 1, 0)));
         void'(author_vio_function(device_builder.add_vf(1, 0, 2, 0)));
@@ -1048,6 +1121,7 @@ class virtio_fabric_resource_test extends uvm_test;
         device_builder.select_af(selected_af);
 
         device_cfg = device_builder.make_env_config();
+        author_snapshot_qpair_placement(selected_af.key);
         cfg = virtio_net_env_config::type_id::create("cfg");
         cfg.default_num_pairs = 1;
         uvm_config_db#(dpu_device_env_config)::set(
@@ -1073,8 +1147,6 @@ class virtio_fabric_resource_test extends uvm_test;
     virtual task run_phase(uvm_phase phase);
         int unsigned global_rx_qids[$];
         bar_range_t all_bars[$];
-        int unsigned stale_global_rx_qid;
-        string why;
 
         phase.raise_objection(this);
 
@@ -1088,6 +1160,9 @@ class virtio_fabric_resource_test extends uvm_test;
         device_snapshot = device_env.get_snapshot();
         if ((device_snapshot == null) || !device_snapshot.is_frozen())
             `uvm_fatal("FABRIC_RESOURCE", "device environment did not publish a frozen snapshot")
+        resource_snapshot = device_env.get_resource_snapshot();
+        if ((resource_snapshot == null) || !resource_snapshot.is_frozen())
+            `uvm_fatal("FABRIC_RESOURCE", "device environment did not publish a frozen resource snapshot")
         assert_same_domain_collisions_rejected();
         assert_snapshot_order_and_reverse_lookup();
         assert_independent_domain_numeric_reuse();
@@ -1100,20 +1175,22 @@ class virtio_fabric_resource_test extends uvm_test;
                 env.pf_instances.size(), env.vf_instances.size()))
         end
 
+        assert_sparse_snapshot_mapping(
+            env.pf_instances[0].pf_function, "immediate configuration");
+
         foreach (env.pf_instances[pf_index]) begin
             if (env.pf_instances[pf_index].pf_function.transport.is_vf) begin
                 `uvm_fatal("FABRIC_RESOURCE", "PF function was modeled as a VF")
             end
             assert_bar_layout(env.pf_instances[pf_index].pf_function);
             assert_unique_bars(env.pf_instances[pf_index].pf_function, all_bars);
-            if (env.pf_instances[pf_index].pf_function.resource_client.reserve_qpairs(
-                0, 1, why
-            )) begin
-                `uvm_fatal("FABRIC_RESOURCE",
-                    "Fabric QP lease was accepted before capability discovery")
-            end
+            assert_unique_qpair(env.pf_instances[pf_index].pf_function,
+                                global_rx_qids);
             discover_fabric_function(env.pf_instances[pf_index].pf_function);
-            assert_unique_qpair(env.pf_instances[pf_index].pf_function, global_rx_qids);
+            if (pf_index == 0)
+                assert_sparse_snapshot_mapping(
+                    env.pf_instances[pf_index].pf_function,
+                    "capability discovery");
 
             foreach (env.pf_instances[pf_index].vf_functions[vf_index]) begin
                 if (!env.pf_instances[pf_index].vf_functions[vf_index].transport.is_vf) begin
@@ -1122,15 +1199,9 @@ class virtio_fabric_resource_test extends uvm_test;
                 assert_bar_layout(env.pf_instances[pf_index].vf_functions[vf_index]);
                 assert_unique_bars(env.pf_instances[pf_index].vf_functions[vf_index],
                                    all_bars);
-                if (env.pf_instances[pf_index].vf_functions[vf_index].resource_client.reserve_qpairs(
-                    0, 1, why
-                )) begin
-                    `uvm_fatal("FABRIC_RESOURCE",
-                        "Fabric QP lease was accepted before capability discovery")
-                end
-                discover_fabric_function(env.pf_instances[pf_index].vf_functions[vf_index]);
                 assert_unique_qpair(env.pf_instances[pf_index].vf_functions[vf_index],
                                     global_rx_qids);
+                discover_fabric_function(env.pf_instances[pf_index].vf_functions[vf_index]);
             end
         end
 
@@ -1140,86 +1211,18 @@ class virtio_fabric_resource_test extends uvm_test;
                 global_rx_qids.size()))
         end
 
-        // A frozen lease remains saved and mapped, but no new lease can be
-        // acquired until it is restored.
-        if (!env.pf_instances[0].pf_function.resource_client.freeze_qpairs(why) ||
-            env.pf_instances[0].pf_function.resource_client.reserve_qpairs(1, 1, why) ||
-            !env.pf_instances[0].pf_function.resource_client.restore_qpairs(why)) begin
-            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "QP freeze/restore lifecycle was not enforced: %s", why))
-        end
-
-        // Function reset owns lease cleanup.  Call the public FLR path rather
-        // than releasing through the client so a reset cannot leak Fabric QPs.
+        // FLR owns runtime cleanup only; immutable placement survives reset.
         env.pf_instances[0].pf_function.on_flr();
-        if ((env.pf_instances[0].pf_function.resource_client.qpair_leases.size() != 0) ||
-            (env.pf_instances[0].pf_function.resource_client.qpair_mappings.size() != 0) ||
-            env.pf_instances[0].pf_function.resource_client.local_qid_to_global_qid(
-                0, stale_global_rx_qid
-            )) begin
-            `uvm_fatal("FABRIC_RESOURCE",
-                "FLR did not release the function's Fabric QP leases")
-        end
+        assert_sparse_snapshot_mapping(
+            env.pf_instances[0].pf_function, "FLR");
+        discover_fabric_function(env.pf_instances[0].pf_function);
+        assert_sparse_snapshot_mapping(
+            env.pf_instances[0].pf_function, "reinitialization");
 
-        // A migration freeze is stateful even when this function has no local
-        // QP leases.  FLR teardown must still restore it, so a later QP
-        // reservation is not rejected as frozen.
-        if (!env.pf_instances[0].pf_function.resource_client.freeze_qpairs(why)) begin
-            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "could not freeze zero-lease function before FLR: %s", why))
-        end
-        env.pf_instances[0].pf_function.on_flr();
-        if (!env.pf_instances[0].pf_function.resource_client.reserve_qpairs(
-            0, 1, why
-        )) begin
-            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "zero-lease frozen FLR left Fabric QP state frozen: %s", why))
-        end
-
-        // Return to a zero-lease state so disabled-function teardown covers
-        // the same migration edge case independently of FLR.
-        if (!env.pf_instances[0].pf_function.resource_client.release_qpairs(why)) begin
-            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "could not clear QP lease before zero-lease shutdown: %s", why))
-        end
-        if (!env.pf_instances[0].pf_function.resource_client.freeze_qpairs(why)) begin
-            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "could not freeze zero-lease function before shutdown: %s", why))
-        end
+        // Shutdown is also runtime-only and cannot unregister placement.
         env.pf_instances[0].pf_function.shutdown();
-        if (!env.pf_instances[0].pf_function.resource_client.reserve_qpairs(
-            0, 1, why
-        )) begin
-            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "zero-lease frozen shutdown left Fabric QP state frozen: %s", why))
-        end
-
-        // Shutdown is the disabled-function teardown path and must release
-        // the same Fabric-owned QP leases even when migration left them saved.
-        if (!env.pf_instances[0].vf_functions[0].resource_client.freeze_qpairs(why)) begin
-            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "could not freeze VF QP lease before shutdown: %s", why))
-        end
-        env.pf_instances[0].vf_functions[0].shutdown();
-        if ((env.pf_instances[0].vf_functions[0].resource_client.qpair_leases.size() != 0) ||
-            (env.pf_instances[0].vf_functions[0].resource_client.qpair_mappings.size() != 0) ||
-            env.pf_instances[0].vf_functions[0].resource_client.local_qid_to_global_qid(
-                0, stale_global_rx_qid
-            )) begin
-            `uvm_fatal("FABRIC_RESOURCE",
-                "function shutdown did not release Fabric QP leases")
-        end
-
-        foreach (env.pf_instances[pf_index]) begin
-            if (!env.pf_instances[pf_index].pf_function.resource_client.release_qpairs(why))
-                `uvm_fatal("FABRIC_RESOURCE", $sformatf("PF QP release failed: %s", why))
-            foreach (env.pf_instances[pf_index].vf_functions[vf_index]) begin
-                if (!env.pf_instances[pf_index].vf_functions[vf_index].resource_client.release_qpairs(why)) begin
-                    `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                        "VF QP release failed: %s", why))
-                end
-            end
-        end
+        assert_sparse_snapshot_mapping(
+            env.pf_instances[0].pf_function, "shutdown");
 
         phase.drop_objection(this);
     endtask

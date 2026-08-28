@@ -172,6 +172,62 @@ class virtio_monitor_routing_test extends uvm_test;
         return null;
     endfunction
 
+    protected function dpu_service_key_t allow_vio_service(
+        input dpu_function_cfg function_cfg
+    );
+        dpu_service_key_t key;
+
+        function_cfg.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
+        key.function_key = function_cfg.key;
+        key.service_kind = DPU_SERVICE_VIO_NET;
+        key.service_instance_id = 0;
+        return key;
+    endfunction
+
+    protected function void author_snapshot_qpair_placement(
+        input dpu_function_key_t sparse_owner
+    );
+        dpu_resource_pool_config_t profile;
+        dpu_vio_placement_request request;
+        dpu_vio_device_constraint count_rule;
+        dpu_vio_qpair_override override;
+        int unsigned sparse_locals[3] = '{0, 3, 17};
+        int unsigned sparse_globals[3] = '{30, 33, 47};
+
+        profile = device_env_cfg.resource_profiles[0];
+        device_env_cfg.placement_cfg.profiles.push_back(profile);
+        request = dpu_vio_placement_request::type_id::create(
+            "routing_snapshot_qpair_request");
+        request.request_id = 2000;
+        request.total_qpairs = 5;
+        request.candidate_kind = DPU_VIO_CANDIDATE_PF_AND_VF;
+        request.device_policy = DPU_VIO_DEVICE_FIXED;
+        foreach (device_env_cfg.device_cfg.functions[index]) begin
+            request.fixed_devices.push_back(
+                device_env_cfg.device_cfg.functions[index].key);
+            count_rule = dpu_vio_device_constraint::type_id::create(
+                $sformatf("routing_exact_qpairs_%0d", index));
+            count_rule.function_key = device_env_cfg.device_cfg.functions[index].key;
+            count_rule.mode = DPU_COUNT_EXACT;
+            count_rule.qpair_count = dpu_same_function_key(
+                count_rule.function_key, sparse_owner) ? 3 : 1;
+            request.device_constraints.push_back(count_rule);
+        end
+        foreach (sparse_locals[index]) begin
+            override = dpu_vio_qpair_override::type_id::create(
+                $sformatf("routing_sparse_qpair_%0d", index));
+            override.request_pair_index = index;
+            override.owner_mode = DPU_ASSIGN_PINNED;
+            override.requested_owner = sparse_owner;
+            override.local_mode = DPU_ASSIGN_PINNED;
+            override.requested_local_pair_id = sparse_locals[index];
+            override.global_mode = DPU_ASSIGN_PINNED;
+            override.requested_global_qpair_id = sparse_globals[index];
+            request.qpair_overrides.push_back(override);
+        end
+        device_env_cfg.placement_cfg.vio_requests.push_back(request);
+    endfunction
+
     // Break caught: bind_to_device accepts a manager that was not seeded from
     // the frozen global device snapshot.
     protected function bit check_device_bind_requires_snapshot_seed();
@@ -425,16 +481,16 @@ class virtio_monitor_routing_test extends uvm_test;
         pin_real_dut_bars(
             pf_cfg, PF_BAR0_BASE, PF_BAR2_BASE, PF_BAR4_BASE);
         device_builder.add_real_dut_bars(vf_cfg);
-        pf_service_key = device_builder.add_vio_service(pf_cfg, 0);
-        vf_service_key = device_builder.add_vio_service(vf_cfg, 0);
+        pf_service_key = allow_vio_service(pf_cfg);
+        vf_service_key = allow_vio_service(vf_cfg);
         reused_pf_cfg = device_builder.add_pf(
             1, 0, 0, DPU_ALLOC_PINNED, PF_BDF);
         pin_real_dut_bars(
             reused_pf_cfg, PF_BAR0_BASE, PF_BAR2_BASE, PF_BAR4_BASE);
-        reused_pf_service_key = device_builder.add_vio_service(
-            reused_pf_cfg, 0);
+        reused_pf_service_key = allow_vio_service(reused_pf_cfg);
         device_builder.select_af(pf_cfg);
         device_env_cfg = device_builder.make_env_config();
+        author_snapshot_qpair_placement(pf_cfg.key);
 
         virtio_cfg = virtio_net_env_config::type_id::create("virtio_cfg");
         virtio_cfg.scb_enable = 1;
@@ -560,7 +616,10 @@ class virtio_monitor_routing_test extends uvm_test;
         virtio_function_instance vf;
         virtio_function_instance reused_pf;
         dpu_function_key_t reused_pf_key;
+        dpu_service_key_t reverse_service_key;
+        int unsigned reverse_local_qid;
         pcie_tl_mem_tlp tlp;
+        int unsigned snapshot_global_qid;
 
         phase.raise_objection(this);
         @(posedge virtio_tb_top.rst_n);
@@ -571,6 +630,27 @@ class virtio_monitor_routing_test extends uvm_test;
         reused_pf_key = pf.function_key;
         reused_pf_key.host_id = 1;
         reused_pf = find_vio_function(reused_pf_key);
+        if (!pf.resource_client.local_qid_to_global_qid(
+                6, snapshot_global_qid) || (snapshot_global_qid != 66)) begin
+            `uvm_fatal("ROUTING_TEST",
+                "immediate sparse pair 3 mapping did not come from snapshot")
+        end
+        if (!virtio_env.pf_instances[0].pf_manager.resource_pool.
+                local_to_global_for_service(
+                    pf.service_key, 6, snapshot_global_qid) ||
+            (snapshot_global_qid != 66) ||
+            !virtio_env.pf_instances[0].pf_manager.resource_pool.
+                global_to_service_local(
+                    66, reverse_service_key, reverse_local_qid) ||
+            (dpu_service_key_name(reverse_service_key) !=
+             dpu_service_key_name(pf.service_key)) ||
+            (reverse_local_qid != 6) ||
+            (virtio_env.pf_instances[0].pf_manager.resource_pool.get_queue_name(
+                pf.service_key, 6) != $sformatf("%s_receiveq_3",
+                    dpu_service_key_name(pf.service_key)))) begin
+            `uvm_fatal("ROUTING_TEST",
+                "service-keyed pool replaced sparse pair 3 with control queue")
+        end
         assert(reused_pf != null)
             else `uvm_fatal("ROUTING_TEST",
                 "reused-domain VIO function was not constructed")
@@ -656,6 +736,15 @@ class virtio_monitor_routing_test extends uvm_test;
         test_real_msix_memory_write(pf, vf);
         test_protocol_vif_isolation(pf, vf);
         test_queue_and_device_resets(pf);
+        if (!pf.resource_client.local_qid_to_global_qid(
+                6, snapshot_global_qid) || (snapshot_global_qid != 66) ||
+            !virtio_env.pf_instances[0].pf_manager.resource_pool.
+                local_to_global_for_service(
+                    pf.service_key, 6, snapshot_global_qid) ||
+            (snapshot_global_qid != 66)) begin
+            `uvm_fatal("ROUTING_TEST",
+                "runtime reset mutated immutable sparse placement")
+        end
         assert_domain_reused_transport_path(pf, reused_pf);
 
         `uvm_info("ROUTING_TEST", "External PCIe monitor routing PASSED", UVM_NONE)

@@ -51,7 +51,8 @@ class virtio_pf_instance extends uvm_component;
         input dpu_device_snapshot snapshot,
         input dpu_service_key_t service_keys[$],
         input dpu_resource_manager manager,
-        output string why
+        output string why,
+        input dpu_resource_snapshot resource_snapshot = null
     );
         dpu_function_key_t owner;
         dpu_pcie_function_id_t pcie_id;
@@ -64,6 +65,7 @@ class virtio_pf_instance extends uvm_component;
         dpu_dut_caps manager_caps;
         bit owner_seen;
         int unsigned vf_count;
+        dpu_vio_qpair_binding_t service_bindings[$];
 
         why = "";
         if (services_configured) begin
@@ -89,6 +91,13 @@ class virtio_pf_instance extends uvm_component;
         end
         if (!manager.is_seeded_from_snapshot(snapshot)) begin
             why = "VIO service group manager belongs to a different snapshot";
+            return 0;
+        end
+        if ((resource_snapshot != null) &&
+            (!resource_snapshot.is_frozen() ||
+             !resource_snapshot.references_device_snapshot(snapshot) ||
+             !manager.is_seeded_from_snapshots(snapshot, resource_snapshot))) begin
+            why = "VIO service group requires its exact frozen resource snapshot";
             return 0;
         end
         if (!manager.lookup_resource_class(
@@ -153,6 +162,14 @@ class virtio_pf_instance extends uvm_component;
             end
             if (!snapshot.get_service_owner(service_keys[index], owner, why))
                 return 0;
+            if (resource_snapshot != null) begin
+                resource_snapshot.list_vio_bindings_for_service(
+                    service_keys[index], service_bindings);
+                if (service_bindings.size() == 0) begin
+                    why = "VIO service has no resource-snapshot qpair bindings";
+                    return 0;
+                end
+            end
             if ((owner.host_id != parent_pf_key.host_id) ||
                 (owner.pf_id != parent_pf_key.pf_id) ||
                 ((owner.kind != DPU_FUNCTION_PF) &&
@@ -205,6 +222,8 @@ class virtio_pf_instance extends uvm_component;
         end
         vf_keys = new[vf_count];
         vf_functions = new[vf_count];
+        if (pf_manager == null)
+            pf_manager = virtio_pf_manager::type_id::create("pf_manager");
 
         foreach (service_keys[index]) begin
             owner = resolved_owners[index];
@@ -216,7 +235,8 @@ class virtio_pf_instance extends uvm_component;
                 pf_function = virtio_function_instance::type_id::create(
                     "pf_function", this);
                 if (!pf_function.configure_from_service(
-                        snapshot, service_keys[index], manager)) begin
+                        snapshot, service_keys[index], manager, null,
+                        resource_snapshot)) begin
                     why = "could not configure resolved PF VIO function";
                     return 0;
                 end
@@ -232,8 +252,18 @@ class virtio_pf_instance extends uvm_component;
                 vf_functions[vf_index] = virtio_vf_instance::type_id::create(
                     $sformatf("vf_function_%0d", owner.vf_id), this);
                 if (!vf_functions[vf_index].configure_from_service(
-                        snapshot, service_keys[index], manager)) begin
+                        snapshot, service_keys[index], manager, null,
+                        resource_snapshot)) begin
                     why = "could not configure resolved VF VIO function";
+                    return 0;
+                end
+            end
+        end
+        if (resource_snapshot != null) begin
+            foreach (service_keys[index]) begin
+                if (!pf_manager.resource_pool.import_service_bindings(
+                        service_keys[index], resource_snapshot, why)) begin
+                    why = {"could not import VIO service queue view: ", why};
                     return 0;
                 end
             end
@@ -260,7 +290,8 @@ class virtio_pf_instance extends uvm_component;
                 "PF instance requires snapshot-declared VIO services")
             return;
         end
-        pf_manager = virtio_pf_manager::type_id::create("pf_manager");
+        if (pf_manager == null)
+            pf_manager = virtio_pf_manager::type_id::create("pf_manager");
         pf_manager.pf_index = pf_id;
         configuration_valid = 1;
     endfunction

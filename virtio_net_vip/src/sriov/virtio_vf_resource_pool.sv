@@ -1,15 +1,13 @@
 `ifndef VIRTIO_VF_RESOURCE_POOL_SV
 `define VIRTIO_VF_RESOURCE_POOL_SV
 
-// A local virtio queue-name view.  It is deliberately not a resource
-// allocator: Fabric owns global identifiers and a function's
-// virtio_resource_client supplies any global IDs this view exposes.
+// Read-only service-keyed naming and lookup view over frozen qpair bindings.
+// Control/Admin-VQ identity is intentionally outside this snapshot view.
 typedef struct {
-    dpu_function_key_t function_key;
-    int unsigned       local_qid;
-    int unsigned       global_qid;
-    bit                has_global_qid;
-    string             queue_name;
+    dpu_service_key_t service_key;
+    int unsigned      local_qid;
+    int unsigned      global_qid;
+    string            queue_name;
 } virtio_local_queue_mapping_t;
 
 class virtio_vf_resource_pool extends uvm_object;
@@ -21,121 +19,87 @@ class virtio_vf_resource_pool extends uvm_object;
         super.new(name);
     endfunction
 
-    protected function bit same_function(
-        input dpu_function_key_t lhs,
-        input dpu_function_key_t rhs
+    protected function bit same_service(
+        input dpu_service_key_t lhs,
+        input dpu_service_key_t rhs
     );
-        return (lhs.host_id == rhs.host_id) &&
-               (lhs.pf_id == rhs.pf_id) &&
-               (lhs.kind == rhs.kind) &&
-               (lhs.vf_id == rhs.vf_id);
+        return dpu_service_key_name(lhs) == dpu_service_key_name(rhs);
     endfunction
 
-    function void register_function_queues(
-        input dpu_function_key_t key,
-        input int unsigned num_pairs
+    function bit import_service_bindings(
+        input dpu_service_key_t service_key,
+        input dpu_resource_snapshot resource_snapshot,
+        output string why
     );
+        dpu_vio_qpair_binding_t bindings[$];
+        virtio_local_queue_mapping_t imported[$];
         virtio_local_queue_mapping_t mapping;
+        int unsigned existing_count;
 
-        unregister_function(key);
-        for (int unsigned pair_id = 0; pair_id < num_pairs; pair_id++) begin
-            mapping.function_key = key;
-            mapping.local_qid = 2 * pair_id;
-            mapping.global_qid = '0;
-            mapping.has_global_qid = 0;
-            mapping.queue_name = $sformatf("function_%0d_%0d_%0d_%0d_receiveq_%0d",
-                key.host_id, key.pf_id, key.kind, key.vf_id, pair_id);
-            queue_map.push_back(mapping);
-
-            mapping.local_qid = 2 * pair_id + 1;
-            mapping.queue_name = $sformatf("function_%0d_%0d_%0d_%0d_transmitq_%0d",
-                key.host_id, key.pf_id, key.kind, key.vf_id, pair_id);
-            queue_map.push_back(mapping);
+        why = "";
+        if ((resource_snapshot == null) || !resource_snapshot.is_frozen()) begin
+            why = "queue view requires a frozen resource snapshot";
+            return 0;
         end
-
-        mapping.function_key = key;
-        mapping.local_qid = 2 * num_pairs;
-        mapping.global_qid = '0;
-        mapping.has_global_qid = 0;
-        mapping.queue_name = $sformatf("function_%0d_%0d_%0d_%0d_controlq",
-            key.host_id, key.pf_id, key.kind, key.vf_id);
-        queue_map.push_back(mapping);
-    endfunction
-
-    protected function void import_queue_mapping(
-        input dpu_function_key_t key,
-        input int unsigned local_qid,
-        input int unsigned global_qid,
-        input string queue_name
-    );
-        virtio_local_queue_mapping_t mapping;
-
-        foreach (queue_map[index]) begin
-            if (same_function(queue_map[index].function_key, key) &&
-                (queue_map[index].local_qid == local_qid)) begin
-                queue_map[index].global_qid = global_qid;
-                queue_map[index].has_global_qid = 1;
-                return;
+        resource_snapshot.list_vio_bindings_for_service(service_key, bindings);
+        if (bindings.size() == 0) begin
+            why = "queue view service has no qpair bindings";
+            return 0;
+        end
+        foreach (bindings[index]) begin
+            if (dpu_service_key_name(bindings[index].service_key) !=
+                dpu_service_key_name(service_key)) begin
+                why = "queue view received a binding for another service";
+                return 0;
             end
+            mapping.service_key = service_key;
+            mapping.local_qid = 2 * bindings[index].local_pair_id;
+            mapping.global_qid = 2 * bindings[index].global_qpair_id;
+            mapping.queue_name = $sformatf("%s_receiveq_%0d",
+                dpu_service_key_name(service_key),
+                bindings[index].local_pair_id);
+            imported.push_back(mapping);
+            mapping.local_qid = 2 * bindings[index].local_pair_id + 1;
+            mapping.global_qid = 2 * bindings[index].global_qpair_id + 1;
+            mapping.queue_name = $sformatf("%s_transmitq_%0d",
+                dpu_service_key_name(service_key),
+                bindings[index].local_pair_id);
+            imported.push_back(mapping);
         end
-        mapping.function_key = key;
-        mapping.local_qid = local_qid;
-        mapping.global_qid = global_qid;
-        mapping.has_global_qid = 1;
-        mapping.queue_name = queue_name;
-        queue_map.push_back(mapping);
-    endfunction
 
-    // Import is a view operation: these global IDs were granted by Fabric;
-    // this class never chooses or increments an ID itself.
-    function void import_qpair_leases(
-        input dpu_function_key_t key,
-        input virtio_resource_client client
-    );
-        virtio_local_queue_mapping_t mapping;
-
-        if (client == null)
-            return;
-        foreach (client.qpair_mappings[index]) begin
-            mapping.local_qid = 2 * client.qpair_mappings[index].local_pair;
-            mapping.queue_name = $sformatf("function_%0d_%0d_%0d_%0d_receiveq_%0d",
-                key.host_id, key.pf_id, key.kind, key.vf_id,
-                client.qpair_mappings[index].local_pair);
-            import_queue_mapping(key, mapping.local_qid,
-                client.qpair_mappings[index].rx_global_qid, mapping.queue_name);
-
-            mapping.local_qid++;
-            mapping.queue_name = $sformatf("function_%0d_%0d_%0d_%0d_transmitq_%0d",
-                key.host_id, key.pf_id, key.kind, key.vf_id,
-                client.qpair_mappings[index].local_pair);
-            import_queue_mapping(key, mapping.local_qid,
-                client.qpair_mappings[index].tx_global_qid, mapping.queue_name);
-        end
-    endfunction
-
-    function void unregister_function(input dpu_function_key_t key);
-        virtio_local_queue_mapping_t remaining[$];
-
+        existing_count = 0;
         foreach (queue_map[index]) begin
-            if (!same_function(queue_map[index].function_key, key))
-                remaining.push_back(queue_map[index]);
+            if (!same_service(queue_map[index].service_key, service_key))
+                continue;
+            if ((existing_count >= imported.size()) ||
+                (queue_map[index].local_qid != imported[existing_count].local_qid) ||
+                (queue_map[index].global_qid != imported[existing_count].global_qid) ||
+                (queue_map[index].queue_name != imported[existing_count].queue_name)) begin
+                why = "queue view service mapping cannot be reassigned";
+                return 0;
+            end
+            existing_count++;
         end
-        queue_map = remaining;
+        if (existing_count != 0) begin
+            if (existing_count != imported.size()) begin
+                why = "queue view service mapping cannot be reassigned";
+                return 0;
+            end
+            return 1;
+        end
+        foreach (imported[index])
+            queue_map.push_back(imported[index]);
+        return 1;
     endfunction
 
-    function void unregister_all();
-        queue_map.delete();
-    endfunction
-
-    function bit local_to_global_for_function(
-        input dpu_function_key_t key,
+    function bit local_to_global_for_service(
+        input dpu_service_key_t service_key,
         input int unsigned local_qid,
         output int unsigned global_qid
     );
         foreach (queue_map[index]) begin
-            if (same_function(queue_map[index].function_key, key) &&
-                (queue_map[index].local_qid == local_qid) &&
-                queue_map[index].has_global_qid) begin
+            if (same_service(queue_map[index].service_key, service_key) &&
+                (queue_map[index].local_qid == local_qid)) begin
                 global_qid = queue_map[index].global_qid;
                 return 1;
             end
@@ -144,126 +108,51 @@ class virtio_vf_resource_pool extends uvm_object;
         return 0;
     endfunction
 
-    // Legacy APIs preserve PF-manager call sites.  They register local VF
-    // names only; their global IDs now remain Fabric-owned and unavailable
-    // until a client imports a lease.
-    function void register_vf_queues(int unsigned vf_id, int unsigned num_pairs);
-        dpu_function_key_t key;
-
-        key.host_id = 0;
-        key.pf_id = 0;
-        key.kind = DPU_FUNCTION_VF;
-        key.vf_id = vf_id;
-        register_function_queues(key, num_pairs);
-    endfunction
-
-    function void register_vfs(int unsigned num_vfs, int unsigned pairs_per_vf = 1);
-        for (int unsigned vf_id = 0; vf_id < num_vfs; vf_id++)
-            register_vf_queues(vf_id, pairs_per_vf);
-    endfunction
-
-    function void unregister_vf(int unsigned vf_id);
-        dpu_function_key_t key;
-
-        key.host_id = 0;
-        key.pf_id = 0;
-        key.kind = DPU_FUNCTION_VF;
-        key.vf_id = vf_id;
-        unregister_function(key);
-    endfunction
-
-    function int unsigned local_to_global(int unsigned vf_id, int unsigned local_qid);
-        dpu_function_key_t key;
-        int unsigned global_qid;
-
-        key.host_id = 0;
-        key.pf_id = 0;
-        key.kind = DPU_FUNCTION_VF;
-        key.vf_id = vf_id;
-        if (local_to_global_for_function(key, local_qid, global_qid))
-            return global_qid;
-        `uvm_error("VF_RES_POOL", $sformatf(
-            "no Fabric global mapping for VF%0d local_qid=%0d", vf_id, local_qid))
+    function bit global_to_service_local(
+        input int unsigned global_qid,
+        output dpu_service_key_t service_key,
+        output int unsigned local_qid
+    );
+        foreach (queue_map[index]) begin
+            if (queue_map[index].global_qid == global_qid) begin
+                service_key = queue_map[index].service_key;
+                local_qid = queue_map[index].local_qid;
+                return 1;
+            end
+        end
+        service_key.function_key.host_id = 0;
+        service_key.function_key.pf_id = 0;
+        service_key.function_key.kind = DPU_FUNCTION_PF;
+        service_key.function_key.vf_id = 0;
+        service_key.service_kind = DPU_SERVICE_VIO_NET;
+        service_key.service_instance_id = 0;
+        local_qid = '0;
         return 0;
     endfunction
 
-    function void global_to_local(
-        int unsigned global_qid,
-        ref int unsigned vf_id,
-        ref int unsigned local_qid
+    function string get_queue_name(
+        input dpu_service_key_t service_key,
+        input int unsigned local_qid
     );
         foreach (queue_map[index]) begin
-            if (queue_map[index].has_global_qid &&
-                (queue_map[index].global_qid == global_qid)) begin
-                vf_id = queue_map[index].function_key.vf_id;
-                local_qid = queue_map[index].local_qid;
-                return;
-            end
-        end
-        `uvm_error("VF_RES_POOL", $sformatf(
-            "no Fabric local mapping for global_qid=%0d", global_qid))
-        vf_id = '0;
-        local_qid = '0;
-    endfunction
-
-    function int unsigned get_total_queues();
-        return queue_map.size();
-    endfunction
-
-    function int unsigned get_vf_queue_count(int unsigned vf_id);
-        int unsigned count;
-
-        count = 0;
-        foreach (queue_map[index]) begin
-            if ((queue_map[index].function_key.kind == DPU_FUNCTION_VF) &&
-                (queue_map[index].function_key.vf_id == vf_id))
-                count++;
-        end
-        return count;
-    endfunction
-
-    function string get_queue_name(int unsigned vf_id, int unsigned local_qid);
-        foreach (queue_map[index]) begin
-            if ((queue_map[index].function_key.kind == DPU_FUNCTION_VF) &&
-                (queue_map[index].function_key.vf_id == vf_id) &&
+            if (same_service(queue_map[index].service_key, service_key) &&
                 (queue_map[index].local_qid == local_qid))
                 return queue_map[index].queue_name;
         end
         return "";
     endfunction
 
-    // Kept for legacy PF-manager users.  This only compares mappings that
-    // Fabric already granted; it cannot create a conflicting global ID.
-    function bit check_resource_conflict(int unsigned vf_id_a, int unsigned vf_id_b);
-        foreach (queue_map[left_index]) begin
-            if (!queue_map[left_index].has_global_qid ||
-                (queue_map[left_index].function_key.kind != DPU_FUNCTION_VF) ||
-                (queue_map[left_index].function_key.vf_id != vf_id_a))
-                continue;
-            foreach (queue_map[right_index]) begin
-                if (queue_map[right_index].has_global_qid &&
-                    (queue_map[right_index].function_key.kind == DPU_FUNCTION_VF) &&
-                    (queue_map[right_index].function_key.vf_id == vf_id_b) &&
-                    (queue_map[left_index].global_qid ==
-                     queue_map[right_index].global_qid)) begin
-                    return 1;
-                end
-            end
-        end
-        return 0;
+    function int unsigned get_total_queues();
+        return queue_map.size();
     endfunction
 
     function void print_map();
         foreach (queue_map[index]) begin
             `uvm_info("VF_RES_POOL", $sformatf(
-                "function=%0d:%0d:%0d:%0d local_qid=%0d global_qid=%0d valid=%0b %s",
-                queue_map[index].function_key.host_id,
-                queue_map[index].function_key.pf_id,
-                queue_map[index].function_key.kind,
-                queue_map[index].function_key.vf_id,
+                "service=%s local_qid=%0d global_qid=%0d %s",
+                dpu_service_key_name(queue_map[index].service_key),
                 queue_map[index].local_qid, queue_map[index].global_qid,
-                queue_map[index].has_global_qid, queue_map[index].queue_name),
-                UVM_LOW)
+                queue_map[index].queue_name), UVM_LOW)
         end
     endfunction
 endclass : virtio_vf_resource_pool
