@@ -26,6 +26,26 @@ VIRTIO_MAINTAINED_TESTS=(
   virtio_traffic_test
 )
 
+_count_literal_occurrences() {
+  local file_path="$1"
+  local literal="$2"
+
+  if [[ -z "$literal" ]]; then
+    echo "literal occurrence counter requires a nonempty token" >&2
+    return 2
+  fi
+  awk -v literal="$literal" '
+    {
+      remainder = $0
+      while ((offset = index(remainder, literal)) != 0) {
+        count++
+        remainder = substr(remainder, offset + length(literal))
+      }
+    }
+    END { print count + 0 }
+  ' "$file_path"
+}
+
 _validate_virtio_test_manifest() {
   local manifest_root required test_name count
   local -A seen=()
@@ -63,15 +83,23 @@ _validate_global_dpu_static_contracts() {
   local executor_input_count executor_assignment_count
   local removed_caps_binder removed_caps_call_pattern
   local placement_decl_count auto_policy_count resource_snapshot_count
+  local placement_decl_literal auto_policy_literal resource_snapshot_literal
 
   manifest_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  placement_decl_count="$(grep -c \
-    'dpu_resource_placement_cfg placement_cfg;' "$manifest_root/README.md" || true)"
-  auto_policy_count="$(grep -c \
-    'DPU_VIO_DEVICE_AUTO_MINIMUM' "$manifest_root/README.md" || true)"
-  resource_snapshot_count="$(grep -c \
-    'dpu_resource_snapshot resource_snapshot;' \
-    "$manifest_root/README.md" || true)"
+  # Assemble guarded tokens so the implementation cannot satisfy its own
+  # checks if the scan scope is widened later.
+  placement_decl_literal='dpu_resource_'
+  placement_decl_literal+='placement_cfg placement_cfg;'
+  auto_policy_literal='DPU_VIO_DEVICE_'
+  auto_policy_literal+='AUTO_MINIMUM'
+  resource_snapshot_literal='dpu_resource_'
+  resource_snapshot_literal+='snapshot resource_snapshot;'
+  placement_decl_count="$(_count_literal_occurrences \
+    "$manifest_root/README.md" "$placement_decl_literal")"
+  auto_policy_count="$(_count_literal_occurrences \
+    "$manifest_root/README.md" "$auto_policy_literal")"
+  resource_snapshot_count="$(_count_literal_occurrences \
+    "$manifest_root/README.md" "$resource_snapshot_literal")"
   if [[ "$placement_decl_count" -ne 1 || "$auto_policy_count" -ne 1 ||
         "$resource_snapshot_count" -ne 1 ]]; then
     echo "README placement example is missing or duplicated" >&2
@@ -220,9 +248,11 @@ unset -f _validate_virtio_test_manifest
 _validate_global_dpu_static_contracts || {
   contract_status=$?
   unset -f _validate_global_dpu_static_contracts
+  unset -f _count_literal_occurrences
   return "$contract_status" 2>/dev/null || exit "$contract_status"
 }
 unset -f _validate_global_dpu_static_contracts
+unset -f _count_literal_occurrences
 
 _validate_documentation_contracts || {
   documentation_status=$?

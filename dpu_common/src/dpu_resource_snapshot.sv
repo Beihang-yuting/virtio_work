@@ -122,25 +122,6 @@ class dpu_resource_snapshot extends uvm_object;
         binding.global_qpair_id = 0;
     endfunction
 
-    protected function void sort_and_unique_ids(ref int unsigned ids[$]);
-        int unsigned swap;
-        int unsigned result[$];
-        for (int left = 0; left < ids.size(); left++) begin
-            for (int right = left + 1; right < ids.size(); right++) begin
-                if (ids[right] < ids[left]) begin
-                    swap = ids[left];
-                    ids[left] = ids[right];
-                    ids[right] = swap;
-                end
-            end
-        end
-        foreach (ids[index]) begin
-            if ((result.size() == 0) || (result[result.size() - 1] != ids[index]))
-                result.push_back(ids[index]);
-        end
-        ids = result;
-    endfunction
-
     protected function void sort_and_merge_ranges(
         ref dpu_global_id_range_t ranges[$]
     );
@@ -168,6 +149,27 @@ class dpu_resource_snapshot extends uvm_object;
         ranges = result;
     endfunction
 
+    protected function void canonicalize_reservations(
+        ref int unsigned ids[$],
+        ref dpu_global_id_range_t ranges[$]
+    );
+        dpu_global_id_range_t intervals[$];
+
+        intervals = ranges;
+        foreach (ids[index]) begin
+            intervals.push_back('{first_id: ids[index], last_id: ids[index]});
+        end
+        sort_and_merge_ranges(intervals);
+        ids.delete();
+        ranges.delete();
+        foreach (intervals[index]) begin
+            if (intervals[index].first_id == intervals[index].last_id)
+                ids.push_back(intervals[index].first_id);
+            else
+                ranges.push_back(intervals[index]);
+        end
+    endfunction
+
     protected function bit copy_plan(
         input dpu_normalized_placement_plan source,
         output dpu_normalized_placement_plan copied,
@@ -192,8 +194,7 @@ class dpu_resource_snapshot extends uvm_object;
         source.list_reserved_global_qpair_ids(reservation_ids);
         source.list_reserved_global_qpair_ranges(reservation_ranges);
         source.list_resource_profiles(profiles);
-        sort_and_unique_ids(reservation_ids);
-        sort_and_merge_ranges(reservation_ranges);
+        canonicalize_reservations(reservation_ids, reservation_ranges);
         copied = dpu_normalized_placement_plan::type_id::create(
             {get_name(), "_plan"});
         copied.effective_global_capacity = source.effective_global_capacity;

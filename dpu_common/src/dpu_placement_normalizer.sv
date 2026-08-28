@@ -167,9 +167,8 @@ class dpu_placement_normalizer extends uvm_object;
                 if (!valid_key(template_key, cfg.dut_caps) ||
                     (cfg.vf_pools[pool_index].vf_templates[template_index].domain_key.host_id !=
                      cfg.vf_pools[pool_index].parent_pf.host_id) ||
-                    !has_eligibility(cfg.vf_pools[pool_index].vf_templates[template_index].eligible_service_kinds) ||
                     find_explicit_function(cfg, template_key, parent)) begin
-                    why = "VF template is invalid, ineligible, or collides with an explicit function";
+                    why = "VF template is invalid or collides with an explicit function";
                     return 0;
                 end
                 foreach (cfg.vf_pools[pool_index].vf_templates[template_index].bars[bar_index]) begin
@@ -225,7 +224,8 @@ class dpu_placement_normalizer extends uvm_object;
                     candidate.is_template = 1;
                     candidate.function_cfg = null;
                     candidate.vf_template = cfg.vf_pools[pool_index].vf_templates[template_index];
-                    if (filter_matches(request.candidate_filter, candidate))
+                    if (has_eligibility(candidate.vf_template.eligible_service_kinds) &&
+                        filter_matches(request.candidate_filter, candidate))
                         candidates.push_back(candidate);
                 end
             end
@@ -321,9 +321,11 @@ class dpu_placement_normalizer extends uvm_object;
                            output dpu_placement_diagnostic diagnostic);
         dpu_resource_pool_config_t profile;
         dpu_vio_placement_request ordered_requests[$];
+        candidate_t eligible_candidates[$];
         candidate_t candidates[$];
         candidate_t effective_candidates[$];
         candidate_t selected[$];
+        candidate_t selected_members[$];
         dpu_normalized_vio_request normalized_request;
         dpu_vio_participant_target_t target;
         dpu_normalized_vio_pair_t pair;
@@ -331,7 +333,6 @@ class dpu_placement_normalizer extends uvm_object;
         dpu_service_decl service;
         dpu_function_key_t consumed[$];
         int unsigned profile_count;
-        int unsigned required_devices;
         int unsigned remaining;
         int unsigned pair_index;
         int unsigned best_index;
@@ -463,9 +464,66 @@ class dpu_placement_normalizer extends uvm_object;
                 set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_INVALID_REQUEST,
                             "only FIXED requests may name fixed devices", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
             end
-            if (!collect_candidates(device_cfg, ordered_requests[request_index], candidates)) begin
+            if (!collect_candidates(device_cfg, ordered_requests[request_index],
+                                    eligible_candidates)) begin
                 set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_NO_ELIGIBLE_DEVICE,
                             "request has no eligible devices", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
+            end
+            // Hard references retain duplicate-owner diagnostics even though
+            // consumed functions are removed from automatic candidate queues.
+            foreach (ordered_requests[request_index].fixed_devices[fixed_index]) begin
+                if (contains_key(consumed,
+                                 ordered_requests[request_index].fixed_devices[fixed_index])) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                DPU_PLACE_ERR_DUPLICATE_SERVICE_OWNER,
+                                "a prior request already owns the fixed function",
+                                ordered_requests[request_index].request_id, 1);
+                    diagnostic.set_function_context(
+                        ordered_requests[request_index].fixed_devices[fixed_index]);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+            end
+            foreach (ordered_requests[request_index].device_constraints[constraint_index]) begin
+                if ((ordered_requests[request_index].device_constraints[constraint_index] != null) &&
+                    contains_key(consumed,
+                        ordered_requests[request_index].device_constraints[constraint_index].function_key)) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                DPU_PLACE_ERR_DUPLICATE_SERVICE_OWNER,
+                                "a prior request already owns the constrained function",
+                                ordered_requests[request_index].request_id, 1);
+                    diagnostic.set_function_context(
+                        ordered_requests[request_index].device_constraints[constraint_index].function_key);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+            end
+            foreach (ordered_requests[request_index].qpair_overrides[override_index]) begin
+                if ((ordered_requests[request_index].qpair_overrides[override_index] != null) &&
+                    (ordered_requests[request_index].qpair_overrides[override_index].owner_mode ==
+                     DPU_ASSIGN_PINNED) &&
+                    contains_key(consumed,
+                        ordered_requests[request_index].qpair_overrides[override_index].requested_owner)) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                DPU_PLACE_ERR_DUPLICATE_SERVICE_OWNER,
+                                "a prior request already owns the pinned function",
+                                ordered_requests[request_index].request_id, 1);
+                    diagnostic.set_function_context(
+                        ordered_requests[request_index].qpair_overrides[override_index].requested_owner);
+                    diagnostic.set_pair_context(
+                        ordered_requests[request_index].qpair_overrides[override_index].request_pair_index);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+            end
+            candidates.delete();
+            foreach (eligible_candidates[index]) begin
+                if (!contains_key(consumed, eligible_candidates[index].key))
+                    candidates.push_back(eligible_candidates[index]);
+            end
+            if (candidates.size() == 0) begin
+                set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                            DPU_PLACE_ERR_NO_ELIGIBLE_DEVICE,
+                            "request has no unconsumed eligible devices",
+                            ordered_requests[request_index].request_id, 1);
+                normalized_device_cfg = null; normalized_plan = null; return 0;
             end
             effective_candidates = candidates;
             if (ordered_requests[request_index].ordering == DPU_PLACEMENT_SEEDED_RANDOM)
@@ -579,9 +637,6 @@ class dpu_placement_normalizer extends uvm_object;
             end else if (ordered_requests[request_index].device_policy == DPU_VIO_DEVICE_ALL_ELIGIBLE) begin
                 selected = effective_candidates;
             end else if (ordered_requests[request_index].device_policy == DPU_VIO_DEVICE_AUTO_MINIMUM) begin
-                required_devices = (ordered_requests[request_index].total_qpairs +
-                    normalized_plan.effective_device_capacity - 1) /
-                    normalized_plan.effective_device_capacity;
                 foreach (effective_candidates[index]) begin
                     bit mandatory;
                     mandatory = 0;
@@ -597,16 +652,6 @@ class dpu_placement_normalizer extends uvm_object;
                                                   effective_candidates[index].key)) mandatory = 1;
                     end
                     if (mandatory) selected.push_back(effective_candidates[index]);
-                end
-                foreach (overrides_by_pair[pair_index]) begin
-                    if ((overrides_by_pair[pair_index] != null) &&
-                        (overrides_by_pair[pair_index].owner_mode == DPU_ASSIGN_PREFERRED) &&
-                        (selected.size() < required_devices) &&
-                        find_candidate_index(effective_candidates,
-                            overrides_by_pair[pair_index].requested_owner, candidate_index) &&
-                        !find_candidate_index(selected,
-                            overrides_by_pair[pair_index].requested_owner, selected_index))
-                        selected.push_back(effective_candidates[candidate_index]);
                 end
             end else begin
                 set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_INVALID_REQUEST,
@@ -670,6 +715,46 @@ class dpu_placement_normalizer extends uvm_object;
                 minimum_sum += selected_minimums[index];
             end
             if (ordered_requests[request_index].device_policy == DPU_VIO_DEVICE_AUTO_MINIMUM) begin
+                // Preferences participate only while the true capacity of the
+                // mandatory set is insufficient.  EXACT participants
+                // contribute their exact count; flexible participants
+                // contribute the effective per-device capacity.
+                foreach (overrides_by_pair[pair_index]) begin
+                    if ((exact_sum + flexible_capacity_sum >=
+                         ordered_requests[request_index].total_qpairs) ||
+                        (overrides_by_pair[pair_index] == null) ||
+                        (overrides_by_pair[pair_index].owner_mode !=
+                         DPU_ASSIGN_PREFERRED) ||
+                        !find_candidate_index(effective_candidates,
+                            overrides_by_pair[pair_index].requested_owner,
+                            candidate_index) ||
+                        find_candidate_index(selected,
+                            overrides_by_pair[pair_index].requested_owner,
+                            selected_index))
+                        continue;
+                    selected.push_back(effective_candidates[candidate_index]);
+                    selected_minimums.push_back(target_minimum(
+                        ordered_requests[request_index],
+                        effective_candidates[candidate_index].key,
+                        selected_is_exact[selected.size() - 1],
+                        selected_pinned_counts[selected.size() - 1]));
+                    if (selected_is_exact[selected.size() - 1])
+                        exact_sum += selected_minimums[selected.size() - 1];
+                    else
+                        flexible_capacity_sum +=
+                            normalized_plan.effective_device_capacity;
+                    if (selected_minimums[selected.size() - 1] >
+                        normalized_plan.effective_device_capacity) begin
+                        set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                    DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED,
+                                    "participant minimum exceeds effective device capacity",
+                                    ordered_requests[request_index].request_id, 1);
+                        diagnostic.set_function_context(
+                            effective_candidates[candidate_index].key);
+                        normalized_device_cfg = null; normalized_plan = null; return 0;
+                    end
+                    minimum_sum += selected_minimums[selected.size() - 1];
+                end
                 foreach (effective_candidates[index]) begin
                     if ((exact_sum + flexible_capacity_sum >=
                          ordered_requests[request_index].total_qpairs) ||
@@ -696,6 +781,35 @@ class dpu_placement_normalizer extends uvm_object;
                     minimum_sum += selected_minimums[selected.size() - 1];
                 end
             end
+            // Selection membership is independent of publication/order.
+            // Rebuild selected participants in the full effective candidate
+            // order so water-level ties and targets cannot be reordered by a
+            // non-leading preferred admission.
+            selected_members = selected;
+            selected.delete();
+            foreach (effective_candidates[index]) begin
+                if (find_candidate_index(selected_members,
+                                         effective_candidates[index].key,
+                                         selected_index))
+                    selected.push_back(effective_candidates[index]);
+            end
+            selected_minimums.delete();
+            selected_pinned_counts.delete();
+            selected_is_exact.delete();
+            exact_sum = 0;
+            flexible_capacity_sum = 0;
+            minimum_sum = 0;
+            foreach (selected[index]) begin
+                selected_minimums.push_back(target_minimum(
+                    ordered_requests[request_index], selected[index].key,
+                    selected_is_exact[index], selected_pinned_counts[index]));
+                if (selected_is_exact[index])
+                    exact_sum += selected_minimums[index];
+                else
+                    flexible_capacity_sum +=
+                        normalized_plan.effective_device_capacity;
+                minimum_sum += selected_minimums[index];
+            end
             if ((selected.size() == 0) ||
                 (minimum_sum > ordered_requests[request_index].total_qpairs) ||
                 (exact_sum + flexible_capacity_sum <
@@ -720,8 +834,8 @@ class dpu_placement_normalizer extends uvm_object;
             normalized_request.device_policy = ordered_requests[request_index].device_policy;
             normalized_request.ordering = ordered_requests[request_index].ordering;
             foreach (candidates[index]) normalized_request.canonical_candidates.push_back(candidates[index].key);
+            foreach (effective_candidates[index]) normalized_request.effective_candidates.push_back(effective_candidates[index].key);
             foreach (selected[index]) begin
-                normalized_request.effective_candidates.push_back(selected[index].key);
                 target.request_id = normalized_request.request_id;
                 target.service_key.function_key = selected[index].key;
                 target.service_key.service_kind = DPU_SERVICE_VIO_NET;

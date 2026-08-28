@@ -291,18 +291,17 @@ class virtio_pf_manager extends uvm_object;
     // ========================================================================
     // enable_sriov -- Enable SR-IOV with specified number of VFs
     //
-    // Steps:
-    //   1. Delegate to PCIe layer: call enable_vfs on pcie_tl_func_manager
-    //   2. Register queue mappings in resource_pool
-    //   3. VF instances are created by the env (not here)
-    //   4. Poll each VF's config space to verify accessibility
+    // Runtime lifecycle steps:
+    //   1. Verify the environment supplied its PCIe function-manager handle
+    //   2. Check that environment-owned VF instances are available
+    //   3. Poll each VF's config space to verify runtime accessibility
+    //   4. Publish the runtime-active VF count
     //
     // The pcie_func_mgr_ref must be set before calling this method.
     // The vf_instances[] array must be populated by the env before calling.
     // ========================================================================
 
-    virtual task enable_sriov(int unsigned num_vfs, int unsigned pairs_per_vf = 1);
-        bit [31:0] read_data;
+    virtual task enable_sriov(int unsigned num_vfs);
         int unsigned elapsed;
         int unsigned eff_timeout;
         int unsigned interval;
@@ -310,8 +309,8 @@ class virtio_pf_manager extends uvm_object;
         int unsigned max_att;
 
         `uvm_info("PF_MGR",
-            $sformatf("enable_sriov: num_vfs=%0d, pairs_per_vf=%0d, pf_index=%0d",
-                      num_vfs, pairs_per_vf, pf_index),
+            $sformatf("enable_sriov: num_vfs=%0d, pf_index=%0d",
+                      num_vfs, pf_index),
             UVM_LOW)
 
         // -----------------------------------------------------------------
@@ -327,7 +326,7 @@ class virtio_pf_manager extends uvm_object;
         end
 
         // -----------------------------------------------------------------
-        // Step 3: VF instances are created by the env, verify they exist
+        // Step 2: VF instances are created by the env, verify they exist
         // -----------------------------------------------------------------
         if (vf_instances.size() < num_vfs) begin
             `uvm_warning("PF_MGR",
@@ -336,7 +335,7 @@ class virtio_pf_manager extends uvm_object;
         end
 
         // -----------------------------------------------------------------
-        // Step 4: Poll each VF's config space to verify accessibility
+        // Step 3: Poll each VF's config space to verify accessibility
         // Use wait_pol for polling, not bare #delay
         // -----------------------------------------------------------------
         if (wait_pol == null) begin
@@ -400,10 +399,10 @@ class virtio_pf_manager extends uvm_object;
     // ========================================================================
     // disable_sriov -- Disable SR-IOV, shutdown all VFs
     //
-    // Steps:
+    // Runtime lifecycle steps:
     //   1. Shutdown all VF instances
-    //   2. Delegate VF disable to PCIe layer
-    //   3. Clear queue mappings
+    //   2. Verify the PCIe disable delegate is available to the environment
+    //   3. Reset the runtime-active VF count
     // ========================================================================
 
     virtual task disable_sriov();

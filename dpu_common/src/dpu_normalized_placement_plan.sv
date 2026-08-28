@@ -118,6 +118,63 @@ class dpu_normalized_placement_plan extends uvm_object;
         end
     endfunction
 
+    protected function bit reservations_are_valid(
+        input int unsigned ids[$],
+        input dpu_global_id_range_t ranges[$]
+    );
+        foreach (ids[index]) begin
+            if (ids[index] >= DPU_MAX_VIO_GLOBAL_QPAIRS)
+                return 0;
+        end
+        foreach (ranges[index]) begin
+            if ((ranges[index].first_id > ranges[index].last_id) ||
+                (ranges[index].last_id >= DPU_MAX_VIO_GLOBAL_QPAIRS))
+                return 0;
+        end
+        return 1;
+    endfunction
+
+    protected function void canonicalize_reservations();
+        dpu_global_id_range_t intervals[$];
+        dpu_global_id_range_t merged[$];
+        dpu_global_id_range_t swap;
+
+        intervals = reserved_global_qpair_ranges;
+        foreach (reserved_global_qpair_ids[index]) begin
+            intervals.push_back('{first_id: reserved_global_qpair_ids[index],
+                                  last_id: reserved_global_qpair_ids[index]});
+        end
+        for (int left = 0; left < intervals.size(); left++) begin
+            for (int right = left + 1; right < intervals.size(); right++) begin
+                if ((intervals[right].first_id < intervals[left].first_id) ||
+                    ((intervals[right].first_id == intervals[left].first_id) &&
+                     (intervals[right].last_id < intervals[left].last_id))) begin
+                    swap = intervals[left];
+                    intervals[left] = intervals[right];
+                    intervals[right] = swap;
+                end
+            end
+        end
+        foreach (intervals[index]) begin
+            if ((merged.size() == 0) ||
+                (intervals[index].first_id >
+                 (merged[merged.size() - 1].last_id + 1))) begin
+                merged.push_back(intervals[index]);
+            end else if (intervals[index].last_id >
+                         merged[merged.size() - 1].last_id) begin
+                merged[merged.size() - 1].last_id = intervals[index].last_id;
+            end
+        end
+        reserved_global_qpair_ids.delete();
+        reserved_global_qpair_ranges.delete();
+        foreach (merged[index]) begin
+            if (merged[index].first_id == merged[index].last_id)
+                reserved_global_qpair_ids.push_back(merged[index].first_id);
+            else
+                reserved_global_qpair_ranges.push_back(merged[index]);
+        end
+    endfunction
+
     function bit add_request(input dpu_normalized_vio_request request,
                              output string why);
         dpu_normalized_vio_request request_copy;
@@ -177,6 +234,11 @@ class dpu_normalized_placement_plan extends uvm_object;
         if (!frozen) begin
             reserved_global_qpair_ids = ids;
             reserved_global_qpair_ranges = ranges;
+            // Preserve malformed authoring for the resolver's structured
+            // validation.  Every valid authoring form is normalized to one
+            // ascending, non-overlapping union before any query or allocation.
+            if (reservations_are_valid(ids, ranges))
+                canonicalize_reservations();
         end
     endfunction
 

@@ -624,6 +624,62 @@ class dpu_resource_resolver_test extends uvm_test;
             `uvm_fatal("RESOURCE_SNAPSHOT", {name, " accepted invalid snapshot or lost diagnostic context"})
     endfunction
 
+    function void test_reservation_union_publication();
+        dpu_device_snapshot device_snapshot;
+        dpu_service_key_t service_key;
+        dpu_resource_resolver resolver;
+        dpu_normalized_placement_plan plan;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_placement_diagnostic diagnostic;
+        dpu_assignment_mode_e local_modes[$];
+        dpu_assignment_mode_e global_modes[$];
+        int unsigned local_ids[$];
+        int unsigned global_ids[$];
+        int unsigned reservation_ids[$];
+        dpu_global_id_range_t authored_ranges[$];
+        dpu_global_id_range_t published_ranges[$];
+
+        device_snapshot = make_device_snapshot(service_key);
+        resolver = dpu_resource_resolver::type_id::create(
+            "reservation_union_resolver");
+        local_modes = '{DPU_ASSIGN_AUTO, DPU_ASSIGN_AUTO};
+        local_ids = '{0, 0};
+        global_modes = '{DPU_ASSIGN_AUTO, DPU_ASSIGN_AUTO};
+        global_ids = '{0, 0};
+        reservation_ids = '{2};
+        authored_ranges = '{'{first_id: 1, last_id: 2},
+                            '{first_id: 3, last_id: 4}};
+        plan = make_plan(service_key, 128, 32, 2, 2,
+                         local_modes, local_ids, global_modes, global_ids,
+                         reservation_ids, authored_ranges);
+        if (!resolver.resolve(device_snapshot, plan, resource_snapshot,
+                              diagnostic)) begin
+            `uvm_fatal("RESOURCE_RESERVATION_UNION", diagnostic.message)
+        end
+        expect_binding(resource_snapshot, 0, 0, 0);
+        expect_binding(resource_snapshot, 1, 1, 5);
+
+        resource_snapshot.list_reserved_global_qpair_ids(reservation_ids);
+        resource_snapshot.list_reserved_global_qpair_ranges(published_ranges);
+        if ((reservation_ids.size() != 0) || (published_ranges.size() != 1) ||
+            (published_ranges[0].first_id != 1) ||
+            (published_ranges[0].last_id != 4)) begin
+            `uvm_fatal("RESOURCE_RESERVATION_UNION",
+                "snapshot did not publish one canonical individual/range union")
+        end
+        published_ranges[0].first_id = 0;
+        published_ranges[0].last_id = 0;
+        reservation_ids.push_back(99);
+        resource_snapshot.list_reserved_global_qpair_ids(reservation_ids);
+        resource_snapshot.list_reserved_global_qpair_ranges(published_ranges);
+        if ((reservation_ids.size() != 0) || (published_ranges.size() != 1) ||
+            (published_ranges[0].first_id != 1) ||
+            (published_ranges[0].last_id != 4)) begin
+            `uvm_fatal("RESOURCE_RESERVATION_UNION",
+                "reservation metadata query leaked mutable storage")
+        end
+    endfunction
+
     virtual function void build_phase(uvm_phase phase);
         dpu_device_snapshot device_snapshot;
         dpu_normalized_placement_plan plan;
@@ -651,8 +707,17 @@ class dpu_resource_resolver_test extends uvm_test;
         dpu_global_id_range_t reservation_ranges[$];
         dpu_device_snapshot two_service_snapshot;
         dpu_service_key_t second_service_key;
+        string directed_case;
 
         super.build_phase(phase);
+        if ($value$plusargs("DIRECTED_CASE=%s", directed_case)) begin
+            case (directed_case)
+                "reservation_union": test_reservation_union_publication();
+                default: `uvm_fatal("RESOURCE_RESOLVER",
+                    {"unknown directed case: ", directed_case})
+            endcase
+            return;
+        end
         device_snapshot = make_device_snapshot(service_key);
         resolver = dpu_resource_resolver::type_id::create("resolver");
 
@@ -850,6 +915,7 @@ class dpu_resource_resolver_test extends uvm_test;
             `uvm_fatal("RESOURCE_SNAPSHOT", "failure did not publish a usable diagnostic")
         test_deleted_service_owner_is_snapshot_mismatch();
         test_configuration_resolver_atomicity();
+        test_reservation_union_publication();
     endfunction
 endclass : dpu_resource_resolver_test
 

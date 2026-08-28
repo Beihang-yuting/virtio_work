@@ -46,6 +46,18 @@ class dpu_resource_manager_snapshot_probe extends dpu_resource_snapshot;
     endfunction
 endclass : dpu_resource_manager_snapshot_probe
 
+class dpu_resource_manager_device_snapshot_probe extends dpu_device_snapshot;
+    `uvm_object_utils(dpu_resource_manager_device_snapshot_probe)
+
+    function new(string name = "dpu_resource_manager_device_snapshot_probe");
+        super.new(name);
+    endfunction
+
+    function void mark_unfrozen();
+        m_frozen = 0;
+    endfunction
+endclass : dpu_resource_manager_device_snapshot_probe
+
 
 // Snapshot imports retain the full DUT function inventory, while VIO qpair
 // ownership remains service-scoped, coordinator-authored, and immutable.
@@ -267,6 +279,8 @@ class dpu_resource_manager_test extends uvm_test;
         dpu_service_key_t services[$];
 
         super.build_phase(phase);
+        dpu_device_snapshot::type_id::set_type_override(
+            dpu_resource_manager_device_snapshot_probe::get_type());
         dpu_resource_snapshot::type_id::set_type_override(
             dpu_resource_manager_snapshot_probe::get_type());
         resolve_capacity_pair(
@@ -287,11 +301,14 @@ class dpu_resource_manager_test extends uvm_test;
         dpu_resource_lease_t leases[$];
         dpu_function_key_t keys[$];
         dpu_resource_snapshot unfrozen_resource;
+        dpu_device_snapshot unfrozen_device;
+        dpu_resource_snapshot unfrozen_device_resource;
         dpu_resource_snapshot expanded_resource;
         dpu_resource_snapshot conflicted_resource;
         dpu_resource_snapshot mismatched_resource;
         dpu_device_snapshot mismatched_device;
         dpu_resource_manager_snapshot_probe snapshot_probe;
+        dpu_resource_manager_device_snapshot_probe device_snapshot_probe;
         dpu_dut_caps caps;
         int unsigned global_id;
         string why;
@@ -376,6 +393,36 @@ class dpu_resource_manager_test extends uvm_test;
             `uvm_fatal("DPU_RESOURCE", "unfrozen resource snapshot imported")
         end
         assert_unconfigured(failed_manager, keys[0], "unfrozen snapshot");
+
+        // Resolve a fully valid, identity-matched pair, then use a test-only
+        // device hook to expose the manager guard independently.  The frozen
+        // resource snapshot continues to reference this exact device handle.
+        resolve_capacity_pair("unfrozen_device", unfrozen_device,
+                              unfrozen_device_resource);
+        if (!$cast(device_snapshot_probe, unfrozen_device) ||
+            !unfrozen_device_resource.references_device_snapshot(
+                unfrozen_device)) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "unfrozen-device fixture lost exact snapshot identity")
+        end
+        device_snapshot_probe.mark_unfrozen();
+        if (unfrozen_device.is_frozen() ||
+            !unfrozen_device_resource.references_device_snapshot(
+                unfrozen_device)) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "unfrozen-device probe changed resource snapshot identity")
+        end
+        failed_manager = dpu_resource_manager::type_id::create(
+            "unfrozen_device_manager");
+        authority = failed_manager.claim_registry_authority();
+        if (failed_manager.configure_from_snapshots(
+                authority, unfrozen_device, unfrozen_device_resource, why) ||
+            (why != "resource snapshot is not frozen against the supplied device snapshot") ||
+            failed_manager.is_snapshot_seeded()) begin
+            `uvm_fatal("DPU_RESOURCE",
+                "unfrozen device snapshot did not receive the freeze/reference rejection")
+        end
+        assert_unconfigured(failed_manager, keys[0], "unfrozen device snapshot");
 
         resolve_capacity_pair(
             "expanded", mismatched_device, expanded_resource);

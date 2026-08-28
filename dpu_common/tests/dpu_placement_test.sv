@@ -136,6 +136,307 @@ class dpu_placement_test extends uvm_test;
         end
     endfunction
 
+    function void test_auto_requests_consume_candidates();
+        dpu_device_cfg source_cfg;
+        dpu_device_cfg normalized_cfg;
+        dpu_resource_placement_cfg placement_cfg;
+        dpu_vio_placement_request request;
+        dpu_placement_normalizer normalizer;
+        dpu_normalized_placement_plan plan;
+        dpu_normalized_vio_request requests[$];
+        dpu_vio_participant_target_t first_targets[$];
+        dpu_vio_participant_target_t second_targets[$];
+        dpu_placement_diagnostic diagnostic;
+        dpu_function_key_t pf0;
+        dpu_function_key_t pf1;
+
+        source_cfg = make_source_cfg();
+        placement_cfg = make_placement_cfg();
+        normalizer = dpu_placement_normalizer::type_id::create(
+            "auto_consumption_normalizer");
+        pf0 = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
+        pf1 = make_function_key(0, 1, DPU_FUNCTION_PF, 0);
+
+        // Author in reverse order to prove request IDs, not declaration order,
+        // determine which request consumes the first canonical candidate.
+        request = make_request(101, 1, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        request.candidate_filter.function_keys.push_back(pf0);
+        request.candidate_filter.function_keys.push_back(pf1);
+        placement_cfg.vio_requests.push_back(request);
+        request = make_request(100, 1, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        request.candidate_filter.function_keys.push_back(pf0);
+        request.candidate_filter.function_keys.push_back(pf1);
+        placement_cfg.vio_requests.push_back(request);
+
+        if (!normalizer.normalize(source_cfg, placement_cfg, normalized_cfg,
+                                  plan, diagnostic)) begin
+            `uvm_fatal("PLACEMENT_AUTO_CONSUME", diagnostic.message)
+        end
+        plan.list_requests(requests);
+        plan.list_targets(100, first_targets);
+        plan.list_targets(101, second_targets);
+        if ((requests.size() != 2) || (first_targets.size() != 1) ||
+            (second_targets.size() != 1) ||
+            !dpu_same_function_key(first_targets[0].service_key.function_key,
+                                   pf0) ||
+            !dpu_same_function_key(second_targets[0].service_key.function_key,
+                                   pf1)) begin
+            `uvm_fatal("PLACEMENT_AUTO_CONSUME",
+                "stable AUTO requests did not consume distinct canonical PFs")
+        end
+        foreach (source_cfg.functions[index]) begin
+            if (source_cfg.functions[index].services.size() != 0)
+                `uvm_fatal("PLACEMENT_AUTO_CONSUME",
+                    "multi-request normalization mutated source services")
+        end
+
+        // A hard later reference to a consumed function remains an intentional
+        // duplicate-owner error, rather than becoming a no-candidate failure.
+        placement_cfg = make_placement_cfg();
+        request = make_request(110, 1, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_FIXED);
+        request.fixed_devices.push_back(pf0);
+        placement_cfg.vio_requests.push_back(request);
+        request = make_request(111, 1, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_FIXED);
+        request.fixed_devices.push_back(pf0);
+        placement_cfg.vio_requests.push_back(request);
+        if (normalizer.normalize(source_cfg, placement_cfg, normalized_cfg,
+                                 plan, diagnostic) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_DUPLICATE_SERVICE_OWNER) ||
+            !diagnostic.has_request_id || (diagnostic.request_id != 111) ||
+            !diagnostic.has_function_key ||
+            !dpu_same_function_key(diagnostic.function_key, pf0)) begin
+            `uvm_fatal("PLACEMENT_AUTO_CONSUME",
+                "explicit consumed owner lost duplicate diagnostic context")
+        end
+    endfunction
+
+    function void test_full_candidate_order_and_preferred_tie();
+        dpu_device_cfg source_cfg;
+        dpu_device_cfg normalized_cfg;
+        dpu_resource_placement_cfg placement_cfg;
+        dpu_vio_placement_request request;
+        dpu_placement_normalizer normalizer;
+        dpu_normalized_placement_plan plan;
+        dpu_normalized_vio_request normalized_request;
+        dpu_vio_participant_target_t targets[$];
+        dpu_normalized_vio_pair_t pairs[$];
+        dpu_placement_diagnostic diagnostic;
+        dpu_function_key_t pf0;
+        dpu_function_key_t pf1;
+        dpu_function_key_t pf2;
+
+        source_cfg = make_source_cfg();
+        placement_cfg = make_placement_cfg();
+        normalizer = dpu_placement_normalizer::type_id::create(
+            "candidate_order_normalizer");
+        pf0 = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
+        pf1 = make_function_key(0, 1, DPU_FUNCTION_PF, 0);
+        pf2 = make_function_key(0, 2, DPU_FUNCTION_PF, 0);
+        request = make_request(120, 33, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        request.candidate_filter.function_keys.push_back(pf0);
+        request.candidate_filter.function_keys.push_back(pf1);
+        request.candidate_filter.function_keys.push_back(pf2);
+        request.qpair_overrides.push_back(make_override(
+            0, DPU_ASSIGN_PREFERRED, pf1, DPU_ASSIGN_AUTO, 0,
+            DPU_ASSIGN_AUTO, 0));
+        placement_cfg.vio_requests.push_back(request);
+
+        if (!normalizer.normalize(source_cfg, placement_cfg, normalized_cfg,
+                                  plan, diagnostic)) begin
+            `uvm_fatal("PLACEMENT_CANDIDATE_ORDER", diagnostic.message)
+        end
+        if (!plan.get_request(120, normalized_request))
+            `uvm_fatal("PLACEMENT_CANDIDATE_ORDER", "normalized request missing")
+        plan.list_targets(120, targets);
+        plan.list_pairs(120, pairs);
+        if ((normalized_request.canonical_candidates.size() != 3) ||
+            (normalized_request.effective_candidates.size() != 3) ||
+            !dpu_same_function_key(normalized_request.canonical_candidates[0], pf0) ||
+            !dpu_same_function_key(normalized_request.canonical_candidates[1], pf1) ||
+            !dpu_same_function_key(normalized_request.canonical_candidates[2], pf2) ||
+            !dpu_same_function_key(normalized_request.effective_candidates[0], pf0) ||
+            !dpu_same_function_key(normalized_request.effective_candidates[1], pf1) ||
+            !dpu_same_function_key(normalized_request.effective_candidates[2], pf2)) begin
+            `uvm_fatal("PLACEMENT_CANDIDATE_ORDER",
+                "normalized request did not publish both full candidate orders")
+        end
+        if ((targets.size() != 2) ||
+            !dpu_same_function_key(targets[0].service_key.function_key, pf0) ||
+            !dpu_same_function_key(targets[1].service_key.function_key, pf1) ||
+            (targets[0].qpair_count != 17) ||
+            (targets[1].qpair_count != 16)) begin
+            `uvm_fatal("PLACEMENT_CANDIDATE_ORDER",
+                "preferred membership reordered effective-order water-level ties")
+        end
+        if ((pairs.size() != 33) ||
+            !dpu_same_function_key(pairs[0].service_key.function_key, pf1) ||
+            !dpu_same_function_key(pairs[1].service_key.function_key, pf0) ||
+            !dpu_same_function_key(pairs[17].service_key.function_key, pf0) ||
+            !dpu_same_function_key(pairs[18].service_key.function_key, pf1)) begin
+            `uvm_fatal("PLACEMENT_CANDIDATE_ORDER",
+                "pair ownership disagrees with preferred slot and canonical targets")
+        end
+    endfunction
+
+    function void test_exact_capacity_preferred_admission();
+        dpu_device_cfg source_cfg;
+        dpu_device_cfg normalized_cfg;
+        dpu_resource_placement_cfg placement_cfg;
+        dpu_vio_placement_request request;
+        dpu_placement_normalizer normalizer;
+        dpu_normalized_placement_plan plan;
+        dpu_vio_participant_target_t targets[$];
+        dpu_normalized_vio_pair_t pairs[$];
+        dpu_placement_diagnostic diagnostic;
+        dpu_function_key_t pf0;
+        dpu_function_key_t pf1;
+        dpu_function_key_t pf2;
+        dpu_function_key_t pf3;
+
+        source_cfg = make_source_cfg();
+        normalizer = dpu_placement_normalizer::type_id::create(
+            "exact_capacity_normalizer");
+        pf0 = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
+        pf1 = make_function_key(0, 1, DPU_FUNCTION_PF, 0);
+        pf2 = make_function_key(0, 2, DPU_FUNCTION_PF, 0);
+        pf3 = make_function_key(0, 3, DPU_FUNCTION_PF, 0);
+
+        // Two mandatory EXACT 1 devices contribute only two pairs.  The next
+        // required flexible participant must honor the preferred owner even
+        // though an ordinary candidate precedes it in effective order.
+        placement_cfg = make_placement_cfg();
+        request = make_request(130, 33, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        request.device_constraints.push_back(
+            make_constraint(pf0, DPU_COUNT_EXACT, 1));
+        request.device_constraints.push_back(
+            make_constraint(pf1, DPU_COUNT_EXACT, 1));
+        request.qpair_overrides.push_back(make_override(
+            0, DPU_ASSIGN_PREFERRED, pf3, DPU_ASSIGN_AUTO, 0,
+            DPU_ASSIGN_AUTO, 0));
+        placement_cfg.vio_requests.push_back(request);
+        if (!normalizer.normalize(source_cfg, placement_cfg, normalized_cfg,
+                                  plan, diagnostic)) begin
+            `uvm_fatal("PLACEMENT_EXACT_CAPACITY", diagnostic.message)
+        end
+        plan.list_targets(130, targets);
+        plan.list_pairs(130, pairs);
+        if ((targets.size() != 3) ||
+            !dpu_same_function_key(targets[0].service_key.function_key, pf0) ||
+            !dpu_same_function_key(targets[1].service_key.function_key, pf1) ||
+            !dpu_same_function_key(targets[2].service_key.function_key, pf3) ||
+            (targets[0].qpair_count != 1) ||
+            (targets[1].qpair_count != 1) ||
+            (targets[2].qpair_count != 31) ||
+            !dpu_same_function_key(pairs[0].service_key.function_key, pf3)) begin
+            `uvm_fatal("PLACEMENT_EXACT_CAPACITY",
+                "EXACT-reduced capacity did not admit the required preferred device")
+        end
+
+        // EXACT 1 plus one flexible device already supplies 33 pairs; a
+        // preferred third device must not inflate the minimum selected set.
+        placement_cfg = make_placement_cfg();
+        request = make_request(131, 33, DPU_VIO_CANDIDATE_PF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        request.device_constraints.push_back(
+            make_constraint(pf0, DPU_COUNT_EXACT, 1));
+        request.device_constraints.push_back(
+            make_constraint(pf1, DPU_COUNT_AT_LEAST, 1));
+        request.qpair_overrides.push_back(make_override(
+            0, DPU_ASSIGN_PREFERRED, pf2, DPU_ASSIGN_AUTO, 0,
+            DPU_ASSIGN_AUTO, 0));
+        placement_cfg.vio_requests.push_back(request);
+        if (!normalizer.normalize(source_cfg, placement_cfg, normalized_cfg,
+                                  plan, diagnostic)) begin
+            `uvm_fatal("PLACEMENT_EXACT_CAPACITY", diagnostic.message)
+        end
+        plan.list_targets(131, targets);
+        if ((targets.size() != 2) ||
+            !dpu_same_function_key(targets[0].service_key.function_key, pf0) ||
+            !dpu_same_function_key(targets[1].service_key.function_key, pf1) ||
+            (targets[0].qpair_count != 1) ||
+            (targets[1].qpair_count != 32)) begin
+            `uvm_fatal("PLACEMENT_EXACT_CAPACITY",
+                "preference added a device after exact plus flexible capacity was sufficient")
+        end
+    endfunction
+
+    function void test_non_vio_template_inventory();
+        dpu_device_cfg source_cfg;
+        dpu_device_cfg normalized_cfg;
+        dpu_resource_placement_cfg placement_cfg;
+        dpu_vio_placement_request request;
+        dpu_placement_normalizer normalizer;
+        dpu_normalized_placement_plan plan;
+        dpu_normalized_vio_request normalized_request;
+        dpu_vio_participant_target_t targets[$];
+        dpu_placement_diagnostic diagnostic;
+        dpu_vf_template_cfg rdma_template;
+        dpu_bar_request bar;
+        dpu_function_key_t vf6;
+        dpu_function_key_t vf7;
+        bit materialized_vf6;
+        bit materialized_vf7;
+
+        source_cfg = make_source_cfg();
+        rdma_template = dpu_vf_template_cfg::type_id::create(
+            "rdma_only_vf6_template");
+        rdma_template.vf_id = 6;
+        rdma_template.domain_key.host_id = 0;
+        rdma_template.domain_key.segment_id = 0;
+        bar = dpu_bar_request::type_id::create("rdma_only_vf6_bar");
+        rdma_template.bars.push_back(bar);
+        rdma_template.eligible_service_kinds.push_back(DPU_SERVICE_RDMA);
+        source_cfg.vf_pools[0].vf_templates.push_front(rdma_template);
+
+        placement_cfg = make_placement_cfg();
+        request = make_request(140, 1, DPU_VIO_CANDIDATE_VF_ONLY,
+                               DPU_VIO_DEVICE_AUTO_MINIMUM);
+        placement_cfg.vio_requests.push_back(request);
+        normalizer = dpu_placement_normalizer::type_id::create(
+            "non_vio_template_normalizer");
+        vf6 = make_function_key(0, 0, DPU_FUNCTION_VF, 6);
+        vf7 = make_function_key(0, 0, DPU_FUNCTION_VF, 7);
+
+        if (!normalizer.normalize(source_cfg, placement_cfg, normalized_cfg,
+                                  plan, diagnostic)) begin
+            `uvm_fatal("PLACEMENT_TEMPLATE_ELIGIBILITY", diagnostic.message)
+        end
+        if (!plan.get_request(140, normalized_request))
+            `uvm_fatal("PLACEMENT_TEMPLATE_ELIGIBILITY", "normalized request missing")
+        plan.list_targets(140, targets);
+        if ((normalized_request.canonical_candidates.size() != 1) ||
+            (normalized_request.effective_candidates.size() != 1) ||
+            !dpu_same_function_key(normalized_request.canonical_candidates[0], vf7) ||
+            !dpu_same_function_key(normalized_request.effective_candidates[0], vf7) ||
+            (targets.size() != 1) ||
+            !dpu_same_function_key(targets[0].service_key.function_key, vf7)) begin
+            `uvm_fatal("PLACEMENT_TEMPLATE_ELIGIBILITY",
+                "non-VIO template leaked into VIO candidate selection")
+        end
+        materialized_vf6 = 0;
+        materialized_vf7 = 0;
+        foreach (normalized_cfg.functions[index]) begin
+            if (dpu_same_function_key(normalized_cfg.functions[index].key, vf6))
+                materialized_vf6 = 1;
+            if (dpu_same_function_key(normalized_cfg.functions[index].key, vf7))
+                materialized_vf7 = 1;
+        end
+        if (materialized_vf6 || !materialized_vf7 ||
+            (source_cfg.functions.size() != 4) ||
+            (source_cfg.vf_pools[0].vf_templates.size() != 2) ||
+            (source_cfg.vf_pools[0].vf_templates[0].vf_id != 6) ||
+            (source_cfg.vf_pools[0].vf_templates[1].vf_id != 7)) begin
+            `uvm_fatal("PLACEMENT_TEMPLATE_ELIGIBILITY",
+                "template filtering materialized or mutated inactive inventory")
+        end
+    endfunction
+
     virtual function void build_phase(uvm_phase phase);
         dpu_device_cfg source_cfg;
         dpu_device_cfg normalized_cfg;
@@ -155,10 +456,22 @@ class dpu_placement_test extends uvm_test;
         dpu_device_cfg reordered_cfg;
         dpu_function_cfg function_swap;
         string why;
+        string directed_case;
         dpu_function_key_t vf7;
         bit found_vf7;
 
         super.build_phase(phase);
+        if ($value$plusargs("DIRECTED_CASE=%s", directed_case)) begin
+            case (directed_case)
+                "auto_consumption": test_auto_requests_consume_candidates();
+                "candidate_order": test_full_candidate_order_and_preferred_tie();
+                "exact_capacity": test_exact_capacity_preferred_admission();
+                "template_eligibility": test_non_vio_template_inventory();
+                default: `uvm_fatal("PLACEMENT", {"unknown directed case: ",
+                                                   directed_case})
+            endcase
+            return;
+        end
         normalizer = dpu_placement_normalizer::type_id::create("normalizer");
         diagnostic = dpu_placement_diagnostic::type_id::create("diagnostic");
 
@@ -306,7 +619,7 @@ class dpu_placement_test extends uvm_test;
             `uvm_fatal("PLACEMENT", "normalized plan accepted duplicate pair records")
 
         // EXACT targets are fixed; the remaining demand is water-level balanced
-        // only among flexible participants.
+        // only among flexible participants in full effective-candidate order.
         placement_cfg = make_placement_cfg();
         request = make_request(20, 100, DPU_VIO_CANDIDATE_PF_AND_VF,
                                DPU_VIO_DEVICE_AUTO_MINIMUM);
@@ -320,9 +633,11 @@ class dpu_placement_test extends uvm_test;
             `uvm_fatal("PLACEMENT", diagnostic.message)
         plan.list_targets(20, targets);
         if ((targets.size() != 5) || (targets[0].qpair_count != 20) ||
-            (targets[1].qpair_count != 4) || (targets[2].qpair_count != 26) ||
+            !dpu_same_function_key(targets[1].service_key.function_key, vf7) ||
+            (targets[1].qpair_count != 26) || (targets[2].qpair_count != 4) ||
             (targets[3].qpair_count != 25) || (targets[4].qpair_count != 25))
-            `uvm_fatal("PLACEMENT", "EXACT 20/4 did not preserve 26/25/25 flexibility")
+            `uvm_fatal("PLACEMENT",
+                "EXACT 20/4 lost effective-order 26/25/25 flexibility")
 
         // A PINNED owner makes an otherwise virtual VF template mandatory and
         // preserves local/global intent on the explicit normalized record.
@@ -551,6 +866,11 @@ class dpu_placement_test extends uvm_test;
             !diagnostic.has_request_id || (diagnostic.request_id != 35) ||
             !diagnostic.has_pair_index || (diagnostic.request_pair_index != 0))
             `uvm_fatal("PLACEMENT", "global qpair intent above 2047 missed structured diagnostic")
+
+        test_auto_requests_consume_candidates();
+        test_full_candidate_order_and_preferred_tie();
+        test_exact_capacity_preferred_admission();
+        test_non_vio_template_inventory();
     endfunction
 endclass : dpu_placement_test
 
