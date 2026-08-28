@@ -640,6 +640,7 @@ class virtio_dut_caps_test extends uvm_test;
     `uvm_component_utils(virtio_dut_caps_test)
 
     dpu_device_env manager_device_env;
+    dpu_device_env capacity_boundary_device_env;
     virtio_net_env invalid_legacy_env;
     dpu_device_env invalid_legacy_device_env;
     virtio_net_env_config invalid_legacy_cfg;
@@ -826,7 +827,8 @@ class virtio_dut_caps_test extends uvm_test;
         input int unsigned num_pfs,
         input int unsigned num_vfs,
         input int unsigned qpair_limit = 32,
-        input int unsigned global_qpair_capacity = 2048
+        input int unsigned global_qpair_capacity = 2048,
+        input int unsigned qpairs_per_function = 1
     );
         virtio_test_device_builder builder;
         dpu_device_env_config device_cfg;
@@ -865,13 +867,13 @@ class virtio_dut_caps_test extends uvm_test;
         builder.placement_cfg.profiles[0].capacity = global_qpair_capacity;
         builder.placement_cfg.profiles[0].max_per_function = qpair_limit;
         request = builder.add_fixed_vio_request(
-            0, vio_devices, vio_devices.size());
+            0, vio_devices, vio_devices.size() * qpairs_per_function);
         foreach (vio_devices[index]) begin
             count_rule = dpu_vio_device_constraint::type_id::create(
                 $sformatf("%s_exact_qpair_%0d", name, index));
             count_rule.function_key = vio_devices[index];
             count_rule.mode = DPU_COUNT_EXACT;
-            count_rule.qpair_count = 1;
+            count_rule.qpair_count = qpairs_per_function;
             request.device_constraints.push_back(count_rule);
         end
         device_cfg = builder.make_env_config();
@@ -904,6 +906,8 @@ class virtio_dut_caps_test extends uvm_test;
         super.build_phase(phase);
         manager_device_env = make_device_env_fixture(
             "manager_device_env", 1, 1);
+        capacity_boundary_device_env = make_device_env_fixture(
+            "capacity_boundary_device_env", 1, 0, 32, 32, 32);
 
         invalid_legacy_cfg = virtio_net_env_config::type_id::create(
             "invalid_legacy_cfg");
@@ -3537,6 +3541,103 @@ class virtio_dut_caps_test extends uvm_test;
                 "mutating a listed mapping changed immutable client routing")
     endtask
 
+    task assert_vio_max_per_function_boundary();
+        dpu_device_snapshot device_snapshot;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_service_key_t pf_service;
+        dpu_vio_qpair_binding_t bindings[$];
+        dpu_vio_qpair_binding_t boundary_binding;
+
+        device_snapshot = capacity_boundary_device_env.get_snapshot();
+        resource_snapshot =
+            capacity_boundary_device_env.get_resource_snapshot();
+        pf_service = make_vio_service_key(
+            make_key(0, 0, DPU_FUNCTION_PF, 0));
+        if ((device_snapshot == null) || !device_snapshot.is_frozen() ||
+            (resource_snapshot == null) || !resource_snapshot.is_frozen() ||
+            !resource_snapshot.references_device_snapshot(device_snapshot)) begin
+            `uvm_fatal("DUT_CAPS",
+                "exact device-capacity placement did not publish matching frozen snapshots")
+        end
+        resource_snapshot.list_vio_bindings(bindings);
+        if (bindings.size() != 32) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                "exact device-capacity placement returned %0d bindings instead of 32",
+                bindings.size()))
+        end
+        if (!resource_snapshot.get_vio_binding_by_service_local(
+                pf_service, 31, boundary_binding) ||
+            (boundary_binding.local_pair_id != 31) ||
+            (boundary_binding.rx_local_virtqueue_id != 62) ||
+            (boundary_binding.tx_local_virtqueue_id != 63) ||
+            (boundary_binding.global_qpair_id != 31)) begin
+            `uvm_fatal("DUT_CAPS",
+                "valid local pair 31 did not retain derived qids 62/63 at the exact device-capacity boundary")
+        end
+    endtask
+
+    task assert_vio_global_capacity_diagnostic();
+        virtio_test_device_builder builder;
+        dpu_function_cfg pf_cfg;
+        dpu_function_key_t fixed_devices[$];
+        dpu_vio_placement_request request;
+        dpu_vio_device_constraint count_rule;
+        dpu_configuration_resolver resolver;
+        dpu_device_snapshot device_snapshot;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_placement_diagnostic diagnostic;
+
+        builder = virtio_test_device_builder::type_id::create(
+            "dut_caps_global_capacity_builder");
+        builder.device_cfg.dut_caps.max_hosts = 1;
+        builder.device_cfg.dut_caps.max_pfs_per_host = 3;
+        builder.device_cfg.dut_caps.max_functions = 3;
+        builder.device_cfg.dut_caps.vio_global_qpair_count = 2;
+        builder.device_cfg.dut_caps.max_vio_net_qpairs_per_device = 1;
+        void'(builder.add_host_domain(0, 0));
+        for (int unsigned pf_id = 0; pf_id < 3; pf_id++) begin
+            pf_cfg = builder.add_pf(0, pf_id, 0);
+            builder.add_real_dut_bars(pf_cfg);
+            void'(builder.allow_vio_service(pf_cfg));
+            fixed_devices.push_back(pf_cfg.key);
+            if (pf_id == 0)
+                builder.select_af(pf_cfg);
+        end
+        builder.placement_cfg.profiles[0].capacity = 2;
+        builder.placement_cfg.profiles[0].max_per_function = 1;
+        request = builder.add_fixed_vio_request(92, fixed_devices, 3);
+        foreach (fixed_devices[index]) begin
+            count_rule = dpu_vio_device_constraint::type_id::create(
+                $sformatf("dut_caps_global_exact_one_%0d", index));
+            count_rule.function_key = fixed_devices[index];
+            count_rule.mode = DPU_COUNT_EXACT;
+            count_rule.qpair_count = 1;
+            request.device_constraints.push_back(count_rule);
+        end
+        resolver = dpu_configuration_resolver::type_id::create(
+            "dut_caps_global_capacity_resolver");
+        if (resolver.resolve(builder.device_cfg, builder.placement_cfg,
+                device_snapshot, resource_snapshot, diagnostic)) begin
+            `uvm_fatal("DUT_CAPS",
+                "three fixed one-pair participants exceeded global capacity 2 without rejection")
+        end
+        if ((device_snapshot != null) || (resource_snapshot != null)) begin
+            `uvm_fatal("DUT_CAPS",
+                "global capacity failure published a partial snapshot")
+        end
+        if ((diagnostic == null) ||
+            (diagnostic.stage != DPU_PLACE_STAGE_SELECTION) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_GLOBAL_QID_EXHAUSTED) ||
+            !diagnostic.has_request_id || (diagnostic.request_id != 92) ||
+            diagnostic.has_function_key || diagnostic.has_service_key ||
+            diagnostic.has_pair_index ||
+            (request.fixed_devices.size() != 3) ||
+            (request.device_constraints.size() != 3)) begin
+            `uvm_fatal("DUT_CAPS",
+                "global capacity failure lost request-only structured diagnostics or three-participant authoring")
+        end
+    endtask
+
     task assert_vio_binding_ownership();
         virtio_resource_client owner_client;
         virtio_resource_client secondary_client;
@@ -3711,6 +3812,8 @@ class virtio_dut_caps_test extends uvm_test;
         assert_adapter_direct_bind_failure_is_latched();
         assert_env_null_protocol_vif_returns();
         assert_env_null_observer_returns();
+        assert_vio_global_capacity_diagnostic();
+        assert_vio_max_per_function_boundary();
         assert_vio_local_qpair_limit();
         assert_vio_binding_ownership();
         assert_vio_placement_diagnostics();
