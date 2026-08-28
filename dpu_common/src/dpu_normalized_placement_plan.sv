@@ -136,6 +136,15 @@ class dpu_normalized_placement_plan extends uvm_object;
                 return 0;
             end
         end
+        foreach (request.pairs[index]) begin
+            for (int prior = 0; prior < index; prior++) begin
+                if (request.pairs[prior].request_pair_index ==
+                    request.pairs[index].request_pair_index) begin
+                    why = "normalized placement plan has duplicate explicit pair records";
+                    return 0;
+                end
+            end
+        end
         request_copy = dpu_normalized_vio_request::type_id::create(
             $sformatf("%s_request_%0d", get_name(), request.request_id));
         request_copy.copy_from(request);

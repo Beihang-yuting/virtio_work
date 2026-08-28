@@ -234,6 +234,76 @@ class dpu_placement_normalizer extends uvm_object;
         return candidates.size() != 0;
     endfunction
 
+    protected function bit find_candidate_index(input candidate_t candidates[$],
+                                                input dpu_function_key_t key,
+                                                output int unsigned found_index);
+        foreach (candidates[index]) begin
+            if (dpu_same_function_key(candidates[index].key, key)) begin
+                found_index = index;
+                return 1;
+            end
+        end
+        found_index = 0;
+        return 0;
+    endfunction
+
+    protected function int unsigned xorshift32(ref int unsigned state);
+        if (state == 0) state = 32'h6d2b79f5;
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    endfunction
+
+    protected function void shuffle_candidates(ref candidate_t candidates[$],
+                                               input int unsigned seed);
+        candidate_t swap;
+        int unsigned state;
+        int unsigned swap_index;
+
+        state = seed;
+        for (int index = candidates.size() - 1; index > 0; index--) begin
+            swap_index = xorshift32(state) % (index + 1);
+            swap = candidates[index];
+            candidates[index] = candidates[swap_index];
+            candidates[swap_index] = swap;
+        end
+    endfunction
+
+    protected function int unsigned target_minimum(
+        input dpu_vio_placement_request request,
+        input dpu_function_key_t key,
+        output bit is_exact,
+        output int unsigned pinned_count
+    );
+        int unsigned minimum;
+
+        is_exact = 0;
+        pinned_count = 0;
+        minimum = 1;
+        foreach (request.qpair_overrides[index]) begin
+            if ((request.qpair_overrides[index].owner_mode == DPU_ASSIGN_PINNED) &&
+                dpu_same_function_key(request.qpair_overrides[index].requested_owner,
+                                      key))
+                pinned_count++;
+        end
+        foreach (request.device_constraints[index]) begin
+            if (dpu_same_function_key(request.device_constraints[index].function_key,
+                                      key)) begin
+                if (request.device_constraints[index].mode == DPU_COUNT_EXACT) begin
+                    is_exact = 1;
+                    minimum = request.device_constraints[index].qpair_count;
+                end else begin
+                    minimum = request.device_constraints[index].qpair_count;
+                end
+                break;
+            end
+        end
+        if (!is_exact && (pinned_count > minimum))
+            minimum = pinned_count;
+        return minimum;
+    endfunction
+
     protected function void set_failure(ref dpu_placement_diagnostic diagnostic,
                                         input dpu_placement_stage_e stage,
                                         input dpu_placement_error_e code,
@@ -252,12 +322,13 @@ class dpu_placement_normalizer extends uvm_object;
         dpu_resource_pool_config_t profile;
         dpu_vio_placement_request ordered_requests[$];
         candidate_t candidates[$];
+        candidate_t effective_candidates[$];
         candidate_t selected[$];
         dpu_normalized_vio_request normalized_request;
         dpu_vio_participant_target_t target;
         dpu_normalized_vio_pair_t pair;
+        dpu_vio_qpair_override overrides_by_pair[$];
         dpu_service_decl service;
-        int unsigned selected_keys[$];
         dpu_function_key_t consumed[$];
         int unsigned profile_count;
         int unsigned required_devices;
@@ -265,6 +336,17 @@ class dpu_placement_normalizer extends uvm_object;
         int unsigned pair_index;
         int unsigned best_index;
         int unsigned total_selected_qpairs;
+        int unsigned selected_minimums[$];
+        int unsigned selected_pinned_counts[$];
+        int unsigned assigned_counts[$];
+        int unsigned exact_sum;
+        int unsigned flexible_capacity_sum;
+        int unsigned minimum_sum;
+        int unsigned candidate_index;
+        int unsigned selected_index;
+        bit selected_is_exact[$];
+        bit pair_assigned[$];
+        dpu_service_key_t pair_owners[$];
         string why;
 
         profile_count = 0;
@@ -361,13 +443,12 @@ class dpu_placement_normalizer extends uvm_object;
             end
             if ((ordered_requests[request_index].total_qpairs == 0) ||
                 (ordered_requests[request_index].service_instance_id != 0) ||
-                (ordered_requests[request_index].ordering != DPU_PLACEMENT_CANONICAL) ||
-                (ordered_requests[request_index].device_constraints.size() != 0) ||
-                (ordered_requests[request_index].qpair_overrides.size() != 0) ||
+                ((ordered_requests[request_index].ordering != DPU_PLACEMENT_CANONICAL) &&
+                 (ordered_requests[request_index].ordering != DPU_PLACEMENT_SEEDED_RANDOM)) ||
                 !validate_filter(ordered_requests[request_index].candidate_filter,
                                  device_cfg.dut_caps, why)) begin
                 set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_INVALID_REQUEST,
-                            "request is invalid or uses an unsupported Task 3 policy", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
+                            "request has invalid placement fields", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
             end
             if (ordered_requests[request_index].total_qpairs >
                 (normalized_plan.effective_global_capacity - total_selected_qpairs)) begin
@@ -386,54 +467,244 @@ class dpu_placement_normalizer extends uvm_object;
                 set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_NO_ELIGIBLE_DEVICE,
                             "request has no eligible devices", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
             end
+            effective_candidates = candidates;
+            if (ordered_requests[request_index].ordering == DPU_PLACEMENT_SEEDED_RANDOM)
+                shuffle_candidates(effective_candidates, ordered_requests[request_index].seed);
+
+            foreach (ordered_requests[request_index].device_constraints[constraint_index]) begin
+                if ((ordered_requests[request_index].device_constraints[constraint_index] == null) ||
+                    (ordered_requests[request_index].device_constraints[constraint_index].qpair_count == 0) ||
+                    (ordered_requests[request_index].device_constraints[constraint_index].qpair_count >
+                     normalized_plan.effective_device_capacity) ||
+                    ((ordered_requests[request_index].device_constraints[constraint_index].mode != DPU_COUNT_EXACT) &&
+                     (ordered_requests[request_index].device_constraints[constraint_index].mode != DPU_COUNT_AT_LEAST)) ||
+                    !find_candidate_index(candidates,
+                        ordered_requests[request_index].device_constraints[constraint_index].function_key,
+                        candidate_index)) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_INPUT,
+                                DPU_PLACE_ERR_DEVICE_CONSTRAINT_CONFLICT,
+                                "device constraint is null, invalid, or ineligible",
+                                ordered_requests[request_index].request_id, 1);
+                    if (ordered_requests[request_index].device_constraints[constraint_index] != null)
+                        diagnostic.set_function_context(ordered_requests[request_index].device_constraints[constraint_index].function_key);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+                for (int prior = 0; prior < constraint_index; prior++) begin
+                    if ((ordered_requests[request_index].device_constraints[prior] != null) &&
+                        dpu_same_function_key(
+                            ordered_requests[request_index].device_constraints[prior].function_key,
+                            ordered_requests[request_index].device_constraints[constraint_index].function_key)) begin
+                        set_failure(diagnostic, DPU_PLACE_STAGE_INPUT,
+                                    DPU_PLACE_ERR_DEVICE_CONSTRAINT_CONFLICT,
+                                    "request has duplicate device constraints",
+                                    ordered_requests[request_index].request_id, 1);
+                        diagnostic.set_function_context(ordered_requests[request_index].device_constraints[constraint_index].function_key);
+                        normalized_device_cfg = null; normalized_plan = null; return 0;
+                    end
+                end
+            end
+            overrides_by_pair.delete();
+            for (int index = 0; index < ordered_requests[request_index].total_qpairs; index++)
+                overrides_by_pair.push_back(null);
+            foreach (ordered_requests[request_index].qpair_overrides[override_index]) begin
+                if ((ordered_requests[request_index].qpair_overrides[override_index] == null) ||
+                    (ordered_requests[request_index].qpair_overrides[override_index].request_pair_index >=
+                     ordered_requests[request_index].total_qpairs) ||
+                    ((ordered_requests[request_index].qpair_overrides[override_index].owner_mode != DPU_ASSIGN_AUTO) &&
+                     (ordered_requests[request_index].qpair_overrides[override_index].owner_mode != DPU_ASSIGN_PINNED) &&
+                     (ordered_requests[request_index].qpair_overrides[override_index].owner_mode != DPU_ASSIGN_PREFERRED)) ||
+                    ((ordered_requests[request_index].qpair_overrides[override_index].local_mode != DPU_ASSIGN_AUTO) &&
+                     (ordered_requests[request_index].qpair_overrides[override_index].local_mode != DPU_ASSIGN_PINNED) &&
+                     (ordered_requests[request_index].qpair_overrides[override_index].local_mode != DPU_ASSIGN_PREFERRED)) ||
+                    ((ordered_requests[request_index].qpair_overrides[override_index].global_mode != DPU_ASSIGN_AUTO) &&
+                     (ordered_requests[request_index].qpair_overrides[override_index].global_mode != DPU_ASSIGN_PINNED) &&
+                     (ordered_requests[request_index].qpair_overrides[override_index].global_mode != DPU_ASSIGN_PREFERRED))) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_INVALID_REQUEST,
+                                "qpair override is null, out of range, or has an invalid mode",
+                                ordered_requests[request_index].request_id, 1);
+                    if (ordered_requests[request_index].qpair_overrides[override_index] != null)
+                        diagnostic.set_pair_context(ordered_requests[request_index].qpair_overrides[override_index].request_pair_index);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+                pair_index = ordered_requests[request_index].qpair_overrides[override_index].request_pair_index;
+                if (overrides_by_pair[pair_index] != null) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_INVALID_REQUEST,
+                                "request has duplicate qpair overrides",
+                                ordered_requests[request_index].request_id, 1);
+                    diagnostic.set_pair_context(pair_index);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+                if ((ordered_requests[request_index].qpair_overrides[override_index].owner_mode == DPU_ASSIGN_PINNED) &&
+                    !find_candidate_index(candidates,
+                        ordered_requests[request_index].qpair_overrides[override_index].requested_owner,
+                        candidate_index)) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                DPU_PLACE_ERR_DEVICE_CONSTRAINT_CONFLICT,
+                                "pinned qpair owner is not an eligible candidate",
+                                ordered_requests[request_index].request_id, 1);
+                    diagnostic.set_function_context(ordered_requests[request_index].qpair_overrides[override_index].requested_owner);
+                    diagnostic.set_pair_context(pair_index);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+                overrides_by_pair[pair_index] = ordered_requests[request_index].qpair_overrides[override_index];
+            end
             selected.delete();
+            selected_minimums.delete();
+            selected_pinned_counts.delete();
+            selected_is_exact.delete();
             if (ordered_requests[request_index].device_policy == DPU_VIO_DEVICE_FIXED) begin
                 if (ordered_requests[request_index].fixed_devices.size() == 0) begin
                     set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_INVALID_REQUEST,
                                 "FIXED request has an empty device list", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
                 end
                 foreach (ordered_requests[request_index].fixed_devices[fixed_index]) begin
-                    bit matched;
-                    foreach (candidates[candidate_index]) begin
-                        if (dpu_same_function_key(candidates[candidate_index].key,
-                                                  ordered_requests[request_index].fixed_devices[fixed_index])) begin
-                            selected.push_back(candidates[candidate_index]); matched = 1; break;
-                        end
-                    end
-                    if (!matched || ((fixed_index != 0) && contains_key(
+                    if (!find_candidate_index(candidates,
+                            ordered_requests[request_index].fixed_devices[fixed_index], candidate_index) ||
+                        ((fixed_index != 0) && contains_key(
                             ordered_requests[request_index].fixed_devices[0:fixed_index-1],
                             ordered_requests[request_index].fixed_devices[fixed_index]))) begin
                         set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_INVALID_REQUEST,
                                     "FIXED request has an ineligible or duplicate device", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
                     end
                 end
+                foreach (effective_candidates[index]) begin
+                    if (contains_key(ordered_requests[request_index].fixed_devices,
+                                     effective_candidates[index].key))
+                        selected.push_back(effective_candidates[index]);
+                end
             end else if (ordered_requests[request_index].device_policy == DPU_VIO_DEVICE_ALL_ELIGIBLE) begin
-                selected = candidates;
+                selected = effective_candidates;
             end else if (ordered_requests[request_index].device_policy == DPU_VIO_DEVICE_AUTO_MINIMUM) begin
                 required_devices = (ordered_requests[request_index].total_qpairs +
                     normalized_plan.effective_device_capacity - 1) /
                     normalized_plan.effective_device_capacity;
-                if (required_devices > candidates.size()) begin
-                    set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED,
-                                "eligible device capacity cannot satisfy demand", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
+                foreach (effective_candidates[index]) begin
+                    bit mandatory;
+                    mandatory = 0;
+                    foreach (ordered_requests[request_index].device_constraints[constraint_index]) begin
+                        if (dpu_same_function_key(
+                            ordered_requests[request_index].device_constraints[constraint_index].function_key,
+                            effective_candidates[index].key)) mandatory = 1;
+                    end
+                    foreach (overrides_by_pair[pair_index]) begin
+                        if ((overrides_by_pair[pair_index] != null) &&
+                            (overrides_by_pair[pair_index].owner_mode == DPU_ASSIGN_PINNED) &&
+                            dpu_same_function_key(overrides_by_pair[pair_index].requested_owner,
+                                                  effective_candidates[index].key)) mandatory = 1;
+                    end
+                    if (mandatory) selected.push_back(effective_candidates[index]);
                 end
-                for (int selected_index = 0; selected_index < required_devices; selected_index++)
-                    selected.push_back(candidates[selected_index]);
+                foreach (overrides_by_pair[pair_index]) begin
+                    if ((overrides_by_pair[pair_index] != null) &&
+                        (overrides_by_pair[pair_index].owner_mode == DPU_ASSIGN_PREFERRED) &&
+                        (selected.size() < required_devices) &&
+                        find_candidate_index(effective_candidates,
+                            overrides_by_pair[pair_index].requested_owner, candidate_index) &&
+                        !find_candidate_index(selected,
+                            overrides_by_pair[pair_index].requested_owner, selected_index))
+                        selected.push_back(effective_candidates[candidate_index]);
+                end
             end else begin
                 set_failure(diagnostic, DPU_PLACE_STAGE_INPUT, DPU_PLACE_ERR_INVALID_REQUEST,
                             "request has an unknown device policy", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
             end
+            // FIXED/ALL_ELIGIBLE must include every constraint and pinned owner.
+            foreach (ordered_requests[request_index].device_constraints[constraint_index]) begin
+                if (!find_candidate_index(selected,
+                    ordered_requests[request_index].device_constraints[constraint_index].function_key,
+                    selected_index)) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                DPU_PLACE_ERR_DEVICE_CONSTRAINT_CONFLICT,
+                                "selected devices omit a constrained participant",
+                                ordered_requests[request_index].request_id, 1);
+                    diagnostic.set_function_context(ordered_requests[request_index].device_constraints[constraint_index].function_key);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+            end
+            foreach (overrides_by_pair[pair_index]) begin
+                if ((overrides_by_pair[pair_index] != null) &&
+                    (overrides_by_pair[pair_index].owner_mode == DPU_ASSIGN_PINNED) &&
+                    !find_candidate_index(selected, overrides_by_pair[pair_index].requested_owner,
+                                          selected_index)) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                DPU_PLACE_ERR_DEVICE_CONSTRAINT_CONFLICT,
+                                "selected devices omit a pinned qpair owner",
+                                ordered_requests[request_index].request_id, 1);
+                    diagnostic.set_function_context(overrides_by_pair[pair_index].requested_owner);
+                    diagnostic.set_pair_context(pair_index);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+            end
+            exact_sum = 0;
+            flexible_capacity_sum = 0;
+            minimum_sum = 0;
+            foreach (selected[index]) begin
+                selected_minimums.push_back(target_minimum(ordered_requests[request_index],
+                    selected[index].key, selected_is_exact[index],
+                    selected_pinned_counts[index]));
+                if (selected_is_exact[index]) begin
+                    if (selected_pinned_counts[index] > selected_minimums[index]) begin
+                        set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                    DPU_PLACE_ERR_DEVICE_CONSTRAINT_CONFLICT,
+                                    "EXACT device count is below its pinned qpair count",
+                                    ordered_requests[request_index].request_id, 1);
+                        diagnostic.set_function_context(selected[index].key);
+                        normalized_device_cfg = null; normalized_plan = null; return 0;
+                    end
+                    exact_sum += selected_minimums[index];
+                end else begin
+                    flexible_capacity_sum += normalized_plan.effective_device_capacity;
+                end
+                if (selected_minimums[index] > normalized_plan.effective_device_capacity) begin
+                    set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED,
+                                "participant minimum exceeds effective device capacity",
+                                ordered_requests[request_index].request_id, 1);
+                    diagnostic.set_function_context(selected[index].key);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
+                end
+                minimum_sum += selected_minimums[index];
+            end
+            if (ordered_requests[request_index].device_policy == DPU_VIO_DEVICE_AUTO_MINIMUM) begin
+                foreach (effective_candidates[index]) begin
+                    if ((exact_sum + flexible_capacity_sum >=
+                         ordered_requests[request_index].total_qpairs) ||
+                        find_candidate_index(selected, effective_candidates[index].key,
+                                             selected_index))
+                        continue;
+                    selected.push_back(effective_candidates[index]);
+                    selected_minimums.push_back(target_minimum(ordered_requests[request_index],
+                        effective_candidates[index].key, selected_is_exact[selected.size() - 1],
+                        selected_pinned_counts[selected.size() - 1]));
+                    if (selected_is_exact[selected.size() - 1])
+                        exact_sum += selected_minimums[selected.size() - 1];
+                    else
+                        flexible_capacity_sum += normalized_plan.effective_device_capacity;
+                    if (selected_minimums[selected.size() - 1] >
+                        normalized_plan.effective_device_capacity) begin
+                        set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                    DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED,
+                                    "participant minimum exceeds effective device capacity",
+                                    ordered_requests[request_index].request_id, 1);
+                        diagnostic.set_function_context(effective_candidates[index].key);
+                        normalized_device_cfg = null; normalized_plan = null; return 0;
+                    end
+                    minimum_sum += selected_minimums[selected.size() - 1];
+                end
+            end
             if ((selected.size() == 0) ||
-                (ordered_requests[request_index].total_qpairs < selected.size()) ||
-                (ordered_requests[request_index].total_qpairs >
-                 selected.size() * normalized_plan.effective_device_capacity)) begin
+                (minimum_sum > ordered_requests[request_index].total_qpairs) ||
+                (exact_sum + flexible_capacity_sum <
+                 ordered_requests[request_index].total_qpairs)) begin
                 set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED,
                             "selected participants cannot satisfy demand", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
             end
             foreach (selected[index]) begin
                 if (contains_key(consumed, selected[index].key)) begin
                     set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_DUPLICATE_SERVICE_OWNER,
-                                "a prior request already owns the selected function", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
+                                "a prior request already owns the selected function", ordered_requests[request_index].request_id, 1);
+                    diagnostic.set_function_context(selected[index].key);
+                    normalized_device_cfg = null; normalized_plan = null; return 0;
                 end
             end
             normalized_request = dpu_normalized_vio_request::type_id::create(
@@ -451,36 +722,87 @@ class dpu_placement_normalizer extends uvm_object;
                 target.service_key.function_key = selected[index].key;
                 target.service_key.service_kind = DPU_SERVICE_VIO_NET;
                 target.service_key.service_instance_id = 0;
-                target.qpair_count = 1;
+                target.qpair_count = selected_minimums[index];
                 normalized_request.targets.push_back(target);
             end
-            remaining = normalized_request.total_qpairs - selected.size();
+            remaining = normalized_request.total_qpairs - minimum_sum;
             while (remaining != 0) begin
                 best_index = 0;
                 for (int index = 1; index < normalized_request.targets.size(); index++) begin
-                    if (normalized_request.targets[index].qpair_count <
-                        normalized_request.targets[best_index].qpair_count)
+                    if (!selected_is_exact[index] &&
+                        (selected_is_exact[best_index] ||
+                         (normalized_request.targets[index].qpair_count <
+                          normalized_request.targets[best_index].qpair_count)))
                         best_index = index;
                 end
-                if (normalized_request.targets[best_index].qpair_count >=
-                    normalized_plan.effective_device_capacity) begin
+                if (selected_is_exact[best_index] ||
+                    (normalized_request.targets[best_index].qpair_count >=
+                     normalized_plan.effective_device_capacity)) begin
                     set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION, DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED,
                                 "water-level balancing exceeded device capacity", normalized_request.request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
                 end
                 normalized_request.targets[best_index].qpair_count++;
                 remaining--;
             end
-            pair_index = 0;
-            foreach (normalized_request.targets[target_index]) begin
-                for (int count = 0; count < normalized_request.targets[target_index].qpair_count; count++) begin
-                    pair.request_pair_index = pair_index++;
-                    pair.service_key = normalized_request.targets[target_index].service_key;
+            assigned_counts.delete();
+            pair_assigned.delete();
+            pair_owners.delete();
+            foreach (normalized_request.targets[index]) assigned_counts.push_back(0);
+            for (int index = 0; index < normalized_request.total_qpairs; index++) begin
+                pair_assigned.push_back(0);
+                if ((overrides_by_pair[index] != null) &&
+                    (overrides_by_pair[index].owner_mode == DPU_ASSIGN_PINNED)) begin
+                    find_candidate_index(selected, overrides_by_pair[index].requested_owner,
+                                         selected_index);
+                    pair_owners.push_back(normalized_request.targets[selected_index].service_key);
+                    assigned_counts[selected_index]++;
+                    pair_assigned[index] = 1;
+                end else
+                    pair_owners.push_back(normalized_request.targets[0].service_key);
+            end
+            for (int index = 0; index < normalized_request.total_qpairs; index++) begin
+                if (!pair_assigned[index] && (overrides_by_pair[index] != null) &&
+                    (overrides_by_pair[index].owner_mode == DPU_ASSIGN_PREFERRED) &&
+                    find_candidate_index(selected, overrides_by_pair[index].requested_owner,
+                                         selected_index) &&
+                    (assigned_counts[selected_index] <
+                     normalized_request.targets[selected_index].qpair_count)) begin
+                    pair_owners[index] = normalized_request.targets[selected_index].service_key;
+                    assigned_counts[selected_index]++;
+                    pair_assigned[index] = 1;
+                end
+            end
+            for (int index = 0; index < normalized_request.total_qpairs; index++) begin
+                if (!pair_assigned[index]) begin
+                    for (selected_index = 0; selected_index < normalized_request.targets.size(); selected_index++) begin
+                        if (assigned_counts[selected_index] <
+                            normalized_request.targets[selected_index].qpair_count) break;
+                    end
+                    if (selected_index == normalized_request.targets.size()) begin
+                        set_failure(diagnostic, DPU_PLACE_STAGE_SELECTION,
+                                    DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED,
+                                    "pair owner expansion exceeded target capacity",
+                                    normalized_request.request_id, 1);
+                        diagnostic.set_pair_context(index);
+                        normalized_device_cfg = null; normalized_plan = null; return 0;
+                    end
+                    pair_owners[index] = normalized_request.targets[selected_index].service_key;
+                    assigned_counts[selected_index]++;
+                end
+                pair.request_pair_index = index;
+                pair.service_key = pair_owners[index];
+                if (overrides_by_pair[index] == null) begin
                     pair.local_mode = DPU_ASSIGN_AUTO;
                     pair.requested_local_pair_id = 0;
                     pair.global_mode = DPU_ASSIGN_AUTO;
                     pair.requested_global_qpair_id = 0;
-                    normalized_request.pairs.push_back(pair);
+                end else begin
+                    pair.local_mode = overrides_by_pair[index].local_mode;
+                    pair.requested_local_pair_id = overrides_by_pair[index].requested_local_pair_id;
+                    pair.global_mode = overrides_by_pair[index].global_mode;
+                    pair.requested_global_qpair_id = overrides_by_pair[index].requested_global_qpair_id;
                 end
+                normalized_request.pairs.push_back(pair);
             end
             foreach (selected[index]) begin
                 consumed.push_back(selected[index].key);
