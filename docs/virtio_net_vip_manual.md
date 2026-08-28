@@ -1614,7 +1614,7 @@ make regression
 `virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、
 `virtio_e2e_test`、`virtio_full_integration_test`、
 `virtio_pf_lifecycle_reset_test`、`virtio_monitor_routing_test`、
-`virtio_dual_test`、`virtio_smoke_test` 和 `virtio_traffic_test`，共 21 项。该入口
+`virtio_dual_test`、`virtio_smoke_test` 和 `virtio_traffic_test`，共 22 项。该入口
 要求 `make check-deps` 先通过；无 VCS 环境时它应在编译前报告 VCS 依赖错误。
 
 ### 6.2 编写测试
