@@ -114,13 +114,19 @@ class dpu_resource_manager_test extends uvm_test;
         input dpu_service_key_t owner,
         input int unsigned profile_capacity = 2048,
         input int unsigned profile_per_function = 32,
-        input bit freeze_snapshot = 1
+        input bit freeze_snapshot = 1,
+        input dpu_resource_class_id_t qpair_snapshot_class_id = 0,
+        input bit add_reordered_aux_profile = 0,
+        input bit conflict_class_ids = 0,
+        input int unsigned reservation_ids[$] = '{},
+        input dpu_global_id_range_t reservation_ranges[$] = '{}
     );
         dpu_normalized_placement_plan plan;
         dpu_normalized_vio_request request;
         dpu_normalized_vio_pair_t pair;
         dpu_vio_participant_target_t target;
         dpu_resource_pool_config_t profile;
+        dpu_resource_pool_config_t auxiliary_profile;
         dpu_vio_qpair_binding_t binding;
         dpu_resource_snapshot result;
         dpu_placement_diagnostic diagnostic;
@@ -130,11 +136,23 @@ class dpu_resource_manager_test extends uvm_test;
         plan.effective_global_capacity = 2048;
         plan.effective_device_capacity = 32;
         profile.name = "virtio.qpair";
-        profile.class_id = 0;
+        profile.class_id = qpair_snapshot_class_id;
         profile.kind = DPU_RESOURCE_KIND_QUEUE;
         profile.capacity = profile_capacity;
         profile.max_per_function = profile_per_function;
-        plan.set_profiles('{profile});
+        if (add_reordered_aux_profile || conflict_class_ids) begin
+            auxiliary_profile.name = "auxiliary.resource";
+            auxiliary_profile.class_id = conflict_class_ids ?
+                                       qpair_snapshot_class_id : 7;
+            auxiliary_profile.kind = DPU_RESOURCE_KIND_DMA_WINDOW;
+            auxiliary_profile.capacity = 64;
+            auxiliary_profile.max_per_function = 4;
+            plan.set_profiles('{auxiliary_profile, profile});
+        end
+        else begin
+            plan.set_profiles('{profile});
+        end
+        plan.set_reservations(reservation_ids, reservation_ranges);
         request = dpu_normalized_vio_request::type_id::create("manager_request");
         request.request_id = 77;
         request.service_instance_id = owner.service_instance_id;
@@ -223,9 +241,12 @@ class dpu_resource_manager_test extends uvm_test;
         dpu_function_key_t keys[$];
         dpu_resource_snapshot unfrozen_resource;
         dpu_resource_snapshot expanded_resource;
+        dpu_resource_snapshot conflicted_resource;
         dpu_device_snapshot mismatched_device;
         dpu_device_resolver resolver;
         int unsigned global_id;
+        int unsigned reservation_ids[$];
+        dpu_global_id_range_t reservation_ranges[$];
         string why;
 
         phase.raise_objection(this);
@@ -233,6 +254,11 @@ class dpu_resource_manager_test extends uvm_test;
         if (keys.size() != DPU_MAX_FUNCTIONS)
             `uvm_fatal("DPU_RESOURCE", "resolved snapshot lost 1024-function coverage")
 
+        reservation_ids = '{4};
+        reservation_ranges = '{'{first_id: 8, last_id: 9}};
+        resource_snapshot = make_resource_snapshot(
+            device_snapshot, service_key, 2048, 32, 1, 41, 1, 0,
+            reservation_ids, reservation_ranges);
         manager = dpu_resource_manager::type_id::create("snapshot_manager");
         authority = manager.claim_registry_authority();
         if ((authority == null) || !manager.configure_from_snapshots(
@@ -241,6 +267,7 @@ class dpu_resource_manager_test extends uvm_test;
         if (!manager.is_seeded_from_snapshots(device_snapshot, resource_snapshot))
             `uvm_fatal("DPU_RESOURCE", "manager lost exact snapshot identity")
         if (!manager.lookup_resource_class("virtio.qpair", qpair_class_id, why) ||
+            (qpair_class_id != 41) ||
             !manager.local_pair_to_global_qpair(service_key, qpair_class_id, 17,
                                                 global_id) || (global_id != 91))
             `uvm_fatal("DPU_RESOURCE", {"manager query disagrees with snapshot: ", why})
@@ -255,6 +282,14 @@ class dpu_resource_manager_test extends uvm_test;
         manager.list_service_leases(service_key, leases);
         if (leases[0].global_id != 7)
             `uvm_fatal("DPU_RESOURCE", "service lease query leaked mutable state")
+        if (!manager.mark_function_device_ready(keys[1], why) ||
+            !manager.acquire_leases(keys[1], qpair_class_id, 0, 10, leases, why))
+            `uvm_fatal("DPU_RESOURCE", {"legacy allocation probe failed: ", why})
+        foreach (leases[index]) begin
+            if ((leases[index].global_id == 4) || (leases[index].global_id == 8) ||
+                (leases[index].global_id == 9))
+                `uvm_fatal("DPU_RESOURCE", "legacy allocation consumed a reserved global qpair")
+        end
         if (manager.configure_from_snapshots(authority, device_snapshot,
                                              resource_snapshot, why) ||
             !manager.is_seeded_from_snapshots(device_snapshot, resource_snapshot))
@@ -286,6 +321,16 @@ class dpu_resource_manager_test extends uvm_test;
                                                     expanded_resource, why))
             `uvm_fatal("DPU_RESOURCE", "profile expansion imported")
         assert_unconfigured(failed_manager, keys[0], "profile expansion");
+
+        failed_manager = dpu_resource_manager::type_id::create("class_id_conflict_manager");
+        authority = failed_manager.claim_registry_authority();
+        conflicted_resource = make_resource_snapshot(
+            device_snapshot, service_key, 2048, 32, 1, 41, 1, 1,
+            reservation_ids, reservation_ranges);
+        if (failed_manager.configure_from_snapshots(authority, device_snapshot,
+                                                    conflicted_resource, why))
+            `uvm_fatal("DPU_RESOURCE", "conflicting snapshot class IDs imported")
+        assert_unconfigured(failed_manager, keys[0], "conflicting class IDs");
 
         resolver = dpu_device_resolver::type_id::create("mismatch_resolver");
         if (!resolver.resolve(make_capacity_device_cfg(), mismatched_device, why))

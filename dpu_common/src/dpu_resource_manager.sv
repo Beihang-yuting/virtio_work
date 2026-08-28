@@ -333,6 +333,8 @@ class dpu_resource_manager extends uvm_object;
         dpu_function_key_t function_keys[$];
         dpu_resource_pool_config_t profiles[$];
         dpu_vio_qpair_binding_t bindings[$];
+        int unsigned reserved_global_ids[$];
+        dpu_global_id_range_t reserved_global_ranges[$];
         dpu_resource_class_id_t qpair_class_id;
         dpu_resource_class_id_t class_id;
 
@@ -383,10 +385,8 @@ class dpu_resource_manager extends uvm_object;
                     return 0;
                 end
             end
-            if (!candidate.register_resource_class_internal(
-                    profiles[index].name, profiles[index].kind,
-                    profiles[index].capacity, profiles[index].max_per_function,
-                    class_id, why))
+            if (!candidate.register_imported_resource_profile(
+                    profiles[index], class_id, why))
                 return 0;
         end
         if (!candidate.lookup_resource_class("virtio.qpair", qpair_class_id,
@@ -398,6 +398,34 @@ class dpu_resource_manager extends uvm_object;
             DPU_RESOURCE_KIND_QUEUE) begin
             why = "virtio.qpair profile is not a queue resource class";
             return 0;
+        end
+        resource_snapshot.list_reserved_global_qpair_ids(reserved_global_ids);
+        resource_snapshot.list_reserved_global_qpair_ranges(reserved_global_ranges);
+        foreach (reserved_global_ids[index]) begin
+            if (reserved_global_ids[index] >= DPU_MAX_VIO_GLOBAL_QPAIRS) begin
+                why = "resource snapshot has an out-of-range reserved global qpair ID";
+                return 0;
+            end
+            if (reserved_global_ids[index] <
+                candidate.resource_profiles_by_id[qpair_class_id].capacity)
+                candidate.active_global_ids[qpair_class_id][
+                    reserved_global_ids[index]] = 1;
+        end
+        foreach (reserved_global_ranges[index]) begin
+            if ((reserved_global_ranges[index].first_id >
+                 reserved_global_ranges[index].last_id) ||
+                (reserved_global_ranges[index].last_id >=
+                 DPU_MAX_VIO_GLOBAL_QPAIRS)) begin
+                why = "resource snapshot has an invalid reserved global qpair range";
+                return 0;
+            end
+            for (int unsigned global_id = reserved_global_ranges[index].first_id;
+                 global_id <= reserved_global_ranges[index].last_id;
+                 global_id++) begin
+                if (global_id < candidate.resource_profiles_by_id[
+                        qpair_class_id].capacity)
+                    candidate.active_global_ids[qpair_class_id][global_id] = 1;
+            end
         end
         resource_snapshot.list_vio_bindings(bindings);
         foreach (bindings[index]) begin
@@ -494,6 +522,43 @@ class dpu_resource_manager extends uvm_object;
         snapshot = dpu_dut_caps::type_id::create("dut_caps_snapshot");
         snapshot.copy_from(dut_caps);
         return snapshot;
+    endfunction
+
+    // Snapshot profile IDs are externally visible lease/query identities.
+    // Unlike legacy registration, importing must retain them exactly.
+    protected function bit register_imported_resource_profile(
+        input dpu_resource_pool_config_t profile,
+        output dpu_resource_class_id_t class_id,
+        output string why
+    );
+        class_id = profile.class_id;
+        why = "";
+        if (resource_classes_sealed) begin
+            why = "resource-class registry is sealed";
+            return 0;
+        end
+        if (profile.capacity == 0) begin
+            why = "resource-class capacity must be nonzero";
+            return 0;
+        end
+        if (profile.max_per_function == 0) begin
+            why = "resource-class per-function quota must be nonzero";
+            return 0;
+        end
+        if (class_id_by_name.exists(profile.name)) begin
+            why = "resource snapshot has a duplicate profile name";
+            return 0;
+        end
+        if (resource_profiles_by_id.exists(profile.class_id)) begin
+            why = "resource snapshot has a duplicate profile class ID";
+            return 0;
+        end
+        class_id_by_name[profile.name] = profile.class_id;
+        resource_profiles_by_id[profile.class_id] = profile;
+        class_allocated_count[profile.class_id] = 0;
+        if (next_resource_class_id <= profile.class_id)
+            next_resource_class_id = profile.class_id + 1;
+        return 1;
     endfunction
 
     protected function bit register_resource_class_internal(
