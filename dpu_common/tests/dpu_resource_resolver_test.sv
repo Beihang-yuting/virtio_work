@@ -15,7 +15,6 @@ class dpu_corruptible_device_snapshot extends dpu_device_snapshot;
     function void delete_service_owner(input dpu_service_key_t service_key);
         string service_name;
         service_name = dpu_service_key_name(service_key);
-        m_frozen = 0;
         m_services.delete(service_name);
         m_service_owners.delete(service_name);
         foreach (m_service_order[index]) begin
@@ -195,7 +194,13 @@ class dpu_resource_resolver_test extends uvm_test;
         dpu_pcie_function_id_t vf_pcie;
         dpu_bar_pair_lease_t vf_bar;
         dpu_service_key_t services[$];
+        dpu_vio_participant_target_t participants[$];
+        dpu_vio_qpair_binding_t participant_bindings[$];
+        dpu_vio_qpair_binding_t all_bindings[$];
         dpu_function_key_t vf7;
+        int unsigned request10_count;
+        int unsigned request20_count;
+        int unsigned request30_count;
         string why;
         bit found_vf_service;
 
@@ -213,6 +218,30 @@ class dpu_resource_resolver_test extends uvm_test;
             !resource_snapshot.get_vio_binding(30, 0, request30) ||
             (request10.global_qpair_id >= request20.global_qpair_id))
             `uvm_fatal("CONFIG_RESOLVER", "request IDs did not determine AUTO global allocation order")
+        resource_snapshot.list_vio_participants(participants);
+        resource_snapshot.list_vio_bindings(all_bindings);
+        request10_count = 0;
+        request20_count = 0;
+        request30_count = 0;
+        foreach (all_bindings[index]) begin
+            case (all_bindings[index].request_id)
+                10: request10_count++;
+                20: request20_count++;
+                30: request30_count++;
+                default: `uvm_fatal("CONFIG_RESOLVER", "unexpected request binding")
+            endcase
+        end
+        if ((participants.size() != 3) || (all_bindings.size() != 3) ||
+            (request10_count != 1) || (request20_count != 1) ||
+            (request30_count != 1))
+            `uvm_fatal("CONFIG_RESOLVER", "resource snapshot lost exact request totals")
+        foreach (participants[index]) begin
+            resource_snapshot.list_vio_bindings_for_service(
+                participants[index].service_key, participant_bindings);
+            if ((participant_bindings.size() == 0) ||
+                (participant_bindings.size() != participants[index].qpair_count))
+                `uvm_fatal("CONFIG_RESOLVER", "participant binding total disagrees with placement")
+        end
         vf7 = make_coordinator_function(0, DPU_FUNCTION_VF, 7).key;
         if (!device_snapshot.get_pcie_id(vf7, vf_pcie, why) ||
             !device_snapshot.get_bar(vf7, DPU_BAR_DEVICE_MEMORY, vf_bar, why))
@@ -521,13 +550,28 @@ class dpu_resource_resolver_test extends uvm_test;
         dpu_corruptible_device_snapshot device_snapshot;
         dpu_service_key_t service_key;
         dpu_resource_resolver resolver;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_placement_diagnostic diagnostic;
 
         device_snapshot = make_corruptible_device_snapshot(service_key);
         device_snapshot.delete_service_owner(service_key);
+        if (!device_snapshot.is_frozen())
+            `uvm_fatal("RESOURCE_RESOLVER", "corruption probe no longer reaches frozen snapshot validation")
         resolver = dpu_resource_resolver::type_id::create("corruptible_resolver");
-        expect_resolve_failure("deleted_service_owner", resolver, device_snapshot,
-            make_plan(service_key), DPU_PLACE_ERR_SNAPSHOT_REFERENCE_MISMATCH,
-            0, 0);
+        resource_snapshot = null;
+        diagnostic = dpu_placement_diagnostic::type_id::create("deleted_service_diag");
+        if (resolver.resolve(device_snapshot, make_plan(service_key),
+                             resource_snapshot, diagnostic) ||
+            (resource_snapshot != null) ||
+            (diagnostic.stage != DPU_PLACE_STAGE_RESOURCE_RESOLUTION) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_SNAPSHOT_REFERENCE_MISMATCH) ||
+            !diagnostic.has_request_id || diagnostic.has_pair_index ||
+            !diagnostic.has_service_key || !diagnostic.has_function_key ||
+            (dpu_service_key_name(diagnostic.service_key) !=
+             dpu_service_key_name(service_key)) ||
+            !dpu_same_function_key(diagnostic.function_key,
+                                   service_key.function_key))
+            `uvm_fatal("RESOURCE_RESOLVER", "deleted frozen service was not a contextual snapshot mismatch")
     endfunction
 
     function automatic void expect_binding(

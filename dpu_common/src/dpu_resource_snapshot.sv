@@ -251,7 +251,17 @@ class dpu_resource_snapshot extends uvm_object;
                     found_service = 1;
             end
         end
-        if (!found_service || (service_count != 1)) begin
+        if (!found_service) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_SNAPSHOT_REFERENCE_MISMATCH,
+                        "participating VIO-net service is absent from device snapshot");
+            diagnostic.set_request_context(request_id);
+            if (has_pair_index)
+                diagnostic.set_pair_context(request_pair_index);
+            diagnostic.set_service_context(service_key);
+            diagnostic.set_function_context(service_key.function_key);
+            return 0;
+        end
+        if (service_count != 1) begin
             set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
                         "participating function must expose exactly one VIO-net service");
             diagnostic.set_request_context(request_id);

@@ -60,6 +60,12 @@ class dpu_configuration_resolver extends uvm_object;
                            "coordinator produced an unfrozen snapshot");
             return 0;
         end
+        if (!candidate_resource.references_device_snapshot(candidate_device)) begin
+            diagnostic.set(DPU_PLACE_STAGE_CROSS_SNAPSHOT,
+                           DPU_PLACE_ERR_SNAPSHOT_REFERENCE_MISMATCH,
+                           "resource snapshot does not reference candidate device snapshot");
+            return 0;
+        end
         device_snapshot = candidate_device;
         resource_snapshot = candidate_resource;
         diagnostic.clear();
