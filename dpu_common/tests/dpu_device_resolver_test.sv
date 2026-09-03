@@ -967,6 +967,60 @@ class dpu_device_resolver_test extends uvm_test;
                    64'h0000_0001_0400_0000, 64'h0000_0000_0200_0000);
     endfunction
 
+    // Random BAR placement must remain inside the declared MMIO aperture and
+    // preserve same-domain non-overlap, while producing more than one legal
+    // layout over repeated simulator-randomized resolutions.
+    function void test_random_bar_placement(input dpu_device_resolver resolver);
+        dpu_device_cfg cfg;
+        dpu_function_cfg peer;
+        dpu_device_snapshot snapshots[$];
+        dpu_bar_pair_lease_t first_bars[$];
+        dpu_bar_pair_lease_t second_bars[$];
+        dpu_function_key_t first_key;
+        dpu_function_key_t second_key;
+        dpu_bar_pair_lease_t bar;
+        string why;
+        bit saw_different;
+
+        cfg = make_single_pf_cfg();
+        cfg.hosts[0].pcie_domains[0].bar_placement_policy =
+            DPU_BAR_PLACEMENT_RANDOM;
+        peer = make_function(0, 1, DPU_FUNCTION_PF, 0, 0);
+        cfg.functions.push_back(peer);
+        cfg.af_request.requester = cfg.functions[0].key;
+        first_key = cfg.functions[0].key;
+        second_key = peer.key;
+        saw_different = 0;
+        for (int iteration = 0; iteration < 8; iteration++) begin
+            dpu_device_snapshot snapshot;
+            if (!resolver.resolve(cfg, snapshot, why) ||
+                (snapshot == null) || !snapshot.is_frozen())
+                `uvm_fatal("RESOLVER_TEST", {"random BAR resolution failed: ", why})
+            snapshots.push_back(snapshot);
+            if (!snapshot.get_bar(first_key, DPU_BAR_DEVICE_MEMORY, bar, why))
+                `uvm_fatal("RESOLVER_TEST", {"random BAR0 missing: ", why})
+            first_bars.push_back(bar);
+            if (!snapshot.get_bar(second_key, DPU_BAR_DEVICE_MEMORY, bar, why))
+                `uvm_fatal("RESOLVER_TEST", {"random peer BAR0 missing: ", why})
+            second_bars.push_back(bar);
+            if ((bar.base < 64'h0000_0001_0000_0000) ||
+                (bar.base + bar.size > 64'h0000_0002_0000_0000))
+                `uvm_fatal("RESOLVER_TEST", "random BAR escaped MMIO window")
+        end
+        foreach (first_bars[index]) begin
+            if ((first_bars[index].base != first_bars[0].base) ||
+                (second_bars[index].base != second_bars[0].base))
+                saw_different = 1;
+            if ((first_bars[index].base < second_bars[index].base +
+                 second_bars[index].size) &&
+                (second_bars[index].base < first_bars[index].base +
+                 first_bars[index].size))
+                `uvm_fatal("RESOLVER_TEST", "random same-domain BARs overlap")
+        end
+        if (!saw_different)
+            `uvm_fatal("RESOLVER_TEST", "random BAR policy produced one fixed layout")
+    endfunction
+
     // Catches omission of reserved-BDF rejection for exact requests.
     function void test_pinned_bdf_reserved(input dpu_device_resolver resolver);
         dpu_device_cfg cfg;
@@ -1507,6 +1561,7 @@ class dpu_device_resolver_test extends uvm_test;
         test_bar_request_role_pair_profile_mismatch(resolver);
         test_deterministic_domain_aware_allocation(resolver);
         test_auto_bar_lowest_aligned_after_reservation(resolver);
+        test_random_bar_placement(resolver);
         test_pinned_bdf_reserved(resolver);
         test_pinned_bdf_out_of_range(resolver);
         test_pinned_bdf_same_domain_duplicate(resolver);

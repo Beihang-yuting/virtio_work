@@ -1,6 +1,7 @@
 // All paths are relative to the repository root.
 // Compile host_mem_pkg before the PCIe package that imports it. The
-// virtio-net package includes host_mem_manager.sv in its own package scope.
+// virtio-net package includes host_mem_manager.sv and host_mem_pool.sv in its
+// own package scope; the pool must be visible before env configuration.
 // The pinned net_packet revision currently contributes no SystemVerilog sources.
 
 +incdir+virtio_net_vip/ext/host_mem/src

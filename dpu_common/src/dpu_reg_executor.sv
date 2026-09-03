@@ -17,6 +17,13 @@ virtual class dpu_reg_executor extends uvm_object;
         return last_error_text;
     endfunction
 
+    // Optional topology hand-off performed by dpu_device_env after resolving
+    // the frozen snapshot.  Generic executors ignore it; concrete PCIe
+    // executors use it to translate BAR-relative register offsets at the
+    // final execution boundary.
+    virtual function void bind_topology(input uvm_object topology);
+    endfunction
+
     pure virtual function bit preflight(
         dpu_reg_plan plan,
         output string why

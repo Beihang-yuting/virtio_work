@@ -44,9 +44,26 @@ class virtio_net_env_config extends uvm_object;
     // ===== Memory =====
     bit [63:0]           mem_base = 64'h0000_0001_0000_0000;
     bit [63:0]           mem_end  = 64'h0000_0001_FFFF_FFFF;
+    // Host address-domain selection.  A top-level DPU environment can inject
+    // the shared manager for this Host; when null, the legacy single-Host
+    // behavior creates one locally.
+    int unsigned         host_id = 0;
+    host_mem_alloc_policy_e host_mem_policy = HOST_MEM_RANDOM;
+    host_mem_manager     host_mem_binding = null;
+    // Optional top-level ownership object.  When supplied, the environment
+    // resolves host_id through this pool and shares the returned manager with
+    // every service environment bound to the same Host.
+    host_mem_pool        host_mem_pool_binding = null;
 
     // ===== IOMMU =====
     bit                  iommu_strict = 1;
+    // IOVA is a device-visible address space and is intentionally configured
+    // independently from Host GPA/BAR apertures.  The default keeps the
+    // existing 64-bit model range while selecting the random allocator;
+    // FIRST_FIT remains available for deterministic debug runs.
+    bit [63:0]           iova_base = 64'h0000_0000_8000_0000;
+    bit [63:0]           iova_limit = 64'hffff_ffff_ffff_f000;
+    iommu_iova_alloc_policy_e iova_alloc_policy = IOMMU_IOVA_RANDOM;
 
     // ===== Performance =====
     bit                  bw_limit_enable = 0;
@@ -195,6 +212,13 @@ class virtio_net_env_config extends uvm_object;
                             mem_base, mem_end);
             return 0;
         end
+        if ((iova_base == 0) || ((iova_base & 64'hfff) != 0) ||
+            ((iova_limit & 64'hfff) != 0) || (iova_limit <= iova_base)) begin
+            why = $sformatf(
+                "invalid IOVA aperture [0x%016h,0x%016h): base/limit must be nonzero, page-aligned and nonempty",
+                iova_base, iova_limit);
+            return 0;
+        end
         default_cfg = make_default_driver_config(
             DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE);
         if (!validate_driver_behavior(default_cfg, "default VIO behavior", why))
@@ -274,7 +298,13 @@ class virtio_net_env_config extends uvm_object;
         string s;
         s = $sformatf("virtio_net_env_config:\n");
         s = {s, $sformatf("  mem_base=0x%016h, mem_end=0x%016h\n", mem_base, mem_end)};
-        s = {s, $sformatf("  iommu_strict=%0b\n", iommu_strict)};
+        s = {s, $sformatf("  host_id=%0d, host_mem_policy=%s, host_mem_binding=%s, host_mem_pool=%s\n",
+                          host_id, host_mem_policy.name(),
+                          (host_mem_binding == null) ? "none" : host_mem_binding.get_name(),
+                          (host_mem_pool_binding == null) ? "none" : host_mem_pool_binding.get_name())};
+        s = {s, $sformatf("  iommu_strict=%0b, iova=[0x%016h,0x%016h), policy=%s\n",
+                          iommu_strict, iova_base, iova_limit,
+                          iova_alloc_policy.name())};
         s = {s, $sformatf("  default: pairs=%0d, qsize=%0d, vq_type=%s, mode=%s\n",
                           default_num_pairs, default_queue_size,
                           default_vq_type.name(), default_driver_mode.name())};

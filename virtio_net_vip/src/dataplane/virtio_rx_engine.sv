@@ -61,6 +61,7 @@ class virtio_rx_engine extends uvm_object;
     virtio_offload_engine       offload;
     virtio_dataplane_callback   custom_cb;   // null = standard mode
     bit [15:0]                  bdf;
+    int unsigned                host_id;
 
     // ===== Configuration =====
     bit [63:0]       negotiated_features;
@@ -144,7 +145,8 @@ class virtio_rx_engine extends uvm_object;
             mem.mem_set(buf_gpa, 0, alloc_size);
 
             // 2. DMA map (device writes into these buffers)
-            buf_iova = iommu.map(bdf, buf_gpa, alloc_size, DMA_FROM_DEVICE);
+            buf_iova = iommu.map_for_host(host_id, bdf, buf_gpa, alloc_size,
+                                          DMA_FROM_DEVICE);
 
             // 3. Track for cleanup
             rx_buf_gpa_to_iova[buf_gpa] = buf_iova;
@@ -559,7 +561,7 @@ class virtio_rx_engine extends uvm_object;
     // ==================================================================
     protected virtual function void cleanup_rx_buffer(bit [63:0] buf_gpa);
         if (rx_buf_gpa_to_iova.exists(buf_gpa)) begin
-            iommu.unmap(bdf, rx_buf_gpa_to_iova[buf_gpa]);
+            iommu.unmap_for_host(host_id, bdf, rx_buf_gpa_to_iova[buf_gpa]);
             rx_buf_gpa_to_iova.delete(buf_gpa);
         end
 

@@ -73,6 +73,12 @@ class virtio_auto_fsm extends uvm_report_object;
         mq_pair_limit_bound = 0;
     endfunction
 
+    protected function int unsigned iommu_host_id();
+        if ((ops != null) && (ops.transport != null))
+            return ops.transport.iommu_host_id();
+        return 0;
+    endfunction
+
     // Snapshot the function's effective MQ limit.  Zero is the compatibility
     // encoding used by standalone/legacy driver configs created before this
     // field existed.  Repeated binds are idempotent, but a different value is
@@ -242,6 +248,8 @@ class virtio_auto_fsm extends uvm_report_object;
                 checksum = migration_checksum_word(checksum,
                     {32'h0, indirect_snapshot.head_id});
                 checksum = migration_checksum_word(checksum,
+                    {32'h0, indirect_snapshot.mapping.host_id});
+                checksum = migration_checksum_word(checksum,
                     {48'h0, indirect_snapshot.mapping.bdf});
                 checksum = migration_checksum_word(checksum,
                     indirect_snapshot.mapping.gpa);
@@ -264,6 +272,8 @@ class virtio_auto_fsm extends uvm_report_object;
                 iommu_mapping_t queue_dma_mapping;
 
                 queue_dma_mapping = queue_snapshot.queue_dma_mappings[m];
+                checksum = migration_checksum_word(checksum,
+                    {32'h0, queue_dma_mapping.host_id});
                 checksum = migration_checksum_word(checksum,
                     {48'h0, queue_dma_mapping.bdf});
                 checksum = migration_checksum_word(checksum,
@@ -299,6 +309,8 @@ class virtio_auto_fsm extends uvm_report_object;
 
             record = snap.dirty_page_records[r];
             checksum = migration_checksum_word(checksum, record.page_id);
+            checksum = migration_checksum_word(checksum,
+                {32'h0, record.mapping.host_id});
             checksum = migration_checksum_word(checksum, {48'h0, record.mapping.bdf});
             checksum = migration_checksum_word(checksum, record.mapping.gpa);
             checksum = migration_checksum_word(checksum, record.mapping.iova);
@@ -321,6 +333,8 @@ class virtio_auto_fsm extends uvm_report_object;
             virtio_mapping_snapshot_t record;
 
             record = snap.mapping_records[r];
+            checksum = migration_checksum_word(checksum,
+                {32'h0, record.mapping.host_id});
             checksum = migration_checksum_word(checksum, {48'h0, record.mapping.bdf});
             checksum = migration_checksum_word(checksum, record.mapping.gpa);
             checksum = migration_checksum_word(checksum, record.mapping.iova);
@@ -342,6 +356,8 @@ class virtio_auto_fsm extends uvm_report_object;
             record = snap.normal_dma_records[r];
             checksum = migration_checksum_word(checksum, {32'h0, record.queue_id});
             checksum = migration_checksum_word(checksum, {63'h0, record.is_tx});
+            checksum = migration_checksum_word(checksum,
+                {32'h0, record.mapping.host_id});
             checksum = migration_checksum_word(checksum, {48'h0, record.mapping.bdf});
             checksum = migration_checksum_word(checksum, record.mapping.gpa);
             checksum = migration_checksum_word(checksum, record.mapping.iova);
@@ -384,7 +400,8 @@ class virtio_auto_fsm extends uvm_report_object;
         iommu_mapping_t left,
         iommu_mapping_t right
     );
-        return (left.bdf  == right.bdf)  &&
+        return (left.host_id == right.host_id) &&
+               (left.bdf  == right.bdf)  &&
                (left.gpa  == right.gpa)  &&
                (left.iova == right.iova) &&
                (left.size == right.size) &&
@@ -398,7 +415,8 @@ class virtio_auto_fsm extends uvm_report_object;
         iommu_mapping_t left,
         iommu_mapping_t right
     );
-        return (left.bdf  == right.bdf)  &&
+        return (left.host_id == right.host_id) &&
+               (left.bdf  == right.bdf)  &&
                (left.iova == right.iova) &&
                (left.size == right.size) &&
                (left.dir  == right.dir);
@@ -459,6 +477,7 @@ class virtio_auto_fsm extends uvm_report_object;
                 (snap.queue_snapshots[record.queue_id].queue_id !=
                  record.queue_id) ||
                 (record.is_tx != expected_is_tx) ||
+                (record.mapping.host_id != iommu_host_id()) ||
                 (record.mapping.bdf != ops.transport.bdf) ||
                 (record.mapping.size == 0) ||
                 (record.mapping.dir != expected_dir)) begin
@@ -512,7 +531,8 @@ class virtio_auto_fsm extends uvm_report_object;
 
                 mapping = snap.queue_snapshots[q].queue_dma_mappings[i];
                 found_mapping = 0;
-                if ((mapping.bdf != ops.transport.bdf) ||
+                if ((mapping.host_id != iommu_host_id()) ||
+                    (mapping.bdf != ops.transport.bdf) ||
                     (mapping.iova == 0) ||
                     (mapping.size == 0) ||
                     (mapping.desc_id != 0)) begin
@@ -542,7 +562,8 @@ class virtio_auto_fsm extends uvm_report_object;
                             continue;
                         other_mapping =
                             snap.queue_snapshots[other_q].queue_dma_mappings[j];
-                        if ((mapping.bdf == other_mapping.bdf) &&
+                        if ((mapping.host_id == other_mapping.host_id) &&
+                            (mapping.bdf == other_mapping.bdf) &&
                             (mapping.iova == other_mapping.iova)) begin
                             `uvm_error("AUTO_FSM", $sformatf(
                                 "restore_from_migration: duplicate queue DMA IOVA=0x%016h",
@@ -552,7 +573,8 @@ class virtio_auto_fsm extends uvm_report_object;
                     end
                 end
                 foreach (snap.normal_dma_records[n]) begin
-                    if ((mapping.bdf == snap.normal_dma_records[n].mapping.bdf) &&
+                    if ((mapping.host_id == snap.normal_dma_records[n].mapping.host_id) &&
+                        (mapping.bdf == snap.normal_dma_records[n].mapping.bdf) &&
                         (mapping.iova == snap.normal_dma_records[n].mapping.iova)) begin
                         `uvm_error("AUTO_FSM", $sformatf(
                             "restore_from_migration: queue DMA overlaps normal ownership IOVA=0x%016h",
@@ -562,7 +584,9 @@ class virtio_auto_fsm extends uvm_report_object;
                 end
                 foreach (snap.queue_snapshots[owner_q]) begin
                     foreach (snap.queue_snapshots[owner_q].indirect_tables[t]) begin
-                        if ((mapping.bdf ==
+                        if ((mapping.host_id ==
+                             snap.queue_snapshots[owner_q].indirect_tables[t].mapping.host_id) &&
+                            (mapping.bdf ==
                              snap.queue_snapshots[owner_q].indirect_tables[t].mapping.bdf) &&
                             (mapping.iova ==
                              snap.queue_snapshots[owner_q].indirect_tables[t].mapping.iova)) begin
@@ -1141,7 +1165,8 @@ class virtio_auto_fsm extends uvm_report_object;
         // 1. Enable a new generation before requesting dataplane quiesce.
         // Any in-flight device write observed while workers drain belongs to
         // this snapshot, and no older dirty bitmap can leak into it.
-        snap.dirty_generation = ops.iommu.begin_dirty_generation();
+        snap.dirty_generation =
+            ops.iommu.begin_dirty_generation_for_host(iommu_host_id());
 
         // 2. Stop data plane
         if (state == FSM_RUNNING) begin
@@ -1186,12 +1211,15 @@ class virtio_auto_fsm extends uvm_report_object;
         // 6. Atomically capture this generation.  Each completed device write
         // already saved its exact post-write mapping span in the IOMMU before
         // normal completion could unmap/free its backing allocation.
-        ops.iommu.capture_dirty_generation(snap.dirty_pages);
+        ops.iommu.capture_dirty_generation_for_host(iommu_host_id(),
+                                                    snap.dirty_pages);
         snap.dirty_page_records.delete();
         foreach (snap.dirty_pages[i]) begin
             virtio_dirty_page_snapshot_t records[$];
 
-            ops.iommu.get_dirty_page_records(snap.dirty_pages[i], records);
+            ops.iommu.get_dirty_page_records_for_host(
+                iommu_host_id(),
+                snap.dirty_pages[i], records);
             if (records.size() == 0) begin
                 state = FSM_ERROR;
                 `uvm_error("AUTO_FSM", $sformatf(
@@ -1227,8 +1255,9 @@ class virtio_auto_fsm extends uvm_report_object;
         // Dirty records protect completed device writes.  Capture the whole
         // payload of every mapping still live after quiesce as well, because
         // queue snapshots can retain clean DMA_TO_DEVICE or indirect IOVAs.
-        if (!ops.iommu.snapshot_live_mappings(ops.mem, ops.transport.bdf,
-                                              snap.mapping_records)) begin
+        if (!ops.iommu.snapshot_live_mappings_for_host(
+                iommu_host_id(),
+                ops.mem, ops.transport.bdf, snap.mapping_records)) begin
             state = FSM_ERROR;
             `uvm_error("AUTO_FSM",
                 "freeze_for_migration: unable to capture live mapping payloads")
@@ -1381,6 +1410,15 @@ class virtio_auto_fsm extends uvm_report_object;
             bit mapping_retired;
 
             record = snap.dirty_page_records[i];
+            if ((record.mapping.host_id != iommu_host_id()) ||
+                (record.mapping.bdf != ops.transport.bdf)) begin
+                state = FSM_ERROR;
+                `uvm_error("AUTO_FSM", $sformatf(
+                    "restore_from_migration: dirty record belongs to host=%0d BDF=0x%04h, expected host=%0d BDF=0x%04h",
+                    record.mapping.host_id, record.mapping.bdf,
+                    iommu_host_id(), ops.transport.bdf))
+                return;
+            end
             page_is_listed = 0;
             foreach (snap.dirty_pages[p]) begin
                 if (snap.dirty_pages[p] == record.page_id) begin
@@ -1453,7 +1491,9 @@ class virtio_auto_fsm extends uvm_report_object;
             bit mapping_retired;
 
             record = snap.mapping_records[i];
-            if ((record.mapping.size == 0) ||
+            if ((record.mapping.host_id != iommu_host_id()) ||
+                (record.mapping.bdf != ops.transport.bdf) ||
+                (record.mapping.size == 0) ||
                 (record.payload.size() != record.mapping.size)) begin
                 state = FSM_ERROR;
                 `uvm_error("AUTO_FSM", $sformatf(
@@ -1491,6 +1531,7 @@ class virtio_auto_fsm extends uvm_report_object;
             end
             foreach (snap.mapping_records[j]) begin
                 if ((j > i) &&
+                    (record.mapping.host_id == snap.mapping_records[j].mapping.host_id) &&
                     (record.mapping.bdf == snap.mapping_records[j].mapping.bdf) &&
                     (record.mapping.iova == snap.mapping_records[j].mapping.iova)) begin
                     state = FSM_ERROR;

@@ -40,6 +40,7 @@ class virtio_atomic_ops extends uvm_object;
     // buffer that backs it.  Keep the ownership pair together until one
     // completion or a verified device reset retires it.
     typedef struct {
+        int unsigned host_id;
         bit [15:0] bdf;
         bit [63:0] gpa;
         bit [63:0] iova;
@@ -61,13 +62,23 @@ class virtio_atomic_ops extends uvm_object;
         negotiated_features = '0;
     endfunction
 
+    // A numeric BDF is scoped by the PCIe host domain.  Standalone transports
+    // without a frozen identity retain the legacy host0 behavior.
+    protected function int unsigned get_iommu_host_id(
+        virtio_pci_transport t
+    );
+        if (t != null)
+            return t.iommu_host_id();
+        return 0;
+    endfunction
+
     // Retire one ordinary data-DMA ownership record.  This is deliberately
     // separate from ring/indirect-table ownership, which remains owned by
     // the virtqueue implementation.
     protected function void retire_normal_dma_record(
         normal_dma_record_t record
     );
-        iommu.unmap(record.bdf, record.iova);
+        iommu.unmap_for_host(record.host_id, record.bdf, record.iova);
         mem.free(record.gpa);
     endfunction
 
@@ -103,7 +114,9 @@ class virtio_atomic_ops extends uvm_object;
             `uvm_error("ATOMIC_OPS", "device_dma_write: incomplete DMA context")
             return 0;
         end
-        return iommu.write_from_device(mem, transport.bdf, iova, data, fault);
+        return iommu.write_from_device_for_host(get_iommu_host_id(transport),
+                                                mem, transport.bdf, iova,
+                                                data, fault);
     endfunction
 
     // Materialize one complete saved mapping after reset.  The destination
@@ -120,6 +133,7 @@ class virtio_atomic_ops extends uvm_object;
         bit [63:0] destination_iova;
         normal_dma_record_t ownership;
 
+        destination.host_id = '0;
         destination.bdf = '0;
         destination.gpa = '0;
         destination.iova = '0;
@@ -150,7 +164,8 @@ class virtio_atomic_ops extends uvm_object;
             return 0;
         end
         mem.write_mem(destination_gpa, source_payload);
-        destination_iova = iommu.map_fixed(source_mapping.bdf, destination_gpa,
+        destination_iova = iommu.map_fixed_for_host(source_mapping.host_id,
+                                           source_mapping.bdf, destination_gpa,
                                            source_mapping.size, source_mapping.dir,
                                            source_mapping.iova);
         if ((destination_iova == '1) || (destination_iova == 0)) begin
@@ -160,12 +175,14 @@ class virtio_atomic_ops extends uvm_object;
             return 0;
         end
 
+        destination.host_id = source_mapping.host_id;
         destination.bdf = source_mapping.bdf;
         destination.gpa = destination_gpa;
         destination.iova = destination_iova;
         destination.size = source_mapping.size;
         destination.dir = source_mapping.dir;
         destination.desc_id = source_mapping.desc_id;
+        ownership.host_id = source_mapping.host_id;
         ownership.bdf = source_mapping.bdf;
         ownership.gpa = destination_gpa;
         ownership.iova = destination_iova;
@@ -193,7 +210,9 @@ class virtio_atomic_ops extends uvm_object;
                 iommu_mapping_t mapping;
                 virtio_normal_dma_snapshot_t snapshot_record;
 
-                if (!iommu.get_live_mapping(tx_dma_map[queue_id][i].bdf,
+                if (!iommu.get_live_mapping_for_host(
+                                            tx_dma_map[queue_id][i].host_id,
+                                            tx_dma_map[queue_id][i].bdf,
                                             tx_dma_map[queue_id][i].iova,
                                             mapping)) begin
                     `uvm_error("ATOMIC_OPS", $sformatf(
@@ -213,7 +232,9 @@ class virtio_atomic_ops extends uvm_object;
                 iommu_mapping_t mapping;
                 virtio_normal_dma_snapshot_t snapshot_record;
 
-                if (!iommu.get_live_mapping(rx_dma_map[queue_id][i].bdf,
+                if (!iommu.get_live_mapping_for_host(
+                                            rx_dma_map[queue_id][i].host_id,
+                                            rx_dma_map[queue_id][i].bdf,
                                             rx_dma_map[queue_id][i].iova,
                                             mapping)) begin
                     `uvm_error("ATOMIC_OPS", $sformatf(
@@ -238,10 +259,12 @@ class virtio_atomic_ops extends uvm_object;
         foreach (migration_restore_dma[i]) begin
             iommu_mapping_t live_mapping;
 
-            if ((migration_restore_dma[i].bdf != expected.bdf) ||
+            if ((migration_restore_dma[i].host_id != expected.host_id) ||
+                (migration_restore_dma[i].bdf != expected.bdf) ||
                 (migration_restore_dma[i].iova != expected.iova))
                 continue;
-            if (!iommu.get_live_mapping(expected.bdf, expected.iova,
+            if (!iommu.get_live_mapping_for_host(expected.host_id,
+                                        expected.bdf, expected.iova,
                                         live_mapping) ||
                 (live_mapping.size != expected.size) ||
                 (live_mapping.dir != expected.dir))
@@ -308,7 +331,8 @@ class virtio_atomic_ops extends uvm_object;
             iommu_mapping_t live_mapping;
 
             found_index = -1;
-            if ((expected_mappings[i].bdf != transport.bdf) ||
+            if ((expected_mappings[i].host_id != get_iommu_host_id(transport)) ||
+                (expected_mappings[i].bdf != transport.bdf) ||
                 (expected_mappings[i].iova == 0) ||
                 (expected_mappings[i].size == 0)) begin
                 `uvm_error("ATOMIC_OPS", $sformatf(
@@ -327,10 +351,13 @@ class virtio_atomic_ops extends uvm_object;
                     end
                 end
                 if (already_claimed ||
+                    (migration_restore_dma[m].host_id != expected_mappings[i].host_id) ||
                     (migration_restore_dma[m].bdf != expected_mappings[i].bdf) ||
                     (migration_restore_dma[m].iova != expected_mappings[i].iova))
                     continue;
-                if (!iommu.get_live_mapping(expected_mappings[i].bdf,
+                if (!iommu.get_live_mapping_for_host(
+                                            expected_mappings[i].host_id,
+                                            expected_mappings[i].bdf,
                                             expected_mappings[i].iova,
                                             live_mapping) ||
                     (live_mapping.size != expected_mappings[i].size) ||
@@ -446,7 +473,8 @@ class virtio_atomic_ops extends uvm_object;
         // Clear all tracked IOMMU mappings for rings
         foreach (ring_iovas[qid]) begin
             foreach (ring_iovas[qid][i]) begin
-                iommu.unmap(transport.bdf, ring_iovas[qid][i]);
+                iommu.unmap_for_host(get_iommu_host_id(transport),
+                                     transport.bdf, ring_iovas[qid][i]);
             end
         end
         ring_iovas.delete();
@@ -682,18 +710,24 @@ class virtio_atomic_ops extends uvm_object;
         endcase
 
         // 7. Map ring addresses through IOMMU
-        desc_iova  = iommu.map(transport.bdf, vq.desc_table_addr,  desc_size,  DMA_BIDIRECTIONAL);
-        avail_iova = iommu.map(transport.bdf, vq.driver_ring_addr, avail_size, DMA_BIDIRECTIONAL);
-        used_iova  = iommu.map(transport.bdf, vq.device_ring_addr, used_size,  DMA_BIDIRECTIONAL);
+        desc_iova  = iommu.map_for_host(get_iommu_host_id(transport),
+            transport.bdf, vq.desc_table_addr, desc_size, DMA_BIDIRECTIONAL);
+        avail_iova = iommu.map_for_host(get_iommu_host_id(transport),
+            transport.bdf, vq.driver_ring_addr, avail_size, DMA_BIDIRECTIONAL);
+        used_iova  = iommu.map_for_host(get_iommu_host_id(transport),
+            transport.bdf, vq.device_ring_addr, used_size, DMA_BIDIRECTIONAL);
         if ((desc_iova == '1) || (desc_iova == 0) ||
             (avail_iova == '1) || (avail_iova == 0) ||
             (used_iova == '1) || (used_iova == 0)) begin
             if ((desc_iova != '1) && (desc_iova != 0))
-                iommu.unmap(transport.bdf, desc_iova);
+                iommu.unmap_for_host(get_iommu_host_id(transport),
+                                     transport.bdf, desc_iova);
             if ((avail_iova != '1) && (avail_iova != 0))
-                iommu.unmap(transport.bdf, avail_iova);
+                iommu.unmap_for_host(get_iommu_host_id(transport),
+                                     transport.bdf, avail_iova);
             if ((used_iova != '1) && (used_iova != 0))
-                iommu.unmap(transport.bdf, used_iova);
+                iommu.unmap_for_host(get_iommu_host_id(transport),
+                                     transport.bdf, used_iova);
             vq_mgr.destroy_queue(queue_id);
             `uvm_error("ATOMIC_OPS", $sformatf(
                 "setup_queue: failed to map queue_id=%0d rings", queue_id))
@@ -746,7 +780,8 @@ class virtio_atomic_ops extends uvm_object;
         // 3. Unmap ring IOVAs
         if (ring_iovas.exists(queue_id)) begin
             foreach (ring_iovas[queue_id][i]) begin
-                iommu.unmap(transport.bdf, ring_iovas[queue_id][i]);
+                iommu.unmap_for_host(get_iommu_host_id(transport),
+                                     transport.bdf, ring_iovas[queue_id][i]);
             end
             ring_iovas.delete(queue_id);
         end
@@ -946,7 +981,8 @@ class virtio_atomic_ops extends uvm_object;
         end
 
         // 5. Map through IOMMU (DMA_TO_DEVICE -- device reads these buffers)
-        hdr_iova = iommu.map(transport.bdf, hdr_gpa, hdr_size, DMA_TO_DEVICE);
+        hdr_iova = iommu.map_for_host(get_iommu_host_id(transport),
+            transport.bdf, hdr_gpa, hdr_size, DMA_TO_DEVICE);
         if ((hdr_iova == '1) || (hdr_iova == 0)) begin
             mem.free(hdr_gpa);
             mem.free(pkt_gpa);
@@ -954,9 +990,11 @@ class virtio_atomic_ops extends uvm_object;
                 "tx_submit: failed to map header for queue %0d", queue_id))
             return;
         end
-        pkt_iova = iommu.map(transport.bdf, pkt_gpa, pkt_size, DMA_TO_DEVICE);
+        pkt_iova = iommu.map_for_host(get_iommu_host_id(transport),
+            transport.bdf, pkt_gpa, pkt_size, DMA_TO_DEVICE);
         if ((pkt_iova == '1) || (pkt_iova == 0)) begin
-            iommu.unmap(transport.bdf, hdr_iova);
+            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                                 hdr_iova);
             mem.free(hdr_gpa);
             mem.free(pkt_gpa);
             `uvm_error("ATOMIC_OPS", $sformatf(
@@ -967,10 +1005,12 @@ class virtio_atomic_ops extends uvm_object;
         // Track the complete DMA ownership pairs for completion/reset.
         if (!tx_dma_map.exists(queue_id))
             tx_dma_map[queue_id] = {};
+        dma_record.host_id = get_iommu_host_id(transport);
         dma_record.bdf = transport.bdf;
         dma_record.gpa = hdr_gpa;
         dma_record.iova = hdr_iova;
         tx_dma_map[queue_id].push_back(dma_record);
+        dma_record.host_id = get_iommu_host_id(transport);
         dma_record.bdf = transport.bdf;
         dma_record.gpa = pkt_gpa;
         dma_record.iova = pkt_iova;
@@ -993,8 +1033,10 @@ class virtio_atomic_ops extends uvm_object;
         // rejected chain must not remain in the completion map or reach the
         // notification path.
         if (result == '1) begin
-            iommu.unmap(transport.bdf, hdr_iova);
-            iommu.unmap(transport.bdf, pkt_iova);
+            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                                 hdr_iova);
+            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                                 pkt_iova);
             mem.free(hdr_gpa);
             mem.free(pkt_gpa);
             tx_dma_map[queue_id].pop_back();
@@ -1101,7 +1143,8 @@ class virtio_atomic_ops extends uvm_object;
             mem.mem_set(buf_gpa, 0, buf_size);
 
             // Map through IOMMU (DMA_FROM_DEVICE -- device writes to this buffer)
-            buf_iova = iommu.map(transport.bdf, buf_gpa, buf_size, DMA_FROM_DEVICE);
+            buf_iova = iommu.map_for_host(get_iommu_host_id(transport),
+                transport.bdf, buf_gpa, buf_size, DMA_FROM_DEVICE);
             if ((buf_iova == '1) || (buf_iova == 0)) begin
                 mem.free(buf_gpa);
                 `uvm_error("ATOMIC_OPS", $sformatf(
@@ -1113,6 +1156,7 @@ class virtio_atomic_ops extends uvm_object;
             // Track the complete DMA ownership pair for completion/reset.
             if (!rx_dma_map.exists(queue_id))
                 rx_dma_map[queue_id] = {};
+            dma_record.host_id = get_iommu_host_id(transport);
             dma_record.bdf = transport.bdf;
             dma_record.gpa = buf_gpa;
             dma_record.iova = buf_iova;
@@ -1125,7 +1169,8 @@ class virtio_atomic_ops extends uvm_object;
 
             result = vq.add_buf(sgs, 0, 1, null, 0);
             if (result == '1) begin
-                iommu.unmap(transport.bdf, buf_iova);
+                iommu.unmap_for_host(get_iommu_host_id(transport),
+                                     transport.bdf, buf_iova);
                 mem.free(buf_gpa);
                 rx_dma_map[queue_id].pop_back();
                 if (rx_dma_map[queue_id].size() == 0)
@@ -1290,6 +1335,8 @@ class virtio_atomic_ops extends uvm_object;
         // notification still address one VQ/requester/memory/IOMMU binding.
         // Reject before allocation or any queue/device-visible side effect.
         if ((admin_context.queue_id != admin_context.vq.queue_id) ||
+            (admin_context.vq.host_id !=
+                admin_context.transport.iommu_host_id()) ||
             (admin_context.vq.bdf != admin_context.transport.bdf) ||
             (admin_context.vq.mem != admin_context.mem) ||
             (admin_context.vq.iommu != admin_context.iommu)) begin
@@ -1330,14 +1377,16 @@ class virtio_atomic_ops extends uvm_object;
         admin_context.mem.write_mem(request_gpa, write_buf);
         admin_context.mem.mem_set(response_gpa, 8'hFF, admin_context.response_capacity);
 
-        request_iova = admin_context.iommu.map(
+        request_iova = admin_context.iommu.map_for_host(
+            get_iommu_host_id(admin_context.transport),
             admin_context.transport.bdf, request_gpa, cmd_data.size(), DMA_TO_DEVICE
         );
         if (request_iova == '1 || request_iova == 0) begin
             `uvm_error("ATOMIC_OPS", "admin_vq_submit: request DMA map failed")
         end else begin
             request_mapped = 1;
-            response_iova = admin_context.iommu.map(
+            response_iova = admin_context.iommu.map_for_host(
+                get_iommu_host_id(admin_context.transport),
                 admin_context.transport.bdf, response_gpa, admin_context.response_capacity,
                 DMA_FROM_DEVICE
             );
@@ -1460,9 +1509,13 @@ class virtio_atomic_ops extends uvm_object;
         end
 
         if (release_safe && response_mapped)
-            admin_context.iommu.unmap(admin_context.transport.bdf, response_iova);
+            admin_context.iommu.unmap_for_host(
+                get_iommu_host_id(admin_context.transport),
+                admin_context.transport.bdf, response_iova);
         if (release_safe && request_mapped)
-            admin_context.iommu.unmap(admin_context.transport.bdf, request_iova);
+            admin_context.iommu.unmap_for_host(
+                get_iommu_host_id(admin_context.transport),
+                admin_context.transport.bdf, request_iova);
         if (release_safe && response_allocated)
             admin_context.mem.free(response_gpa);
         if (release_safe && request_allocated)
@@ -1556,9 +1609,12 @@ class virtio_atomic_ops extends uvm_object;
         mem.write_mem(ack_gpa, write_buf);
 
         // 3. Map through IOMMU
-        hdr_iova  = iommu.map(transport.bdf, hdr_gpa,  2, DMA_TO_DEVICE);
-        data_iova = iommu.map(transport.bdf, data_gpa, data_alloc_size, DMA_TO_DEVICE);
-        ack_iova  = iommu.map(transport.bdf, ack_gpa,  1, DMA_FROM_DEVICE);
+        hdr_iova  = iommu.map_for_host(get_iommu_host_id(transport),
+            transport.bdf, hdr_gpa, 2, DMA_TO_DEVICE);
+        data_iova = iommu.map_for_host(get_iommu_host_id(transport),
+            transport.bdf, data_gpa, data_alloc_size, DMA_TO_DEVICE);
+        ack_iova  = iommu.map_for_host(get_iommu_host_id(transport),
+            transport.bdf, ack_gpa, 1, DMA_FROM_DEVICE);
 
         // 4. Build scatter-gather: [hdr(out)] [data(out)] [ack(in)]
         entry.addr = hdr_iova;
@@ -1615,9 +1671,12 @@ class virtio_atomic_ops extends uvm_object;
         end
 
         // Cleanup IOMMU mappings
-        iommu.unmap(transport.bdf, hdr_iova);
-        iommu.unmap(transport.bdf, data_iova);
-        iommu.unmap(transport.bdf, ack_iova);
+        iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                             hdr_iova);
+        iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                             data_iova);
+        iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                             ack_iova);
 
         // Free host memory
         mem.free(hdr_gpa);

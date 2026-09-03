@@ -5,6 +5,8 @@
 // Control/Admin-VQ identity is intentionally outside this snapshot view.
 typedef struct {
     dpu_service_key_t service_key;
+    int unsigned      virtio_pair_index;
+    int unsigned      local_pair_id;
     int unsigned      local_qid;
     int unsigned      global_qid;
     string            queue_name;
@@ -26,6 +28,20 @@ class virtio_vf_resource_pool extends uvm_object;
         input dpu_service_key_t rhs
     );
         return dpu_service_key_name(lhs) == dpu_service_key_name(rhs);
+    endfunction
+
+    // One real-DUT global qid identifies an RX/TX pair.  The two directional
+    // entries are therefore allowed to share a global qid only when they
+    // belong to the same service and the same local pair.
+    protected function bit same_pair_directions(
+        input virtio_local_queue_mapping_t lhs,
+        input virtio_local_queue_mapping_t rhs
+    );
+        return same_service(lhs.service_key, rhs.service_key) &&
+               (lhs.virtio_pair_index == rhs.virtio_pair_index) &&
+               (lhs.local_pair_id == rhs.local_pair_id) &&
+               (lhs.local_qid != rhs.local_qid) &&
+               ((lhs.local_qid ^ rhs.local_qid) == 1);
     endfunction
 
     function bit import_service_bindings(
@@ -60,14 +76,19 @@ class virtio_vf_resource_pool extends uvm_object;
                 return 0;
             end
             mapping.service_key = service_key;
-            mapping.local_qid = 2 * bindings[index].local_pair_id;
-            mapping.global_qid = 2 * bindings[index].global_qpair_id;
+            mapping.virtio_pair_index = bindings[index].virtio_pair_index;
+            mapping.local_pair_id = bindings[index].local_pair_id;
+            mapping.local_qid = bindings[index].rx_local_virtqueue_id;
+            // A tx/rx pair is one hardware queue resource.  The driver uses
+            // the same global queue index for VTX and VRX; local_qid remains
+            // directional (even=RX, odd=TX).
+            mapping.global_qid = bindings[index].global_qpair_id;
             mapping.queue_name = $sformatf("%s_receiveq_%0d",
                 dpu_service_key_name(service_key),
                 bindings[index].local_pair_id);
             imported.push_back(mapping);
-            mapping.local_qid = 2 * bindings[index].local_pair_id + 1;
-            mapping.global_qid = 2 * bindings[index].global_qpair_id + 1;
+            mapping.local_qid = bindings[index].tx_local_virtqueue_id;
+            mapping.global_qid = bindings[index].global_qpair_id;
             mapping.queue_name = $sformatf("%s_transmitq_%0d",
                 dpu_service_key_name(service_key),
                 bindings[index].local_pair_id);
@@ -99,11 +120,13 @@ class virtio_vf_resource_pool extends uvm_object;
         end
 
         // Validate the complete candidate against itself and the existing
-        // pool before committing any queue. These checks keep every forward
-        // and reverse lookup one-to-one across all services.
+        // pool before committing any queue. A global qid may occur twice in
+        // one service only for the RX/TX entries of one local pair; it must
+        // remain unique across services and local pairs.
         foreach (imported[left]) begin
             for (int right = left + 1; right < imported.size(); right++) begin
-                if (imported[left].global_qid == imported[right].global_qid) begin
+                if ((imported[left].global_qid == imported[right].global_qid) &&
+                    !same_pair_directions(imported[left], imported[right])) begin
                     why = "queue view has an ambiguous global reverse mapping";
                     return 0;
                 end
@@ -169,6 +192,9 @@ class virtio_vf_resource_pool extends uvm_object;
         foreach (queue_map[index]) begin
             if (queue_map[index].global_qid == global_qid) begin
                 service_key = queue_map[index].service_key;
+                // A global qid identifies a pair, so reverse lookup exposes
+                // the resolved RX virtqueue ID.  Callers that need TX can
+                // query the paired entry instead of deriving it arithmetically.
                 local_qid = queue_map[index].local_qid;
                 return 1;
             end

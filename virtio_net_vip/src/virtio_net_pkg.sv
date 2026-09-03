@@ -19,6 +19,9 @@ package virtio_net_pkg;
   import pcie_tl_pkg::*;
   import dpu_resource_pkg::*;
   `include "host_mem_manager.sv"
+  `include "host_mem_pool.sv"
+  `include "shared/host_mem_bar_reservation_importer.sv"
+  `include "pcie/pcie_tl_dpu_reg_backend.sv"
 
   // ---------------------------------------------------------------------------
   // Phase 1 – Types and shared utilities

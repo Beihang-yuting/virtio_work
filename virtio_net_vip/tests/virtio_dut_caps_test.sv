@@ -745,6 +745,7 @@ class virtio_dut_caps_test extends uvm_test;
         snapshot = dpu_device_snapshot::type_id::create(
             "vio_behavior_snapshot");
         caps = dpu_dut_caps::type_id::create("vio_behavior_caps");
+        caps.af_extra_queue_count = 0;
         caps.max_vio_net_qpairs_per_device = 4;
         if (!snapshot.set_dut_caps(caps, why))
             `uvm_fatal("DUT_CAPS", {"could not set VIO behavior caps: ", why})
@@ -801,6 +802,7 @@ class virtio_dut_caps_test extends uvm_test;
 
         snapshot = dpu_device_snapshot::type_id::create(name);
         caps = dpu_dut_caps::type_id::create({name, "_caps"});
+        caps.af_extra_queue_count = 0;
         caps.vio_global_qpair_count = global_qpair_capacity;
         caps.max_vio_net_qpairs_per_device = qpair_limit;
         pf_key = make_key(0, 0, DPU_FUNCTION_PF, 0);
@@ -847,6 +849,10 @@ class virtio_dut_caps_test extends uvm_test;
         builder.device_cfg.dut_caps.max_functions = num_pfs + num_vfs;
         builder.device_cfg.dut_caps.vio_global_qpair_count =
             global_qpair_capacity;
+        // These capability-focused fixtures model ordinary VIO qpairs only.
+        // Real-driver AF extra queues are covered by the dedicated DPU plan
+        // tests and would make synthetic one-pair capacities invalid.
+        builder.device_cfg.dut_caps.af_extra_queue_count = 0;
         builder.device_cfg.dut_caps.max_vio_net_qpairs_per_device =
             qpair_limit;
         void'(builder.add_host_domain(0, 0));
@@ -1509,6 +1515,8 @@ class virtio_dut_caps_test extends uvm_test;
         bit configuration_succeeded;
         bit bars_preserved;
         bit [15:0] original_bdf;
+        dpu_vio_qpair_binding_t owned_bindings[$];
+        int unsigned expected_allocated_qpairs;
 
         failing_function = helper_fatal_env.pf_instances[0].pf_function;
         owner_manager = helper_fatal_device_env.get_resource_manager();
@@ -1528,6 +1536,14 @@ class virtio_dut_caps_test extends uvm_test;
         end
         original_key = failing_function.function_key;
         candidate_service = make_vio_service_key(original_key);
+        helper_fatal_device_env.get_resource_snapshot().
+            list_vio_bindings_for_service(
+                failing_function.service_key, owned_bindings);
+        expected_allocated_qpairs = owned_bindings.size();
+        if (expected_allocated_qpairs == 0) begin
+            `uvm_fatal("DUT_CAPS",
+                "helper fatal function has no frozen VIO qpair bindings")
+        end
         original_bdf = failing_function.bdf;
         original_bars = failing_function.bar_pairs;
         catcher = new("env_function_failure_catcher",
@@ -1575,7 +1591,8 @@ class virtio_dut_caps_test extends uvm_test;
             (failing_function.vq_mgr.bdf != original_bdf) ||
             (retained_caps == null) ||
             (retained_caps.max_vio_net_qpairs_per_device != 32) ||
-            (failing_function.drv_cfg.max_vio_net_qpairs_per_device != 32)) begin
+            (failing_function.drv_cfg.max_vio_net_qpairs_per_device !=
+             expected_allocated_qpairs)) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
                 {"demoted device function-configuration fatal returned or ",
                  "changed owned state: reports=%0d success=%0d valid=%0d ",
@@ -1835,7 +1852,7 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS",
                 "first PF did not retain immutable global qpair 0")
         if (!clients[1].local_qid_to_global_qid(0, global_qid) ||
-            (global_qid != 2) ||
+            (global_qid != 1) ||
             clients[0].local_qid_to_global_qid(2, global_qid))
             `uvm_fatal("DUT_CAPS",
                 "placement did not retain one immutable qpair per PF")
@@ -3493,6 +3510,7 @@ class virtio_dut_caps_test extends uvm_test;
         dpu_service_key_t vf_service;
         virtio_qpair_mapping_t copied_mappings[$];
         int unsigned global_qid;
+        int unsigned observed_tx_qid;
         string why;
 
         device_snapshot = manager_device_env.get_snapshot();
@@ -3527,7 +3545,9 @@ class virtio_dut_caps_test extends uvm_test;
                 "mutating the observed VF caps changed the bound snapshot")
         end
         if (!vf_client.local_qid_to_global_qid(0, global_qid) ||
-            (global_qid != 2) ||
+            (global_qid != 1) ||
+            !vf_client.local_qid_to_global_qid(1, observed_tx_qid) ||
+            (observed_tx_qid != global_qid) ||
             vf_client.local_qid_to_global_qid(2, global_qid) ||
             !pf_client.local_qid_to_global_qid(0, global_qid) ||
             (global_qid != 0))
@@ -3536,7 +3556,7 @@ class virtio_dut_caps_test extends uvm_test;
         vf_client.list_qpair_mappings(copied_mappings);
         copied_mappings[0].rx_global_qid = 99;
         if (!vf_client.local_qid_to_global_qid(0, global_qid) ||
-            (global_qid != 2))
+            (global_qid != 1))
             `uvm_fatal("DUT_CAPS",
                 "mutating a listed mapping changed immutable client routing")
     endtask
@@ -3593,6 +3613,7 @@ class virtio_dut_caps_test extends uvm_test;
         builder.device_cfg.dut_caps.max_pfs_per_host = 3;
         builder.device_cfg.dut_caps.max_functions = 3;
         builder.device_cfg.dut_caps.vio_global_qpair_count = 2;
+        builder.device_cfg.dut_caps.af_extra_queue_count = 0;
         builder.device_cfg.dut_caps.max_vio_net_qpairs_per_device = 1;
         void'(builder.add_host_domain(0, 0));
         for (int unsigned pf_id = 0; pf_id < 3; pf_id++) begin

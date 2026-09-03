@@ -19,6 +19,27 @@ class dpu_device_resolver extends uvm_object;
         super.new(name);
     endfunction
 
+    // Keep BAR randomization on the simulator/UVM random stream so the normal
+    // simulation seed controls reproducibility.  Rejection sampling avoids a
+    // modulo bias for apertures larger than 32 bits.
+    protected function bit [63:0] random_u64();
+        return {$urandom(), $urandom()};
+    endfunction
+
+    protected function bit [63:0] random_bounded_u64(
+        input bit [63:0] upper_exclusive
+    );
+        bit [63:0] candidate;
+        bit [63:0] cutoff;
+
+        if (upper_exclusive <= 1)
+            return '0;
+        cutoff = ('1 / upper_exclusive) * upper_exclusive;
+        do candidate = random_u64();
+        while (candidate >= cutoff);
+        return candidate % upper_exclusive;
+    endfunction
+
     protected function string host_key_name(input int unsigned host_id);
         return $sformatf("h%0d", host_id);
     endfunction
@@ -730,6 +751,88 @@ class dpu_device_resolver extends uvm_object;
                 if (!windows[window_index].allows_role(
                         bar_items[index].request.role))
                     continue;
+
+                // Random placement deliberately samples legal aligned slots
+                // rather than randomizing an unconstrained 64-bit value.  A
+                // bounded retry budget keeps pathological fragmented windows
+                // cheap; the canonical first-fit walk below remains the
+                // guaranteed fallback when random candidates hit blockers.
+                if (domain.bar_placement_policy == DPU_BAR_PLACEMENT_RANDOM) begin
+                    bit [63:0] first_aligned;
+                    bit [63:0] slot_count;
+                    bit [63:0] window_span;
+
+                    if (windows[window_index].limit <=
+                        windows[window_index].base)
+                        continue;
+                    first_aligned = (windows[window_index].base +
+                        bar_items[index].request.alignment - 1) &
+                        ~(bar_items[index].request.alignment - 1);
+                    if (first_aligned < windows[window_index].base ||
+                        first_aligned >= windows[window_index].limit ||
+                        bar_items[index].request.size >
+                        (windows[window_index].limit - first_aligned))
+                        continue;
+                    window_span = windows[window_index].limit - first_aligned;
+                    slot_count = ((window_span -
+                        bar_items[index].request.size) /
+                        bar_items[index].request.alignment) + 1;
+                    for (int attempt = 0; attempt < 32; attempt++) begin
+                        bit [63:0] aligned_base;
+                        bit [63:0] bar_end;
+                        bit blocked;
+
+                        aligned_base = first_aligned +
+                            random_bounded_u64(slot_count) *
+                            bar_items[index].request.alignment;
+                        bar_end = aligned_base + bar_items[index].request.size;
+                        blocked = 0;
+                        foreach (domain.reserved_mmio_ranges[range_index]) begin
+                            if (ranges_overlap(
+                                    aligned_base, bar_end,
+                                    domain.reserved_mmio_ranges[range_index].base,
+                                    domain.reserved_mmio_ranges[range_index].limit)) begin
+                                blocked = 1;
+                                break;
+                            end
+                        end
+                        if (blocked)
+                            continue;
+                        foreach (used_bars[used_index]) begin
+                            bit [63:0] used_end;
+
+                            used_end = used_bars[used_index].base +
+                                used_bars[used_index].size;
+                            if (dpu_same_domain_key(
+                                    used_bars[used_index].domain,
+                                    bar_items[index].function_cfg.domain_key) &&
+                                ranges_overlap(aligned_base, bar_end,
+                                               used_bars[used_index].base,
+                                               used_end)) begin
+                                blocked = 1;
+                                break;
+                            end
+                        end
+                        if (blocked)
+                            continue;
+                        lease.role = bar_items[index].request.role;
+                        lease.even_bar_id =
+                            bar_items[index].request.even_bar_id;
+                        lease.base = aligned_base;
+                        lease.size = bar_items[index].request.size;
+                        bars_by_name[dpu_function_bar_key_name(
+                            bar_items[index].function_cfg.key, lease.role)] = lease;
+                        used.domain = bar_items[index].function_cfg.domain_key;
+                        used.base = lease.base;
+                        used.size = lease.size;
+                        used_bars.push_back(used);
+                        found = 1;
+                        break;
+                    end
+                    if (found)
+                        break;
+                end
+
                 cursor = windows[window_index].base;
                 while (cursor < windows[window_index].limit) begin
                     bit [63:0] aligned_base;

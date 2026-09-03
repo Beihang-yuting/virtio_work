@@ -443,6 +443,9 @@ class dpu_placement_normalizer extends uvm_object;
                             "request has an unknown candidate kind", ordered_requests[request_index].request_id, 1); normalized_device_cfg = null; normalized_plan = null; return 0;
             end
             if ((ordered_requests[request_index].total_qpairs == 0) ||
+                (ordered_requests[request_index].lan_msix_vectors >
+                 ordered_requests[request_index].total_qpairs) ||
+                (ordered_requests[request_index].lan_msix_vectors > 128) ||
                 (ordered_requests[request_index].service_instance_id != 0) ||
                 ((ordered_requests[request_index].ordering != DPU_PLACEMENT_CANONICAL) &&
                  (ordered_requests[request_index].ordering != DPU_PLACEMENT_SEEDED_RANDOM)) ||
@@ -830,6 +833,8 @@ class dpu_placement_normalizer extends uvm_object;
             normalized_request.request_id = ordered_requests[request_index].request_id;
             normalized_request.service_instance_id = ordered_requests[request_index].service_instance_id;
             normalized_request.total_qpairs = ordered_requests[request_index].total_qpairs;
+            normalized_request.lan_msix_vectors =
+                ordered_requests[request_index].lan_msix_vectors;
             normalized_request.seed = ordered_requests[request_index].seed;
             normalized_request.device_policy = ordered_requests[request_index].device_policy;
             normalized_request.ordering = ordered_requests[request_index].ordering;

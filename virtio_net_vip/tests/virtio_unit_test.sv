@@ -116,6 +116,23 @@ class virtio_expected_rc_completion_warning_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_expected_rc_completion_warning_catcher
 
+class virtio_expected_iommu_map_error_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "virtio_expected_iommu_map_error_catcher");
+        super.new(name);
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) && (get_id() == "IOMMU_MAP")) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_expected_iommu_map_error_catcher
+
 // ============================================================================
 // virtio_unit_test
 //
@@ -169,6 +186,9 @@ class virtio_unit_test extends uvm_test;
 
         test_host_mem();
         test_iommu();
+        test_iommu_host_domains();
+        test_iommu_random_aperture();
+        test_iommu_translation_overflow();
         test_split_virtqueue();
         test_wait_policy();
         test_pcie_scoreboard_byte_enables();
@@ -181,6 +201,43 @@ class virtio_unit_test extends uvm_test;
 
         `uvm_info("UNIT_TEST", "All unit tests PASSED", UVM_NONE)
         phase.drop_objection(this);
+    endtask
+
+    // A request that starts inside a valid mapping but wraps the 64-bit IOVA
+    // end address must fail range checking instead of appearing smaller than
+    // the mapped end after unsigned addition overflow.
+    task test_iommu_translation_overflow();
+        virtio_iommu_model iommu = virtio_iommu_model::type_id::create(
+            "overflow_iommu");
+        bit [63:0] fixed_iova;
+        bit [63:0] gpa;
+        iommu_fault_e fault;
+        string why;
+        bit ok;
+
+        if (!iommu.configure_iova_aperture(
+                64'hffff_ffff_ffff_d000,
+                64'hffff_ffff_ffff_f000,
+                IOMMU_IOVA_FIRST_FIT, why))
+            `uvm_fatal("TEST", {"could not configure top IOVA aperture: ", why})
+        fixed_iova = 64'hffff_ffff_ffff_e000;
+        if (iommu.map_fixed(16'h0124, 64'h0000_0000_7000_0000,
+                            4096, DMA_TO_DEVICE, fixed_iova) != fixed_iova)
+            `uvm_fatal("TEST", "could not create top-of-address-space IOVA map")
+
+        // Keep the request inside the mapped start address but make its end
+        // wrap the 64-bit address space.  A range check that performs
+        // unsigned ``iova + size`` without an overflow guard would otherwise
+        // see the wrapped end (0x0000_0000_0000_dfff) and incorrectly accept
+        // this translation.
+        ok = iommu.translate(16'h0124, fixed_iova, 32'hffff_ffff,
+                             DMA_TO_DEVICE, gpa, fault);
+        if (ok || (fault != IOMMU_FAULT_OUT_OF_RANGE))
+            `uvm_fatal("TEST", $sformatf(
+                "wrapping IOVA translation was not rejected: ok=%0b fault=%s gpa=0x%016h",
+                ok, fault.name(), gpa))
+        iommu.unmap(16'h0124, fixed_iova);
+        `uvm_info("UNIT_TEST", "test_iommu_translation_overflow PASSED", UVM_LOW)
     endtask
 
     task test_late_driver_agent_binding();
@@ -250,6 +307,208 @@ class virtio_unit_test extends uvm_test;
         iommu.leak_check();
 
         `uvm_info("UNIT_TEST", "test_iommu PASSED", UVM_LOW)
+    endtask
+
+    // A numeric BDF is only unique inside one host/IOMMU requester domain.
+    // Two hosts must be able to expose the same BDF and IOVA without one
+    // mapping shadowing or invalidating the other.
+    task test_iommu_host_domains();
+        virtio_iommu_model iommu = virtio_iommu_model::type_id::create(
+            "host_domain_iommu");
+        bit [63:0] host0_iova, host1_iova;
+        bit [63:0] host0_gpa, host1_gpa;
+        bit [63:0] host0_write_iova, host1_write_iova;
+        bit [63:0] host0_write_gpa, host1_write_gpa;
+        bit [63:0] fixed_iova;
+        bit [63:0] dirty_pages0[$], dirty_pages1[$];
+        byte host0_data[], host1_data[], readback[];
+        virtio_dirty_page_snapshot_t dirty_records[$];
+        iommu_fault_rule_t rule;
+        host_mem_manager mem = host_mem_manager::type_id::create(
+            "host_domain_mem");
+        virtio_pci_transport transport =
+            virtio_pci_transport::type_id::create("host1_transport");
+        virtio_atomic_ops ops =
+            virtio_atomic_ops::type_id::create("host1_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create("host1_vq_mgr");
+        virtqueue_base host1_vq;
+        dpu_pcie_function_id_t pcie_id;
+        iommu_fault_e fault;
+        bit ok;
+
+        // This test checks host-domain independence using the historical
+        // deterministic allocator.  Random placement is covered separately
+        // by test_iommu_random_aperture(); keeping this test first-fit makes
+        // the equal numeric IOVA assertion intentional and reproducible.
+        iommu.set_iova_alloc_policy(IOMMU_IOVA_FIRST_FIT);
+
+        host0_iova = iommu.map_for_host(0, 16'h0042, 64'h1000_0000,
+                                        4096, DMA_TO_DEVICE);
+        host1_iova = iommu.map_for_host(1, 16'h0042, 64'h2000_0000,
+                                        4096, DMA_TO_DEVICE);
+        assert(host0_iova != 0 && host1_iova != 0)
+            else `uvm_fatal("TEST", "host-domain map failed");
+        assert(host0_iova == host1_iova)
+            else `uvm_fatal("TEST", "host domains should have independent IOVA spaces");
+
+        ok = iommu.translate_for_host(0, 16'h0042, host0_iova, 64,
+                                      DMA_TO_DEVICE, host0_gpa, fault);
+        assert(ok && host0_gpa == 64'h1000_0000)
+            else `uvm_fatal("TEST", "host0 translation mismatch");
+        ok = iommu.translate_for_host(1, 16'h0042, host1_iova, 64,
+                                      DMA_TO_DEVICE, host1_gpa, fault);
+        assert(ok && host1_gpa == 64'h2000_0000)
+            else `uvm_fatal("TEST", "host1 translation mismatch");
+
+        // Fault injection is scoped by the same host-qualified requester key.
+        rule = '{host_id: 0, host_id_valid: 0, bdf_mask: '0,
+                 iova_start: '0, iova_end: '0, dir: DMA_TO_DEVICE,
+                 fault_type: IOMMU_NO_FAULT, trigger_count: 0,
+                 triggered: 0};
+        rule.host_id = 1;
+        rule.host_id_valid = 1;
+        rule.bdf_mask = 16'h0042;
+        rule.iova_start = host1_iova;
+        rule.iova_end = host1_iova + 4095;
+        rule.dir = DMA_TO_DEVICE;
+        rule.fault_type = IOMMU_FAULT_DEVICE_ABORT;
+        rule.trigger_count = 1;
+        iommu.add_fault_rule(rule);
+        ok = iommu.translate_for_host(0, 16'h0042, host0_iova, 64,
+                                      DMA_TO_DEVICE, host0_gpa, fault);
+        assert(ok) else `uvm_fatal("TEST", "host1 fault rule affected host0");
+        ok = iommu.translate_for_host(1, 16'h0042, host1_iova, 64,
+                                      DMA_TO_DEVICE, host1_gpa, fault);
+        assert(!ok && fault == IOMMU_FAULT_DEVICE_ABORT)
+            else `uvm_fatal("TEST", "host-scoped fault rule did not fire");
+        iommu.clear_fault_rules();
+
+        // Fixed IOVAs may also repeat across hosts.
+        fixed_iova = 64'h9000_0000;
+        assert(iommu.map_fixed_for_host(0, 16'h0043, 64'h3000_0000,
+                   4096, DMA_TO_DEVICE, fixed_iova) == fixed_iova)
+            else `uvm_fatal("TEST", "host0 fixed map failed");
+        assert(iommu.map_fixed_for_host(1, 16'h0043, 64'h4000_0000,
+                   4096, DMA_TO_DEVICE, fixed_iova) == fixed_iova)
+            else `uvm_fatal("TEST", "host1 equal fixed map failed");
+        iommu.unmap_for_host(0, 16'h0043, fixed_iova);
+        iommu.unmap_for_host(1, 16'h0043, fixed_iova);
+
+        // Exercise the production atomic-write boundary and host-scoped dirty
+        // snapshots, not only the direct IOMMU translate API.
+        mem.init_region(64'h5000_0000, 64'h5001_FFFF);
+        host0_write_gpa = mem.alloc(4096, .align(4096));
+        host1_write_gpa = mem.alloc(4096, .align(4096));
+        host0_write_iova = iommu.map_for_host(0, 16'h0042, host0_write_gpa,
+                                              4096, DMA_FROM_DEVICE);
+        host1_write_iova = iommu.map_for_host(1, 16'h0042, host1_write_gpa,
+                                              4096, DMA_FROM_DEVICE);
+        assert(host0_write_iova == host1_write_iova)
+            else `uvm_fatal("TEST", "write IOVA spaces are not host-local");
+        void'(iommu.begin_dirty_generation_for_host(0));
+        void'(iommu.begin_dirty_generation_for_host(1));
+        host0_data = new[1];
+        host0_data[0] = 8'hA0;
+        assert(iommu.write_from_device_for_host(0, mem, 16'h0042,
+                   host0_write_iova, host0_data, fault))
+            else `uvm_fatal("TEST", "host0 device write failed");
+        pcie_id = '{domain: '{host_id: 1, segment_id: 0}, bdf: 16'h0042};
+        transport.configure_pcie_identity(pcie_id);
+        vq_mgr.host_id = 1;
+        vq_mgr.bdf = 16'h0042;
+        host1_vq = vq_mgr.create_queue(7, 8, VQ_SPLIT);
+        assert(host1_vq != null && host1_vq.host_id == 1 &&
+               host1_vq.bdf == 16'h0042)
+            else `uvm_fatal("TEST", "virtqueue manager lost host identity");
+        ops.transport = transport;
+        ops.iommu = iommu;
+        ops.mem = mem;
+        host1_data = new[1];
+        host1_data[0] = 8'hB1;
+        assert(ops.device_dma_write(host1_write_iova, host1_data, fault))
+            else `uvm_fatal("TEST", "atomic ops did not use host1 domain");
+        iommu.capture_dirty_generation_for_host(0, dirty_pages0);
+        iommu.capture_dirty_generation_for_host(1, dirty_pages1);
+        assert(dirty_pages0.size() == 1 && dirty_pages1.size() == 1)
+            else `uvm_fatal("TEST", "dirty generations are not host-scoped");
+        iommu.get_dirty_page_records_for_host(1, dirty_pages1[0],
+                                              dirty_records);
+        assert(dirty_records.size() == 1 &&
+               dirty_records[0].mapping.host_id == 1 &&
+               dirty_records[0].payload[0] == 8'hB1)
+            else `uvm_fatal("TEST", "host1 dirty snapshot mismatch");
+        mem.read_mem(host0_write_gpa, 1, readback);
+        assert(readback[0] == 8'hA0)
+            else `uvm_fatal("TEST", "host1 write mutated host0 backing");
+        iommu.unmap_for_host(0, 16'h0042, host0_write_iova);
+        iommu.unmap_for_host(1, 16'h0042, host1_write_iova);
+        mem.free(host0_write_gpa);
+        mem.free(host1_write_gpa);
+
+        iommu.unmap_for_host(0, 16'h0042, host0_iova);
+        ok = iommu.translate_for_host(1, 16'h0042, host1_iova, 64,
+                                      DMA_TO_DEVICE, host1_gpa, fault);
+        assert(ok && host1_gpa == 64'h2000_0000)
+            else `uvm_fatal("TEST", "host0 unmap affected host1 mapping");
+        iommu.unmap_for_host(1, 16'h0042, host1_iova);
+
+        `uvm_info("UNIT_TEST", "test_iommu_host_domains PASSED", UVM_LOW)
+    endtask
+
+    // Random IOVA placement is constrained by a configurable page-aligned
+    // aperture and must never overlap live mappings for one requester.
+    task test_iommu_random_aperture();
+        virtio_iommu_model iommu = virtio_iommu_model::type_id::create(
+            "random_iommu");
+        bit [63:0] iovas[$];
+        bit [63:0] iova;
+        bit [63:0] gpa;
+        iommu_fault_e fault;
+        string why;
+        bit ok;
+        virtio_expected_iommu_map_error_catcher invalid_map_catcher;
+        bit saw_non_linear_random_slot;
+
+        saw_non_linear_random_slot = 0;
+
+        if (!iommu.configure_iova_aperture(
+                64'h0000_0000_4000_0000,
+                64'h0000_0000_4002_0000,
+                IOMMU_IOVA_RANDOM, why))
+            `uvm_fatal("TEST", {"could not configure IOVA aperture: ", why})
+        for (int index = 0; index < 12; index++) begin
+            iova = iommu.map(16'h0123, 64'h6000_0000 + index * 4096,
+                             4096, DMA_TO_DEVICE);
+            if ((iova == 0) || (iova == '1) ||
+                (iova < 64'h0000_0000_4000_0000) ||
+                (iova + 4096 > 64'h0000_0000_4002_0000))
+                `uvm_fatal("TEST", "random IOVA escaped configured aperture")
+            foreach (iovas[previous]) begin
+                if (iova == iovas[previous])
+                    `uvm_fatal("TEST", "random IOVA allocation collided")
+            end
+            if ((index != 0) && (iova != iovas[0] + index * 4096))
+                saw_non_linear_random_slot = 1;
+            iovas.push_back(iova);
+            ok = iommu.translate(16'h0123, iova, 4096,
+                                 DMA_TO_DEVICE, gpa, fault);
+            if (!ok || (gpa != 64'h6000_0000 + index * 4096))
+                `uvm_fatal("TEST", "random IOVA translation mismatch")
+        end
+        invalid_map_catcher = new("invalid_map_catcher");
+        uvm_report_cb::add(null, invalid_map_catcher);
+        if (iommu.map_fixed(16'h0123, 64'h7000_0000, 4096,
+                            DMA_TO_DEVICE, 64'h4000_0000) != '1)
+            `uvm_fatal("TEST", "fixed IOVA outside aperture was accepted")
+        uvm_report_cb::delete(null, invalid_map_catcher);
+        if (invalid_map_catcher.caught_count != 1)
+            `uvm_fatal("TEST", "invalid fixed IOVA was not rejected")
+        if (!saw_non_linear_random_slot)
+            `uvm_fatal("TEST", "random IOVA policy produced only linear slots")
+        foreach (iovas[index])
+            iommu.unmap(16'h0123, iovas[index]);
+        `uvm_info("UNIT_TEST", "test_iommu_random_aperture PASSED", UVM_LOW)
     endtask
 
     // Test 3: Split virtqueue alloc/add_buf/free

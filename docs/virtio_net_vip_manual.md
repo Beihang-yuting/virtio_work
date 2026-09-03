@@ -118,7 +118,7 @@ disable fork;  // 杀死调用线程中的所有子进程!
 | `host_mem_manager` | `/ryan/shm_work/host_mem` | Buddy 分配器，用于描述符环和数据缓冲区 | 共享实例 |
 | `net_packet` | `/ryan/shm_work/net_packet` | 协议报文生成器（L2-L4，隧道，RDMA） | `packet_item` UVM 封装 |
 
-本版本固定使用 `pcie_tl_vip@3e2d8c972f1baa78e073f98e8a38ad2f04db6e1a`；`make check-deps` 会在编译前验证该依赖版本。
+本版本固定使用 `pcie_tl_vip@854d4964e217a48bd65a4968c03fc4567ce885bd`；`make check-deps` 会在编译前验证该依赖版本。
 
 ---
 
@@ -547,9 +547,9 @@ VIP 定义了以下枚举类型：
 | `virtio_sg_list` | `entries[$]` | scatter-gather 列表 |
 | `virtio_used_info` | `desc_id`, `len`, `submit_time`, `complete_time` | Used Ring 回收信息 |
 | `virtqueue_snapshot_t` | `queue_id`, `queue_size`, 地址, 索引, `ring_data[]` | 队列迁移快照 |
-| `iommu_mapping_t` | `bdf`, `gpa`, `iova`, `size`, `dir`, `desc_id` | DMA 映射记录 |
+| `iommu_mapping_t` | `host_id`, `bdf`, `gpa`, `iova`, `size`, `dir`, `desc_id` | Host-qualified DMA 映射记录 |
 | `iommu_mapping_entry_t` | 同上 + `valid`, `map_time`, `caller_file`, `caller_line` | 带调试信息的映射 |
-| `iommu_fault_rule_t` | `bdf_mask`, `iova_start/end`, `dir`, `fault_type`, `trigger_count` | Fault 注入规则 |
+| `iommu_fault_rule_t` | `host_id/host_id_valid`, `bdf_mask`, `iova_start/end`, `dir`, `fault_type`, `trigger_count` | 可按 Host 限定的 Fault 注入规则 |
 | `virtio_net_hdr_t` | `flags`, `gso_type`, `hdr_len`, `gso_size`, `csum_start/offset`, `num_buffers`, `hash_value/report` | virtio-net 头部 |
 | `virtio_net_device_config_t` | `mac`, `status`, `max_virtqueue_pairs`, `mtu`, `speed`, `duplex`, RSS 字段 | 设备配置空间 |
 | `virtio_pci_cap_t` | `cap_id`, `cap_next`, `cfg_type`, `bar`, `offset`, `length` | PCI capability 信息 |
@@ -709,13 +709,30 @@ barrier.print_stats();
 
 `virtio_iommu_model` 模拟 IOMMU 地址翻译功能，为 `VIRTIO_F_ACCESS_PLATFORM` feature 提供支持。
 
+映射唯一键是 `{host_id[31:0], BDF[15:0], IOVA[63:0]}`。Host 之间拥有独立
+IOVA bump cursor，因此 `host0 + 00:08.2 + 0x80000000` 与
+`host1 + 00:08.2 + 0x80000000` 可以同时存在。生产路径从冻结的
+`dpu_pcie_function_id_t.domain.host_id` 取得 Host；旧 API 和未绑定 PCIe identity
+的 standalone 对象兼容地落到 host0。
+
+IOMMU 只管理 DMA 地址空间。BAR aperture、notify address、MSI-X table/PBA、
+QSCH/DSCH 和 global qpair placement 都由各自配置平面管理，不通过 `iommu.map()`。
+本模型中的 Host key 不隐式创建独立 host memory：若不同 Host 还要复用相同数值
+GPA、但访问不同字节内容，应分别注入 `host_mem_manager`；共享 manager 表示共享
+GPA backing。
+
 #### 4.4.1 核心接口
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
 | `map()` | `function bit[63:0] map(bdf, gpa, size, dir)` | 分配 IOVA, 创建映射，返回 IOVA |
+| `map_for_host()` | `function bit[63:0] map_for_host(host_id, bdf, gpa, size, dir)` | 在显式 Host requester domain 创建映射 |
 | `unmap()` | `function void unmap(bdf, iova)` | 移除映射，保存到 unmap_history |
+| `unmap_for_host()` | `function void unmap_for_host(host_id, bdf, iova)` | 只移除目标 Host 的映射 |
 | `translate()` | `function bit translate(bdf, iova, size, dir, ref gpa, ref fault)` | 地址翻译，成功返回 1 |
+| `translate_for_host()` | `function bit translate_for_host(host_id, bdf, iova, size, dir, ref gpa, ref fault)` | Host-qualified 地址翻译 |
+| `map_fixed_for_host()` | `function bit[63:0] map_fixed_for_host(host_id, bdf, gpa, size, dir, iova)` | 在迁移恢复时重建稳定 IOVA |
+| `write_from_device_for_host()` | `function bit write_from_device_for_host(host_id, mem, bdf, iova, data, ref fault)` | 完成 device-write 并产生 Host-scoped dirty record |
 | `add_fault_rule()` | `function void add_fault_rule(rule)` | 添加 fault 注入规则 |
 | `clear_fault_rules()` | `function void clear_fault_rules()` | 清除所有规则 |
 | `leak_check()` | `function void leak_check()` | 测试结束时检查未释放映射 |
@@ -723,15 +740,21 @@ barrier.print_stats();
 
 #### 4.4.2 IOVA 分配
 
-使用 Bump 分配器，从 `IOVA_BASE = 0x8000_0000` 开始递增分配，每次分配对齐到 4KB 页面边界。
+每个 Host 使用独立 allocator。默认策略是 `IOMMU_IOVA_RANDOM`：在可配置的
+page-aligned `[iova_base, iova_limit)` 64-bit aperture 中随机选择 4KB slot，并在
+同一 `{host_id, BDF}` requester 域内检查 live mapping 的区间冲突；随机候选耗尽
+后使用确定性的 first-fit，保证接近满 aperture 时仍能完成分配。可调用
+`configure_iova_aperture(base, limit, IOMMU_IOVA_FIRST_FIT, why)` 切换为稳定布局。
+IOVA 0 保留为失败返回值；不同 Host 的数值 IOVA 可以相同，因为 requester identity
+包含 host-id。随机使用仿真器/UVM 的现有随机状态，不新增环境 seed 字段。
 
 #### 4.4.3 翻译检查顺序
 
 `translate()` 按以下顺序执行检查：
 
 1. **Fault 注入规则检查** -- 首先检查是否有匹配的注入规则
-2. **Use-after-unmap 检测** -- 检查 IOVA 是否已被 unmap
-3. **映射查找** -- 查找覆盖该 IOVA 的有效映射
+2. **映射查找** -- 在目标 `{host_id, BDF}` 中查找覆盖该 IOVA 的有效映射
+3. **Use-after-unmap 检测** -- live mapping 不存在时，仅检查同 Host/BDF 的 retired history
 4. **范围检查** -- `(iova + size)` 不能超过映射范围
 5. **权限检查** -- DMA 方向必须兼容
 6. **GPA 计算** -- `gpa = entry.gpa + (iova - entry.iova)`
@@ -741,6 +764,8 @@ barrier.print_stats();
 
 ```systemverilog
 iommu_fault_rule_t rule;
+rule.host_id       = 1;
+rule.host_id_valid = 1;                  // 0 表示兼容 wildcard，作用于所有 Host
 rule.bdf_mask    = 16'hFFFF;           // 匹配所有 BDF
 rule.iova_start  = 64'h8000_0000;
 rule.iova_end    = 64'h8000_FFFF;
@@ -754,14 +779,18 @@ iommu.add_fault_rule(rule);
 
 #### 4.4.5 脏页追踪
 
-为热迁移提供支持，以 4KB 粒度追踪被写入的页面：
+为热迁移提供支持，以 4KB 粒度、按 Host 独立追踪完成的 device write：
 
 ```systemverilog
-iommu.dirty_tracking_enable = 1;
-// ... DMA 操作 ...
+void'(iommu.begin_dirty_generation_for_host(host_id));
+// ... write_from_device_for_host(host_id, ...) ...
 bit [63:0] dirty_pages[$];
-iommu.get_and_clear_dirty(dirty_pages);
+iommu.capture_dirty_generation_for_host(host_id, dirty_pages);
 ```
+
+`begin_dirty_generation()` / `capture_dirty_generation()` 和旧 dirty helper 仍表示
+host0。Host-scoped bitmap、mapping snapshot 和 generation state 不会因相同 GPA
+page number 而在不同 Host 之间合并。
 
 ### 4.5 Virtqueue 层 (virtqueue/)
 
@@ -1287,9 +1316,64 @@ frozen snapshot pair 和 pair-seeded manager；`virtio_resource_client` 按 serv
 local/global queue lookup。Global config 与 VIO config 分别通过 `uvm_config_db`
 传入 `dpu_device_env` 及其 VIO child；bootstrap plan 只读 device snapshot，
 `dpu_reg_executor` 在 `dpu_device_env_config.executor` 中与 plan construction 分开
-注入。本仓库不提供 production real-DUT executor。
+注入。仓库提供 `pcie_tl_dpu_reg_backend`/`pcie_tl_dpu_reg_executor` 作为 PCIe-TL
+实现：backend 绑定 `pcie_tl_virtual_sequencer` 和 frozen `dpu_device_snapshot`，将
+配置空间写入、BAR-relative MMIO 写入/回读转换为真实 PCIe TLP。MMIO 执行时按
+`BDF + BAR id` 从 snapshot 解析绝对地址 `BAR base + operation.address`，posted
+Memory Write 不等待不存在的 Completion，读回和显式 barrier 用于建立可观察顺序；
+Completion status、读回值和 4KB TLP 边界都会检查。用户平台可继承同一 backend，或
+直接替换 executor；未注入 executor 时仍报告 `NOT_EXECUTED`。
 
 VIO behavior 可配置参数：
+
+Host memory 的所有权与业务配置分离。顶层 DPU/Host 环境应为每个
+`host_id` 创建一个 `host_mem_pool` entry，并把同一个 manager 注入该 Host
+上的 VIO、RDMA、VBLK 子环境；不同 Host 创建不同 entry，即使数值 GPA 区间相同也
+不会互相覆盖。若不注入 `host_mem_binding`，`virtio_net_env` 为兼容旧测试创建
+单个 manager。也可以设置 `host_mem_pool_binding`，环境会按 `host_id` 查找
+manager；它与 `host_mem_binding` 互斥，pool 中不存在该 Host 时在 build 阶段失败。
+默认 `HOST_MEM_RANDOM` 使用仿真器随机状态在初始化 aperture 内选取对齐地址，
+`HOST_MEM_FIRST_FIT` 用于稳定调试；随机地址始终有真实 backing storage。
+冻结的 `dpu_device_snapshot` 会在 VIO 分配 ring/buffer 前自动导入当前 Host 的
+BAR reservation：BAR 完全位于 host memory aperture 时会被排除，位于独立 MMIO
+空间时跳过，部分相交则拒绝配置；同一 BAR 的重复导入是幂等的。手工使用
+`reserve_range()` 时 base/size 需按 manager granule 对齐，之后 allocator 不会返回
+保留区间。该阶段不改变 IOVA 模型；IOVA 仍与 GPA/BAR 保持独立地址空间。只有 DUT
+明确使用统一地址译码时，才应在平台 backend 增加显式的 IOVA→GPA 处理，不能由
+PCIe executor 默默替换 BAR 地址。
+
+真实 DUT 的 PCIe DMA responder 复用这个 manager，不在 VIO 环境内复制 Host
+memory 或增加 IOVA 回译层。顶层先创建所有 Host entry，再把 VIO 和 PCIe 配置指向
+同一所有权源：
+
+```systemverilog
+host_mem_pool host_mem_owners;
+host_mem_api  host0_mem;
+host_mem_api  host1_mem;
+string        why;
+
+void'(host_mem_owners.create_host(0, host0_base, host0_end));
+void'(host_mem_owners.create_host(1, host1_base, host1_end));
+host0_mem = host_mem_owners.get_host(0);
+host1_mem = host_mem_owners.get_host(1);
+
+device_cfg.host_mem_pool_ref = host_mem_owners;
+if (!pcie_cfg.bind_host_memory(0, 0, host0_mem, why) ||
+    !pcie_cfg.bind_host_memory(1, 1, host1_mem, why))
+  `uvm_fatal("TOP_CFG", why)
+```
+
+第一个参数是 `pcie_tl_env` 的 Root/RC 数组下标，第二个参数是 manager 的
+`host_id`。配置层拒绝 null、Host-ID 不匹配、重复 Root、缺项和超范围绑定；显式
+绑定模式要求 `0..num_roots-1` 全覆盖。`pcie_tl_env.host_mem_by_root[root]` 和相应
+`rc_agents[root].rc_driver.mem` 保存同一个 handle，`pcie_tl_env.host_mem` 仅是
+root0 兼容 alias。DUT/EP 发出的 MWr 直接更新该 Host backing storage，MRd 从该
+storage 生成 Completion。两个 Host 即使使用相同 GPA 数值也不会串扰，因为 Root
+持有不同 manager 对象。manager 已初始化时 PCIe 环境不再调用 `init_region()`；
+未初始化的旧单 Root config-db manager 仍使用原有 0..4-GiB 默认 aperture。
+`PCIE_TL_MEM_PREMAP` 针对唯一 manager handle 只分配一次；多个 Root 共享同一
+Host manager 时不会重复消耗 aperture，分配失败会触发 `PCIE_TL_HOST_MEM` 配置
+fatal。
 
 | 类别 | 参数 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -1304,6 +1388,10 @@ VIO behavior 可配置参数：
 | | `default_driver_mode` | `DRV_MODE_AUTO` | 默认驱动模式 |
 | 内存 | `mem_base` | `64'h1_0000_0000` | host_mem 起始地址 |
 | | `mem_end` | `64'h1_FFFF_FFFF` | host_mem 结束地址 |
+| | `host_id` | 0 | 当前环境所属 Host 地址域 |
+| | `host_mem_policy` | `HOST_MEM_RANDOM` | Host memory 放置策略；可选 `HOST_MEM_FIRST_FIT` |
+| | `host_mem_binding` | `null` | 注入由顶层 `host_mem_pool` 持有的共享 manager |
+| | `host_mem_pool_binding` | `null` | 注入按 `host_id` 管理多个 manager 的共享 pool；与 `host_mem_binding` 互斥 |
 | IOMMU | `iommu_strict` | 1 | 严格权限检查 |
 | 性能 | `bw_limit_enable` | 0 | 带宽限制开关 |
 | | `bw_limit_mbps` | 0 | 带宽限制值 (Mbps) |
@@ -1489,14 +1577,40 @@ local pair ID 与 global qpair ID 使用 `DPU_ASSIGN_AUTO`、`DPU_ASSIGN_PINNED`
 
 三种 ID namespace 有不同所有者：`request_id` 只识别 placement request，
 `service_instance_id` 结合 function key 识别 VIO service，`local_pair_id` 只在
-一个 service 内唯一；`global_qpair_id` 是 Fabric-wide snapshot identity，范围为
+一个 service 内唯一并作为 placement/resource 的本地 qpair label；
+`virtio_pair_index` 是该 service 内
+连续的软件 pair 序号；`global_qpair_id` 是 Fabric-wide snapshot identity，范围为
 `0..2047`。一个 global qpair ID 描述一组 RX/TX queues，不为两个方向分别 author
 global allocation。当前 real-DUT profile 要求 `service_instance_id == 0`，每个 PF/VF
-至多一个 VIO-net service。sparse local pair ID 合法；local pair ID `p` 的 RX local
-virtqueue ID 是 `2*p`，TX local virtqueue ID 是 `2*p+1`。默认硬件限制为每个 device
+至多一个 VIO-net service。软件 pair index `p` 的 RX virtqueue ID 是 `2*p`，TX
+virtqueue ID 是 `2*p+1`；这两个协议队列号与 DUT local pair ID 相互独立。默认硬件限制为每个 device
 32 pairs、全局 2048 pairs，所以
 `total_qpairs=100` 至少需要四个 32-pair eligible devices。`virtio.qpair` profile
 可低于 snapshot capability，不能提高它。
+
+`dpu_vio_placement_request.lan_msix_vectors` 可以显式选择该 function 的 LAN
+q-vector 数量：0 表示沿用一 qpair 一 vector 的默认 lowering；非零值必须不超过
+qpair 数量，resolver 会复现驱动的 `DIV_ROUND_UP(remaining_rings,
+remaining_vectors)` 分配，使多个 qpair 合法共享 local/global vector。共享 vector
+不会重复写 MSI-X linear/info/interval，而每个 qpair 仍有独立 notify entry；mailbox
+和 AF extra control vectors 仍按 capability 计数。
+
+默认真实驱动 capability 会在选中 AF 的普通 LAN qpairs 后追加 11 个独立 queue
+binding。其布局固定如下：
+
+| extra offset | 类型 | 端口/队列 | `local_queue_index` |
+|--------------|------|-----------|---------------------|
+| 0 | forward | - | `ordinary_af_qpair_count + 0` |
+| 1 | BPDU | - | `ordinary_af_qpair_count + 1` |
+| 2..5 | ETH netdev | port0 / queue0..3 | `ordinary_af_qpair_count + offset` |
+| 6..9 | ETH netdev | port1 / queue0..3 | `ordinary_af_qpair_count + offset` |
+| 10 | PTP | - | `ordinary_af_qpair_count + 10` |
+
+这些 binding 与普通 VIO qpair 从同一个 global qpair bitmap/pool 分配，不能重号；
+AF 的普通与 extra qpair 总数不能超过 32，因此默认 11-extra profile 下 AF 最多拥有
+21 个普通 VIO qpair。11 个 extra queue vector 追加在普通 AF LAN vectors 后；resolver
+还按 capability 为 mailbox、MAC age 和 PTP stamp 等非 queue interrupt 保留资源，
+但它们不是 `dpu_af_extra_queue_binding_t`。
 
 resolver 冻结 device/resource snapshots 后，manager 只从 exact pair import profile、
 reservation 和 bindings；VIO 以完整 service key 查询同一 mapping。它不在 runtime
@@ -1589,9 +1703,158 @@ real-DUT AF notify table 的 logical match 是：
 {host_id, notify_addr[60:7], local_pair_id} -> global_qpair_id
 ```
 
-placement 不生成或编程该 AF table。notify mapping、MSI-X、route 和 scheduler
-plan builders 在需要时读取 frozen snapshot 的 identity 与 binding；它们不是
-authoring 或 placement execution 的一部分。
+`dpu_vio_register_plan_builder` 在 placement freeze 后读取该 matching domain 和
+binding，生成 VIO service 范围内的 real-DUT BDF/MSI-X/notify lowering；placement 本身仍不执行 PCIe
+访问。builder 先合并 BAR/AF bootstrap，再按 DAG 顺序写 BDF map、MSI-X linear/info/
+interval 和选定 inactive notify bank，最后写 `BAR0 + 0x20044` 的 ready/select
+commit。notify entry 是 16 字节（两个 64-bit write），匹配字段严格为
+`{host_id, notify_addr[60:7], local_qid}`；其中 `local_qid` 使用驱动
+`txrx_queues[]` 的连续 pair index，placement 的 sparse `local_pair_id` 仅用于
+资源命名和约束。并把 snapshot 的 explicit `global_qpair_id` 放入 payload；不会用
+稀疏 local ID 推导 global ID。PBA 是 DUT
+运行时状态，不由配置 plan 伪写。notify entries 按驱动的 host/address key 排序；
+`select_inactive_notify_bank` 默认开启并选择活动 bank 的另一份 shadow bank。冷启动
+默认把 bank0 视为 active，因此第一次 setup 写 bank1；若 attach 到运行中的 DUT，必须
+在 build 前通过 `dpu_device_env_config.vio_policy.active_notify_bank` 输入硬件的实际
+active bank。`dpu_device_env` 仅在 plan 成功执行并完成 commit 后更新 tracked active
+bank；仅 build、`NOT_EXECUTED`、preflight failure 或执行失败都不会推进 bank 状态。
+`emit_full_notify_bank` 默认开启：有效项之后写入 driver-compatible invalid entries，
+形成完整 128-entry shadow。每个 entry 的 low/high 写入完成后，builder 生成两次
+`POLL_UNTIL` readback，默认最多 5 次、间隔 5 us；notify commit 直接依赖每项最终
+verify。聚焦测试可以显式关闭完整 shadow 或 readback，但真实 DUT 默认路径不会依赖
+上电残留状态恰好为空。
+
+真实驱动的 `DPU_QID_MAP_TABLE_ENTRIES`/`DPU_MAX_TXRX_QUEUE` 是 128，因此默认
+shadow bank 只生成或清理 128 项；1024 只是模型支持的编码上限。普通 VIO 和
+AF extra queue 的 notify entries 使用同一排序和 commit。extra queue 从 frozen
+snapshot 的显式 binding 生成自己的 BDF dependency、MSI-X linear/info/interval
+以及 notify low/high operation，不在 builder 中重新分配 qid 或 vector。
+resource manager 将 11 个 extra queue 导入为选中 AF 的 function-owned frozen
+lease，防止其 global qpair ID 被动态资源再次使用；它们不进入 service lease，
+因此 `virtio_resource_client` 看不到这些驱动控制队列。
+
+环境层调用方式：
+
+```systemverilog
+dpu_reg_plan plan;
+dpu_execution_report report;
+string why;
+if (!device_env.build_vio_register_plan(plan, why))
+  `uvm_fatal("DPU_CFG", why)
+device_env.apply_vio_register_plan(plan, report);
+```
+
+配置成功进入 `DPU_DEVICE_ACTIVE` 后，独立的 teardown API 使用同一对 frozen
+snapshots，且不重新分配任何 ID：
+
+```systemverilog
+dpu_reg_plan teardown_plan;
+if (!device_env.build_vio_teardown_plan(teardown_plan, why))
+  `uvm_fatal("DPU_CFG", why)
+device_env.apply_vio_teardown_plan(teardown_plan, report);
+```
+
+teardown 先把完整 invalid notify shadow 写入 inactive bank 并以 ready=0 commit，
+随后只对普通 VIO/AF-extra binding 实际拥有的 global vector、function/local vector
+和 function，依次清零 MSI-X info、MSI-X linear 与 BDF map。成功后状态回到
+`RESOLVED`；`NOT_EXECUTED`、plan invalid 或 preflight failure 保持 `ACTIVE`，执行中
+失败进入 `FAILED`。
+
+setup 与 teardown 从相同的普通 VIO/AF-extra bindings 构造 VIO-owned function 集合。
+没有这些 queue ownership 的 PF/VF 不由 VIO plan 写入或清理 BDF map；BAR bootstrap
+属于公共 PCIe topology 配置，仍覆盖 snapshot 中的完整 function/BAR 集合，不随 VIO
+BDF ownership 收窄。
+
+`dpu_vio_register_plan_policy` 提供 notify bank/type、MSI-X interval 和 self-mask
+策略；这些字段不会改变 frozen topology。`dpu_device_env_config.executor` 是唯一
+真实下发扩展点，`apply_vio_register_plan` 会先 freeze 和调用 executor preflight，
+preflight 失败不会产生 PCIe 写入。用户可继承 `dpu_reg_executor` 将每个
+`dpu_reg_op` 翻译成平台 PCIe config/MMIO TLP；仓库不绑定某一具体 PCIe VIP transport。
+
+当前仓库已提供与 53 号机真实驱动一致的
+`dpu_vio_driver_dataplane_extension`。它从 frozen resource snapshot 派生
+Host/function/MSI-X 字段，写入 QSCH init、Q2TC/N2G/G2P/SPWRR、可选的 TC0..TC7
+WRR weight，以及 VTX/VRX queue-parameter RAM 的 content、RAM select 和
+0→1 write-enable；AF BAR0 aperture
+和所有字段宽度在 plan 阶段检查。驱动没有初始化的 VTX context、VRX tail、QSCH
+链表/调度树节点仍不会被伪造。场景可直接填充 extension 的
+`qsch_queues`、`qsch_functions`、`vtx_queues` 和 `vrx_queues`，也可以继承基类覆盖
+以下 hook：
+
+`qsch_functions` 中的 `weight_valid` 置 1 时，`tc_weight[0:7]` 会按驱动的
+`qsch_tc_wgt_cfg_table_entry`（每个 TC 4 bit）生成
+`DSCH_QSCH_BASE + 0x14000 + global_func_id*4` 写入；不置 1 则保持驱动默认权重，
+不会增加额外写操作。
+QSCH G2P 的 `src_port` 按 `dpu_snd1.ko` 的实际一位编码处理：驱动源码中的
+`QSCH_PORT_HOST0 + host_id` 在写入结构体时被截断为低位，因此 plan 不会写入
+超出该字段的逻辑端口值。
+
+### QSCH 逻辑拓扑与随机 lowering
+
+QSCH 不直接从寄存器字段反向随机，而是先在 `dpu-common` 生成逻辑图，再 lowering
+到真实 DUT 配置。`dpu_qsch_topology_generator` 的输入是已经冻结的
+`dpu_device_snapshot` 和 `dpu_resource_snapshot`，输出为
+`dpu_qsch_topology_cfg`：
+
+```text
+Function/global_func_id ──> net ──> group ──> port
+global_qpair_id ────────────────> TC/net
+                                  │
+                                  └── traffic_classes[0..7]
+```
+
+支持的模式为 `DPU_QSCH_TOPOLOGY_RANDOM_VALID` 和
+`DPU_QSCH_TOPOLOGY_RANDOM_STRESS`。随机使用仿真全局 seed，因此同一仿真 seed 可以
+复现同一张图，不需要环境额外维护 seed。net ID 不是独立随机数，而是对应 Function
+的 `global_func_id`；随机的是 group/port 节点、qpair 的 TC、net 的 SP/WRR 与可选
+TC weight。生成器保证 qpair owner、net、group、port 引用完整且字段范围合法，每个
+生成的 group 至少有一个 net。需要覆盖多 Function 共享调度组时设置
+`generator.require_shared_group = 1`；只要存在两个以上 Function，生成器就会约束
+group 数量小于 net 数量，并让剩余 net 继续随机挂接，从而保证至少一个 group 被多个
+net-device 共享。
+
+```systemverilog
+dpu_qsch_topology_generator generator;
+dpu_qsch_topology_cfg topology;
+generator = dpu_qsch_topology_generator::type_id::create("qsch_generator");
+generator.mode = DPU_QSCH_TOPOLOGY_RANDOM_VALID;
+if (!generator.build_random(device_snapshot, resource_snapshot, topology, why))
+  `uvm_fatal("QSCH", why)
+
+driver_extension.set_qsch_topology(topology);
+```
+
+`set_qsch_topology()` 在 lowering 前再次校验 snapshots 和关系，随后沿用已审计的
+Q2TC/N2G/G2P/SPWRR/weight 地址和位域。由于 53 号真实驱动的 N2G/G2P 表项仍按
+`global_func_id` 寻址，随机 group 写入 N2G 的 group 字段，group 的 port 写入该 net
+的 G2P 字段；当前不会凭空增加未经驱动确认的独立 group-table 或硬件链表寄存器。
+拓扑对象本身就是验证期望模型，可用于后续 DUT readback/数据面检查。
+
+```systemverilog
+class my_vio_dataplane_extension extends dpu_vio_dataplane_plan_extension;
+  `uvm_object_utils(my_vio_dataplane_extension)
+
+  virtual function bit contribute_qsch(
+      dpu_device_snapshot devices,
+      dpu_resource_snapshot resources,
+      dpu_reg_plan plan,
+      output string why);
+    // 从 frozen resources 读取 qpair/MSI-X/AF-extra binding，向 plan 追加
+    // 已由用户核实的 scheduler node/table operations 和 dependencies。
+    why = "";
+    return 1;
+  endfunction
+endclass
+
+env_cfg.vio_dataplane_extension =
+    my_vio_dataplane_extension::type_id::create("vio_dataplane_extension");
+```
+
+builder 固定按 `contribute_qsch()`、`contribute_vtx()`、`contribute_vrx()` 顺序，
+在核心 BDF/MSI-X/notify commit operation 已存在后调用这些 hook。三者获得同一对
+frozen snapshots 和仍可追加 operation/dependency 的 plan；任一 hook 返回 0，
+plan build 整体失败且 executor 不会运行。QSCH 与 DSCH 调度树可先统一从
+`contribute_qsch()` lowering，后续字段核实后再拆分专用 builder。
 
 冻结 snapshot 中的 VIO qpair capabilities 是硬件上限，并在以下边界执行：
 
@@ -1620,8 +1883,14 @@ mailbox 和 64 KiB MSI-X table/PBA；VF 的对应大小为 16 KiB、16 KiB 和
 在 domain 的 MMIO windows 中检查 role、size、alignment、overflow 和 overlap，
 并将完整解析结果发布到冻结的 `dpu_device_snapshot`。
 
-当前边界已包含 resolved PCI BAR 和 AF declaration/bootstrap plan lowering，
-但仓库不提供 production real-DUT executor。只有测试或集成环境显式
+当前边界已包含 resolved PCI BAR、AF declaration/bootstrap plan lowering 和 PCIe-TL
+executor。当前 plan 已包含 11 个 AF extra queue
+的 BDF dependency、MSI-X internal mapping 和 notify lowering，以及上述驱动证据充分
+的 QSCH/VTX/VRX queue-parameter lowering；AF mailbox/MAC-age/PTP-stamp 等非 queue
+control interrupt及标准 PCIe MSI-X table address/data 初始化仍由后续专用 builder
+或平台集成处理。现有 teardown 已覆盖 snapshot-owned notify、MSI-X info/linear 和
+BDF map；不会写 PBA、BAR4 MSI-X table、interval 或无 VIO queue 的其他 function。
+PBA 是 DUT-maintained pending state，应通过读/检查验证而不是由配置层清零。只有测试或集成环境显式
 注入 `dpu_reg_executor` 后才会访问硬件；未注入时报告
 `NOT_EXECUTED`，不伪报硬件成功。
 
@@ -1638,14 +1907,16 @@ make regression
 
 `scripts/test_manifest.sh` 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的
 单一事实源。该入口按清单顺序运行 `dpu_resource_manager_test`、
-`dpu_reg_plan_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
-`dpu_resource_resolver_test`、`dpu_device_bootstrap_plan_test`、`virtio_dut_caps_test`、
+`dpu_reg_plan_test`、`dpu_pcie_reg_executor_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
+`dpu_resource_resolver_test`、`dpu_device_bootstrap_plan_test`、`dpu_vio_reg_plan_test`、`virtio_dut_caps_test`、
 `virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、
 `virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、
 `virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、
 `virtio_e2e_test`、`virtio_full_integration_test`、
 `virtio_pf_lifecycle_reset_test`、`virtio_monitor_routing_test`、
-`virtio_dual_test`、`virtio_smoke_test` 和 `virtio_traffic_test`，共 23 项。该入口
+`virtio_dual_test`、`virtio_smoke_test`、`virtio_traffic_test`、
+`host_mem_random_test`、`virtio_pcie_host_mem_test` 和
+`dpu_pcie_tl_executor_integration_test`，共 28 项。该入口
 要求 `make check-deps` 先通过；无 VCS 环境时它应在编译前报告 VCS 依赖错误。
 
 ### 6.2 编写测试
@@ -1857,12 +2128,18 @@ BAR 地址通过 `bar_accessor.enumerate_bars()` 自动枚举和分配。默认 
 | 方法 | 签名 | 说明 |
 |------|------|------|
 | `map` | `function bit[63:0] map(bit[15:0] bdf, bit[63:0] gpa, int unsigned size, dma_dir_e dir, string file="", int line=0)` | 创建映射 |
+| `map_for_host` | `function bit[63:0] map_for_host(int unsigned host_id, bit[15:0] bdf, bit[63:0] gpa, int unsigned size, dma_dir_e dir, ...)` | 创建 Host-qualified 映射 |
 | `unmap` | `function void unmap(bit[15:0] bdf, bit[63:0] iova, string file="", int line=0)` | 移除映射 |
+| `unmap_for_host` | `function void unmap_for_host(int unsigned host_id, bit[15:0] bdf, bit[63:0] iova, ...)` | 移除指定 Host 映射 |
 | `translate` | `function bit translate(bit[15:0] bdf, bit[63:0] iova, int unsigned size, dma_dir_e access_dir, ref bit[63:0] gpa, ref iommu_fault_e fault)` | 地址翻译 |
+| `translate_for_host` | `function bit translate_for_host(int unsigned host_id, bit[15:0] bdf, bit[63:0] iova, int unsigned size, dma_dir_e access_dir, ref bit[63:0] gpa, ref iommu_fault_e fault)` | 指定 Host 地址翻译 |
+| `map_fixed_for_host` | function | 指定 Host 重建固定 IOVA |
+| `write_from_device_for_host` | function | 指定 Host 的完成 DMA write/dirty 边界 |
+| `snapshot_live_mappings_for_host` | function | 快照指定 Host/BDF 的 live mappings |
 | `add_fault_rule` | `function void add_fault_rule(iommu_fault_rule_t rule)` | 添加 fault 规则 |
 | `clear_fault_rules` | `function void clear_fault_rules()` | 清除规则 |
-| `mark_dirty` | `function void mark_dirty(bit[63:0] gpa, int unsigned size)` | 标记脏页 |
 | `get_and_clear_dirty` | `function void get_and_clear_dirty(ref bit[63:0] dirty_pages[$])` | 获取并清除脏页 |
+| `begin_dirty_generation_for_host` / `capture_dirty_generation_for_host` | function | Host-scoped dirty generation |
 | `leak_check` | `function void leak_check()` | 泄漏检查 |
 | `reset` | `function void reset()` | 重置 |
 | `print_stats` | `function void print_stats()` | 打印统计 |
@@ -1946,6 +2223,13 @@ BAR 地址通过 `bar_accessor.enumerate_bars()` 自动枚举和分配。默认 
 | `validate_local(why)` | 检查与 snapshot 无关的本地配置合法性 |
 | `validate_against_snapshot(snapshot, why)` | 检查 service ownership 并按冻结 snapshot capability 校验/裁剪 |
 | `convert2string()` | 格式化输出 |
+
+`host_mem_pool` 提供 `create_host(host_id, base, end, mode, granule, policy)`、
+`get_host(host_id)` 和 `has_host(host_id)`。`create_host()` 对每个 Host 只创建
+一个 manager；重复获取返回同一 handle。业务环境通过 `host_mem_pool_binding`
+按 Host 查找这个 handle（或直接通过 `host_mem_binding` 注入），从而让同 Host
+的 VIO/RDMA/VBLK 分配在一个互斥地址域内。pool 会在发布 manager 前检查 64 位
+aperture 是否可表示，拒绝完整 `2^64` 区间等无效配置。
 
 ---
 

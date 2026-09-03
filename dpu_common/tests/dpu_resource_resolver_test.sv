@@ -288,7 +288,8 @@ class dpu_resource_resolver_test extends uvm_test;
     function automatic dpu_device_snapshot make_device_snapshot(
         output dpu_service_key_t service_key,
         input int unsigned service_instance_id = 0,
-        input bit add_second_vio_service = 0
+        input bit add_second_vio_service = 0,
+        input int unsigned af_extra_queue_count = 0
     );
         dpu_device_snapshot snapshot;
         dpu_dut_caps caps;
@@ -300,6 +301,7 @@ class dpu_resource_resolver_test extends uvm_test;
 
         snapshot = dpu_device_snapshot::type_id::create("device_snapshot");
         caps = dpu_dut_caps::type_id::create("dut_caps");
+        caps.af_extra_queue_count = af_extra_queue_count;
         function_key = make_function_key();
         pcie_id.domain.host_id = 0;
         pcie_id.domain.segment_id = 0;
@@ -343,6 +345,7 @@ class dpu_resource_resolver_test extends uvm_test;
 
         snapshot = dpu_device_snapshot::type_id::create("two_service_snapshot");
         caps = dpu_dut_caps::type_id::create("two_service_caps");
+        caps.af_extra_queue_count = 0;
         first_function = make_function_key();
         second_function = first_function;
         second_function.pf_id = 1;
@@ -387,6 +390,7 @@ class dpu_resource_resolver_test extends uvm_test;
         snapshot = dpu_corruptible_device_snapshot::type_id::create(
             "corruptible_device_snapshot");
         caps = dpu_dut_caps::type_id::create("corruptible_device_caps");
+        caps.af_extra_queue_count = 0;
         function_key = make_function_key();
         pcie_id.domain.host_id = 0;
         pcie_id.domain.segment_id = 0;
@@ -589,11 +593,47 @@ class dpu_resource_resolver_test extends uvm_test;
         dpu_vio_qpair_binding_t observed;
 
         if (!snapshot.get_vio_binding(3, pair_index, observed) ||
+            (observed.virtio_pair_index != pair_index) ||
             (observed.local_pair_id != local_id) ||
-            (observed.rx_local_virtqueue_id != (2 * local_id)) ||
-            (observed.tx_local_virtqueue_id != ((2 * local_id) + 1)) ||
+            (observed.rx_local_virtqueue_id != (2 * pair_index)) ||
+            (observed.tx_local_virtqueue_id != ((2 * pair_index) + 1)) ||
             (observed.global_qpair_id != global_id))
             `uvm_fatal("RESOURCE_RESOLVER", "resolved qpair binding disagrees with allocation contract")
+    endfunction
+
+    // The software Virtio pair ordinal is independent from the DUT's local
+    // qpair index.  A sparse hardware placement must not create sparse PCI
+    // virtqueue IDs: the first software pair still owns RX=0/TX=1.
+    function void test_protocol_pair_index_is_independent_of_local_id();
+        dpu_service_key_t service_key;
+        dpu_device_snapshot device_snapshot;
+        dpu_resource_resolver resolver;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_placement_diagnostic diagnostic;
+        dpu_vio_qpair_binding_t binding;
+
+        device_snapshot = make_device_snapshot(service_key);
+        resolver = dpu_resource_resolver::type_id::create(
+            "protocol_pair_index_resolver");
+        resource_snapshot = null;
+        diagnostic = dpu_placement_diagnostic::type_id::create(
+            "protocol_pair_index_diag");
+        if (!resolver.resolve(
+                device_snapshot,
+                make_plan(service_key, 128, 32, 1, 1,
+                          '{DPU_ASSIGN_PINNED}, '{17},
+                          '{DPU_ASSIGN_PINNED}, '{91}),
+                resource_snapshot, diagnostic)) begin
+            `uvm_fatal("RESOURCE_RESOLVER", diagnostic.message)
+        end
+        if (!resource_snapshot.get_vio_binding(3, 0, binding) ||
+            (binding.local_pair_id != 17) ||
+            (binding.rx_local_virtqueue_id != 0) ||
+            (binding.tx_local_virtqueue_id != 1) ||
+            (binding.global_qpair_id != 91)) begin
+            `uvm_fatal("RESOURCE_RESOLVER",
+                "protocol virtqueue IDs must be independent from DUT local qpair ID")
+        end
     endfunction
 
     function automatic void expect_freeze_failure(
@@ -622,6 +662,42 @@ class dpu_resource_resolver_test extends uvm_test;
             (diagnostic.has_service_key != expect_service_context) ||
             (diagnostic.has_function_key != expect_function_context))
             `uvm_fatal("RESOURCE_SNAPSHOT", {name, " accepted invalid snapshot or lost diagnostic context"})
+    endfunction
+
+    // A frozen snapshot is the authority consumed by register-plan builders.
+    // It must not silently omit queues declared by the DUT capability.
+    function void test_snapshot_rejects_missing_af_extra_bindings();
+        dpu_service_key_t service_key;
+        dpu_device_snapshot device_snapshot;
+        dpu_normalized_placement_plan plan;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_placement_diagnostic diagnostic;
+        dpu_vio_qpair_binding_t binding;
+
+        device_snapshot = make_device_snapshot(service_key, 0, 0, 11);
+        plan = make_plan(service_key);
+        resource_snapshot = dpu_resource_snapshot::type_id::create(
+            "missing_af_extra_snapshot");
+        diagnostic = dpu_placement_diagnostic::type_id::create(
+            "missing_af_extra_diagnostic");
+        binding.request_id = 3;
+        binding.request_pair_index = 0;
+        binding.service_key = service_key;
+        binding.virtio_pair_index = 0;
+        binding.local_pair_id = 0;
+        binding.rx_local_virtqueue_id = 0;
+        binding.tx_local_virtqueue_id = 1;
+        binding.global_qpair_id = 0;
+        binding.local_msix_vector_id = 0;
+        binding.global_msix_vector_id = 0;
+        if (!resource_snapshot.set_normalized_plan(plan, diagnostic) ||
+            !resource_snapshot.add_vio_binding(binding, diagnostic))
+            `uvm_fatal("RESOURCE_SNAPSHOT", diagnostic.message)
+        if (resource_snapshot.freeze(device_snapshot, diagnostic) ||
+            (diagnostic.error_code != DPU_PLACE_ERR_INVALID_REQUEST) ||
+            !diagnostic.has_function_key)
+            `uvm_fatal("RESOURCE_SNAPSHOT",
+                "snapshot accepted missing AF extra queue bindings")
     endfunction
 
     function void test_reservation_union_publication();
@@ -826,10 +902,13 @@ class dpu_resource_resolver_test extends uvm_test;
         binding.request_id = 3;
         binding.request_pair_index = 0;
         binding.service_key = service_key;
+        binding.virtio_pair_index = 0;
         binding.local_pair_id = 17;
-        binding.rx_local_virtqueue_id = 34;
-        binding.tx_local_virtqueue_id = 35;
+        binding.rx_local_virtqueue_id = 0;
+        binding.tx_local_virtqueue_id = 1;
         binding.global_qpair_id = 91;
+        binding.local_msix_vector_id = 0;
+        binding.global_msix_vector_id = 0;
         if (!resource_snapshot.set_normalized_plan(plan, diagnostic) ||
             !resource_snapshot.add_vio_binding(binding, diagnostic) ||
             !resource_snapshot.freeze(device_snapshot, diagnostic))
@@ -870,8 +949,8 @@ class dpu_resource_resolver_test extends uvm_test;
 
         invalid_binding = binding;
         invalid_binding.local_pair_id = 32;
-        invalid_binding.rx_local_virtqueue_id = 64;
-        invalid_binding.tx_local_virtqueue_id = 65;
+        invalid_binding.rx_local_virtqueue_id = 0;
+        invalid_binding.tx_local_virtqueue_id = 1;
         expect_freeze_failure("local_hard_limit", make_plan(service_key, 128, 33),
                               device_snapshot, invalid_binding,
                               DPU_PLACE_ERR_LOCAL_QID_OUT_OF_RANGE, 1, 1, 1, 0);
@@ -916,6 +995,8 @@ class dpu_resource_resolver_test extends uvm_test;
         test_deleted_service_owner_is_snapshot_mismatch();
         test_configuration_resolver_atomicity();
         test_reservation_union_publication();
+        test_protocol_pair_index_is_independent_of_local_id();
+        test_snapshot_rejects_missing_af_extra_bindings();
     endfunction
 endclass : dpu_resource_resolver_test
 

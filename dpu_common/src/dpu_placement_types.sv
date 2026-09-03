@@ -83,10 +83,46 @@ typedef struct {
     int unsigned request_id;
     int unsigned request_pair_index;
     dpu_service_key_t service_key;
+    // Dense software-side pair ordinal within this VIO service.  This is
+    // independent from local_pair_id, which is the placement/resource label.
+    int unsigned virtio_pair_index;
     int unsigned local_pair_id;
+    // Virtio-net protocol queue IDs.  RX/TX are the two directions of one
+    // hardware qpair and are derived from virtio_pair_index in the standard
+    // profile (2*p and 2*p+1).
     int unsigned rx_local_virtqueue_id;
     int unsigned tx_local_virtqueue_id;
     int unsigned global_qpair_id;
+    // Local MSI-X vector index consumed by the driver's function interrupt
+    // array.  It is kept explicit so a future shared-vector policy can map
+    // several qpairs to one vector without changing the register builder.
+    int unsigned local_msix_vector_id;
+    // Resolved global MSI-X vector selected by the resource allocator.  The
+    // register-plan builder consumes this binding and must never renumber it.
+    int unsigned global_msix_vector_id;
 } dpu_vio_qpair_binding_t;
+
+// The real driver appends these AF-owned queue pairs after the ordinary LAN
+// queue pairs in func_res->txrx_queues[].  They are control/dataplane
+// resources, not guest-visible Virtio queues, so they use a separate binding
+// type and are never published through virtio_resource_client.
+typedef enum int unsigned {
+    DPU_AF_EXTRA_QUEUE_FORWARD,
+    DPU_AF_EXTRA_QUEUE_BPDU,
+    DPU_AF_EXTRA_QUEUE_ETH_PORT_NETDEV,
+    DPU_AF_EXTRA_QUEUE_PTP
+} dpu_af_extra_queue_kind_e;
+
+typedef struct {
+    dpu_function_key_t af_function_key;
+    dpu_af_extra_queue_kind_e kind;
+    int unsigned extra_queue_offset;
+    int unsigned local_queue_index;
+    int unsigned global_qpair_id;
+    int unsigned local_msix_vector_id;
+    int unsigned global_msix_vector_id;
+    int unsigned eth_port_id;
+    int unsigned eth_queue_id;
+} dpu_af_extra_queue_binding_t;
 
 `endif // DPU_PLACEMENT_TYPES_SV

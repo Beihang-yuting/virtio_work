@@ -34,6 +34,7 @@ class virtqueue_manager extends uvm_object;
     virtio_memory_barrier_model barrier;
     virtqueue_error_injector  err_inj;
     virtio_wait_policy        wait_pol;
+    int unsigned              host_id;
     bit [15:0]                bdf;
 
     // ------------------------------------------------------------------
@@ -93,7 +94,8 @@ class virtqueue_manager extends uvm_object;
         endcase
 
         // Initialize with shared references
-        vq.setup(queue_id, queue_size, mem, iommu, barrier, err_inj, wait_pol, bdf);
+        vq.setup(queue_id, queue_size, mem, iommu, barrier, err_inj, wait_pol,
+                 bdf, host_id);
 
         // Store in map
         queues[queue_id] = vq;

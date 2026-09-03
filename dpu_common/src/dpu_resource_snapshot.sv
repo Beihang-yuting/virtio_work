@@ -8,9 +8,13 @@ class dpu_resource_snapshot extends uvm_object;
     protected dpu_normalized_placement_plan m_plan;
     protected dpu_device_snapshot m_device_snapshot;
     protected dpu_vio_qpair_binding_t m_bindings[$];
+    protected dpu_af_extra_queue_binding_t m_af_extra_bindings[$];
     protected int unsigned m_request_index[string];
     protected int unsigned m_service_local_index[string];
+    protected int unsigned m_service_virtio_pair_index[string];
     protected int unsigned m_global_index[string];
+    protected int unsigned m_af_extra_offset_index[string];
+    protected int unsigned m_af_extra_global_index[string];
     protected int unsigned m_reserved_ids[$];
     protected dpu_global_id_range_t m_reserved_ranges[$];
     protected dpu_resource_pool_config_t m_profiles[$];
@@ -55,6 +59,14 @@ class dpu_resource_snapshot extends uvm_object;
                 $sformatf(":%0d", local_pair_id)};
     endfunction
 
+    protected function string service_virtio_pair_key(
+        input dpu_service_key_t service_key,
+        input int unsigned virtio_pair_index
+    );
+        return {dpu_service_key_name(service_key),
+                $sformatf(":%0d", virtio_pair_index)};
+    endfunction
+
     protected function string global_key(input int unsigned global_qpair_id);
         return $sformatf("%0d", global_qpair_id);
     endfunction
@@ -92,16 +104,43 @@ class dpu_resource_snapshot extends uvm_object;
         end
     endfunction
 
+    protected function void sort_af_extra_bindings();
+        dpu_af_extra_queue_binding_t swap;
+        for (int left = 0; left < m_af_extra_bindings.size(); left++) begin
+            for (int right = left + 1;
+                 right < m_af_extra_bindings.size(); right++) begin
+                if (m_af_extra_bindings[right].extra_queue_offset <
+                    m_af_extra_bindings[left].extra_queue_offset) begin
+                    swap = m_af_extra_bindings[left];
+                    m_af_extra_bindings[left] = m_af_extra_bindings[right];
+                    m_af_extra_bindings[right] = swap;
+                end
+            end
+        end
+    endfunction
+
     protected function void rebuild_indexes();
         m_request_index.delete();
         m_service_local_index.delete();
+        m_service_virtio_pair_index.delete();
         m_global_index.delete();
+        m_af_extra_offset_index.delete();
+        m_af_extra_global_index.delete();
         foreach (m_bindings[index]) begin
             m_request_index[request_key(m_bindings[index].request_id,
                                         m_bindings[index].request_pair_index)] = index;
             m_service_local_index[service_local_key(m_bindings[index].service_key,
                                                     m_bindings[index].local_pair_id)] = index;
+            m_service_virtio_pair_index[service_virtio_pair_key(
+                m_bindings[index].service_key,
+                m_bindings[index].virtio_pair_index)] = index;
             m_global_index[global_key(m_bindings[index].global_qpair_id)] = index;
+        end
+        foreach (m_af_extra_bindings[index]) begin
+            m_af_extra_offset_index[$sformatf(
+                "%0d", m_af_extra_bindings[index].extra_queue_offset)] = index;
+            m_af_extra_global_index[global_key(
+                m_af_extra_bindings[index].global_qpair_id)] = index;
         end
     endfunction
 
@@ -116,10 +155,13 @@ class dpu_resource_snapshot extends uvm_object;
         binding.service_key.function_key.vf_id = 0;
         binding.service_key.service_kind = DPU_SERVICE_VIO_NET;
         binding.service_key.service_instance_id = 0;
+        binding.virtio_pair_index = 0;
         binding.local_pair_id = 0;
         binding.rx_local_virtqueue_id = 0;
         binding.tx_local_virtqueue_id = 0;
         binding.global_qpair_id = 0;
+        binding.local_msix_vector_id = 0;
+        binding.global_msix_vector_id = 0;
     endfunction
 
     protected function void sort_and_merge_ranges(
@@ -283,6 +325,66 @@ class dpu_resource_snapshot extends uvm_object;
         dpu_normalized_vio_pair_t pairs[$];
         dpu_vio_participant_target_t targets[$];
         bit pair_keys[string];
+        bit msix_occupied[DPU_MAX_GLOBAL_MSIX_VECTORS];
+        dpu_function_key_t msix_owner[DPU_MAX_GLOBAL_MSIX_VECTORS];
+        int unsigned msix_local[DPU_MAX_GLOBAL_MSIX_VECTORS];
+        int unsigned function_local_global[string];
+        dpu_dut_caps caps;
+        dpu_function_key_t expected_af_key;
+        dpu_bar_pair_lease_t expected_af_bar0;
+        int unsigned af_regular_qpair_count;
+        int unsigned af_lan_msix_count;
+        int unsigned af_msix_base;
+        bit af_msix_base_valid;
+        string caps_why;
+
+        msix_occupied = '{default: 0};
+        caps = device_snapshot.snapshot_dut_caps();
+        if ((caps == null) || !caps.validate(caps_why)) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_INVALID_PROFILE,
+                        (caps == null) ?
+                        "resource snapshot cannot read DUT capabilities" :
+                        {"resource snapshot has invalid DUT capabilities: ",
+                         caps_why});
+            return 0;
+        end
+        if (!device_snapshot.get_expected_af(expected_af_key,
+                                             expected_af_bar0, caps_why)) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_SNAPSHOT_REFERENCE_MISMATCH,
+                        {"resource snapshot cannot resolve AF: ", caps_why});
+            return 0;
+        end
+        af_regular_qpair_count = 0;
+        af_lan_msix_count = 0;
+        af_msix_base = 0;
+        af_msix_base_valid = 0;
+        foreach (m_bindings[index]) begin
+            if (dpu_same_function_key(
+                    m_bindings[index].service_key.function_key,
+                    expected_af_key)) begin
+                int unsigned candidate_base;
+                af_regular_qpair_count++;
+                if ((m_bindings[index].local_msix_vector_id + 1) >
+                    af_lan_msix_count)
+                    af_lan_msix_count =
+                        m_bindings[index].local_msix_vector_id + 1;
+                if (m_bindings[index].global_msix_vector_id <
+                    m_bindings[index].local_msix_vector_id) begin
+                    set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                                "AF VIO MSI-X binding has an invalid vector base");
+                    return 0;
+                end
+                candidate_base = m_bindings[index].global_msix_vector_id -
+                                 m_bindings[index].local_msix_vector_id;
+                if (af_msix_base_valid && (candidate_base != af_msix_base)) begin
+                    set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                                "AF VIO MSI-X bindings disagree on the function vector base");
+                    return 0;
+                end
+                af_msix_base = candidate_base;
+                af_msix_base_valid = 1;
+            end
+        end
 
         if ((m_plan == null) || !m_plan.is_frozen()) begin
             set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
@@ -378,14 +480,16 @@ class dpu_resource_snapshot extends uvm_object;
                 diagnostic.set_service_context(m_bindings[index].service_key);
                 return 0;
             end
-            if ((m_bindings[index].rx_local_virtqueue_id !=
-                 2 * m_bindings[index].local_pair_id) ||
+            if (m_bindings[index].virtio_pair_index >=
+                m_plan.effective_device_capacity ||
+                (m_bindings[index].rx_local_virtqueue_id !=
+                 2 * m_bindings[index].virtio_pair_index) ||
                 (m_bindings[index].tx_local_virtqueue_id !=
-                 (2 * m_bindings[index].local_pair_id + 1)) ||
+                 (2 * m_bindings[index].virtio_pair_index + 1)) ||
                 (m_bindings[index].rx_local_virtqueue_id >= 64) ||
                 (m_bindings[index].tx_local_virtqueue_id >= 64)) begin
                 set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
-                            "binding local virtqueue IDs are not derived from local pair ID");
+                            "binding virtqueue IDs are not derived from software pair index");
                 diagnostic.set_request_context(m_bindings[index].request_id);
                 diagnostic.set_pair_context(m_bindings[index].request_pair_index);
                 diagnostic.set_service_context(m_bindings[index].service_key);
@@ -402,6 +506,165 @@ class dpu_resource_snapshot extends uvm_object;
                 diagnostic.set_service_context(m_bindings[index].service_key);
                 return 0;
             end
+            if ((m_bindings[index].local_msix_vector_id >= 128) ||
+                (m_bindings[index].global_msix_vector_id >=
+                 caps.global_msix_vector_count)) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                            "binding MSI-X vector is outside the driver table domain");
+                diagnostic.set_request_context(m_bindings[index].request_id);
+                diagnostic.set_pair_context(m_bindings[index].request_pair_index);
+                diagnostic.set_service_context(m_bindings[index].service_key);
+                return 0;
+            end
+            if (msix_occupied[m_bindings[index].global_msix_vector_id] &&
+                (!dpu_same_function_key(
+                    msix_owner[m_bindings[index].global_msix_vector_id],
+                    m_bindings[index].service_key.function_key) ||
+                 (msix_local[m_bindings[index].global_msix_vector_id] !=
+                  m_bindings[index].local_msix_vector_id))) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                            "binding global MSI-X vector conflicts with another function or local vector");
+                diagnostic.set_request_context(m_bindings[index].request_id);
+                diagnostic.set_pair_context(m_bindings[index].request_pair_index);
+                diagnostic.set_service_context(m_bindings[index].service_key);
+                return 0;
+            end
+            if (!msix_occupied[m_bindings[index].global_msix_vector_id]) begin
+                msix_occupied[m_bindings[index].global_msix_vector_id] = 1;
+                msix_owner[m_bindings[index].global_msix_vector_id] =
+                    m_bindings[index].service_key.function_key;
+                msix_local[m_bindings[index].global_msix_vector_id] =
+                    m_bindings[index].local_msix_vector_id;
+            end
+            begin
+                string function_local_key;
+                function_local_key = {dpu_function_key_name(
+                    m_bindings[index].service_key.function_key), ":",
+                    $sformatf("%0d", m_bindings[index].local_msix_vector_id)};
+                if (function_local_global.exists(function_local_key) &&
+                    (function_local_global[function_local_key] !=
+                     m_bindings[index].global_msix_vector_id)) begin
+                    set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                                "local MSI-X vector maps to multiple global vectors");
+                    diagnostic.set_request_context(m_bindings[index].request_id);
+                    diagnostic.set_pair_context(m_bindings[index].request_pair_index);
+                    diagnostic.set_service_context(m_bindings[index].service_key);
+                    return 0;
+                end
+                function_local_global[function_local_key] =
+                    m_bindings[index].global_msix_vector_id;
+            end
+        end
+        if (m_af_extra_bindings.size() != caps.af_extra_queue_count) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                        "AF extra queue binding count disagrees with DUT capability");
+            diagnostic.set_function_context(expected_af_key);
+            return 0;
+        end
+        if ((af_regular_qpair_count + m_af_extra_bindings.size()) >
+            caps.max_vio_net_qpairs_per_device) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_DEVICE_CAPACITY_EXHAUSTED,
+                        "AF ordinary and extra qpairs exceed the per-device ceiling");
+            diagnostic.set_function_context(expected_af_key);
+            return 0;
+        end
+        foreach (m_af_extra_bindings[index]) begin
+            dpu_af_extra_queue_kind_e expected_kind;
+            int unsigned expected_port;
+            int unsigned expected_queue;
+            int unsigned candidate_base;
+            string function_local_key;
+
+            if (!dpu_same_function_key(
+                    m_af_extra_bindings[index].af_function_key,
+                    expected_af_key)) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_SNAPSHOT_REFERENCE_MISMATCH,
+                            "AF extra queue binding owner is not the selected AF");
+                diagnostic.set_function_context(
+                    m_af_extra_bindings[index].af_function_key);
+                return 0;
+            end
+            if ((m_af_extra_bindings[index].extra_queue_offset != index) ||
+                !dpu_decode_af_extra_queue_offset(
+                    m_af_extra_bindings[index].extra_queue_offset,
+                    expected_kind, expected_port, expected_queue) ||
+                (m_af_extra_bindings[index].kind != expected_kind) ||
+                (m_af_extra_bindings[index].eth_port_id != expected_port) ||
+                (m_af_extra_bindings[index].eth_queue_id != expected_queue)) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                            "AF extra queue binding disagrees with the driver layout");
+                diagnostic.set_function_context(expected_af_key);
+                return 0;
+            end
+            if (m_af_extra_bindings[index].local_queue_index !=
+                (af_regular_qpair_count + index)) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_LOCAL_QID_OUT_OF_RANGE,
+                            "AF extra queue local index is not appended after LAN qpairs");
+                diagnostic.set_function_context(expected_af_key);
+                return 0;
+            end
+            if ((m_af_extra_bindings[index].global_qpair_id >=
+                 m_plan.effective_global_capacity) ||
+                (m_af_extra_bindings[index].global_qpair_id >=
+                 DPU_MAX_VIO_GLOBAL_QPAIRS)) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_GLOBAL_QID_OUT_OF_RANGE,
+                            "AF extra queue global qpair ID exceeds effective capacity");
+                diagnostic.set_function_context(expected_af_key);
+                return 0;
+            end
+            if (m_af_extra_bindings[index].local_msix_vector_id !=
+                (af_lan_msix_count + index)) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                            "AF extra queue MSI-X vector is not appended after LAN vectors");
+                diagnostic.set_function_context(expected_af_key);
+                return 0;
+            end
+            if ((m_af_extra_bindings[index].local_msix_vector_id >= 128) ||
+                (m_af_extra_bindings[index].global_msix_vector_id >=
+                 caps.global_msix_vector_count) ||
+                (m_af_extra_bindings[index].global_msix_vector_id <
+                 m_af_extra_bindings[index].local_msix_vector_id)) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                            "AF extra queue MSI-X vector is outside the driver table domain");
+                diagnostic.set_function_context(expected_af_key);
+                return 0;
+            end
+            candidate_base =
+                m_af_extra_bindings[index].global_msix_vector_id -
+                m_af_extra_bindings[index].local_msix_vector_id;
+            if (af_msix_base_valid && (candidate_base != af_msix_base)) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                            "AF extra queue MSI-X binding disagrees with the function vector base");
+                diagnostic.set_function_context(expected_af_key);
+                return 0;
+            end
+            af_msix_base = candidate_base;
+            af_msix_base_valid = 1;
+            if (msix_occupied[
+                    m_af_extra_bindings[index].global_msix_vector_id]) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                            "AF extra queue global MSI-X vector conflicts with another binding");
+                diagnostic.set_function_context(expected_af_key);
+                return 0;
+            end
+            msix_occupied[m_af_extra_bindings[index].global_msix_vector_id] = 1;
+            msix_owner[m_af_extra_bindings[index].global_msix_vector_id] =
+                expected_af_key;
+            msix_local[m_af_extra_bindings[index].global_msix_vector_id] =
+                m_af_extra_bindings[index].local_msix_vector_id;
+            function_local_key = {dpu_function_key_name(expected_af_key), ":",
+                $sformatf("%0d",
+                    m_af_extra_bindings[index].local_msix_vector_id)};
+            if (function_local_global.exists(function_local_key) &&
+                (function_local_global[function_local_key] !=
+                 m_af_extra_bindings[index].global_msix_vector_id)) begin
+                set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                            "AF extra local MSI-X vector maps to multiple global vectors");
+                diagnostic.set_function_context(expected_af_key);
+                return 0;
+            end
+            function_local_global[function_local_key] =
+                m_af_extra_bindings[index].global_msix_vector_id;
         end
         begin
             dpu_normalized_vio_request requests[$];
@@ -508,13 +771,51 @@ class dpu_resource_snapshot extends uvm_object;
                         "resource snapshot has a duplicate service/local binding");
             return 0;
         end
+        key = service_virtio_pair_key(binding.service_key,
+                                      binding.virtio_pair_index);
+        if (m_service_virtio_pair_index.exists(key)) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                        "resource snapshot has a duplicate service/virtio pair binding");
+            return 0;
+        end
         key = global_key(binding.global_qpair_id);
-        if (m_global_index.exists(key)) begin
+        if (m_global_index.exists(key) || m_af_extra_global_index.exists(key)) begin
             set_failure(diagnostic, DPU_PLACE_ERR_GLOBAL_QID_CONFLICT,
                         "resource snapshot has a duplicate global binding");
             return 0;
         end
         m_bindings.push_back(binding);
+        rebuild_indexes();
+        return 1;
+    endfunction
+
+    function bit add_af_extra_queue_binding(
+        input dpu_af_extra_queue_binding_t binding,
+        output dpu_placement_diagnostic diagnostic
+    );
+        string key;
+
+        if (!mutable(diagnostic))
+            return 0;
+        if (m_plan == null) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_INVALID_REQUEST,
+                        "resource snapshot requires a normalized plan before AF extra bindings");
+            return 0;
+        end
+        key = $sformatf("%0d", binding.extra_queue_offset);
+        if (m_af_extra_offset_index.exists(key)) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_LOCAL_QID_CONFLICT,
+                        "resource snapshot has a duplicate AF extra queue offset");
+            return 0;
+        end
+        key = global_key(binding.global_qpair_id);
+        if (m_global_index.exists(key) ||
+            m_af_extra_global_index.exists(key)) begin
+            set_failure(diagnostic, DPU_PLACE_ERR_GLOBAL_QID_CONFLICT,
+                        "resource snapshot has a duplicate global qpair binding");
+            return 0;
+        end
+        m_af_extra_bindings.push_back(binding);
         rebuild_indexes();
         return 1;
     endfunction
@@ -531,6 +832,7 @@ class dpu_resource_snapshot extends uvm_object;
             return 0;
         end
         sort_bindings();
+        sort_af_extra_bindings();
         rebuild_indexes();
         if (!validate_bindings(device_snapshot, diagnostic))
             return 0;
@@ -549,6 +851,14 @@ class dpu_resource_snapshot extends uvm_object;
         bindings.delete();
         if (m_frozen)
             bindings = m_bindings;
+    endfunction
+
+    function void list_af_extra_queue_bindings(
+        ref dpu_af_extra_queue_binding_t bindings[$]
+    );
+        bindings.delete();
+        if (m_frozen)
+            bindings = m_af_extra_bindings;
     endfunction
 
     function bit get_vio_binding(
@@ -580,6 +890,22 @@ class dpu_resource_snapshot extends uvm_object;
         if (!m_service_local_index.exists(key))
             return 0;
         binding = m_bindings[m_service_local_index[key]];
+        return 1;
+    endfunction
+
+    function bit get_vio_binding_by_service_virtio_pair(
+        input dpu_service_key_t service_key,
+        input int unsigned virtio_pair_index,
+        output dpu_vio_qpair_binding_t binding
+    );
+        string key;
+        clear_binding(binding);
+        if (!m_frozen)
+            return 0;
+        key = service_virtio_pair_key(service_key, virtio_pair_index);
+        if (!m_service_virtio_pair_index.exists(key))
+            return 0;
+        binding = m_bindings[m_service_virtio_pair_index[key]];
         return 1;
     endfunction
 

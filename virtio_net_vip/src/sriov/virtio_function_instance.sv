@@ -321,6 +321,23 @@ class virtio_function_instance extends uvm_component;
         ops.iommu = iommu_mdl;
         ops.wait_pol = wpol;
 
+        // Keep the optional standalone dataplane wrapper in the same
+        // host-qualified DMA domain as the function-owned queue/atomic path.
+        if (dataplane != null) begin
+            dataplane.tx_engine.vq_mgr = vq_mgr_ref;
+            dataplane.tx_engine.mem = hmem;
+            dataplane.tx_engine.iommu = iommu_mdl;
+            dataplane.tx_engine.host_id =
+                transport_ref.iommu_host_id();
+            dataplane.tx_engine.bdf = transport_ref.bdf;
+            dataplane.rx_engine.vq_mgr = vq_mgr_ref;
+            dataplane.rx_engine.mem = hmem;
+            dataplane.rx_engine.iommu = iommu_mdl;
+            dataplane.rx_engine.host_id =
+                transport_ref.iommu_host_id();
+            dataplane.rx_engine.bdf = transport_ref.bdf;
+        end
+
         fsm.ops = ops;
         fsm.drv_cfg = driver_cfg;
 
@@ -560,7 +577,14 @@ class virtio_function_instance extends uvm_component;
         end
         transport.is_vf = (function_kind == DPU_FUNCTION_VF);
         transport.vf_index = vf_index;
+        vq_mgr.host_id = transport.iommu_host_id();
         vq_mgr.bdf = bdf;
+        if (dataplane != null) begin
+            dataplane.tx_engine.host_id = vq_mgr.host_id;
+            dataplane.tx_engine.bdf = bdf;
+            dataplane.rx_engine.host_id = vq_mgr.host_id;
+            dataplane.rx_engine.bdf = bdf;
+        end
         if (bar_pairs.size() != 0)
             transport.bar.configure_fabric_bar_pairs(bar_pairs);
 

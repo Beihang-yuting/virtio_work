@@ -249,7 +249,9 @@ class virtio_admin_vq_test extends uvm_test;
         test_success_completion_and_cleanup();
         test_admin_transport_mismatch_has_no_submission();
         test_configure_rejects_inconsistent_admin_context();
+        test_configure_rejects_cross_host_same_bdf_context();
         test_direct_submit_rechecks_admin_context_bindings();
+        test_direct_submit_rejects_cross_host_same_bdf_context();
         test_admin_context_binding_mismatches_have_no_submission();
         test_recovery_rechecks_admin_context_bindings();
         test_concurrent_admin_commands_are_serialized();
@@ -593,6 +595,36 @@ class virtio_admin_vq_test extends uvm_test;
         finish_context(vq);
     endtask
 
+    // A BDF identifies a requester only within one PCIe Host domain.  The
+    // Admin VQ must not bind a host1 queue to a host0 transport merely because
+    // both use the same numeric BDF.
+    task test_configure_rejects_cross_host_same_bdf_context();
+        virtio_admin_vq_context       ctx;
+        host_mem_manager               mem;
+        virtio_iommu_model             iommu;
+        virtio_admin_vq_test_transport transport;
+        split_virtqueue                vq;
+        virtio_admin_vq_expected_error_catcher catcher;
+
+        configure_admin_context(ctx, mem, iommu, transport, vq);
+        pf_mgr.clear_admin_vq();
+        vq.host_id = transport.iommu_host_id() + 1;
+        catcher = new("configure_cross_host_binding_catcher", '{"PF_MGR"},
+                      '{"configure_admin_vq: Admin VQ binding is inconsistent"});
+        uvm_report_cb::add(null, catcher);
+        pf_mgr.configure_admin_vq(ctx);
+        uvm_report_cb::delete(null, catcher);
+
+        assert(catcher.caught_count == 1 && pf_mgr.admin_vq != ctx &&
+               vq.bdf == transport.bdf && transport.kick_count == 0 &&
+               vq.total_add_buf_ops == 0 && iommu.total_maps == 0 &&
+               iommu.total_unmaps == 0)
+            else `uvm_fatal("ADMIN_VQ",
+                "configure_admin_vq accepted a cross-Host same-BDF Admin VQ")
+        vq.host_id = transport.iommu_host_id();
+        finish_context(vq);
+    endtask
+
     // admin_vq_submit() is public and can be called without the PF manager.
     // It must therefore validate the VQ-owned queue/requester/DMA bindings
     // again after taking the context submission lock, before it allocates,
@@ -660,6 +692,41 @@ class virtio_admin_vq_test extends uvm_test;
             vq.iommu = iommu;
             finish_context(vq);
         end
+    endtask
+
+    // admin_vq_submit() can be called without virtio_pf_manager, so it must
+    // independently reject a queue from another Host domain even when the
+    // numeric BDF is identical.
+    task test_direct_submit_rejects_cross_host_same_bdf_context();
+        virtio_admin_vq_context       ctx;
+        host_mem_manager               mem;
+        virtio_iommu_model             iommu;
+        virtio_admin_vq_test_transport transport;
+        split_virtqueue                vq;
+        virtio_atomic_ops              ops;
+        byte unsigned                  request[];
+        byte unsigned                  response[];
+        bit                            ok;
+        virtio_admin_vq_expected_error_catcher catcher;
+
+        configure_admin_context(ctx, mem, iommu, transport, vq);
+        ops = virtio_atomic_ops::type_id::create("direct_cross_host_ops");
+        vq.host_id = transport.iommu_host_id() + 1;
+        request = '{8'h69};
+        catcher = new("direct_cross_host_binding_catcher", '{"ATOMIC_OPS"},
+                      '{"admin_vq_submit: Admin VQ binding is inconsistent"});
+        uvm_report_cb::add(null, catcher);
+        ops.admin_vq_submit(ctx, request, response, ok);
+        uvm_report_cb::delete(null, catcher);
+
+        assert(!ok && catcher.caught_count == 1 &&
+               vq.bdf == transport.bdf)
+            else `uvm_fatal("ADMIN_VQ",
+                "Direct Admin VQ submit accepted a cross-Host same-BDF binding")
+        assert_no_submission("direct cross-Host same-BDF Admin VQ binding",
+                             transport, vq, iommu, 0);
+        vq.host_id = transport.iommu_host_id();
+        finish_context(vq);
     endtask
 
     task test_admin_context_binding_mismatches_have_no_submission();

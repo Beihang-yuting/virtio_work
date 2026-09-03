@@ -86,6 +86,12 @@ class virtio_pci_transport extends uvm_object;
         notify_mgr.set_function_bdf(function_pcie_id.bdf);
     endfunction
 
+    // Canonical DMA requester-domain projection.  Fabric functions use the
+    // frozen PCIe identity; legacy standalone transports remain in host0.
+    function int unsigned iommu_host_id();
+        return pcie_id_valid ? pcie_id.domain.host_id : 0;
+    endfunction
+
     function bit bind_pcie_endpoint(
         input virtio_pcie_function_endpoint endpoint
     );

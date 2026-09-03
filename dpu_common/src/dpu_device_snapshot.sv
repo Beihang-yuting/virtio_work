@@ -10,6 +10,11 @@ class dpu_device_snapshot extends uvm_object;
     protected dpu_dut_caps m_dut_caps;
     protected dpu_function_key_t m_functions[string];
     protected dpu_pcie_function_id_t m_pcie_ids[string];
+    // The real AF allocates a global function slot before programming the
+    // pre-requester tables.  Freeze assigns the same deterministic first-fit
+    // namespace to the canonical function order so later register builders
+    // never invent an ID while lowering a plan.
+    protected int unsigned m_global_function_ids[string];
     protected dpu_function_key_t m_reverse_functions[string];
     protected dpu_bar_pair_lease_t m_bars[string];
     protected dpu_pcie_domain_key_t m_bar_domains[string];
@@ -26,6 +31,7 @@ class dpu_device_snapshot extends uvm_object;
         m_frozen = 0;
         m_has_caps = 0;
         m_has_expected_af = 0;
+        m_global_function_ids.delete();
     endfunction
 
     protected function bit function_less(
@@ -493,6 +499,9 @@ class dpu_device_snapshot extends uvm_object;
             return 0;
         end
         sort_indexes();
+        m_global_function_ids.delete();
+        foreach (m_function_order[index])
+            m_global_function_ids[m_function_order[index]] = index;
         m_frozen = 1;
         why = "";
         return 1;
@@ -514,6 +523,26 @@ class dpu_device_snapshot extends uvm_object;
             return 0;
         end
         pcie_id = m_pcie_ids[function_name];
+        return 1;
+    endfunction
+
+    function bit get_global_function_id(
+        input dpu_function_key_t key,
+        output int unsigned global_function_id,
+        output string why
+    );
+        string function_name;
+
+        global_function_id = 0;
+        if (!queryable(why))
+            return 0;
+        function_name = dpu_function_key_name(key);
+        if (!m_global_function_ids.exists(function_name)) begin
+            why = {"unknown snapshot global function ID ", function_name};
+            return 0;
+        end
+        global_function_id = m_global_function_ids[function_name];
+        why = "";
         return 1;
     endfunction
 

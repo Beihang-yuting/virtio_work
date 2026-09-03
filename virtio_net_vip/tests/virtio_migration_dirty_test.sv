@@ -174,7 +174,8 @@ class virtio_migration_dirty_real_reset_ops extends virtio_atomic_ops;
 
     function void register_auxiliary_dma(bit [63:0] gpa, bit [63:0] iova);
         auxiliary_dma.push_back(
-            '{bdf: transport.bdf, gpa: gpa, iova: iova});
+            '{host_id: get_iommu_host_id(transport),
+              bdf: transport.bdf, gpa: gpa, iova: iova});
     endfunction
 
     virtual task device_reset_verified(ref bit reset_complete);
@@ -273,6 +274,7 @@ class virtio_migration_dirty_tracking_iommu extends virtio_iommu_model;
         if (mapping_table.size() != 1)
             return 0;
         foreach (mapping_table[key]) begin
+            mapping.host_id = mapping_table[key].host_id;
             mapping.bdf = mapping_table[key].bdf;
             mapping.gpa = mapping_table[key].gpa;
             mapping.iova = mapping_table[key].iova;
@@ -286,12 +288,13 @@ class virtio_migration_dirty_tracking_iommu extends virtio_iommu_model;
 
     function bit get_active_mapping(bit [15:0] bdf, bit [63:0] iova,
                                     ref iommu_mapping_t mapping);
-        bit [79:0] key;
+        bit [111:0] key;
 
         mapping = '{default: 0};
-        key = {bdf, iova};
+        key = {32'd0, bdf, iova};
         if (!mapping_table.exists(key) || !mapping_table[key].valid)
             return 0;
+        mapping.host_id = mapping_table[key].host_id;
         mapping.bdf = mapping_table[key].bdf;
         mapping.gpa = mapping_table[key].gpa;
         mapping.iova = mapping_table[key].iova;
@@ -1858,6 +1861,13 @@ class virtio_migration_dirty_test extends uvm_test;
         setup_outstanding_ownership_context(
             $sformatf("%s_queue_dma_before_indirect", vq_type.name()), vq_type,
             transport, ops, fsm, iommu, mem, vq_mgr, cfg);
+        // This fixture intentionally verifies that a queue-owned mapping
+        // materialized before an indirect table is retained in that order.
+        // The assertion below compares associative-array traversal indices,
+        // which are ordered by IOVA.  Keep only this ordering-sensitive
+        // fixture deterministic; all ordinary migration scenarios continue
+        // to exercise the default randomized IOVA allocator.
+        iommu.set_iova_alloc_policy(IOMMU_IOVA_FIRST_FIT);
         mapping_baseline = iommu.active_mapping_count();
         allocation_baseline = mem.outstanding_allocations();
         source_vq = vq_mgr.get_queue(1);

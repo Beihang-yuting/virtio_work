@@ -25,6 +25,7 @@ class virtio_base_test extends uvm_test;
     virtio_test_device_builder device_builder;
     dpu_device_env_config      device_cfg;
     virtio_net_env_config      cfg;
+    host_mem_pool               host_mem_owners;
     virtio_net_env             env;
 
     function new(string name, uvm_component parent);
@@ -49,7 +50,21 @@ class virtio_base_test extends uvm_test;
 
         cfg = virtio_net_env_config::type_id::create("cfg");
         configure_default(cfg);
+        // Own Host memory at the test/topology level and inject the same
+        // per-Host manager into the VIO environment.  Additional RDMA/VBLK
+        // environments can reuse host_mem_owners.get_host(host_id).
+        host_mem_owners = host_mem_pool::type_id::create("host_mem_owners");
+        if (!host_mem_owners.create_host(
+                cfg.host_id, cfg.mem_base, cfg.mem_end,
+                MODE_BUDDY, DEFAULT_MIN_GRANULE, cfg.host_mem_policy)) begin
+            `uvm_fatal("VIRTIO_BASE_TEST", $sformatf(
+                "could not create Host %0d memory manager", cfg.host_id))
+            return;
+        end
         device_cfg = device_builder.make_env_config();
+        // Publish the owner through the protocol-neutral DPU environment
+        // hook; the child VIO env resolves it after snapshot publication.
+        device_cfg.host_mem_pool_ref = host_mem_owners;
 
         uvm_config_db#(dpu_device_env_config)::set(
             this, "device_env", "cfg", device_cfg);
@@ -57,6 +72,22 @@ class virtio_base_test extends uvm_test;
         uvm_config_db#(virtio_net_env_config)::set(
             this, "device_env.env", "cfg", cfg);
         env = virtio_net_env::type_id::create("env", device_env);
+    endfunction
+
+    virtual function void end_of_elaboration_phase(uvm_phase phase);
+        host_mem_manager expected_host_mem;
+
+        super.end_of_elaboration_phase(phase);
+        if ((host_mem_owners == null) || (env == null) ||
+            !host_mem_owners.has_host(cfg.host_id)) begin
+            `uvm_fatal("VIRTIO_BASE_TEST",
+                       "Host memory pool binding was not constructed")
+            return;
+        end
+        expected_host_mem = host_mem_owners.get_host(cfg.host_id);
+        if ((expected_host_mem == null) || (env.host_mem != expected_host_mem))
+            `uvm_fatal("VIRTIO_BASE_TEST",
+                       "VIO environment did not use the pool-owned Host manager")
     endfunction
 
     // Override in subclasses to customize config before env build

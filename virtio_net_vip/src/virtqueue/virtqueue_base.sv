@@ -38,7 +38,8 @@ virtual class virtqueue_base extends uvm_object;
     virtqueue_error_injector  err_inj;
     virtio_wait_policy        wait_pol;
 
-    // ===== BDF for IOMMU operations =====
+    // ===== Host-qualified requester identity for IOMMU operations =====
+    int unsigned    host_id;
     bit [15:0]      bdf;
 
     // ===== State =====
@@ -99,7 +100,8 @@ virtual class virtqueue_base extends uvm_object;
     //   b          -- Memory barrier model reference
     //   e          -- Error injector reference
     //   w          -- Wait/timeout policy reference
-    //   device_bdf -- PCI BDF for IOMMU operations
+    //   device_bdf     -- PCI BDF for IOMMU operations
+    //   device_host_id -- PCIe host/IOMMU requester domain (legacy host0)
     // ------------------------------------------------------------------
     virtual function void setup(
         int unsigned qid,
@@ -109,7 +111,8 @@ virtual class virtqueue_base extends uvm_object;
         virtio_memory_barrier_model b,
         virtqueue_error_injector e,
         virtio_wait_policy w,
-        bit [15:0] device_bdf
+        bit [15:0] device_bdf,
+        int unsigned device_host_id = 0
     );
         queue_id        = qid;
         queue_size      = size;
@@ -118,12 +121,13 @@ virtual class virtqueue_base extends uvm_object;
         barrier         = b;
         err_inj         = e;
         wait_pol        = w;
+        host_id         = device_host_id;
         bdf             = device_bdf;
         state           = VQ_RESET;
 
         `uvm_info("VQ_BASE",
-            $sformatf("setup: queue_id=%0d size=%0d bdf=0x%04x",
-                      qid, size, device_bdf),
+            $sformatf("setup: queue_id=%0d size=%0d host=%0d bdf=0x%04x",
+                      qid, size, device_host_id, device_bdf),
             UVM_HIGH)
     endfunction
 
@@ -272,7 +276,8 @@ virtual class virtqueue_base extends uvm_object;
         end
         mem.mem_set(table_gpa, 0, table_size);
 
-        table_iova = iommu.map(bdf, table_gpa, table_size, DMA_TO_DEVICE);
+        table_iova = iommu.map_for_host(host_id, bdf, table_gpa, table_size,
+                                        DMA_TO_DEVICE);
         if (table_iova == '1 || table_iova == 0) begin
             `uvm_error("VQ_INDIRECT", $sformatf(
                 "queue_id=%0d failed to map indirect table GPA=0x%016x",
@@ -340,7 +345,7 @@ virtual class virtqueue_base extends uvm_object;
 
         record = indirect_table_records[head_id];
         if (iommu != null && record.iova != 0)
-            iommu.unmap(bdf, record.iova);
+            iommu.unmap_for_host(host_id, bdf, record.iova);
         if (mem != null && record.gpa != 0)
             mem.free(record.gpa);
         indirect_table_records.delete(head_id);
@@ -364,7 +369,7 @@ virtual class virtqueue_base extends uvm_object;
 
         mapping = dma_mappings[mapping_index];
         if (iommu != null && mapping.iova != 0)
-            iommu.unmap(bdf, mapping.iova);
+            iommu.unmap_for_host(mapping.host_id, mapping.bdf, mapping.iova);
         if (migration_owned_dma_iovas.exists(mapping.iova)) begin
             if (mem != null && mapping.gpa != 0)
                 mem.free(mapping.gpa);
@@ -403,6 +408,7 @@ virtual class virtqueue_base extends uvm_object;
 
             source_record = indirect_table_records[head_id];
             snapshot_record.head_id = head_id;
+            snapshot_record.mapping.host_id = host_id;
             snapshot_record.mapping.bdf = bdf;
             snapshot_record.mapping.gpa = source_record.gpa;
             snapshot_record.mapping.iova = source_record.iova;
@@ -468,12 +474,14 @@ virtual class virtqueue_base extends uvm_object;
             if ((snapshot_record.head_id >= queue_size) ||
                 !token_heads.exists(snapshot_record.head_id) ||
                 indirect_heads.exists(snapshot_record.head_id) ||
-                ((snapshot_record.mapping.bdf != bdf)) ||
+                (snapshot_record.mapping.host_id != host_id) ||
+                (snapshot_record.mapping.bdf != bdf) ||
                 (snapshot_record.byte_size == 0) ||
                 (snapshot_record.entry_count == 0) ||
                 (snapshot_record.mapping.size != snapshot_record.byte_size) ||
                 (snapshot_record.mapping.dir != DMA_TO_DEVICE) ||
-                !iommu.get_live_mapping(bdf, snapshot_record.mapping.iova,
+                !iommu.get_live_mapping_for_host(host_id, bdf,
+                                        snapshot_record.mapping.iova,
                                         destination_mapping) ||
                 (destination_mapping.size != snapshot_record.byte_size) ||
                 (destination_mapping.dir != DMA_TO_DEVICE)) begin
@@ -491,12 +499,14 @@ virtual class virtqueue_base extends uvm_object;
             iommu_mapping_t destination_mapping;
 
             snapshot_mapping = snap.queue_dma_mappings[i];
-            if ((snapshot_mapping.bdf != bdf) ||
+            if ((snapshot_mapping.host_id != host_id) ||
+                (snapshot_mapping.bdf != bdf) ||
                 (snapshot_mapping.iova == 0) ||
                 (snapshot_mapping.size == 0) ||
                 (snapshot_mapping.desc_id != 0) ||
                 dma_iovas.exists(snapshot_mapping.iova) ||
-                !iommu.get_live_mapping(bdf, snapshot_mapping.iova,
+                !iommu.get_live_mapping_for_host(host_id, bdf,
+                                        snapshot_mapping.iova,
                                         destination_mapping) ||
                 (destination_mapping.size != snapshot_mapping.size) ||
                 (destination_mapping.dir != snapshot_mapping.dir)) begin
@@ -520,7 +530,8 @@ virtual class virtqueue_base extends uvm_object;
             snapshot_record = snap.indirect_tables[i];
             // This mapping was preflighted above and cannot change during the
             // single-threaded restore transaction.
-            void'(iommu.get_live_mapping(bdf, snapshot_record.mapping.iova,
+            void'(iommu.get_live_mapping_for_host(host_id, bdf,
+                                         snapshot_record.mapping.iova,
                                          destination_mapping));
             destination_record.gpa = destination_mapping.gpa;
             destination_record.iova = destination_mapping.iova;
@@ -536,7 +547,7 @@ virtual class virtqueue_base extends uvm_object;
             // The complete snapshot was preflighted above.  Retain the
             // recreated GPA, but do not make the queue own it until atomic
             // ops has dropped the matching temporary migration record.
-            void'(iommu.get_live_mapping(bdf,
+            void'(iommu.get_live_mapping_for_host(host_id, bdf,
                                          snap.queue_dma_mappings[i].iova,
                                          destination_mapping));
             staged_migration_dma_mappings.push_back(destination_mapping);

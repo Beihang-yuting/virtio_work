@@ -49,9 +49,11 @@ class dpu_pcie_domain_cfg extends uvm_object;
     bit [15:0] reserved_bdfs[$];
     dpu_mmio_window_cfg mmio_windows[$];
     dpu_address_range_t reserved_mmio_ranges[$];
+    dpu_bar_placement_policy_e bar_placement_policy;
 
     function new(string name = "dpu_pcie_domain_cfg");
         super.new(name);
+        bar_placement_policy = DPU_BAR_PLACEMENT_FIRST_FIT;
     endfunction
 
     function void copy_from(input dpu_pcie_domain_cfg rhs);
@@ -61,6 +63,7 @@ class dpu_pcie_domain_cfg extends uvm_object;
         bdf_ranges = rhs.bdf_ranges;
         reserved_bdfs = rhs.reserved_bdfs;
         reserved_mmio_ranges = rhs.reserved_mmio_ranges;
+        bar_placement_policy = rhs.bar_placement_policy;
         mmio_windows.delete();
         foreach (rhs.mmio_windows[index]) begin
             if (rhs.mmio_windows[index] == null) begin

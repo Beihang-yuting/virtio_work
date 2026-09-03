@@ -24,6 +24,33 @@ class dpu_reg_plan extends uvm_object;
         return operations_by_id.num();
     endfunction
 
+    // Return defensive copies of all operations currently held by the plan.
+    // This is intentionally available before freeze so a higher-level plan
+    // builder can compose an existing bootstrap plan without sharing mutable
+    // operation handles.  Callers that need lifecycle order should use
+    // ordered_operations() after freeze().
+    function bit list_operations(
+        ref dpu_reg_op operations[$],
+        output string why
+    );
+        dpu_reg_op copied;
+        string op_id;
+
+        operations.delete();
+        why = "";
+        if (operations_by_id.first(op_id)) begin
+            do begin
+                if (!copy_operation(
+                        operations_by_id[op_id], op_id, copied, why)) begin
+                    operations.delete();
+                    return 0;
+                end
+                operations.push_back(copied);
+            end while (operations_by_id.next(op_id));
+        end
+        return 1;
+    endfunction
+
     function bit is_frozen();
         return frozen;
     endfunction

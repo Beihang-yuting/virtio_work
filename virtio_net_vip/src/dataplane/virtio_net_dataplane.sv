@@ -58,7 +58,8 @@ class virtio_net_dataplane extends uvm_object;
         virtqueue_manager   vq_mgr,
         host_mem_manager    hmem,
         virtio_iommu_model  iommu_mdl,
-        bit [15:0]          device_bdf
+        bit [15:0]          device_bdf,
+        int unsigned        device_host_id = 0
     );
         negotiated_features = features;
         mtu = mtu_val;
@@ -78,6 +79,7 @@ class virtio_net_dataplane extends uvm_object;
         tx_engine.iommu    = iommu_mdl;
         tx_engine.offload  = offload;
         tx_engine.bdf      = device_bdf;
+        tx_engine.host_id  = device_host_id;
         tx_engine.negotiated_features = features;
         tx_engine.mtu      = mtu_val;
 
@@ -87,6 +89,7 @@ class virtio_net_dataplane extends uvm_object;
         rx_engine.iommu    = iommu_mdl;
         rx_engine.offload  = offload;
         rx_engine.bdf      = device_bdf;
+        rx_engine.host_id  = device_host_id;
         rx_engine.negotiated_features = features;
         rx_engine.buf_mode = rx_mode;
         rx_engine.buf_size = rx_buf_sz;

@@ -9,6 +9,13 @@ typedef enum int unsigned { DPU_FUNCTION_PF, DPU_FUNCTION_VF }
     dpu_function_kind_e;
 typedef enum int unsigned { DPU_ALLOC_AUTO, DPU_ALLOC_PINNED }
     dpu_allocation_mode_e;
+// AUTO BAR placement policy.  FIRST_FIT is useful for deterministic debug;
+// RANDOM uses the simulator/UVM random stream while retaining all aperture,
+// alignment, reservation, and same-domain collision constraints.
+typedef enum int unsigned {
+    DPU_BAR_PLACEMENT_FIRST_FIT,
+    DPU_BAR_PLACEMENT_RANDOM
+} dpu_bar_placement_policy_e;
 typedef enum int unsigned {
     DPU_SERVICE_VIO_NET, DPU_SERVICE_RDMA, DPU_SERVICE_VBLK
 } dpu_service_kind_e;

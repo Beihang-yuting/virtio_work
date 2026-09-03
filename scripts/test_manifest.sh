@@ -3,10 +3,12 @@
 VIRTIO_MAINTAINED_TESTS=(
   dpu_resource_manager_test
   dpu_reg_plan_test
+  dpu_pcie_reg_executor_test
   dpu_device_resolver_test
   dpu_placement_test
   dpu_resource_resolver_test
   dpu_device_bootstrap_plan_test
+  dpu_vio_reg_plan_test
   virtio_dut_caps_test
   virtio_fabric_resource_test
   virtio_unit_test
@@ -24,6 +26,9 @@ VIRTIO_MAINTAINED_TESTS=(
   virtio_dual_test
   virtio_smoke_test
   virtio_traffic_test
+  host_mem_random_test
+  virtio_pcie_host_mem_test
+  dpu_pcie_tl_executor_integration_test
 )
 
 _count_literal_occurrences() {

@@ -299,6 +299,8 @@ class dpu_resource_manager_test extends uvm_test;
         dpu_resource_registry_authority wrong_authority;
         dpu_resource_class_id_t qpair_class_id;
         dpu_resource_lease_t leases[$];
+        dpu_resource_lease_t function_leases[$];
+        dpu_af_extra_queue_binding_t af_extra_bindings[$];
         dpu_function_key_t keys[$];
         dpu_resource_snapshot unfrozen_resource;
         dpu_device_snapshot unfrozen_device;
@@ -363,6 +365,29 @@ class dpu_resource_manager_test extends uvm_test;
         manager.list_service_leases(service_key, leases);
         if (leases[0].global_id != 7)
             `uvm_fatal("DPU_RESOURCE", "service lease query leaked mutable state")
+        resource_snapshot.list_af_extra_queue_bindings(af_extra_bindings);
+        manager.list_function_leases(service_key.function_key, function_leases);
+        if ((af_extra_bindings.size() != 11) ||
+            (function_leases.size() != 13))
+            `uvm_fatal("DPU_RESOURCE",
+                "manager did not import AF extra queues as function-owned leases")
+        foreach (af_extra_bindings[extra_index]) begin
+            bit found_extra_lease;
+            found_extra_lease = 0;
+            foreach (function_leases[lease_index]) begin
+                if ((function_leases[lease_index].owner.kind ==
+                     DPU_RESOURCE_OWNER_FUNCTION) &&
+                    (function_leases[lease_index].local_id ==
+                     af_extra_bindings[extra_index].local_queue_index) &&
+                    (function_leases[lease_index].global_id ==
+                     af_extra_bindings[extra_index].global_qpair_id) &&
+                    function_leases[lease_index].frozen)
+                    found_extra_lease = 1;
+            end
+            if (!found_extra_lease)
+                `uvm_fatal("DPU_RESOURCE",
+                    "AF extra queue is not protected by the manager global pool")
+        end
         if (manager.configure_from_snapshots(
                 authority, device_snapshot, resource_snapshot, why) ||
             !manager.is_seeded_from_snapshots(

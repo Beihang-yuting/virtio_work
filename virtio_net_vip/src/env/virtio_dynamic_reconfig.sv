@@ -97,9 +97,31 @@ class virtio_dynamic_reconfig extends uvm_report_object;
         return enforced_max_vio_net_qpairs_per_device;
     endfunction
 
-    function bit qpair_count_supported(input int unsigned count);
+    // Placement is the resource authority for a concrete function.  The
+    // device capability is only a ceiling; a function may be assigned fewer
+    // pairs by the frozen resource snapshot.  Keep the null-VF form for
+    // standalone callers that only have a device-level capability.
+    function int unsigned max_supported_qpairs_for_vf(
+        input virtio_vf_instance vf = null
+    );
+        int unsigned allocated_qpairs;
+
+        if ((vf == null) || (vf.resource_client == null) ||
+            !vf.resource_client.is_bound_to_service())
+            return enforced_max_vio_net_qpairs_per_device;
+        allocated_qpairs = vf.resource_client.qpair_mapping_count();
+        if ((allocated_qpairs == 0) ||
+            (allocated_qpairs >= enforced_max_vio_net_qpairs_per_device))
+            return enforced_max_vio_net_qpairs_per_device;
+        return allocated_qpairs;
+    endfunction
+
+    function bit qpair_count_supported(
+        input int unsigned count,
+        input virtio_vf_instance vf = null
+    );
         return (count != 0) &&
-               (count <= enforced_max_vio_net_qpairs_per_device);
+               (count <= max_supported_qpairs_for_vf(vf));
     endfunction
 
     // ========================================================================
@@ -127,17 +149,20 @@ class virtio_dynamic_reconfig extends uvm_report_object;
         int unsigned new_pairs,
         bit traffic_active
     );
+        int unsigned max_pairs;
+
+        max_pairs = max_supported_qpairs_for_vf(vf);
         if ($isunknown(new_pairs) || (new_pairs == 0)) begin
             `uvm_error("DYN_RECONFIG", $sformatf(
                 "live_mq_resize: %0d pairs is outside supported range 1..%0d",
                 new_pairs,
-                enforced_max_vio_net_qpairs_per_device))
+                max_pairs))
             return;
         end
-        if (!qpair_count_supported(new_pairs)) begin
+        if (!qpair_count_supported(new_pairs, vf)) begin
             `uvm_error("DYN_RECONFIG", $sformatf(
                 "live_mq_resize: %0d pairs exceeds device limit %0d",
-                new_pairs, enforced_max_vio_net_qpairs_per_device))
+                new_pairs, max_pairs))
             return;
         end
         do_live_mq_resize(vf, old_pairs, new_pairs, traffic_active);

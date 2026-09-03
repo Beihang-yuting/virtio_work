@@ -108,6 +108,26 @@ class virtio_monitor_routing_disabled_notify_sva_catcher extends uvm_report_catc
     endfunction
 endclass : virtio_monitor_routing_disabled_notify_sva_catcher
 
+// A VF whose placement owns fewer pairs than the DUT capability must reject
+// an MQ resize beyond its own frozen allocation before touching its queues.
+class virtio_monitor_routing_qpair_limit_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "virtio_monitor_routing_qpair_limit_catcher");
+        super.new(name);
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) &&
+            (get_id() == "DYN_RECONFIG") &&
+            (get_message() == "live_mq_resize: 2 pairs exceeds device limit 1")) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_monitor_routing_qpair_limit_catcher
+
 // Calls configure_services() during the owning test's build phase but does
 // not manufacture compatibility children if the preflight is rejected.
 class virtio_service_preflight_probe extends virtio_pf_instance;
@@ -329,7 +349,9 @@ class virtio_monitor_routing_test extends uvm_test;
         output dpu_device_env_config env_cfg,
         output dpu_resource_manager manager,
         output dpu_function_key_t parent_key,
-        ref dpu_service_key_t service_keys[$]
+        ref dpu_service_key_t service_keys[$],
+        input int unsigned af_extra_queue_count =
+            DPU_DRIVER_AF_EXTRA_QUEUE_COUNT
     );
         virtio_test_device_builder builder;
         dpu_function_cfg pf_cfg;
@@ -342,6 +364,8 @@ class virtio_monitor_routing_test extends uvm_test;
 
         builder = virtio_test_device_builder::type_id::create(
             {label, "_builder"});
+        builder.device_cfg.dut_caps.af_extra_queue_count =
+            af_extra_queue_count;
         void'(builder.add_host_domain(0, 0, 16'h0100, 16'h03ff,
             64'h0000_0002_0000_0000, 64'h0000_0003_0000_0000));
         pf_cfg = builder.add_pf(
@@ -441,7 +465,7 @@ class virtio_monitor_routing_test extends uvm_test;
 
         if (!resolve_probe_snapshot(
                 "fix_round1_empty_resource", 1, snapshot, resolved_resource,
-                env_cfg, resolved_manager, parent_key, service_keys) ||
+                env_cfg, resolved_manager, parent_key, service_keys, 0) ||
             !make_empty_resource_pair(
                 "fix_round1_empty_resource", snapshot, env_cfg,
                 empty_resource, manager)) begin
@@ -764,7 +788,7 @@ class virtio_monitor_routing_test extends uvm_test;
 
     virtual task run_phase(uvm_phase phase);
         virtio_function_instance pf;
-        virtio_function_instance vf;
+        virtio_vf_instance vf;
         virtio_function_instance reused_pf;
         dpu_function_key_t reused_pf_key;
         dpu_service_key_t reverse_service_key;
@@ -782,25 +806,27 @@ class virtio_monitor_routing_test extends uvm_test;
         reused_pf_key.host_id = 1;
         reused_pf = find_vio_function(reused_pf_key);
         if (!pf.resource_client.local_qid_to_global_qid(
-                6, snapshot_global_qid) || (snapshot_global_qid != 66)) begin
+                2, snapshot_global_qid) || (snapshot_global_qid != 33) ||
+            !pf.resource_client.local_qid_to_global_qid(
+                3, reverse_local_qid) || (reverse_local_qid != 33)) begin
             `uvm_fatal("ROUTING_TEST",
-                "immediate sparse pair 3 mapping did not come from snapshot")
+                "immediate software pair 1 did not share one global qid")
         end
         if (!virtio_env.pf_instances[0].pf_manager.resource_pool.
                 local_to_global_for_service(
-                    pf.service_key, 6, snapshot_global_qid) ||
-            (snapshot_global_qid != 66) ||
+                    pf.service_key, 2, snapshot_global_qid) ||
+            (snapshot_global_qid != 33) ||
             !virtio_env.pf_instances[0].pf_manager.resource_pool.
                 global_to_service_local(
-                    66, reverse_service_key, reverse_local_qid) ||
+                    33, reverse_service_key, reverse_local_qid) ||
             (dpu_service_key_name(reverse_service_key) !=
              dpu_service_key_name(pf.service_key)) ||
-            (reverse_local_qid != 6) ||
+            (reverse_local_qid != 2) ||
             (virtio_env.pf_instances[0].pf_manager.resource_pool.get_queue_name(
-                pf.service_key, 6) != $sformatf("%s_receiveq_3",
+                pf.service_key, 2) != $sformatf("%s_receiveq_3",
                     dpu_service_key_name(pf.service_key)))) begin
             `uvm_fatal("ROUTING_TEST",
-                "service-keyed pool replaced sparse pair 3 with control queue")
+                "service-keyed pool replaced software pair 1 with control queue")
         end
         assert(reused_pf != null)
             else `uvm_fatal("ROUTING_TEST",
@@ -826,11 +852,36 @@ class virtio_monitor_routing_test extends uvm_test;
                (vf.resource_manager == device_env.get_resource_manager()))
             else `uvm_fatal("ROUTING_TEST",
                 "VIO functions did not receive the global resource manager")
+        // Behavior requests are service-keyed, but the frozen placement is
+        // the resource authority: PF owns three pairs while VF and the
+        // cross-host PF each own one.  Runtime behavior must be capped to
+        // those actual bindings.
         assert((pf.drv_cfg.num_queue_pairs == 3) &&
-               (vf.drv_cfg.num_queue_pairs == 5) &&
-               (reused_pf.drv_cfg.num_queue_pairs == 7))
+               (vf.drv_cfg.num_queue_pairs == 1) &&
+               (reused_pf.drv_cfg.num_queue_pairs == 1) &&
+               (pf.drv_cfg.max_vio_net_qpairs_per_device == 3) &&
+               (vf.drv_cfg.max_vio_net_qpairs_per_device == 1) &&
+               (reused_pf.drv_cfg.max_vio_net_qpairs_per_device == 1))
             else `uvm_fatal("ROUTING_TEST",
-                "PF/VF behavior was not routed by canonical service key")
+                "runtime VIO behavior exceeded service placement capacity")
+        begin
+            dpu_vio_qpair_binding_t pf_bindings[$];
+            dpu_vio_qpair_binding_t vf_bindings[$];
+            dpu_vio_qpair_binding_t reused_pf_bindings[$];
+
+            device_env.get_resource_snapshot().list_vio_bindings_for_service(
+                pf.service_key, pf_bindings);
+            device_env.get_resource_snapshot().list_vio_bindings_for_service(
+                vf.service_key, vf_bindings);
+            device_env.get_resource_snapshot().list_vio_bindings_for_service(
+                reused_pf.service_key, reused_pf_bindings);
+            if ((pf.drv_cfg.num_queue_pairs > pf_bindings.size()) ||
+                (vf.drv_cfg.num_queue_pairs > vf_bindings.size()) ||
+                (reused_pf.drv_cfg.num_queue_pairs > reused_pf_bindings.size())) begin
+                `uvm_fatal("ROUTING_TEST",
+                    "runtime VIO queue pairs exceeded placement bindings")
+            end
+        end
         if ($test$plusargs("ROUTING_BIND_ONLY")) begin
             assert((pf.driver_agent.ops != null) &&
                    (pf.driver_agent.fsm != null) &&
@@ -888,15 +939,16 @@ class virtio_monitor_routing_test extends uvm_test;
         test_protocol_vif_isolation(pf, vf);
         test_queue_and_device_resets(pf);
         if (!pf.resource_client.local_qid_to_global_qid(
-                6, snapshot_global_qid) || (snapshot_global_qid != 66) ||
+                2, snapshot_global_qid) || (snapshot_global_qid != 33) ||
             !virtio_env.pf_instances[0].pf_manager.resource_pool.
                 local_to_global_for_service(
-                    pf.service_key, 6, snapshot_global_qid) ||
-            (snapshot_global_qid != 66)) begin
+                    pf.service_key, 2, snapshot_global_qid) ||
+            (snapshot_global_qid != 33)) begin
             `uvm_fatal("ROUTING_TEST",
                 "runtime reset mutated immutable sparse placement")
         end
         test_resource_pool_snapshot_and_collision_rejection(pf, vf);
+        test_dynamic_resize_obeys_service_placement(vf);
         assert_domain_reused_transport_path(pf, reused_pf);
 
         `uvm_info("ROUTING_TEST", "External PCIe monitor routing PASSED", UVM_NONE)
@@ -937,8 +989,8 @@ class virtio_monitor_routing_test extends uvm_test;
         if (pool.import_service_bindings(
                 pf.service_key, alternate_resource, why) ||
             (pool.get_total_queues() != original_count) ||
-            !pool.local_to_global_for_service(pf.service_key, 6, global_qid) ||
-            (global_qid != 66)) begin
+            !pool.local_to_global_for_service(pf.service_key, 2, global_qid) ||
+            (global_qid != 33)) begin
             `uvm_fatal("ROUTING_TEST",
                 "pool accepted a different resource snapshot or mutated state")
         end
@@ -959,6 +1011,25 @@ class virtio_monitor_routing_test extends uvm_test;
             `uvm_fatal("ROUTING_TEST",
                 "pool accepted an ambiguous global qid or partially mutated")
         end
+    endtask
+
+    protected task test_dynamic_resize_obeys_service_placement(
+        input virtio_vf_instance vf
+    );
+        virtio_monitor_routing_qpair_limit_catcher catcher;
+
+        if (virtio_env.dyn_reconfig.max_supported_qpairs_for_vf(vf) != 1 ||
+            virtio_env.dyn_reconfig.qpair_count_supported(2, vf)) begin
+            `uvm_fatal("ROUTING_TEST",
+                "dynamic MQ limit did not use the VF's frozen placement count")
+        end
+        catcher = new("placement_qpair_limit_catcher");
+        uvm_report_cb::add(null, catcher);
+        virtio_env.dyn_reconfig.live_mq_resize(vf, 1, 2, 0);
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught_count != 1)
+            `uvm_fatal("ROUTING_TEST",
+                "dynamic MQ resize beyond placement was not rejected before VF access")
     endtask
 
     // The production transport and accessor must preserve endpoint identity

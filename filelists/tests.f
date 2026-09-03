@@ -3,11 +3,13 @@
 virtio_net_vip/tests/virtio_test_device_builder.sv
 dpu_common/tests/dpu_resource_manager_test.sv
 dpu_common/tests/dpu_reg_plan_test.sv
+dpu_common/tests/dpu_pcie_reg_executor_test.sv
 // scripts/test_manifest.sh guards these focused test sources at exact-once.
 dpu_common/tests/dpu_device_resolver_test.sv
 dpu_common/tests/dpu_placement_test.sv
 dpu_common/tests/dpu_resource_resolver_test.sv
 dpu_common/tests/dpu_device_bootstrap_plan_test.sv
+dpu_common/tests/dpu_vio_reg_plan_test.sv
 virtio_net_vip/tests/virtio_unit_test.sv
 virtio_net_vip/tests/virtio_fabric_resource_test.sv
 virtio_net_vip/tests/virtio_stress_unit_test.sv
@@ -26,4 +28,7 @@ virtio_net_vip/tests/virtio_base_test.sv
 virtio_net_vip/tests/virtio_smoke_test.sv
 virtio_net_vip/tests/virtio_traffic_test.sv
 virtio_net_vip/tests/virtio_dut_caps_test.sv
+virtio_net_vip/ext/host_mem/tb/host_mem_random_tb.sv
+virtio_net_vip/tests/virtio_pcie_host_mem_test.sv
+virtio_net_vip/tests/dpu_pcie_tl_executor_integration_test.sv
 virtio_net_vip/tests/virtio_tb_top.sv

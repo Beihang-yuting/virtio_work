@@ -67,9 +67,15 @@ class virtio_resource_client extends uvm_object;
                 why = "resource snapshot returned a binding for another service";
                 return 0;
             end
+            mapping.virtio_pair_index = bindings[index].virtio_pair_index;
             mapping.local_pair = bindings[index].local_pair_id;
-            mapping.rx_global_qid = 2 * bindings[index].global_qpair_id;
-            mapping.tx_global_qid = 2 * bindings[index].global_qpair_id + 1;
+            mapping.rx_virtqueue_id = bindings[index].rx_local_virtqueue_id;
+            mapping.tx_virtqueue_id = bindings[index].tx_local_virtqueue_id;
+            // The real DUT allocates one txrx queue resource per VIO pair.
+            // VTX and VRX both consume that same global queue index; only
+            // the local virtqueue IDs distinguish direction.
+            mapping.rx_global_qid = bindings[index].global_qpair_id;
+            mapping.tx_global_qid = bindings[index].global_qpair_id;
             candidate_mappings.push_back(mapping);
         end
         for (int left = 0; left < candidate_mappings.size(); left++) begin
@@ -133,14 +139,15 @@ class virtio_resource_client extends uvm_object;
         input int unsigned local_qid,
         output int unsigned global_qid
     );
-        int unsigned local_pair;
-
-        local_pair = local_qid / 2;
         foreach (qpair_mappings[index]) begin
-            if (qpair_mappings[index].local_pair == local_pair) begin
-                global_qid = local_qid[0] ?
-                    qpair_mappings[index].tx_global_qid :
+            if (qpair_mappings[index].rx_virtqueue_id == local_qid) begin
+                global_qid =
                     qpair_mappings[index].rx_global_qid;
+                return 1;
+            end
+            if (qpair_mappings[index].tx_virtqueue_id == local_qid) begin
+                global_qid =
+                    qpair_mappings[index].tx_global_qid;
                 return 1;
             end
         end

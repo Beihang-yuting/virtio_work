@@ -10,8 +10,8 @@ submodules=(
   "virtio_net_vip/ext/net_packet"
 )
 expected_revisions=(
-  "f65eec85ecbb10819dab9b2fbc6d50df37094878"
-  "3b9e000d5df4d10efbb3029f43605e0362e0caca"
+  "854d4964e217a48bd65a4968c03fc4567ce885bd"
+  "365b7553fc7dac6b4ad55886a8e4869153607c28"
   "e2af70204f53ede65e366c7a65f695c59acdbbc5"
 )
 
@@ -41,7 +41,7 @@ for source_file in src/host_mem_pkg.sv src/host_mem_manager.sv; do
 done
 
 if (( ${#missing_host_mem_sources[@]} > 0 )); then
-  echo "pinned host_mem dependency 3b9e000d5df4d10efbb3029f43605e0362e0caca is missing: ${missing_host_mem_sources[*]}" >&2
+  echo "pinned host_mem dependency 365b7553fc7dac6b4ad55886a8e4869153607c28 is missing: ${missing_host_mem_sources[*]}" >&2
   exit 6
 fi
 

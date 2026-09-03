@@ -5,6 +5,7 @@ class dpu_normalized_vio_request extends uvm_object;
     `uvm_object_utils(dpu_normalized_vio_request)
 
     int unsigned request_id, service_instance_id, total_qpairs, seed;
+    int unsigned lan_msix_vectors;
     dpu_vio_device_policy_e device_policy;
     dpu_placement_order_e ordering;
     dpu_function_key_t canonical_candidates[$];
@@ -20,6 +21,7 @@ class dpu_normalized_vio_request extends uvm_object;
         request_id = rhs.request_id;
         service_instance_id = rhs.service_instance_id;
         total_qpairs = rhs.total_qpairs;
+        lan_msix_vectors = rhs.lan_msix_vectors;
         seed = rhs.seed;
         device_policy = rhs.device_policy;
         ordering = rhs.ordering;

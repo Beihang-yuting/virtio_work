@@ -207,6 +207,7 @@ class dpu_resource_manager extends uvm_object;
         dpu_function_key_t function_keys[$];
         dpu_resource_pool_config_t profiles[$];
         dpu_vio_qpair_binding_t bindings[$];
+        dpu_af_extra_queue_binding_t af_extra_bindings[$];
         int unsigned reserved_global_ids[$];
         dpu_global_id_range_t reserved_global_ranges[$];
         dpu_resource_class_id_t qpair_class_id;
@@ -370,6 +371,53 @@ class dpu_resource_manager extends uvm_object;
             candidate.active_global_ids[qpair_class_id][lease.global_id] = 1;
             candidate.class_allocated_count[qpair_class_id] = class_count + 1;
         end
+        resource_snapshot.list_af_extra_queue_bindings(af_extra_bindings);
+        foreach (af_extra_bindings[index]) begin
+            dpu_resource_function_state state;
+            dpu_resource_pool_config_t profile;
+            dpu_resource_lease_t lease;
+            int unsigned class_count;
+            int unsigned function_count;
+
+            if (!candidate.lookup_function_state(
+                    af_extra_bindings[index].af_function_key, state, why))
+                return 0;
+            profile = candidate.resource_profiles_by_id[qpair_class_id];
+            if (af_extra_bindings[index].global_qpair_id >= profile.capacity) begin
+                why = "AF extra queue global ID exceeds imported profile capacity";
+                return 0;
+            end
+            if (candidate.active_global_ids[qpair_class_id].exists(
+                    af_extra_bindings[index].global_qpair_id)) begin
+                why = "AF extra queue global ID is duplicated in resource snapshot";
+                return 0;
+            end
+            class_count = candidate.allocated_count(qpair_class_id);
+            function_count = candidate.function_class_lease_count(
+                state, qpair_class_id);
+            if (class_count >= profile.capacity) begin
+                why = "AF extra queue exhausted resource-class capacity";
+                return 0;
+            end
+            if (function_count >= profile.max_per_function) begin
+                why = "AF extra queue exhausted per-function qpair capacity";
+                return 0;
+            end
+            lease.owner.kind = DPU_RESOURCE_OWNER_FUNCTION;
+            lease.owner.function_key =
+                af_extra_bindings[index].af_function_key;
+            lease.owner.service_key.function_key =
+                af_extra_bindings[index].af_function_key;
+            lease.owner.service_key.service_kind = DPU_SERVICE_VIO_NET;
+            lease.owner.service_key.service_instance_id = 0;
+            lease.local_id = af_extra_bindings[index].local_queue_index;
+            lease.class_id = qpair_class_id;
+            lease.global_id = af_extra_bindings[index].global_qpair_id;
+            lease.frozen = 1;
+            state.leases.push_back(lease);
+            candidate.active_global_ids[qpair_class_id][lease.global_id] = 1;
+            candidate.class_allocated_count[qpair_class_id] = class_count + 1;
+        end
         if (!candidate.seal_resource_classes_internal(why))
             return 0;
 
@@ -508,6 +556,31 @@ class dpu_resource_manager extends uvm_object;
                 if ((leases[right].local_id < leases[left].local_id) ||
                     ((leases[right].local_id == leases[left].local_id) &&
                      (leases[right].class_id < leases[left].class_id))) begin
+                    swap = leases[left];
+                    leases[left] = leases[right];
+                    leases[right] = swap;
+                end
+            end
+        end
+    endfunction
+
+    function void list_function_leases(
+        input dpu_function_key_t function_key,
+        ref dpu_resource_lease_t leases[$]
+    );
+        dpu_resource_function_state state;
+        dpu_resource_lease_t swap;
+        string why;
+
+        leases.delete();
+        if (!lookup_function_state(function_key, state, why))
+            return;
+        leases = state.leases;
+        for (int left = 0; left < leases.size(); left++) begin
+            for (int right = left + 1; right < leases.size(); right++) begin
+                if ((leases[right].local_id < leases[left].local_id) ||
+                    ((leases[right].local_id == leases[left].local_id) &&
+                     (leases[right].owner.kind < leases[left].owner.kind))) begin
                     swap = leases[left];
                     leases[left] = leases[right];
                     leases[right] = swap;

@@ -45,10 +45,72 @@ virtio_net_env（顶层环境）
 ├── scoreboard                               ← 记分板（8 类检查项）
 ├── coverage                                 ← 覆盖率（8 组 covergroup）
 │
-├── host_mem_manager（外部组件）               ← Buddy Allocator 内存后端
+├── host_mem_manager（外部组件）               ← Buddy/Linear Host memory 后端
+├── host_mem_pool                              ← 按 host-id 共享 manager 的所有权池
 ├── net_packet（外部组件）                     ← 协议报文产生器（L2-L4 + 隧道）
 └── pcie_tl_env（外部组件，作为子环境）         ← PCIe TL 层 VIP
 ```
+
+IOMMU requester identity 使用 `{host_id, BDF, IOVA}`，不是仅用
+`{BDF, IOVA}`。因此不同 Host 可以合法复用同一数值 BDF 和 IOVA，映射、
+unmap、fault rule、dirty tracking 与迁移快照仍彼此隔离。冻结的 PCIe function
+identity 会把 `host_id` 传播到 virtqueue、atomic ops、Admin VQ 和独立 TX/RX
+dataplane；未绑定全局 identity 的旧 standalone 用法默认属于 host0。
+
+这里的 `iommu.map` 只管理 DMA IOVA 到 GPA 的地址空间，不分配 BAR，也不处理
+notify、MSI-X、QSCH 或 global qpair。BAR/notify 属于 PCIe/DUT 配置平面，DMA
+映射属于 function 发起内存访问时的数据面地址翻译，两者不能混为一张表。
+Host-qualified IOMMU key 也不会自动复制 `host_mem_manager`；若两个 Host 需要相同
+数值 GPA 对应不同物理内容，环境应为它们注入各自的 host-memory backend。
+
+BAR 自动布局默认使用确定性的 first-fit；将
+`dpu_pcie_domain_cfg.bar_placement_policy` 设为
+`DPU_BAR_PLACEMENT_RANDOM` 后，会在声明的 MMIO window 内按 alignment 随机选择
+候选地址，并排除 reserved MMIO 和同一 PCIe domain 已占用的 BAR。随机使用仿真器
+现有状态，因此同一仿真 seed、配置和调用顺序可复现，找不到随机候选时会回退到
+有界的 first-fit。
+
+IOVA 是独立的 requester 地址空间。`virtio_iommu_model` 默认使用
+`IOMMU_IOVA_RANDOM`，可通过 `configure_iova_aperture(base, limit, policy, why)`
+配置 page-aligned、半开区间的 64-bit aperture，或选择 `IOMMU_IOVA_FIRST_FIT` 做
+稳定调试。随机候选只在同一 `{host_id, BDF}` requester 域内检查重叠；不同 Host
+可以合法复用相同数值 IOVA，不能把 IOVA 数值冲突误判成 Host GPA 冲突。IOVA 0 被
+保留，因为 map 返回 0 表示失败；`map_fixed*` 使用同一 aperture 和冲突检查。
+
+Host memory 由 `host_mem_pool` 按 `host_id` 管理：同一 Host 的 VIO、RDMA、VBLK
+服务共享同一个 `host_mem_manager`，不同 Host 使用彼此独立的实例。VIO 可通过
+`host_mem_pool_binding` 按 Host 查找共享对象，也可直接注入 `host_mem_binding`。
+默认 `host_mem_alloc_policy_e::HOST_MEM_RANDOM` 从已初始化、具有 backing storage 的
+区域中随机选择对齐地址；`HOST_MEM_FIRST_FIT` 可用于稳定调试。冻结 snapshot 中
+完全落入 Host memory aperture 的 BAR 会在业务分配前自动导入 reservation（独立
+MMIO 区间跳过，部分相交拒绝），同一 BAR 的重复导入是幂等的；手工 reservation
+通过 `reserve_range(base, size, owner)` 导入，分配器会从空闲结构中扣除这些区间
+（base/size 需满足该 manager 的最小 granule 对齐）。该随机化使用仿真器/UVM 的现有随机状态，不增加环境 seed 字段；
+相同仿真 seed、配置和调用顺序即可复现布局。
+
+PCIe DUT DMA 不再创建另一份 Host memory。顶层从同一个 pool 取得 manager，
+将 VIO 绑定到 pool，并把 protocol-neutral `host_mem_api` handle 按 Root 显式交给
+`pcie_tl_env_config`：
+
+```systemverilog
+host_mem_pool host_mem_owners;
+host_mem_api  host0_mem;
+string        why;
+
+host0_mem = host_mem_owners.get_host(0);
+vio_cfg.host_mem_pool_binding = host_mem_owners;
+if (!pcie_cfg.bind_host_memory(0, 0, host0_mem, why))
+  `uvm_fatal("TOP_CFG", why)
+```
+
+`root_index` 选择 PCIe RC/Root，`host_id` 选择 Host 地址域；多 Root 模式要求每个
+Root 都有一条绑定。PCIe responder 直接以 DUT TLP 中的 Host GPA 访问该 manager，
+因此它与 VIO 的 ring/buffer 分配看到完全相同的 backing storage。不同 Host 必须
+绑定不同 manager，但可合法使用相同的数值 GPA。已初始化 manager 的 64-bit
+aperture 不会被 PCIe 环境重置；旧的 `"host_mem"` config-db 注入只保留给单 Root
+兼容测试。PREMAP 按唯一 manager handle 分配：多个 Root 绑定同一 Host manager
+只占用一次 backing allocation，空间不足会作为 PCIe 配置错误终止。后续
+RDMA/VBLK 只需从 pool 取得本 Host 的同一 handle，无需修改 PCIe package。
 
 ---
 
@@ -122,7 +184,7 @@ PCIe BAR 枚举 → Capability 发现 → 设备复位（写 status=0，轮询�
 |------|---------|
 | **Virtqueue 层** | 循环描述符链、越界 index、零长度 buffer、内存屏障跳过、描述符 double-free、use-after-free、avail ring 溢出 |
 | **PCIe 传输层** | 设备状态转换违规、Feature 协商异常、队列配置错误、通知错误（虚假中断/丢失中断） |
-| **IOMMU 层** | 地址未映射、权限不足、use-after-unmap、可编程故障规则（按 BDF/地址范围/方向/触发次数） |
+| **IOMMU 层** | 地址未映射、权限不足、use-after-unmap、可编程故障规则（按 Host/BDF/地址范围/方向/触发次数） |
 | **数据面** | 错误校验和、超 MTU 包、零长度包、截断包 |
 
 ### 六、性能监控
@@ -217,7 +279,8 @@ virtio_net_vip/
 │   ├── virtio_e2e_test.sv                  ← 端到端集成测试
 │   ├── virtio_full_test.sv                 ← 完整集成测试（含 Completion Bridge）
 │   ├── virtio_traffic_test.sv              ← 大流量测试（1000 包）
-│   └── virtio_dual_test.sv                 ← 双 VIP 互打测试（2 万包 + 带宽控制）
+│   ├── virtio_dual_test.sv                 ← 双 VIP 互打测试（2 万包 + 带宽控制）
+│   └── host_mem_random_tb.sv               ← Host memory 随机布局/reservation 聚焦测试
 └── ext/                                    ← 固定版本的外部 Git submodule
     ├── host_mem       → 内存管理组件
     ├── net_packet     → 协议报文产生器
@@ -228,7 +291,8 @@ virtio_net_vip/
 
 ## 外部依赖
 
-本 VIP 依赖三个外部组件，通过 `ext/` 目录中的固定 Git submodule 集成，**不修改任何外部组件代码**：
+本 VIP 依赖三个外部组件，通过 `ext/` 目录中的固定 Git submodule 集成；Host memory
+在本工程中增加了随机布局与 reservation/pool 适配层：
 
 | 组件 | 功能 | 主要接口 |
 |------|------|---------|
@@ -269,18 +333,20 @@ make test TEST=virtio_unit_test
 `make compile` 仅编译；`make test` 编译后运行指定测试。`scripts/test_manifest.sh`
 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的单一事实源；`make regression`
 按该顺序运行 `dpu_resource_manager_test`、`dpu_reg_plan_test`、
-`dpu_device_resolver_test`、`dpu_placement_test`、`dpu_resource_resolver_test`、`dpu_device_bootstrap_plan_test`、`virtio_dut_caps_test`、
+`dpu_pcie_reg_executor_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
+`dpu_resource_resolver_test`、`dpu_device_bootstrap_plan_test`、`dpu_vio_reg_plan_test`、`virtio_dut_caps_test`、
 `virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、
 `virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、
 `virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、
 `virtio_e2e_test`、`virtio_full_integration_test`、`virtio_pf_lifecycle_reset_test`、
-`virtio_monitor_routing_test`、`virtio_dual_test`、`virtio_smoke_test` 和
-`virtio_traffic_test`，共 23 项。
+`virtio_monitor_routing_test`、`virtio_dual_test`、`virtio_smoke_test`、
+`virtio_traffic_test`、`host_mem_random_test`、`virtio_pcie_host_mem_test` 和
+`dpu_pcie_tl_executor_integration_test`，共 28 项。
 `make check-deps` 会验证 submodule 固定 SHA、VCS 环境以及外部源码完整性。
 
-`pcie_tl_vip@3e2d8c972f1baa78e073f98e8a38ad2f04db6e1a` 和
-`host_mem@3b9e000d5df4d10efbb3029f43605e0362e0caca` 均为固定依赖；仅
-`host_mem@3b9e000d5df4d10efbb3029f43605e0362e0caca` 提供
+`pcie_tl_vip@854d4964e217a48bd65a4968c03fc4567ce885bd` 和
+`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28` 均为固定依赖；仅
+`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28` 提供
 `host_mem_pkg.sv` 和 `host_mem_manager.sv`。filelist 在 PCIe package 前编译
 `host_mem_pkg.sv`，而 `virtio_net_pkg` 在自身 package 内包含 manager。
 固定 SHA 使依赖可复现；实际的 VCS 编译和动态 UVM 回归结果仍取决于运行环境。
@@ -394,24 +460,139 @@ pair override 可为 owner、local pair ID 或 global qpair ID 选择 `AUTO`、
 只在显式 seed 下可复现。`PINNED` assignment 的冲突必须失败；`PREFERRED`
 冲突会回退为 `AUTO`。自动 global qpair ID 总是选择最低的未预留 free ID。
 
-三个 ID namespace 不可混用：`request_id` 识别 authoring request，
+四个 ID namespace 不可混用：`request_id` 识别 authoring request，
 `service_instance_id` 与 function key 共同形成 service key，`local_pair_id`
-只在该 service/device 内唯一；`global_qpair_id` 是 snapshot 中跨 Fabric 的
-`0..2047` ID。每个 qpair 同时表示 RX/TX pair，不为方向另取 Fabric global ID。
+只在该 service/device 内唯一并作为 placement/resource 的本地 qpair label；
+`virtio_pair_index` 是
+该 service 内连续的软件 pair 序号；`global_qpair_id` 是 snapshot 中跨 Fabric
+的 `0..2047` ID。每个 qpair 同时表示 RX/TX pair，不为方向另取 Fabric global ID。
 当前 real-DUT profile 要求 `service_instance_id == 0`，每个 PF/VF 至多拥有一个
-VIO-net service。sparse local pair ID 合法；若 local pair ID 为 `p`，其 RX local
-virtqueue ID 为 `2*p`，TX local virtqueue ID 为 `2*p+1`。
+VIO-net service。若软件 pair index 为 `p`，其 RX virtqueue ID 为 `2*p`，TX
+virtqueue ID 为 `2*p+1`；这两个协议队列号与 DUT local pair ID 相互独立。
 默认 real-DUT 上限为每个 device 32 pairs、全局 2048 pairs；profile 可以缩小，
 不能扩大 snapshot capability，因此 100 pairs 至少需要四个 eligible 32-pair
 devices。
+
+`dpu_vio_placement_request.lan_msix_vectors` 可选地声明该 function 的 LAN
+q-vector 数量。值为 0 时保留一 qpair 一 vector 的默认 lowering；设置为小于
+qpair 数量的值时，resolver 按真实驱动的 `DIV_ROUND_UP(remaining_rings,
+remaining_vectors)` 算法把多个 qpair 绑定到同一 local/global MSI-X vector。
+共享 vector 只产生一份 linear/info/interval 表项，notify entries 仍按每个 qpair
+生成；mailbox 和 AF 控制 vectors 继续从 capability 中单独计数。
+
+默认真实驱动 profile 还会为选中的 AF 固定追加 11 个 queue binding：offset 0
+为 forward，1 为 BPDU，2..5 为 ETH port0 netdev queue0..3，6..9 为 ETH port1
+netdev queue0..3，10 为 PTP。它们的 `local_queue_index` 从 AF 普通 LAN qpair
+数量之后连续追加，并和普通 VIO qpair 共用同一个 2048-entry global qpair pool；
+因此 AF 的普通 LAN qpair 与 11 个 extra queue 合计不能超过 32，默认 profile 下
+AF 最多配置 21 个普通 VIO qpair。extra queue 使用独立的 MSI-X binding，普通 AF
+LAN vector 之后还会为 mailbox 及其他 AF control interrupt 预留 capability 空间。
 
 解析成功后只查询 snapshots：`dpu_resource_snapshot` 提供按 request、
 service/local 或 global ID 的 bindings 查询，`dpu_resource_manager` 仅以精确
 snapshot pair seed 并维持只读 service lease mapping，`virtio_resource_client` 与
 `virtio_vf_resource_pool` 将该 mapping 按 service key 导入且不可改绑。FLR 只复位
 runtime state；已发布的 service、local/global qpair identity 和 snapshot pair
-保持稳定。notify、MSI-X、port/route 和 scheduler plan builders 是这些 frozen
-snapshots 的后续消费者，不是 placement authoring 或执行功能。
+保持稳定。`dpu_vio_register_plan_builder` 现在可以把 frozen snapshot pair
+降低为一份 VIO service 的 real-DUT register plan：它先合并 BAR/AF bootstrap，再写 BDF map、
+MSI-X linear/info/interval 和选定 inactive notify bank，最后通过 commit 写提交 bank。
+所有内部表写均以选中 AF 的 BAR0 为 target，notify 的匹配字段为
+`{host_id, notify_addr[60:7], local_qid}`；其中 `local_qid` 使用驱动
+`txrx_queues[]` 的连续 pair index，placement 的 sparse `local_pair_id` 仅用于
+资源命名和约束。global qpair/vector 使用显式或稳定解析结果，不从稀疏 local ID 反推。
+notify entries 按驱动的 host/address key 排序；
+`select_inactive_notify_bank` 默认开启，自动选择当前活动 bank 的另一份 shadow bank。
+冷启动默认把 bank0 视为 active，因此首次 setup 写 bank1；若环境 attach 到已经运行的
+DUT，用户必须在 build 前通过 `dpu_device_env_config.vio_policy.active_notify_bank`
+提供硬件当前实际的 active bank。环境只在 plan 成功执行并完成 commit 后更新 tracked
+active bank；仅 build、`NOT_EXECUTED`、preflight failure 或执行失败均不会推进该状态。
+`emit_full_notify_bank` 默认开启，按真实驱动写满 128 项 shadow，未使用项填入
+driver-compatible invalid image。每个 16-byte entry 按 low/high 两次写入后，以
+5 次、5 us 间隔做 readback polling；全部 entry 校验成功后才允许 commit。仅做
+无残留状态的聚焦测试时可以显式关闭完整镜像或 readback。PBA 是 DUT 维护的 pending
+状态，不在配置 plan 中伪写。
+
+```systemverilog
+dpu_reg_plan vio_plan;
+dpu_execution_report report;
+string why;
+if (!device_env.build_vio_register_plan(vio_plan, why))
+  `uvm_fatal("DPU_CFG", why)
+device_env.apply_vio_register_plan(vio_plan, report);
+```
+
+配置成功进入 `ACTIVE` 后，可从同一对 frozen snapshots 生成并执行独立 teardown：
+
+```systemverilog
+dpu_reg_plan teardown_plan;
+if (!device_env.build_vio_teardown_plan(teardown_plan, why))
+  `uvm_fatal("DPU_CFG", why)
+device_env.apply_vio_teardown_plan(teardown_plan, report);
+```
+
+teardown 先向 inactive notify bank 提交完整 invalid shadow，再只对 snapshot 中实际
+拥有普通 VIO 或 AF extra queue 的 function，依次失效 MSI-X info、MSI-X linear 和
+BDF map。setup 与 teardown 使用同一个 VIO-owned function 集合；没有 VIO/AF-extra
+queue 的 function 不由 VIO plan 写入或清理 BDF map。公共 BAR bootstrap 仍覆盖完整
+PCIe topology，不随 VIO BDF ownership 收窄。成功后环境回到 `RESOLVED`；未执行或
+preflight 失败保持 `ACTIVE`。
+
+`dpu_vio_register_plan_policy` 可选择 notify bank、notify type、MSI-X interval 和
+self-mask；它只改变寄存器 lowering，不改变 snapshot 拓扑。`apply_vio_register_plan`
+复用 `dpu_device_env_config.executor` 注入的 `dpu_reg_executor`，先做完整 plan
+freeze/preflight，preflight 失败时不会产生任何 PCIe 写入。用户可继承该 executor
+把 `dpu_reg_op` 转换为真实 PCIe config/MMIO TLP；本仓库仍不提供特定平台的 production
+transport。
+
+真实驱动 profile 的 notify shadow 长度是 128 项；`emit_full_notify_bank` 只清理
+到这 128 项，不把硬件编码上限 1024 误当成软件表长度。AF extra queue 以
+`dpu_af_extra_queue_binding_t` 单独保存在 frozen resource snapshot 中。
+resource manager 会把它们导入为 AF function-owned frozen lease，因而占用并保护
+global qpair ID；它们不会成为 guest VIO service lease，也不会暴露给
+`virtio_resource_client`。普通 VIO 与 extra queue 的 register operations 会按同一
+notify match key 合并排序，并为 extra queue 生成 BDF dependency、MSI-X
+linear/info/interval 和 notify low/high 写入。
+
+已提供基于 53 号机真实驱动 `register.h` 的
+`dpu_vio_driver_dataplane_extension`：它把 QSCH init、Q2TC/N2G/G2P/SPWRR 以及
+可选的 QSCH TC0..TC7 WRR weight、VTX/VRX queue-parameter RAM 的 content 和
+0→1 写使能顺序追加到同一个 register plan。QSCH/VTX/VRX 的地址、字段宽度、
+Host/function/MSI-X 派生关系和 AF BAR0
+aperture 都会校验；没有驱动证据的 context、tail、链表和调度树节点不会被伪造。
+用户可直接向 `qsch_queues`、`qsch_functions`、`vtx_queues`、`vrx_queues` 添加
+场景配置，或继承 `dpu_vio_dataplane_plan_extension` 自定义其他平台寄存器，再通过
+`dpu_device_env_config.vio_dataplane_extension` 注入。三个 hook 按上述顺序在核心
+BDF/MSI-X/notify plan 完整生成后调用，接收同一对 frozen snapshots 和仍可追加
+operation/dependency 的 plan；任一 hook 返回失败，整个 plan build 失败且不会执行。
+`qsch_functions.weight_valid` 为 1 时才写入八个 4-bit `tc_weight`；默认不改硬件
+TC weight。
+注意 QSCH G2P 的驱动结构体 `src_port` 实际只有 1 bit；虽然源码使用
+`QSCH_PORT_HOST0 + host_id` 的逻辑值，编译后的 `dpu_snd1.ko` 最终只保留低位，
+plan 也按该硬件可见编码生成。
+QSCH 的随机拓扑与寄存器 lowering 已分层。`dpu_qsch_topology_generator` 先从
+frozen device/resource snapshots 收集实际存在的 Function 和 global qpair，再按仿真
+全局 seed 生成合法的 `port -> group -> net/function -> qpair` 关系；生成结果保存在
+`dpu_qsch_topology_cfg` 中，支持 `DPU_QSCH_TOPOLOGY_RANDOM_VALID` 和
+`DPU_QSCH_TOPOLOGY_RANDOM_STRESS` 两种模式。net ID 不独立随机，而是固定为对应
+Function 的 `global_func_id`，以避免把不存在的硬件 vport 写入 Q2TC；group、port、TC、
+SP/WRR 和 TC weight 才是受字段范围约束的随机部分。每个 qpair 只能属于其 owner
+Function 的 net，group 必须挂到已声明 port，且每个生成的 group 至少被一个 net 使用。
+如果场景需要覆盖多个 net-device 共享调度组，可将
+`generator.require_shared_group = 1`；当存在两个以上 Function 时，生成器会把
+group 数量限制为小于 net 数量，再随机选择剩余 net 的挂接关系，从而保证至少一个
+group 被多个 net 共享，同时保留 group/port/TC 和策略字段的随机性。
+拓扑还显式记录实际被 qpair 使用的 `traffic_classes[0..7]`，便于后续扩展 DSCH/QSCH
+调度树模型。
+
+拓扑生成后可通过 `dpu_vio_driver_dataplane_extension.set_qsch_topology()` 导入，
+builder 会在生成 Q2TC/N2G/G2P/SPWRR operation 前再次校验同一对 frozen snapshots。
+因此用户可以保存或打印拓扑作为期望模型，再把同一份图 lowering 到 DUT。当前真实
+驱动证据中 N2G/G2P 表项仍按 `global_func_id` 寻址，随机 group 作为 N2G 字段、对应
+group 的 port 作为该 net 的 G2P 字段；没有未经核实的独立 group-table 地址被伪造。
+当前 builder 仍不负责 AF mailbox/MAC-age/PTP-stamp 等非 queue control interrupt、
+标准 PCIe MSI-X table address/data 初始化或 PBA 写入。BAR4 MSI-X address/data 由 Host
+PCIe MSI-X 配置流程产生；teardown 只清理本 snapshot 拥有的 DUT internal BDF、
+MSI-X info/linear 和 notify 映射，不触碰 BAR4 table、PBA 或其他业务 function。
 
 ---
 

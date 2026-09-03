@@ -125,6 +125,10 @@ typedef enum { DRV_MODE_AUTO, DRV_MODE_MANUAL, DRV_MODE_HYBRID } driver_mode_e;
 typedef enum { RX_MODE_MERGEABLE, RX_MODE_BIG, RX_MODE_SMALL } rx_buf_mode_e;
 typedef enum { IRQ_MSIX_PER_QUEUE, IRQ_MSIX_SHARED, IRQ_INTX, IRQ_POLLING } interrupt_mode_e;
 typedef enum { DMA_TO_DEVICE, DMA_FROM_DEVICE, DMA_BIDIRECTIONAL } dma_dir_e;
+// IOVA allocation policy is independent from Host-GPA allocation.  RANDOM is
+// the verification default; FIRST_FIT remains available for deterministic
+// debug and characterization runs.
+typedef enum { IOMMU_IOVA_RANDOM, IOMMU_IOVA_FIRST_FIT } iommu_iova_alloc_policy_e;
 typedef enum {
     VIRTIO_MON_BAR_ACCESS,
     VIRTIO_MON_DMA,
@@ -240,7 +244,17 @@ typedef struct { bit [63:0] addr; int unsigned len; bit is_indirect; } virtio_sg
 typedef struct { virtio_sg_entry entries[$]; } virtio_sg_list;
 typedef struct { int unsigned desc_id; int unsigned len; realtime submit_time; realtime complete_time; } virtio_used_info;
 
-typedef struct { bit [15:0] bdf; bit [63:0] gpa, iova; int unsigned size; dma_dir_e dir; int unsigned desc_id; } iommu_mapping_t;
+// A numeric BDF is scoped by the host/IOMMU requester domain.  Keep the
+// domain in every externally visible mapping record so migration and cleanup
+// cannot accidentally operate on an equal BDF belonging to another host.
+typedef struct {
+    int unsigned host_id;
+    bit [15:0]   bdf;
+    bit [63:0]   gpa, iova;
+    int unsigned size;
+    dma_dir_e   dir;
+    int unsigned desc_id;
+} iommu_mapping_t;
 
 // Migration keeps the original VIP token handles so restored completions use
 // the normal queue API and return the original request context.
@@ -274,11 +288,15 @@ typedef struct {
 } virtqueue_snapshot_t;
 
 typedef struct {
+    int unsigned host_id;
     bit [15:0] bdf; bit [63:0] gpa, iova; int unsigned size; dma_dir_e dir; bit valid;
     realtime map_time; string caller_file; int caller_line;
 } iommu_mapping_entry_t;
 
 typedef struct {
+    // host_id_valid=0 keeps the legacy wildcard behavior for all hosts.
+    int unsigned host_id;
+    bit host_id_valid;
     bit [15:0] bdf_mask; bit [63:0] iova_start, iova_end;
     dma_dir_e dir; iommu_fault_e fault_type;
     int unsigned trigger_count, triggered;
@@ -301,7 +319,16 @@ typedef struct { bit [7:0] cap_id, cap_next, cfg_type, bar; bit [31:0] offset, l
 typedef struct { bit [63:0] msg_addr; bit [31:0] msg_data; bit masked; } msix_entry_t;
 
 typedef struct {
+    // Dense software-side Virtio pair ordinal within the function/service.
+    // It is intentionally distinct from local_pair, which is the DUT
+    // hardware qpair index.
+    int unsigned virtio_pair_index;
     int unsigned local_pair;
+    int unsigned rx_virtqueue_id;
+    int unsigned tx_virtqueue_id;
+    // Both directions use the same real-DUT global qpair resource.  The
+    // directional field names are retained for compatibility with existing
+    // callers; they must always carry equal values.
     int unsigned rx_global_qid;
     int unsigned tx_global_qid;
 } virtio_qpair_mapping_t;

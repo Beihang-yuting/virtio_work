@@ -210,8 +210,9 @@ class custom_virtqueue extends virtqueue_base;
         bit [63:0] iova;
         iommu_mapping_t mapping;
 
-        iova = iommu.map(bdf, gpa, size, dir);
+        iova = iommu.map_for_host(host_id, bdf, gpa, size, dir);
 
+        mapping.host_id = host_id;
         mapping.bdf     = bdf;
         mapping.gpa     = gpa;
         mapping.iova    = iova;

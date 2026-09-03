@@ -585,22 +585,22 @@ class virtio_fabric_resource_test extends uvm_test;
 
     task assert_unique_qpair(
         input virtio_function_instance function_instance,
-        ref int unsigned global_rx_qids[$]
+        ref int unsigned global_qpair_ids[$]
     );
-        int unsigned global_rx_qid;
+        int unsigned global_qpair_id;
 
         if (!function_instance.resource_client.local_qid_to_global_qid(
-            0, global_rx_qid
+            0, global_qpair_id
         )) begin
-            `uvm_fatal("FABRIC_RESOURCE", "local RX queue ID did not map globally")
+            `uvm_fatal("FABRIC_RESOURCE", "local RX queue ID did not map to a global qpair")
         end
-        foreach (global_rx_qids[index]) begin
-            if (global_rx_qids[index] == global_rx_qid) begin
+        foreach (global_qpair_ids[index]) begin
+            if (global_qpair_ids[index] == global_qpair_id) begin
                 `uvm_fatal("FABRIC_RESOURCE",
-                    "distinct functions share a global RX queue ID")
+                    "distinct functions share a global qpair ID")
             end
         end
-        global_rx_qids.push_back(global_rx_qid);
+        global_qpair_ids.push_back(global_qpair_id);
     endtask
 
     task assert_sparse_snapshot_mapping(
@@ -608,6 +608,7 @@ class virtio_fabric_resource_test extends uvm_test;
         input string lifecycle
     );
         int unsigned observed_rx;
+        int unsigned observed_tx;
 
         if (!function_instance.resource_client.is_bound_to_service() ||
             (function_instance.resource_client.qpair_mapping_count() != 3)) begin
@@ -616,20 +617,43 @@ class virtio_fabric_resource_test extends uvm_test;
                 lifecycle))
         end
         if (!function_instance.resource_client.local_qid_to_global_qid(
-                0, observed_rx) || (observed_rx != 200)) begin
+                0, observed_rx) || (observed_rx != 100)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
                 "%s RX mapping did not come from snapshot", lifecycle))
         end
         if (!function_instance.resource_client.local_qid_to_global_qid(
-                6, observed_rx) || (observed_rx != 206)) begin
+                1, observed_tx) || (observed_tx != observed_rx)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "%s sparse pair 3 was replaced by a derived control queue",
+                "%s TX queue did not share its pair's global qid", lifecycle))
+        end
+        if (!function_instance.resource_client.local_qid_to_global_qid(
+                2, observed_rx) || (observed_rx != 103)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s software pair 1 was replaced by a derived control queue",
                 lifecycle))
         end
         if (!function_instance.resource_client.local_qid_to_global_qid(
-                34, observed_rx) || (observed_rx != 234)) begin
+                3, observed_tx) || (observed_tx != observed_rx)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "%s sparse pair 17 mapping did not come from snapshot",
+                "%s software pair 1 TX mapping did not share global qid",
+                lifecycle))
+        end
+        if (!function_instance.resource_client.local_qid_to_global_qid(
+                4, observed_rx) || (observed_rx != 117)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s software pair 2 mapping did not come from snapshot",
+                lifecycle))
+        end
+        if (!function_instance.resource_client.local_qid_to_global_qid(
+                5, observed_tx) || (observed_tx != observed_rx)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s software pair 2 TX mapping did not share global qid",
+                lifecycle))
+        end
+        if (function_instance.resource_client.local_qid_to_global_qid(
+                6, observed_rx)) begin
+            `uvm_fatal("FABRIC_RESOURCE", $sformatf(
+                "%s incorrectly exposed a queue ID derived from DUT local pair 3",
                 lifecycle))
         end
     endtask
@@ -890,9 +914,21 @@ class virtio_fabric_resource_test extends uvm_test;
                 if (dpu_same_function_key(
                         env.function_instances[function_index].function_key,
                         expected_keys[index]) &&
-                    (env.function_instances[function_index].bdf != pcie_id.bdf)) begin
+                    ((env.function_instances[function_index].bdf != pcie_id.bdf) ||
+                     !env.function_instances[function_index].pcie_id_valid ||
+                     !dpu_same_domain_key(
+                         env.function_instances[function_index].pcie_id.domain,
+                         pcie_id.domain) ||
+                     (env.function_instances[function_index].vq_mgr.host_id !=
+                         pcie_id.domain.host_id) ||
+                     (env.function_instances[function_index].vq_mgr.bdf !=
+                         pcie_id.bdf) ||
+                     (env.function_instances[function_index].dataplane.tx_engine.host_id !=
+                         pcie_id.domain.host_id) ||
+                     (env.function_instances[function_index].dataplane.rx_engine.host_id !=
+                         pcie_id.domain.host_id))) begin
                     `uvm_fatal("FABRIC_RESOURCE",
-                        "VIO function BDF differs from frozen snapshot")
+                        "VIO function DMA identity differs from frozen snapshot")
                 end
             end
             foreach (env.function_instances[function_index]) begin
@@ -1145,7 +1181,7 @@ class virtio_fabric_resource_test extends uvm_test;
     endfunction
 
     virtual task run_phase(uvm_phase phase);
-        int unsigned global_rx_qids[$];
+        int unsigned global_qpair_ids[$];
         bar_range_t all_bars[$];
 
         phase.raise_objection(this);
@@ -1185,7 +1221,7 @@ class virtio_fabric_resource_test extends uvm_test;
             assert_bar_layout(env.pf_instances[pf_index].pf_function);
             assert_unique_bars(env.pf_instances[pf_index].pf_function, all_bars);
             assert_unique_qpair(env.pf_instances[pf_index].pf_function,
-                                global_rx_qids);
+                                global_qpair_ids);
             discover_fabric_function(env.pf_instances[pf_index].pf_function);
             if (pf_index == 0)
                 assert_sparse_snapshot_mapping(
@@ -1200,15 +1236,15 @@ class virtio_fabric_resource_test extends uvm_test;
                 assert_unique_bars(env.pf_instances[pf_index].vf_functions[vf_index],
                                    all_bars);
                 assert_unique_qpair(env.pf_instances[pf_index].vf_functions[vf_index],
-                                    global_rx_qids);
+                                    global_qpair_ids);
                 discover_fabric_function(env.pf_instances[pf_index].vf_functions[vf_index]);
             end
         end
 
-        if (global_rx_qids.size() != 26) begin
+        if (global_qpair_ids.size() != 26) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "expected one global RX queue ID for 26 functions, received %0d",
-                global_rx_qids.size()))
+                "expected one global qpair ID for 26 functions, received %0d",
+                global_qpair_ids.size()))
         end
 
         // FLR owns runtime cleanup only; immutable placement survives reset.

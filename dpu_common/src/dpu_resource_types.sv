@@ -8,6 +8,9 @@
 localparam int unsigned DPU_MAX_HOSTS = 4;
 localparam int unsigned DPU_MAX_PFS_PER_HOST = 16;
 localparam int unsigned DPU_MAX_VFS_PER_PF = 16;
+// Lower ten-bit source-ID namespace used by the real driver.
+localparam int unsigned DPU_DRIVER_MAX_PF_FUNC = 4;
+localparam int unsigned DPU_DRIVER_MAX_VF_PER_PF = 16;
 localparam int unsigned DPU_MAX_FUNCTIONS = 1024;
 localparam int unsigned DPU_VIO_GLOBAL_QPAIR_ID_WIDTH = 11;
 localparam int unsigned DPU_MAX_VIO_GLOBAL_QPAIRS =
@@ -15,6 +18,41 @@ localparam int unsigned DPU_MAX_VIO_GLOBAL_QPAIRS =
 localparam int unsigned DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE = 32;
 localparam int unsigned DPU_MAX_GLOBAL_MSIX_VECTORS = 256;
 localparam int unsigned DPU_MAX_VIO_NOTIFY_ENTRIES_PER_BANK = 1024;
+// Driver profile audited on 10.11.10.53.  The hardware field can encode more
+// global qids, but this build owns a 128-entry queue bitmap/shadow table and
+// appends eleven AF queue resources in this exact layout.
+localparam int unsigned DPU_DRIVER_VIO_NOTIFY_ENTRIES_PER_BANK = 128;
+localparam int unsigned DPU_DRIVER_AF_EXTRA_QUEUE_COUNT = 11;
+localparam int unsigned DPU_DRIVER_AF_ETH_PORT_COUNT = 2;
+localparam int unsigned DPU_DRIVER_AF_ETH_QUEUES_PER_PORT = 4;
+
+function automatic bit dpu_decode_af_extra_queue_offset(
+    input int unsigned extra_queue_offset,
+    output dpu_af_extra_queue_kind_e kind,
+    output int unsigned eth_port_id,
+    output int unsigned eth_queue_id
+);
+    kind = DPU_AF_EXTRA_QUEUE_FORWARD;
+    eth_port_id = 0;
+    eth_queue_id = 0;
+    case (extra_queue_offset)
+        0: kind = DPU_AF_EXTRA_QUEUE_FORWARD;
+        1: kind = DPU_AF_EXTRA_QUEUE_BPDU;
+        10: kind = DPU_AF_EXTRA_QUEUE_PTP;
+        default: begin
+            if ((extra_queue_offset < 2) || (extra_queue_offset > 9))
+                return 0;
+            kind = DPU_AF_EXTRA_QUEUE_ETH_PORT_NETDEV;
+            eth_port_id = (extra_queue_offset - 2) /
+                          DPU_DRIVER_AF_ETH_QUEUES_PER_PORT;
+            eth_queue_id = (extra_queue_offset - 2) %
+                           DPU_DRIVER_AF_ETH_QUEUES_PER_PORT;
+            if (eth_port_id >= DPU_DRIVER_AF_ETH_PORT_COUNT)
+                return 0;
+        end
+    endcase
+    return 1;
+endfunction
 
 typedef enum int unsigned {
   DPU_RESOURCE_KIND_FUNCTION,

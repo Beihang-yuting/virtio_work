@@ -90,6 +90,8 @@ class virtio_pf_manager extends uvm_object;
             (admin_context.transport == null) || (admin_context.mem == null) ||
             (admin_context.iommu == null) ||
             (admin_context.queue_id != admin_context.vq.queue_id) ||
+            (admin_context.vq.host_id !=
+                admin_context.transport.iommu_host_id()) ||
             (admin_context.vq.bdf != admin_context.transport.bdf) ||
             (admin_context.vq.mem != admin_context.mem) ||
             (admin_context.vq.iommu != admin_context.iommu)) begin
@@ -271,7 +273,8 @@ class virtio_pf_manager extends uvm_object;
                 admin_context.vq.reset_queue();
                 admin_context.vq.alloc_rings();
                 foreach (admin_context.quarantined_iovas[index])
-                    admin_context.iommu.unmap(
+                    admin_context.iommu.unmap_for_host(
+                        admin_context.transport.iommu_host_id(),
                         admin_context.transport.bdf,
                         admin_context.quarantined_iovas[index]
                     );

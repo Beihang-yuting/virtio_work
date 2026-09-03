@@ -9,6 +9,14 @@ class dpu_dut_caps extends uvm_object;
     int unsigned max_vfs_per_pf;
     int unsigned max_functions;
     int unsigned global_msix_vector_count;
+    // Interrupt resources which the real driver reserves after the LAN
+    // vectors for each active function.  AF additionally owns the extra
+    // control/message vectors; keeping these in capabilities makes the
+    // resource snapshot explicit instead of hiding the accounting in the
+    // register-plan builder.
+    int unsigned mailbox_msix_vectors;
+    int unsigned af_extra_msix_vectors;
+    int unsigned af_extra_queue_count;
     int unsigned vio_global_qpair_count;
     int unsigned max_vio_net_qpairs_per_device;
     int unsigned vio_notify_entries_per_bank;
@@ -38,9 +46,17 @@ class dpu_dut_caps extends uvm_object;
         max_vfs_per_pf = 16;
         max_functions = DPU_MAX_FUNCTIONS;
         global_msix_vector_count = DPU_MAX_GLOBAL_MSIX_VECTORS;
+        mailbox_msix_vectors = 1;
+        // dpu_configure_msix_map(): DPU_AF_EXTRA_INTR_NUM - 1.
+        af_extra_msix_vectors = 13;
+        // common.h: forward + BPDU + 2 ports * 4 netdev + PTP.
+        af_extra_queue_count = DPU_DRIVER_AF_EXTRA_QUEUE_COUNT;
         vio_global_qpair_count = DPU_MAX_VIO_GLOBAL_QPAIRS;
         max_vio_net_qpairs_per_device = DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
-        vio_notify_entries_per_bank = DPU_MAX_VIO_NOTIFY_ENTRIES_PER_BANK;
+        // DPU_QID_MAP_TABLE_ENTRIES == DPU_MAX_TXRX_QUEUE == 128 in the
+        // audited driver, even though the encoded table aperture is larger.
+        vio_notify_entries_per_bank =
+            DPU_DRIVER_VIO_NOTIFY_ENTRIES_PER_BANK;
         add_bar_profile(DPU_FUNCTION_PF, DPU_BAR_DEVICE_MEMORY, 0,
                         64'h0000_0000_0200_0000, 64'h0000_0000_0200_0000);
         add_bar_profile(DPU_FUNCTION_PF, DPU_BAR_MAILBOX, 2,
@@ -61,6 +77,9 @@ class dpu_dut_caps extends uvm_object;
         max_vfs_per_pf = rhs.max_vfs_per_pf;
         max_functions = rhs.max_functions;
         global_msix_vector_count = rhs.global_msix_vector_count;
+        mailbox_msix_vectors = rhs.mailbox_msix_vectors;
+        af_extra_msix_vectors = rhs.af_extra_msix_vectors;
+        af_extra_queue_count = rhs.af_extra_queue_count;
         vio_global_qpair_count = rhs.vio_global_qpair_count;
         max_vio_net_qpairs_per_device = rhs.max_vio_net_qpairs_per_device;
         vio_notify_entries_per_bank = rhs.vio_notify_entries_per_bank;
@@ -133,6 +152,26 @@ class dpu_dut_caps extends uvm_object;
         end
         if (global_msix_vector_count > DPU_MAX_GLOBAL_MSIX_VECTORS) begin
             why = "DUT global MSI-X capability exceeds the model ceiling";
+            return 0;
+        end
+        if (mailbox_msix_vectors > global_msix_vector_count) begin
+            why = "DUT mailbox MSI-X capability exceeds global vector capacity";
+            return 0;
+        end
+        if (af_extra_msix_vectors > global_msix_vector_count) begin
+            why = "DUT AF extra MSI-X capability exceeds global vector capacity";
+            return 0;
+        end
+        if (af_extra_queue_count > DPU_DRIVER_AF_EXTRA_QUEUE_COUNT) begin
+            why = "DUT AF extra queue capability exceeds the audited driver layout";
+            return 0;
+        end
+        if (af_extra_queue_count > max_vio_net_qpairs_per_device) begin
+            why = "DUT AF extra queue capability exceeds per-device qpair capacity";
+            return 0;
+        end
+        if (af_extra_msix_vectors < af_extra_queue_count) begin
+            why = "DUT AF extra MSI-X capability cannot cover AF extra queues";
             return 0;
         end
         if (vio_global_qpair_count == 0) begin

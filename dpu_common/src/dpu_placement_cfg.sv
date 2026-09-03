@@ -115,6 +115,10 @@ class dpu_vio_placement_request extends uvm_object;
     int unsigned request_id;
     int unsigned service_instance_id;
     int unsigned total_qpairs;
+    // Number of LAN MSI-X vectors requested for this function.  Zero keeps
+    // the driver default (one vector per qpair in this model); a smaller
+    // value models the real driver's min(online_cpus, rxq) sharing policy.
+    int unsigned lan_msix_vectors;
     int unsigned seed;
     dpu_vio_candidate_kind_e candidate_kind;
     dpu_vio_device_policy_e device_policy;
@@ -129,6 +133,7 @@ class dpu_vio_placement_request extends uvm_object;
         request_id = 0;
         service_instance_id = 0;
         total_qpairs = 0;
+        lan_msix_vectors = 0;
         seed = 0;
         candidate_kind = DPU_VIO_CANDIDATE_PF_AND_VF;
         device_policy = DPU_VIO_DEVICE_AUTO_MINIMUM;
@@ -144,6 +149,7 @@ class dpu_vio_placement_request extends uvm_object;
         request_id = rhs.request_id;
         service_instance_id = rhs.service_instance_id;
         total_qpairs = rhs.total_qpairs;
+        lan_msix_vectors = rhs.lan_msix_vectors;
         seed = rhs.seed;
         candidate_kind = rhs.candidate_kind;
         device_policy = rhs.device_policy;

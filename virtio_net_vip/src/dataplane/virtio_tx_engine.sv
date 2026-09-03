@@ -66,6 +66,7 @@ class virtio_tx_engine extends uvm_object;
     virtio_offload_engine       offload;
     virtio_dataplane_callback   custom_cb;   // null = standard mode
     bit [15:0]                  bdf;
+    int unsigned                host_id;
 
     // ===== Configuration =====
     bit [63:0]       negotiated_features;
@@ -191,7 +192,7 @@ class virtio_tx_engine extends uvm_object;
         // bookkeeping makes the packet visible to completion handling.
         if (desc_id == '1) begin
             for (int i = 0; i < tracker.count(); i++) begin
-                iommu.unmap(bdf, tracker.iova_list[i]);
+                iommu.unmap_for_host(host_id, bdf, tracker.iova_list[i]);
                 mem.free(tracker.gpa_list[i]);
             end
             return;
@@ -249,8 +250,10 @@ class virtio_tx_engine extends uvm_object;
         end
 
         // ---- 4. DMA map both (device reads these) ----
-        hdr_iova  = iommu.map(bdf, hdr_gpa,  hdr_bytes.size(), DMA_TO_DEVICE);
-        data_iova = iommu.map(bdf, data_gpa, pkt_data.size(),  DMA_TO_DEVICE);
+        hdr_iova  = iommu.map_for_host(host_id, bdf, hdr_gpa,
+                                       hdr_bytes.size(), DMA_TO_DEVICE);
+        data_iova = iommu.map_for_host(host_id, bdf, data_gpa,
+                                       pkt_data.size(), DMA_TO_DEVICE);
 
         // ---- 5. Track allocations for cleanup ----
         tracker.add(hdr_gpa,  hdr_iova,  hdr_bytes.size());
@@ -363,7 +366,7 @@ class virtio_tx_engine extends uvm_object;
         tracker = tx_buf_map[token];
 
         for (int i = 0; i < tracker.count(); i++) begin
-            iommu.unmap(bdf, tracker.iova_list[i]);
+            iommu.unmap_for_host(host_id, bdf, tracker.iova_list[i]);
             mem.free(tracker.gpa_list[i]);
         end
 

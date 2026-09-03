@@ -196,6 +196,9 @@ class virtio_net_env extends uvm_env;
 
     virtual function void build_phase(uvm_phase phase);
         string why;
+        host_mem_bar_reservation_importer bar_importer;
+        uvm_object dpu_pool_ref;
+        host_mem_pool selected_pool;
 
         super.build_phase(phase);
 
@@ -251,11 +254,86 @@ class virtio_net_env extends uvm_env;
             UVM_LOW)
 
         // Create shared components
-        host_mem = host_mem_manager::type_id::create("host_mem");
-        host_mem.init_region(cfg.mem_base, cfg.mem_end);
+        selected_pool = cfg.host_mem_pool_binding;
+        if (uvm_config_db#(uvm_object)::get(
+                this, "", "dpu_host_mem_pool", dpu_pool_ref)) begin
+            host_mem_pool dpu_pool;
+
+            if (!$cast(dpu_pool, dpu_pool_ref) || (dpu_pool == null)) begin
+                configuration_valid = 0;
+                `uvm_fatal("VIRTIO_ENV",
+                    "dpu_host_mem_pool is not a host_mem_pool object")
+                return;
+            end
+            if ((selected_pool != null) && (selected_pool != dpu_pool)) begin
+                configuration_valid = 0;
+                `uvm_fatal("VIRTIO_ENV",
+                    "direct host_mem_pool_binding disagrees with DPU owner")
+                return;
+            end
+            selected_pool = dpu_pool;
+        end
+        if ((cfg.host_mem_binding != null) &&
+            (selected_pool != null)) begin
+            configuration_valid = 0;
+            `uvm_fatal("VIRTIO_ENV",
+                "host_mem_binding and host_mem_pool_binding are mutually exclusive")
+            return;
+        end
+        if (cfg.host_mem_binding != null) begin
+            host_mem = cfg.host_mem_binding;
+            if (host_mem.get_host_id() != cfg.host_id) begin
+                configuration_valid = 0;
+                `uvm_fatal("VIRTIO_ENV", $sformatf(
+                    "injected Host memory manager belongs to Host %0d, expected Host %0d",
+                    host_mem.get_host_id(), cfg.host_id))
+                return;
+            end
+        end else if (selected_pool != null) begin
+            if (!selected_pool.has_host(cfg.host_id)) begin
+                configuration_valid = 0;
+                `uvm_fatal("VIRTIO_ENV", $sformatf(
+                    "Host memory pool has no manager for Host %0d",
+                    cfg.host_id))
+                return;
+            end
+            host_mem = selected_pool.get_host(cfg.host_id);
+            if ((host_mem == null) ||
+                (host_mem.get_host_id() != cfg.host_id)) begin
+                configuration_valid = 0;
+                `uvm_fatal("VIRTIO_ENV", $sformatf(
+                    "Host memory pool returned an invalid manager for Host %0d",
+                    cfg.host_id))
+                return;
+            end
+        end else begin
+            host_mem = host_mem_manager::type_id::create("host_mem");
+            host_mem.set_host_id(cfg.host_id);
+            host_mem.set_alloc_policy(cfg.host_mem_policy);
+            host_mem.init_region(cfg.mem_base, cfg.mem_end);
+        end
+
+        // Resolve all snapshot BARs for this Host before any VIO component
+        // allocates rings or buffers.  BARs in a distinct MMIO aperture are
+        // ignored by the importer; intersecting ranges are reserved and
+        // repeated imports are idempotent for multi-service environments.
+        bar_importer = host_mem_bar_reservation_importer::type_id::create(
+            "bar_reservation_importer");
+        if (!bar_importer.import_snapshot(device_snapshot, host_mem,
+                                          cfg.host_id, why)) begin
+            configuration_valid = 0;
+            `uvm_fatal("VIRTIO_ENV", {"BAR reservation import failed: ", why})
+            return;
+        end
 
         iommu = virtio_iommu_model::type_id::create("iommu");
         iommu.strict_permission_check = cfg.iommu_strict;
+        if (!iommu.configure_iova_aperture(
+                cfg.iova_base, cfg.iova_limit, cfg.iova_alloc_policy, why)) begin
+            configuration_valid = 0;
+            `uvm_fatal("VIRTIO_ENV", {"invalid configured IOVA aperture: ", why})
+            return;
+        end
 
         wait_pol = virtio_wait_policy::type_id::create("wait_pol");
         barrier  = virtio_memory_barrier_model::type_id::create("barrier");
@@ -306,6 +384,8 @@ class virtio_net_env extends uvm_env;
 
     virtual function void connect_phase(uvm_phase phase);
         virtio_driver_config_t driver_cfg;
+        dpu_vio_qpair_binding_t service_bindings[$];
+        int unsigned allocated_qpairs;
         string why;
 
         super.connect_phase(phase);
@@ -317,9 +397,22 @@ class virtio_net_env extends uvm_env;
             pf_mgr.wait_pol = wait_pol;
         end
         foreach (function_instances[function_index]) begin
+            service_bindings.delete();
+            resource_snapshot.list_vio_bindings_for_service(
+                function_instances[function_index].service_key,
+                service_bindings);
+            allocated_qpairs = service_bindings.size();
+            if (allocated_qpairs == 0) begin
+                configuration_valid = 0;
+                `uvm_fatal("VIRTIO_ENV", $sformatf(
+                    "published VIO service %s has no allocated qpair bindings",
+                    dpu_service_key_name(
+                        function_instances[function_index].service_key)))
+                return;
+            end
             if (!cfg.get_service_config(
                     function_instances[function_index].service_key,
-                    effective_dut_caps.max_vio_net_qpairs_per_device,
+                    allocated_qpairs,
                     driver_cfg, why)) begin
                 configuration_valid = 0;
                 `uvm_fatal("VIRTIO_ENV", $sformatf(
