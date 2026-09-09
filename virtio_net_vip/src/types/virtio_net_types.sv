@@ -1,6 +1,21 @@
 `ifndef VIRTIO_NET_TYPES_SV
 `define VIRTIO_NET_TYPES_SV
 
+// ============================================================================
+// virtio_net_types (types)
+//
+// VIP 的类型地基:virtio(-net) 规范常量(feature 位号、net_hdr 标志、
+// 描述符 flag、ctrl-VQ 命令码)、全部公共枚举(事务/错误/状态机/中断
+// 模式等)与跨层共享的结构体(SG 链、IOMMU 映射、驱动配置、RSS、迁移
+// snapshot 家族),外加 Admin VQ 的上下文类。位于包编译顺序最前端,
+// 被 shared/iommu/virtqueue/transport/agent/env 各层依赖;本文件自身
+// 只依赖 UVM 与少量前向声明,不 include 其他实现文件。
+// 约束:常量取值/枚举编码对齐 virtio 规范,不可随意改动;新枚举成员
+// 只能追加,避免破坏已编译测试的 name()/序号假设。
+// 无组件、无进程:除 Admin VQ 上下文对象(由 Fabric/调用方创建并注入
+// 资源)外,这里的一切都是纯类型,不涉及所有权与生命周期管理。
+// ============================================================================
+
 // Forward declarations keep the Admin-VQ context at the type boundary while
 // its transport and virtqueue implementations remain in their normal package
 // order below this include.
@@ -458,10 +473,14 @@ typedef struct {
 // Implementations must invalidate or coordinate normal PF queues and DMA
 // before returning reset_complete=1; Admin VQ never assumes that ownership.
 virtual class virtio_admin_full_reset_owner extends uvm_object;
+    // 构造函数:仅透传名称,无状态可初始化。
     function new(string name = "virtio_admin_full_reset_owner");
         super.new(name);
     endfunction
 
+    // 执行完整 PF 生命周期复位;实现方在完成(含普通队列/DMA 的失效或
+    // 协调,见类头英文契约)后置 reset_complete=1。阻塞 task,无超时
+    // 约定——挂起与否由实现负责。
     pure virtual task reset_pf_lifecycle(ref bit reset_complete);
 endclass : virtio_admin_full_reset_owner
 
@@ -491,6 +510,9 @@ class virtio_admin_vq_context extends uvm_object;
     bit [63:0]            quarantined_iovas[$];
     bit [63:0]            quarantined_gpas[$];
 
+    // 构造函数:标记为未配置、无 lease、无恢复/隔离状态,并创建容量为 1
+    // 的 submit_lock(串行化 Admin 命令);transport/vq/mem 等句柄由
+    // 调用方随后注入,本类不创建它们。
     function new(string name = "virtio_admin_vq_context");
         super.new(name);
         queue_id = 0;

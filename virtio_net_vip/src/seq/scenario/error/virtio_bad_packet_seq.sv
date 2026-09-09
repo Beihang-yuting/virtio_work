@@ -1,6 +1,17 @@
 `ifndef VIRTIO_BAD_PACKET_SEQ_SV
 `define VIRTIO_BAD_PACKET_SEQ_SV
 
+// ============================================================================
+// virtio_bad_packet_seq (seq/scenario/error)
+//
+// 畸形报文注入场景:正常 init/启动数据面后,发送一条 net_hdr 字段自相
+// 矛盾的 TX 事务,验证设备/driver 对坏包的容错(不挂死、正确丢弃或报错)。
+// 四种畸形:假 DATA_VALID + 越界 csum 偏移、hdr_len=0xFFFF 超 MTU、
+// hdr_len=0 零长、声明 TSO 却无对应 payload 的截断包。
+// 注意:这里的"坏"全部编码在 net_hdr 里,不动描述符结构——描述符级
+// 错误由 virtio_desc_error_seq 覆盖,两者互补。
+// ============================================================================
+
 class virtio_bad_packet_seq extends virtio_base_seq;
     `uvm_object_utils(virtio_bad_packet_seq)
 
@@ -11,10 +22,13 @@ class virtio_bad_packet_seq extends virtio_base_seq;
 
     rand bad_pkt_type_e pkt_error;
 
+    // 构造函数:畸形类型不给默认值,由随机化或调用方指定。
     function new(string name = "virtio_bad_packet_seq");
         super.new(name);
     endfunction
 
+    // 正常启动后按 pkt_error 组装对应的畸形 net_hdr 并发送;设备的丢弃/
+    // 报错行为由 scoreboard/driver 检查,本序列只保证激励发出。
     virtual task body();
         virtio_transaction req;
 

@@ -43,6 +43,7 @@ class virtio_rx_pkt_wrapper extends uvm_object;
     virtio_net_hdr_t net_hdr;
     int unsigned     pkt_len;
 
+    // 构造函数：空包装对象（长度 0）；payload/net_hdr 由 RX 引擎回填。
     function new(string name = "virtio_rx_pkt_wrapper");
         super.new(name);
         pkt_len = 0;

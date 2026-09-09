@@ -7,6 +7,18 @@
 // capability information.
 //
 // Per virtio spec Section 4.1.4
+//
+// 中文定位：transport 目录内 PCI 能力发现层，回答"某 virtio 区域在哪个
+// BAR 的哪个偏移"这一路由问题。
+// 职责：沿配置空间 0x34 能力链表(上限 48 项防环)解析 virtio vendor 能力
+// (common/notify/ISR/device/pci cfg)与 MSI-X 能力，缓存 BAR/offset/length
+// 与 notify_off_multiplier，并提供只读访问器和能力信息注错。
+// 依赖：virtio_bar_accessor(经 bar_ref 以 uvm_object 保存、运行期 $cast，
+// 用于打破编译顺序耦合)、virtio_pci_regs 的能力 ID/偏移常量。
+// 所有权/生命周期：uvm_object，由 virtio_pci_transport 构造时创建持有；
+// bar_ref 为借用引用。discover_capabilities() 可重入：每次先清全部 found
+// 标志再重扫；注意各 get_* 访问器不检查 found，发现失败时返回的内容无意义，
+// 调用方须先看对应 found 标志。
 // ============================================================================
 
 `ifndef VIRTIO_PCI_CAP_MANAGER_SV
@@ -55,7 +67,8 @@ class virtio_pci_cap_manager extends uvm_object;
     uvm_object        bar_ref;
 
     // ========================================================================
-    // Constructor
+    // 构造：清零全部发现标志与 notify_off_multiplier；bar_ref 留空，
+    // 由 transport 交叉接线注入后方可发现能力。
     // ========================================================================
 
     function new(string name = "virtio_pci_cap_manager");
@@ -335,7 +348,8 @@ class virtio_pci_cap_manager extends uvm_object;
     endtask
 
     // ========================================================================
-    // report_discovery_status
+    // 汇总打印发现结果，并对缺失的强制能力(common/notify/ISR)报 uvm_error、
+    // 缺 device_cfg 仅告警；只上报不中止，是否继续由测试自行决定。
     // ========================================================================
 
     protected function void report_discovery_status();
@@ -374,37 +388,48 @@ class virtio_pci_cap_manager extends uvm_object;
 
     // ========================================================================
     // Convenience accessors: get BAR number and offset for each region
+    // 中文说明：以下访问器均为纯查询、不检查对应 found 标志——发现失败时
+    // 返回的是未初始化 cap 结构的内容，调用方必须先确认 *_found。
     // ========================================================================
 
+    // common config 区在其 BAR 内的字节偏移(零扩展为 64 位)。
     function bit [63:0] get_common_cfg_bar_offset();
         return {32'h0, common_cfg_cap.offset};
     endfunction
 
+    // common config 区所在 BAR 编号。
     function int unsigned get_common_cfg_bar();
         return common_cfg_cap.bar;
     endfunction
 
+    // 由队列 notify_off 序号换算通知地址在 BAR 内的偏移：
+    // cap.offset + queue_notify_off * notify_off_multiplier。
     function bit [63:0] get_notify_bar_offset(int unsigned queue_notify_off);
         return {32'h0, notify_cap.offset} +
                queue_notify_off * notify_off_multiplier;
     endfunction
 
+    // notify 区所在 BAR 编号。
     function int unsigned get_notify_bar();
         return notify_cap.bar;
     endfunction
 
+    // ISR 状态区在其 BAR 内的字节偏移。
     function bit [63:0] get_isr_bar_offset();
         return {32'h0, isr_cap.offset};
     endfunction
 
+    // ISR 状态区所在 BAR 编号。
     function int unsigned get_isr_bar();
         return isr_cap.bar;
     endfunction
 
+    // device 专属 config 区在其 BAR 内的字节偏移。
     function bit [63:0] get_device_cfg_bar_offset();
         return {32'h0, device_cfg_cap.offset};
     endfunction
 
+    // device 专属 config 区所在 BAR 编号。
     function int unsigned get_device_cfg_bar();
         return device_cfg_cap.bar;
     endfunction

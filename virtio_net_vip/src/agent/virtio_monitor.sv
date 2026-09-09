@@ -45,10 +45,14 @@ class virtio_monitor extends uvm_monitor;
     // interrupt vector before it stages the completion pulse.
     protected int unsigned verified_submission_queues[$];
 
+    // 构造函数：仅完成 UVM 注册；端口/FIFO 延迟到 build_phase 创建，
+    // transport/vq_mgr/protocol_vif 由 env 在 connect 阶段注入。
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
 
+    // 创建三个分析端口（txn/err/pkt）、四类事件 FIFO 及对应 uvm_event。
+    // 副作用：FIFO 作为子组件挂在本 monitor 下，事件对象为本地 new。
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
         txn_ap = new("txn_ap", this);
@@ -64,6 +68,8 @@ class virtio_monitor extends uvm_monitor;
         queue_state_event = new("queue_state_event");
     endfunction
 
+    // 配置合法 DMA 地址窗口 [lo, hi]（闭区间）。lo > hi 视为未配置，
+    // 此时 observe_dma 的越界检查被跳过——这是刻意的失效保护而非报错。
     virtual function void configure_dma_range(
         input bit [63:0] lo,
         input bit [63:0] hi
@@ -73,6 +79,9 @@ class virtio_monitor extends uvm_monitor;
         dma_range_configured = (lo <= hi);
     endfunction
 
+    // 复位全部协议语义状态：设备状态回 RESET、清 feature 使用记录、
+    // 丢弃已验证的 notify 队列并清空所有队列配置/使能标记。
+    // 用于设备级复位（FLR、status=0），不触碰 DMA 窗口配置。
     virtual function void reset_protocol_state();
         last_status = DEV_STATUS_RESET;
         used_features = '0;
@@ -83,6 +92,8 @@ class virtio_monitor extends uvm_monitor;
     // Reset helpers are called by the PCIe observer for Q_RESET and by the
     // status decoder for device reset.  They deliberately clear semantic
     // state independently of the observer's decode cache.
+    // 中文：单队列复位——删除该队列的配置/使能标记、丢弃其待完成 notify，
+    // 并把队列状态与复位事件转发给 SVA 接口（vif 未接入时静默跳过）。
     virtual function void reset_queue_state(input int unsigned queue_id);
         queue_configured.delete(queue_id);
         queue_enabled.delete(queue_id);
@@ -93,6 +104,8 @@ class virtio_monitor extends uvm_monitor;
         end
     endfunction
 
+    // 全队列复位：清空所有队列的配置/使能表及待完成 notify 队列，
+    // 并通知 SVA 接口复位全部队列跟踪状态。由 status=0 写入时自动调用。
     virtual function void reset_all_queue_state();
         queue_configured.delete();
         queue_enabled.delete();
@@ -103,6 +116,11 @@ class virtio_monitor extends uvm_monitor;
         end
     endfunction
 
+    // 观察一次 BAR 读写并发布 VIRTIO_MON_BAR_ACCESS 事件。
+    // 若写目标是 common config 的 status 寄存器（且 bar_id 匹配 common cfg
+    // 所在 BAR，或调用方/transport 未提供 BAR 信息则放宽匹配），则做状态机
+    // 转换合法性检查；非法转换标记错误，写 0 触发全队列复位。
+    // 副作用：更新 last_status，并向 protocol_vif 驱动 status 事件。
     virtual function void observe_bar_access(
         input bit [63:0] address,
         input bit is_write,
@@ -139,6 +157,9 @@ class virtio_monitor extends uvm_monitor;
         publish_event(txn);
     endfunction
 
+    // 观察一次已解码的 status 写（调用方直接给出新旧值，不经过 BAR 解码）。
+    // 与 observe_bar_access 的 status 分支逻辑一致：校验转换合法性、
+    // 更新 last_status、status=0 时复位全部队列状态，最后发布事件。
     virtual function void observe_status_write(
         input bit [7:0] old_status,
         input bit [7:0] new_status
@@ -161,6 +182,9 @@ class virtio_monitor extends uvm_monitor;
         publish_event(txn);
     endfunction
 
+    // 观察一次设备侧 DMA 访问。当越界检查使能且 DMA 窗口已配置时，
+    // 校验 [address, address+size-1] 完全落在窗口内；size==0 或地址回绕
+    // （last_byte < address）同样判为越界。事件同时转发给 SVA 接口。
     virtual function void observe_dma(
         input bit [63:0] address,
         input int unsigned size_bytes,
@@ -187,6 +211,9 @@ class virtio_monitor extends uvm_monitor;
         publish_event(txn);
     endfunction
 
+    // 观察一次中断（MSI-X 向量号或 INTx）。通过 take_queue_completion 判定
+    // 该向量是否对应某个已验证 notify 的队列完成，并把判定结果连同队列号
+    // 一起转发给 SVA 接口；irq_mode 取自 transport（未接入时默认 per-queue MSI-X）。
     virtual function void observe_interrupt(input int unsigned vector);
         virtio_transaction txn;
         int unsigned queue_id;
@@ -205,6 +232,9 @@ class virtio_monitor extends uvm_monitor;
         publish_event(txn);
     endfunction
 
+    // 观察队列配置/使能状态变化并更新本地跟踪表。
+    // 协议规则：队列必须先 configured 再 enabled，违反即标记错误。
+    // bar_offset/data/is_write 为可选的原始访问上下文，仅用于事件记录。
     virtual function void observe_queue_state(
         input int unsigned queue_id,
         input bit configured,
@@ -233,6 +263,11 @@ class virtio_monitor extends uvm_monitor;
         publish_event(txn);
     endfunction
 
+    // 观察一次队列 doorbell（kick）。合法性依次要求：队列已 configured 且
+    // enabled；若提供了 notify 地址且 discovery 已填充 queue_notify_off，
+    // 还必须命中该队列专属的 doorbell 偏移；vq_mgr 存在时进一步核对
+    // 队列对象的 queue_enable。合法的 notify 入队 verified_submission_queues
+    // 供后续中断关联；非法 kick 标记 VQ_ERR_KICK_BEFORE_ENABLE 错误。
     virtual function void observe_queue_notify(
         input int unsigned queue_id,
         input bit [15:0] notify_payload = '0,
@@ -294,6 +329,7 @@ class virtio_monitor extends uvm_monitor;
         publish_event(txn);
     endfunction
 
+    // 兼容旧接口：直接委托 observe_status_write 做状态转换检查。
     virtual function void check_status_transition(
         input bit [7:0] old_status,
         input bit [7:0] new_status
@@ -301,6 +337,9 @@ class virtio_monitor extends uvm_monitor;
         observe_status_write(old_status, new_status);
     endfunction
 
+    // 检查 feature 使用是否越权：attempted_use 中未在 negotiated 出现的位
+    // 即为 unauthorized，非零则报违例（错误 txn 的 features 字段只留越权位）。
+    // 副作用：把 attempted_use 累加进 used_features 供覆盖率/后续分析。
     virtual function void check_feature_dependency(
         input bit [63:0] negotiated,
         input bit [63:0] attempted_use
@@ -322,24 +361,31 @@ class virtio_monitor extends uvm_monitor;
         publish_event(txn);
     endfunction
 
+    // 兼容旧接口：按"无地址信息的 kick"语义委托 observe_queue_notify。
     virtual function void check_queue_access_valid(input int unsigned queue_id);
         observe_queue_notify(queue_id);
     endfunction
 
+    // 外部组件（如 driver 回调）直接广播一笔事务到 txn_ap，不走事件 FIFO。
     virtual function void broadcast_txn(virtio_transaction txn);
         txn_ap.write(txn);
     endfunction
 
+    // 把事务标记为错误后同时广播到 txn_ap 和 err_ap（副作用：置 monitor_error）。
     virtual function void broadcast_error(virtio_transaction txn);
         txn.monitor_error = 1;
         txn_ap.write(txn);
         err_ap.write(txn);
     endfunction
 
+    // 广播一个数据面报文对象（收发包路径）到 pkt_ap，供 scoreboard 比对。
     virtual function void broadcast_pkt(uvm_object pkt);
         pkt_ap.write(pkt);
     endfunction
 
+    // 构造一笔 monitor 事件事务：填入事件类型、地址/长度/读写方向，
+    // 并从 transport 快照 BDF、IOMMU host id 与 PCIe segment id（transport
+    // 未接入时全部取 0），保证下游 scoreboard 能按 function 维度归类。
     protected function virtio_transaction new_monitor_txn(
         input virtio_monitor_event_e event_kind,
         input bit [63:0] address,
@@ -360,6 +406,12 @@ class virtio_monitor extends uvm_monitor;
         return txn;
     endfunction
 
+    // 判定 status 寄存器转换是否符合 virtio 1.x 状态机：
+    // - 写 0（复位）和置 FAILED 任何时候都合法；
+    // - 其余转换只能增位不能丢位（new & old == old）；
+    // - DRIVER_OK 需要 FEATURES_OK，FEATURES_OK 需要 DRIVER，
+    //   DRIVER 需要 ACKNOWLEDGE（逐级依赖）。
+    // chk_status_transition==0 时旁路所有检查恒返回 1。
     protected function bit status_transition_valid(
         input bit [7:0] old_status,
         input bit [7:0] new_status
@@ -385,6 +437,7 @@ class virtio_monitor extends uvm_monitor;
         return valid;
     endfunction
 
+    // 把 status 写事件转发给 SVA 接口；protocol_vif 未接入时为无害空操作。
     protected function void drive_status_event(
         input bit [7:0] old_status,
         input bit [7:0] new_status
@@ -401,6 +454,10 @@ class virtio_monitor extends uvm_monitor;
     // emitted so the SVA can report an unmatched queue completion.  INTx
     // additionally requires the ISR queue bit; a simultaneous config-change
     // bit does not suppress that queue completion.
+    // 中文：判定中断向量是否是队列完成。优先消费匹配的已验证 notify
+    //（INTx 或向量号命中该队列 vector）；没有匹配 notify 时退化为在
+    // 已配置且已使能的队列里找一个向量匹配者（不消费，用于报告未匹配
+    // 完成）。返回 1 时通过 queue_id 输出命中的队列号。
     protected function bit take_queue_completion(
         input int unsigned vector,
         output int unsigned queue_id
@@ -443,6 +500,8 @@ class virtio_monitor extends uvm_monitor;
         return 0;
     endfunction
 
+    // 从待完成 notify 队列里剔除指定队列的所有条目（队列复位时防止
+    // 复位前的 kick 被复位后的中断错误关联）。
     protected function void discard_queue_submissions(input int unsigned queue_id);
         for (int index = 0; index < verified_submission_queues.size();) begin
             if (verified_submission_queues[index] == queue_id)
@@ -452,12 +511,17 @@ class virtio_monitor extends uvm_monitor;
         end
     endfunction
 
+    // 把事务标记为协议错误（置 monitor_error、txn_type 改为 INJECT_ERROR）
+    // 并上报 uvm_error；实际的 err_ap 广播由 publish_event 统一完成。
     protected function void mark_error(ref virtio_transaction txn, input string message);
         txn.monitor_error = 1;
         txn.txn_type = VIO_TXN_INJECT_ERROR;
         `uvm_error("VIRTIO_MON", message)
     endfunction
 
+    // 统一出口：按事件类型写入对应 FIFO 并触发 uvm_event，然后恰好一次
+    // 广播到 txn_ap；带错误标记的事务额外复制到 err_ap。
+    // 所有 observe_*/check_* 路径都必须经由此函数发布，避免重复广播。
     protected function void publish_event(virtio_transaction txn);
         case (txn.monitor_event)
             VIRTIO_MON_BAR_ACCESS: begin

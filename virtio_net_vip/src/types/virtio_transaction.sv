@@ -1,6 +1,23 @@
 `ifndef VIRTIO_TRANSACTION_SV
 `define VIRTIO_TRANSACTION_SV
 
+// ============================================================================
+// virtio_transaction (types)
+//
+// 全 VIP 唯一的 sequence item:序列 <-> driver 的命令通道和 monitor 广播
+// 复用同一个类,由 txn_type / is_monitor_event 区分语义。取舍:字段按
+// "各事务类型字段并集"平铺(数据面、控制面、队列管理、迁移、错误注入、
+// monitor 元数据),而不是拆成事务子类——代价是单类偏大,换来 sequencer/
+// FIFO 类型统一和公共 API 稳定(monitor 元数据即以"只增字段"方式演进,
+// 见字段旁英文说明)。
+// 双向约定:packets/ctrl_* 等由序列填入;received_pkts/ctrl_ack/desc_id/
+// snapshot/success 等由 driver 在同一对象上回填,序列在 finish_item 后读取。
+// 报文用 uvm_object 句柄携带(packet_item 定义在更晚的编译层),事务不
+// 拥有报文对象,只传引用。
+// 生命周期:序列/monitor create,经 sequencer/analysis FIFO 传递,UVM
+// 引用计数回收。依赖:virtio_net_types.sv 的全部枚举/结构定义。
+// ============================================================================
+
 class virtio_transaction extends uvm_sequence_item;
     `uvm_object_utils(virtio_transaction)
 
@@ -78,6 +95,10 @@ class virtio_transaction extends uvm_sequence_item;
     // ===== Result =====
     bit                      success;          // operation outcome
 
+    // 构造函数:给全部标量字段确定的默认值(INIT 类型、非 monitor 事件、
+    // 50us 超时、256 队列深度、split ring、NAPI budget 64),避免未赋值
+    // 字段以 X/随机残留进入 driver;monitor_bar_id 用全 F 表示"未提供
+    // BAR 身份"的哨兵值。
     function new(string name = "virtio_transaction");
         super.new(name);
         txn_type = VIO_TXN_INIT;
@@ -111,6 +132,9 @@ class virtio_transaction extends uvm_sequence_item;
 
     // ===== UVM methods =====
 
+    // 字段级浅拷贝:标量/结构按值复制,packets 等对象队列只复制句柄
+    // (与"事务不拥有报文对象"的约定一致)。cast 失败时静默跳过本类字段,
+    // 仅保留 super 拷贝的基类部分。新增字段必须同步维护此列表。
     virtual function void do_copy(uvm_object rhs);
         virtio_transaction rhs_t;
         super.do_copy(rhs);
@@ -163,6 +187,8 @@ class virtio_transaction extends uvm_sequence_item;
         end
     endfunction
 
+    // 单行摘要:monitor 事件打事件/地址/错误位,命令事务只打类型+队列,
+    // 供日志快速定位;详细字段展开走 do_print。
     virtual function string convert2string();
         if (is_monitor_event) begin
             return $sformatf("virtio_monitor_txn: event=%s addr=0x%016h queue=%0d error=%0b",
@@ -171,6 +197,8 @@ class virtio_transaction extends uvm_sequence_item;
         return $sformatf("virtio_txn: type=%s queue=%0d", txn_type.name(), queue_id);
     endfunction
 
+    // uvm_printer 展开:公共字段(类型/队列)之外,按 txn_type 只补打与
+    // 该事务语义相关的字段,避免无关字段刷屏。
     virtual function void do_print(uvm_printer printer);
         super.do_print(printer);
         printer.print_string("txn_type", txn_type.name());

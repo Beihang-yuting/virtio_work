@@ -28,6 +28,8 @@ class virtio_offload_engine extends uvm_object;
     int unsigned mtu = 1500;
     int unsigned mss = 1460;   // TCP MSS default (MTU - IP(20) - TCP(20))
 
+    // 构造函数：创建 csum/tso/uso/rss 四个子引擎并清零协商特性；
+    // 本类是各 offload 子引擎的聚合门面（facade）。
     function new(string name = "virtio_offload_engine");
         super.new(name);
         csum = virtio_csum_engine::type_id::create("csum");
@@ -132,10 +134,12 @@ class virtio_offload_engine extends uvm_object;
         csum.prepare_tx_csum(hdr, pkt_data);
     endfunction
 
+    // 委托 csum 引擎：计算 virtio_net_hdr.csum_start（L4 头起始偏移）。
     function int unsigned calc_csum_start(byte unsigned pkt_data[$]);
         return csum.calc_csum_start(pkt_data);
     endfunction
 
+    // 委托 csum 引擎：计算 checksum 字段在 L4 头内的偏移（TCP=16/UDP=6）。
     function int unsigned calc_csum_offset(byte unsigned pkt_data[$]);
         return csum.calc_csum_offset(pkt_data);
     endfunction

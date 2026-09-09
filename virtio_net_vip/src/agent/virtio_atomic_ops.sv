@@ -82,6 +82,7 @@ class virtio_atomic_ops extends uvm_object;
         mem.free(record.gpa);
     endfunction
 
+    // 批量退休普通 DMA 所有权记录（逐条 unmap+free），并清空调用方队列。
     protected function void retire_normal_dma_records(
         ref normal_dma_record_t records[$]
     );
@@ -91,6 +92,8 @@ class virtio_atomic_ops extends uvm_object;
         records.delete();
     endfunction
 
+    // 是否仍有未退休的普通 DMA 所有权（任一 TX/RX 队列的 map 非空，
+    // 或迁移恢复暂存列表非空）；device_reset 用它判断是否需要 mem 上下文。
     protected function bit has_pending_normal_dma();
         foreach (tx_dma_map[qid]) begin
             if (tx_dma_map[qid].size() != 0)
@@ -190,6 +193,8 @@ class virtio_atomic_ops extends uvm_object;
         return 1;
     endfunction
 
+    // 释放迁移恢复暂存列表中全部尚未被认领的 DMA 分配（unmap+free），
+    // 用于恢复失败/中止路径的兜底清理。
     function void release_migration_restore_payloads();
         retire_normal_dma_records(migration_restore_dma);
     endfunction
@@ -252,6 +257,9 @@ class virtio_atomic_ops extends uvm_object;
         return 1;
     endfunction
 
+    // 从迁移恢复暂存列表认领一条与期望映射（host/bdf/iova）匹配的记录：
+    // 命中后还要求 IOMMU 当前活映射的 size/dir 与期望一致，否则判失败；
+    // 认领成功即从暂存列表移除并经 destination 交还所有权。
     protected function bit claim_migration_restore_dma(
         iommu_mapping_t expected, ref normal_dma_record_t destination
     );
@@ -434,6 +442,8 @@ class virtio_atomic_ops extends uvm_object;
         return validate_restored_queue_ownership(snap);
     endfunction
 
+    // 兼容旧名：仅恢复 indirect 表的调用方入口，委托统一的
+    // claim_restored_queue_ownership。
     virtual function bit claim_restored_indirect_ownership(
         virtqueue_snapshot_t queue_snapshot
     );
@@ -504,6 +514,8 @@ class virtio_atomic_ops extends uvm_object;
         `uvm_info("ATOMIC_OPS", "device_reset: complete", UVM_MEDIUM)
     endtask
 
+    // 便捷入口：执行验证式设备复位但忽略完成标志（结果由日志体现）；
+    // 需要判定复位是否成功的调用方应使用 device_reset_verified。
     virtual task device_reset();
         bit reset_complete;
 

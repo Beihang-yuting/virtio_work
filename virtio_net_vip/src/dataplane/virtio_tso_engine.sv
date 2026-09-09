@@ -19,6 +19,7 @@ class virtio_tso_engine extends uvm_object;
     localparam int unsigned ETHERTYPE_IPV4  = 16'h0800;
     localparam int unsigned ETHERTYPE_IPV6  = 16'h86DD;
 
+    // 构造函数：无状态引擎，仅 UVM 注册。
     function new(string name = "virtio_tso_engine");
         super.new(name);
     endfunction

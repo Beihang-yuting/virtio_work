@@ -16,16 +16,19 @@ class virtio_buf_tracker extends uvm_object;
     bit [63:0]   iova_list[$];
     int unsigned size_list[$];
 
+    // 构造函数：空跟踪器；三个并行列表在 add 时同步增长。
     function new(string name = "virtio_buf_tracker");
         super.new(name);
     endfunction
 
+    // 追加一条缓冲区记录（GPA/IOVA/长度三元组，索引一一对应）。
     function void add(bit [63:0] gpa, bit [63:0] iova, int unsigned size);
         gpa_list.push_back(gpa);
         iova_list.push_back(iova);
         size_list.push_back(size);
     endfunction
 
+    // 返回已跟踪的缓冲区条数（以 gpa_list 为准，三表长度恒一致）。
     function int unsigned count();
         return gpa_list.size();
     endfunction

@@ -14,6 +14,13 @@
 //   3. Error injection -- skip flags allow deliberate barrier omission
 //      to verify that the scoreboard catches ordering violations
 //
+// 中文说明：virtio 驱动内存屏障（smp_wmb/rmb/mb）的行为模型。仿真单线程
+// 顺序执行，屏障对时序本是空操作，但保留调用点有三重价值：在规范要求屏障
+// 的位置留下可审计的记录、统计计数供测试断言"该打的屏障都打了"、以及经
+// skip 开关故意漏打屏障来验证 scoreboard 能抓到乱序违例。三个 skip 开关与
+// virtqueue_error_e 的三种 barrier-skip 错误一一对应，由
+// inject_barrier_skip() 置位、clear_all_skips() 复位。
+//
 // Depends on: virtio_net_types.sv (virtqueue_error_e)
 // ============================================================================
 
@@ -46,6 +53,7 @@ class virtio_memory_barrier_model extends uvm_object;
     // ------------------------------------------------------------------
     // Constructor
     // ------------------------------------------------------------------
+    // 构造函数：skip 开关全关、计数清零，即默认按规范打全所有屏障。
     function new(string name = "virtio_memory_barrier_model");
         super.new(name);
     endfunction

@@ -10,17 +10,23 @@
 
 virtual class virtqueue_custom_callback extends uvm_object;
 
+    // 构造函数：抽象回调基类无自有状态，仅传名字给父类。
     function new(string name = "virtqueue_custom_callback");
         super.new(name);
     endfunction
 
-    // Lifecycle
+    // 生命周期回调：cb_alloc_rings 分配并初始化用户自定义 ring（须回填 vq 的
+    // desc_table_addr 等基址）；cb_free_rings 释放之；cb_reset_queue 清运行态
+    // 但保留 ring 内存；cb_detach_all_unused 摘除未消费缓冲并经 tokens 归还。
+    // vq 参数即宿主 custom_virtqueue，回调借它访问 mem/iommu/barrier 等句柄。
     pure virtual function void cb_alloc_rings(virtqueue_base vq);
     pure virtual function void cb_free_rings(virtqueue_base vq);
     pure virtual function void cb_reset_queue(virtqueue_base vq);
     pure virtual function void cb_detach_all_unused(virtqueue_base vq, ref uvm_object tokens[$]);
 
-    // Driver operations
+    // 驱动操作回调：cb_add_buf 按用户格式把 SG 列表序列化进 ring 并返回描述
+    // 符头 ID；cb_kick 为 task，实现向设备发通知（可耗仿真时间）；
+    // cb_poll_used 非阻塞收割一条完成，输出 token/len，命中返回 1。
     pure virtual function int unsigned cb_add_buf(virtqueue_base vq,
                                                    virtio_sg_list sgs[],
                                                    int unsigned n_out_sgs,
@@ -32,21 +38,26 @@ virtual class virtqueue_custom_callback extends uvm_object;
                                             ref uvm_object token,
                                             ref int unsigned len);
 
-    // Notification control
+    // 通知控制回调（对应 NAPI 语义）：cb_disable_cb/cb_enable_cb 关/开完成
+    // 通知，cb_enable_cb_delayed 延迟到当前 pending 之后再开，cb_vq_poll 判断
+    // last_used 之后是否有新完成。
     pure virtual function void cb_disable_cb(virtqueue_base vq);
     pure virtual function void cb_enable_cb(virtqueue_base vq);
     pure virtual function void cb_enable_cb_delayed(virtqueue_base vq);
     pure virtual function bit  cb_vq_poll(virtqueue_base vq, int unsigned last_used);
 
-    // Query
+    // 只读查询回调：空闲描述符数、已发布未收割数、本次 kick 是否需要真的
+    // 通知设备。
     pure virtual function int unsigned cb_get_free_count(virtqueue_base vq);
     pure virtual function int unsigned cb_get_pending_count(virtqueue_base vq);
     pure virtual function bit          cb_needs_notification(virtqueue_base vq);
 
-    // Error injection
+    // 错误注入回调：按 err_type 在用户自定义 ring 中制造对应的描述符错误；
+    // 通用注入器不认识自定义布局，只能由用户实现落到具体字段。
     pure virtual function void cb_inject_desc_error(virtqueue_base vq, virtqueue_error_e err_type);
 
-    // Migration
+    // 迁移回调：cb_save_state 把自定义队列运行态写入 snap（不得改动队列）；
+    // cb_restore_state 在目的端按 snap 重建，失败返回 0 且不能留下半初始化态。
     pure virtual function void cb_save_state(virtqueue_base vq, ref virtqueue_snapshot_t snap);
     pure virtual function bit cb_restore_state(virtqueue_base vq, virtqueue_snapshot_t snap);
 
@@ -87,6 +98,8 @@ class custom_virtqueue extends virtqueue_base;
     // ------------------------------------------------------------------
     // Constructor
     // ------------------------------------------------------------------
+    // 构造函数：custom_cb 显式置空——所有 ring 操作都依赖用户后续注入回调，
+    // 未注入时各入口经 check_cb() 报错并按安全默认值返回。
     function new(string name = "custom_virtqueue");
         super.new(name);
         custom_cb = null;
@@ -108,6 +121,10 @@ class custom_virtqueue extends virtqueue_base;
     // =================================================================
     // Lifecycle methods -- delegate to callback
     // =================================================================
+    // 以下所有委托包装遵循同一模式：先 check_cb() 确认回调已注入（未注入
+    // 报 uvm_error），再原样转发给 custom_cb；失败时的返回值取各接口的安全
+    // 默认——add_buf 返回 '1（失败约定）、poll_used/vq_poll 返回 0（无完成）、
+    // get_*_count 返回 0、needs_notification 返回 1（宁可多通知不丢通知）。
 
     virtual function void alloc_rings();
         if (!check_cb("alloc_rings")) return;
@@ -204,6 +221,10 @@ class custom_virtqueue extends virtqueue_base;
     // DMA helpers (transport-independent, same as split/packed)
     // =================================================================
 
+    // 用本队列 {host_id, bdf} 域把调用方 GPA 映射为 IOVA，并登记到
+    // dma_mappings 供 teardown/leak_check 统一回收；GPA 所有权仍归调用方。
+    // 与 split/packed 实现一致，不经回调——DMA 映射语义与 ring 格式无关。
+    // 注意映射失败（IOVA 返回 '1）也会照常登记，由上层检查返回值。
     virtual function bit [63:0] dma_map_buf(
         bit [63:0] gpa, int unsigned size, dma_dir_e dir
     );
@@ -229,6 +250,8 @@ class custom_virtqueue extends virtqueue_base;
         return iova;
     endfunction
 
+    // 按 IOVA 找到登记项后经 release_dma_mapping() 解除 IOMMU 映射并注销；
+    // 找不到报 uvm_error（重复 unmap 或 unmap 未登记地址属调用方 bug）。
     virtual function void dma_unmap_buf(bit [63:0] iova);
         int found_idx = -1;
 

@@ -8,6 +8,17 @@ import uvm_pkg::*;
 // their one-clock pulses at negedge so the checker samples them deterministically
 // at the following posedge.  Direct VIF driving remains supported for the
 // protocol-only testbench.
+// 中文文件头：monitor（零时序的函数调用域）与 SVA 检查器（时钟采样域）
+// 之间的跨域桥。职责分三层：
+//   1) stage_* 函数：monitor 回调把解码好的事件暂存进接口（函数不能耗时，
+//      故只入队/置 pending 标志，不直接翻转脉冲信号）；
+//   2) negedge 释放块：每个下降沿弹出一个暂存脉冲并驱动对应单拍信号，
+//      保证 posedge 检查器确定性采样，且保持 monitor 原始事件顺序；
+//   3) posedge 记账块：维护 features_ok_seen/driver_seen 生命周期历史与
+//      按队列的 outstanding submission 信用计数，并在采样后自动清脉冲。
+// 依赖：被 virtio_protocol_assertions 模块以 interface port 绑定；
+// 由 virtio_monitor 通过 virtual interface 调用 stage_*。
+// 协议自测平台也可以绕过 staging 直接驱动脉冲字段（direct VIF 模式）。
 interface virtio_protocol_event_if(input logic clk, input logic rst_n);
     logic        status_write;
     logic        features_ok;
@@ -78,6 +89,7 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
     logic        staged_interrupt_pending;
     logic [15:0] staged_interrupt_vector;
 
+    // 上电初值：所有脉冲/历史/计数清零，断言默认使能。
     initial begin
         status_write = 0;
         features_ok = 0;
@@ -112,6 +124,10 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
     // The queue preserves order across status, notify and completion pulses;
     // a same-half-cycle notify followed by completion therefore remains a
     // prior submission rather than an ambiguous simultaneous pair.
+    // 中文：negedge 释放块——每拍最多释放一个协议脉冲（保序 FIFO），
+    // 电平型元数据（queue/DMA/中断向量）则合并为最新值一次性刷新；
+    // rst_n 拉低时丢弃全部暂存事件。completion 释放时同步锁存
+    // completion_has_pending_submission，把关联查表挡在并发断言之外。
     always @(negedge clk or negedge rst_n) begin
         staged_pulse_t staged;
 
@@ -172,6 +188,12 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         end
     end
 
+    // 中文：posedge 记账块——检查器采样之后更新生命周期历史与信用：
+    // - 写 status=0 视为设备复位，清 features_ok_seen/driver_seen 及全部
+    //   submission 信用（但保留 protocol_error_count 供负向用例统计）；
+    // - verified_submission/completion 按队列增减信用，2'b11 分支仅为
+    //   direct VIF 兼容（production staging 每拍只发一个脉冲）；
+    // - 末尾统一把所有单拍脉冲清零，保证脉冲宽度恰为一拍。
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             status_write <= 0;
@@ -304,6 +326,8 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         end
     end
 
+    // 暂存一次 status 写脉冲（保序入队；FEATURES_OK/DRIVER_OK 派生位
+    // 由释放块根据 new_status 解出）。monitor 回调专用，无副作用于当前拍。
     function void stage_status_write(
         input logic [7:0] old_status,
         input logic [7:0] new_status
@@ -315,6 +339,8 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         staged_pulses.push_back(staged);
     endfunction
 
+    // 暂存队列配置/使能电平（非脉冲）：同半拍多次调用只保留最后一次，
+    // 因为该状态本身不触发 SVA 采样，只作为 notify 断言的背景条件。
     function void stage_queue_state(
         input logic [15:0] id,
         input logic configured,
@@ -326,6 +352,8 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         staged_queue_state_pending = 1;
     endfunction
 
+    // 暂存一次 doorbell 脉冲：携带队列号、配置/使能快照以及 monitor 的
+    // verified 判定（只有 verified==1 的 notify 会在记账块产生 submission 信用）。
     function void stage_notify(
         input logic [15:0] id,
         input logic configured,
@@ -341,6 +369,8 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         staged_pulses.push_back(staged);
     endfunction
 
+    // 暂存一次中断：原始向量号始终作为电平元数据刷新；只有 monitor 判定
+    // 为队列完成（queue_completion==1）时才额外入队 completion 脉冲。
     function void stage_interrupt(
         input logic [15:0] vector,
         input logic queue_completion,
@@ -357,6 +387,7 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         end
     endfunction
 
+    // 暂存单队列复位脉冲：记账块据此仅回收该队列的 submission 信用。
     function void stage_queue_reset(input logic [15:0] id);
         staged_pulse_t staged;
         staged.kind = STAGED_QUEUE_RESET;
@@ -364,6 +395,7 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         staged_pulses.push_back(staged);
     endfunction
 
+    // 暂存全队列复位脉冲：记账块据此清空所有 submission 信用。
     function void stage_reset_all_queues();
         staged_pulse_t staged;
         staged.kind = STAGED_RESET_ALL_QUEUES;
@@ -379,6 +411,8 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
             (outstanding_submissions_for_queue(id) != 0);
     endfunction
 
+    // 查询指定队列当前未完成的 submission 信用数；无记录返回 0。
+    // 供释放块与 direct 模式共用，避免在断言表达式里做关联数组查找。
     function int unsigned outstanding_submissions_for_queue(
         input logic [15:0] id
     );
@@ -387,6 +421,7 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         return 0;
     endfunction
 
+    // 暂存 DMA 地址/长度电平元数据（合并为最新值，不产生 SVA 脉冲）。
     function void stage_dma(
         input logic [63:0] address,
         input logic [31:0] length

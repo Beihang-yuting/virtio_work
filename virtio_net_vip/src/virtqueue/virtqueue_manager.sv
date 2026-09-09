@@ -40,6 +40,8 @@ class virtqueue_manager extends uvm_object;
     // ------------------------------------------------------------------
     // Constructor
     // ------------------------------------------------------------------
+    // 构造函数：共享句柄（mem/iommu/barrier 等）由外部在 create_queue 前
+    // 直接赋值注入，构造期不做任何检查或分配。
     function new(string name = "virtqueue_manager");
         super.new(name);
     endfunction

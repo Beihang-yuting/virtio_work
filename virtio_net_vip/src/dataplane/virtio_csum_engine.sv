@@ -34,6 +34,7 @@ class virtio_csum_engine extends uvm_object;
     localparam int unsigned TCP_CSUM_OFFSET = 16;
     localparam int unsigned UDP_CSUM_OFFSET = 6;
 
+    // 构造函数：无状态引擎，仅 UVM 注册。
     function new(string name = "virtio_csum_engine");
         super.new(name);
     endfunction

@@ -13,6 +13,14 @@
 //   - poll_interval_ns is clamped to minimum 1 to prevent infinite loops
 //   - max_poll_attempts caps iterations as a deadlock guard
 //   - Effective timeout = base_ns * timeout_multiplier
+//
+// 中文说明：全 VIP 统一的等待/超时策略对象——任何等待都必须经它，禁止裸
+// #delay。这样做的原因：(1) 超时可用 timeout_multiplier 一处全局放大（压力
+// 测试）；(2) 双保险防挂死——墙钟超时 + max_poll_attempts 迭代上限（仿真
+// 时间不推进时也能退出）；(3) 所有 fork 均命名并只 disable 具名块，避免
+// "disable fork" 误杀调用方的并行线程。各 *_timeout_ns 字段是场景基准值，
+// 实际生效值 = 基准 × multiplier（饱和乘法防溢出）。超时统一报 uvm_error，
+// 调用方凭 ref 标志判断成功/超时。
 // ============================================================================
 
 class virtio_wait_policy extends uvm_object;
@@ -40,6 +48,7 @@ class virtio_wait_policy extends uvm_object;
     // ------------------------------------------------------------------
     // Constructor
     // ------------------------------------------------------------------
+    // 构造函数：各超时字段用声明处默认值；测试可在 build 阶段直接改写字段。
     function new(string name = "virtio_wait_policy");
         super.new(name);
     endfunction

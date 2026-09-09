@@ -48,6 +48,8 @@ class packed_virtqueue extends virtqueue_base;
     // ------------------------------------------------------------------
     // Constructor
     // ------------------------------------------------------------------
+    // 构造函数：索引清零、两个 wrap counter 按 virtio 规范置 1（首圈 AVAIL=1/
+    // USED=0 的判定基准）；真正可用要等 setup()+alloc_rings()。
     function new(string name = "packed_virtqueue");
         super.new(name);
         next_avail_idx     = 0;
@@ -585,10 +587,14 @@ class packed_virtqueue extends virtqueue_base;
     // Query methods
     // =================================================================
 
+    // 返回可用的空闲 buffer ID 数：packed 队列的可用额度由 free_id_list 管理，
+    // 不读 host memory。
     virtual function int unsigned get_free_count();
         return free_id_list.size();
     endfunction
 
+    // 返回已占用的 buffer ID 数（queue_size - 空闲数），含设备已完成但驱动尚
+    // 未 poll_used 收割的部分；VQ_RESET 态恒为 0。
     virtual function int unsigned get_pending_count();
         if (state == VQ_RESET)
             return 0;
@@ -637,6 +643,9 @@ class packed_virtqueue extends virtqueue_base;
     // DMA helpers (same pattern as split virtqueue)
     // =================================================================
 
+    // 用本队列 {host_id, bdf} 域把调用方 GPA 映射为 IOVA，并登记到
+    // dma_mappings 供 teardown/leak_check 统一回收；GPA 所有权仍归调用方。
+    // 注意映射失败（IOVA 为 '1）也会照常登记，由上层检查返回值。
     virtual function bit [63:0] dma_map_buf(
         bit [63:0] gpa, int unsigned size, dma_dir_e dir
     );
@@ -662,6 +671,8 @@ class packed_virtqueue extends virtqueue_base;
         return iova;
     endfunction
 
+    // 按 IOVA 查登记表，命中则经 release_dma_mapping() 解除 IOMMU 映射并注销
+    // 登记；找不到报 uvm_error——重复 unmap 或 unmap 未登记地址属调用方 bug。
     virtual function void dma_unmap_buf(bit [63:0] iova);
         int found_idx = -1;
 
@@ -688,10 +699,15 @@ class packed_virtqueue extends virtqueue_base;
     // Error injection
     // =================================================================
 
+    // 向通用注入器声明本队列的线上描述符格式为 packed（16 字节
+    // addr/len/id/flags 布局），使其能正确定位字段做破坏。
     virtual function virtqueue_type_e descriptor_format();
         return VQ_PACKED;
     endfunction
 
+    // 定向错误注入分派：三种 barrier-skip 错误直接交给 barrier 模型（属内存序
+    // 语义，与描述符无关）；其余类型配置给 err_inj 并显式限定到本 queue_id，
+    // 由后续 add_buf/kick 路径上的钩子按 phase 消费。err_inj 为空仅告警。
     virtual function void inject_desc_error(virtqueue_error_e err_type);
         case (err_type)
             VQ_ERR_SKIP_WMB_BEFORE_AVAIL,

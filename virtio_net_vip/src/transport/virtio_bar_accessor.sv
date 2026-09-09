@@ -10,6 +10,17 @@
 //   - enumerate_bars:         Standard PCI BAR enumeration
 //   - Error-injection variants for poisoned TLP testing
 //
+// 中文定位：transport 目录内 MMIO/配置空间访问的最底层执行者，virtio 侧所有
+// PCIe 请求(除 DMA)最终都经由本文件的四个 helper sequence 落到 RC sequencer。
+// 职责：字节使能计算与数据抽取、BAR 枚举与地址分配、Fabric 模式下的 BAR
+// 角色租约校验/编程/访问守卫(功能 MMIO 限 BAR0/2、MSI-X 限 BAR4)、
+// 以及 zero-BE 错误注入变体。
+// 依赖：pcie_tl_vip 的 TLP/sequencer 类型、dpu BAR 租约与角色枚举、
+// virtio_tlm_completion_adapter(TLM 路径经 factory override 接管本文件的
+// 四个基类 sequence)。
+// 所有权/生命周期：uvm_object，由 virtio_pci_transport 构造时创建并持有；
+// pcie_rc_seqr/endpoint_completion_adapter 为借用引用，经 bind_pcie_path()
+// 注入。helper sequence 每次访问临时创建、用完即弃。
 // ============================================================================
 
 `ifndef VIRTIO_BAR_ACCESSOR_SV
@@ -39,6 +50,8 @@ class virtio_bar_mem_rd_seq extends uvm_sequence #(pcie_tl_tlp);
     dpu_pcie_function_id_t        endpoint_pcie_id;
     bit                           endpoint_pcie_id_valid;
 
+    // 构造给出安全默认值(全字节使能、32 位地址、失败态回读)；实际请求
+    // 字段由 accessor 在 start 前赋值。
     function new(string name = "virtio_bar_mem_rd_seq");
         super.new(name);
         first_be  = 4'hF;
@@ -50,6 +63,9 @@ class virtio_bar_mem_rd_seq extends uvm_sequence #(pcie_tl_tlp);
         endpoint_pcie_id_valid = 0;
     endfunction
 
+    // 发送 1-DWord MEM_RD 后等待 driver 回填 tlp.rb_done(50000ns 超时兜底)。
+    // 全零 BE 时故意切到 CONSTRAINT_ILLEGAL 以放行错误注入；cpl_ok 只有在
+    // 回填完成且状态为 SC 时才置 1，rdata 按 little-endian 组装。
     virtual task body();
         pcie_tl_mem_tlp tlp;
 
@@ -109,6 +125,7 @@ class virtio_bar_mem_wr_seq extends uvm_sequence #(pcie_tl_tlp);
     dpu_pcie_function_id_t        endpoint_pcie_id;
     bit                           endpoint_pcie_id_valid;
 
+    // 构造给出安全默认值；地址/数据/BE 由 accessor 在 start 前赋值。
     function new(string name = "virtio_bar_mem_wr_seq");
         super.new(name);
         first_be = 4'hF;
@@ -119,6 +136,9 @@ class virtio_bar_mem_wr_seq extends uvm_sequence #(pcie_tl_tlp);
         endpoint_pcie_id_valid = 0;
     endfunction
 
+    // 发送 1-DWord MEM_WR：payload 先全部清零，再把右对齐的 wdata 按
+    // first_be 使能的 lane 依次填入(lane 计数只随使能位递增)。posted 写
+    // 无 completion，发出即结束；全零 BE 同样走 CONSTRAINT_ILLEGAL。
     virtual task body();
         pcie_tl_mem_tlp tlp;
 
@@ -173,6 +193,7 @@ class virtio_bar_cfg_rd_seq extends uvm_sequence #(pcie_tl_tlp);
     dpu_pcie_function_id_t        endpoint_pcie_id;
     bit                           endpoint_pcie_id_valid;
 
+    // 构造给出安全默认值；target_bdf/reg_num 由 accessor 在 start 前赋值。
     function new(string name = "virtio_bar_cfg_rd_seq");
         super.new(name);
         first_be = 4'hF;
@@ -182,6 +203,8 @@ class virtio_bar_cfg_rd_seq extends uvm_sequence #(pcie_tl_tlp);
         endpoint_pcie_id_valid = 0;
     endfunction
 
+    // 发送 Type-0 CFG_RD 并等待 rb_done 回填(50000ns 超时兜底)；
+    // cpl_ok/rdata 语义与 mem 读一致。
     virtual task body();
         pcie_tl_cfg_tlp tlp;
         tlp = pcie_tl_cfg_tlp::type_id::create("bar_cfg_rd_tlp");
@@ -225,6 +248,7 @@ class virtio_bar_cfg_wr_seq extends uvm_sequence #(pcie_tl_tlp);
     dpu_pcie_function_id_t        endpoint_pcie_id;
     bit                           endpoint_pcie_id_valid;
 
+    // 构造给出安全默认值；target_bdf/reg_num/wdata 由 accessor 在 start 前赋值。
     function new(string name = "virtio_bar_cfg_wr_seq");
         super.new(name);
         first_be = 4'hF;
@@ -233,6 +257,8 @@ class virtio_bar_cfg_wr_seq extends uvm_sequence #(pcie_tl_tlp);
         endpoint_pcie_id_valid = 0;
     endfunction
 
+    // 发送 Type-0 CFG_WR(payload little-endian 拆 4 字节)，之后等待 rb_done
+    // 或 50000ns 超时以维持顺序；写结果未检查，失败对调用方不可见(保守观察)。
     virtual task body();
         pcie_tl_cfg_tlp wr_tlp;
 
@@ -292,7 +318,8 @@ class virtio_bar_accessor extends uvm_object;
     bit [63:0]   next_bar_alloc_addr;
 
     // ========================================================================
-    // Constructor
+    // 构造：清空全部 BAR 表项与 Fabric 角色，MMIO 分配窗口从 0xC000_0000
+    // 起步；此时未注入 sequencer，所有访问入口都会 fatal。
     // ========================================================================
 
     function new(string name = "virtio_bar_accessor");
@@ -322,6 +349,8 @@ class virtio_bar_accessor extends uvm_object;
         requester_id = function_pcie_id.bdf;
     endfunction
 
+    // 绑定完整 PCIe 通路：先冻结 identity，再注入 RC sequencer 与可选的
+    // completion adapter(TLM 多 domain 认领用)；重复调用整体覆盖旧绑定。
     function void bind_pcie_path(
         input dpu_pcie_function_id_t function_pcie_id,
         input uvm_sequencer #(pcie_tl_tlp) endpoint_rc_seqr,
@@ -405,10 +434,16 @@ class virtio_bar_accessor extends uvm_object;
         end
     endfunction
 
+    // 查询 Fabric BAR 布局是否已生效(configure_fabric_bar_pairs 校验通过后
+    // 置位)；纯查询，无副作用。
     function bit fabric_bar_layout_is_active();
         return fabric_bar_layout_active;
     endfunction
 
+    // 纯校验(无副作用)：判断一个 Fabric 64 位 BAR 对能否安全写入 PCI 配置
+    // 空间。检查偶数槽位/角色匹配/低 4 位为零(避免属性位插入改地址)/
+    // size 为 2 的幂且 >=0x10/基址按 size 对齐/奇数槽位未被占用/类型为
+    // 64 位 MMIO；任一失败经 why 说明并返回 0。
     protected function bit fabric_bar_pair_is_programmable(
         input int unsigned even_bar_id,
         input dpu_bar_role_e expected_role,
@@ -471,6 +506,9 @@ class virtio_bar_accessor extends uvm_object;
     endfunction
 
     // Program the Fabric-owned 64-bit BAR pairs through PCIe config space.
+    // 中文说明：把三个 Fabric 租约(BAR0/1、2/3、4/5)原样写入 PCI 配置空间；
+    // 写前三对全部预校验，任一不合格直接 fatal，不做部分编程。低 DWord 用
+    // {base[31:4], 4'b0100} 只替换标准 64 位 MMIO 属性位，不改地址位。
     virtual task program_fabric_bar_pairs();
         string why;
         bit [31:0] low_dword;
@@ -512,6 +550,9 @@ class virtio_bar_accessor extends uvm_object;
             requester_id), UVM_MEDIUM)
     endtask
 
+    // Fabric 访问守卫：非 Fabric 模式一律放行；Fabric 模式下功能 MMIO 只允许
+    // 角色匹配的 BAR0(device-memory)或 BAR2(mailbox)偶数基址，BAR4(MSI-X)
+    // 与奇数 BAR 一律拒绝。拒绝路径带 uvm_error 副作用，调用方按返回值放弃访问。
     protected function bit allow_functional_bar_access(input int unsigned bar_id);
         if (!fabric_bar_layout_active)
             return 1;
@@ -544,6 +585,8 @@ class virtio_bar_accessor extends uvm_object;
         return 0;
     endfunction
 
+    // MSI-X 访问守卫：与上面对偶——Fabric 模式下 MSI-X 表访问只允许 BAR4，
+    // 其余拒绝并报错；非 Fabric 模式放行。
     protected function bit allow_msix_bar_access(input int unsigned bar_id);
         if (!fabric_bar_layout_active)
             return 1;
@@ -678,6 +721,8 @@ class virtio_bar_accessor extends uvm_object;
     // MMIO register write via PCIe Memory Write TLP.
     // ========================================================================
 
+    // 实际发写的内部路径：不做 BAR 守卫(由 write_reg/write_msix_reg 各自
+    // 先行检查)，负责地址合成、BE 计算并派发 mem_wr sequence。
     protected task issue_write_reg(int unsigned bar_id, bit [31:0] offset,
                                    int unsigned size, bit [31:0] data);
         bit [63:0] addr;
@@ -708,6 +753,8 @@ class virtio_bar_accessor extends uvm_object;
                       bar_id, offset, size, addr, be, data), UVM_HIGH)
     endtask
 
+    // 公开的功能 MMIO 写入口：先过 bar_id 范围与功能 BAR 守卫，再走
+    // issue_write_reg；被守卫拒绝时静默返回(错误已在守卫内上报)。
     virtual task write_reg(int unsigned bar_id, bit [31:0] offset,
                            int unsigned size, bit [31:0] data);
         if (bar_id > 5) begin

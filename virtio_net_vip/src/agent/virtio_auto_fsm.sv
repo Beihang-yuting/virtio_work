@@ -73,6 +73,8 @@ class virtio_auto_fsm extends uvm_report_object;
         mq_pair_limit_bound = 0;
     endfunction
 
+    // 取本 function 在 IOMMU 视角下的 host id（经 transport 转发）；
+    // ops/transport 尚未接入时返回 0，调用方按默认 host 处理。
     protected function int unsigned iommu_host_id();
         if ((ops != null) && (ops.transport != null))
             return ops.transport.iommu_host_id();
@@ -110,6 +112,10 @@ class virtio_auto_fsm extends uvm_report_object;
         return 0;
     endfunction
 
+    // 把 function 级 MQ 队列对上限绑定进 FSM：0/未知按模型上限展开；
+    // 首次绑定生效并置 mq_pair_limit_bound，重复绑定同值幂等，
+    // 改绑不同值被 mq_pair_limit_binding_supported 拒绝（why 给出原因）。
+    // 返回 1 表示绑定成功或幂等命中。
     function bit bind_mq_pair_limit(
         input int unsigned configured_limit,
         output string why
@@ -130,6 +136,7 @@ class virtio_auto_fsm extends uvm_report_object;
         return 1;
     endfunction
 
+    // 查询当前生效的 MQ 队列对上限（绑定前为模型缺省上限）。
     function int unsigned max_supported_mq_pairs();
         return max_vio_net_qpairs_per_device;
     endfunction
@@ -148,6 +155,8 @@ class virtio_auto_fsm extends uvm_report_object;
         return checksum;
     endfunction
 
+    // FNV-1a 累积步进：把一个 64-bit 字按小端字节序逐字节混入校验和。
+    // 输入当前校验和与数据字，返回更新后的校验和（纯函数，无副作用）。
     protected function bit [63:0] migration_checksum_word(
         bit [63:0] checksum, bit [63:0] value
     );
@@ -158,6 +167,7 @@ class virtio_auto_fsm extends uvm_report_object;
         return checksum;
     endfunction
 
+    // FNV-1a 累积步进：把 byte 动态数组逐字节混入校验和并返回新值。
     protected function bit [63:0] migration_checksum_bytes(
         bit [63:0] checksum, byte data[]
     );
@@ -168,6 +178,8 @@ class virtio_auto_fsm extends uvm_report_object;
         return checksum;
     endfunction
 
+    // 同 migration_checksum_bytes，但输入为 byte unsigned 数组——SV 中
+    // 两种元素类型不能隐式互换，故需要单独重载而非复用。
     protected function bit [63:0] migration_checksum_unsigned_bytes(
         bit [63:0] checksum, byte unsigned data[]
     );
@@ -700,6 +712,9 @@ class virtio_auto_fsm extends uvm_report_object;
                (worker_epoch == dataplane_epoch);
     endfunction
 
+    // 记录一个 dataplane worker 的退出。仅接受当前 epoch 的 worker
+    //（旧代 worker 的迟到上报被丢弃），且完成数不会超过期望数；
+    // 最后一个 worker 退出时记下 stopped_epoch 供 stop/recovery 同步等待。
     protected function void complete_dataplane_worker(int unsigned worker_epoch);
         if ((worker_epoch != dataplane_epoch) ||
             (dataplane_workers_expected == 0) ||
@@ -711,6 +726,9 @@ class virtio_auto_fsm extends uvm_report_object;
         end
     endfunction
 
+    // worker 内部发起本代 dataplane 停止请求：清 running、置 stop 标志并
+    // 广播 stop_event 唤醒其他 worker；epoch 不匹配（已换代）则静默忽略，
+    // 防止旧 worker 误停新一代数据面。
     protected task request_dataplane_stop(int unsigned worker_epoch);
         if (worker_epoch != dataplane_epoch)
             return;
@@ -740,6 +758,12 @@ class virtio_auto_fsm extends uvm_report_object;
         do_full_init();
     endtask
 
+    // full_init 的实现体（入参已由 full_init 校验）：按 virtio 1.x 顺序推进
+    // DISCOVERING（BAR 发现，Fabric 托管走预配置路径）→ NEGOTIATING（复位、
+    // ACK/DRIVER、特性协商、FEATURES_OK）→ QUEUE_SETUP（按队列对数建队，
+    // CTRL_VQ 协商成功时额外 +1 队列）→ MSIX_SETUP → FSM_READY。
+    // 任一步失败置 FSM_ERROR 并向设备写 FAILED 后返回。
+    // protected virtual 以便派生 FSM 覆写初始化流程。
     protected virtual task do_full_init();
         bit [63:0] negotiated;
         bit        feat_ok;
@@ -1079,6 +1103,10 @@ class virtio_auto_fsm extends uvm_report_object;
         do_configure_mq(num_pairs);
     endtask
 
+    // configure_mq 的实现体：先经 ctrl VQ 向设备提交 MQ 变更，设备接受后
+    // 再收敛队列——缩容拆除多余的 RX/TX 队列，扩容按对新建（RX 建失败直接
+    // FSM_ERROR；TX 建失败回滚同对 RX 再报错），最后更新 active_num_pairs。
+    // 设备拒绝时仅报错、不动现有队列。
     protected virtual task do_configure_mq(int unsigned num_pairs);
         bit success;
         bit setup_ok;
@@ -1316,6 +1344,11 @@ class virtio_auto_fsm extends uvm_report_object;
         do_restore_from_migration(snap, ok);
     endtask
 
+    // restore_from_migration 的实现体：先做全部前置校验（依赖组件齐全、
+    // snapshot 整体校验和、队列数/各队列 snapshot 合法性、普通与队列 DMA
+    // 记录、脏页记录），任一失败即 FSM_ERROR + set_failed 并保持 ok=0；
+    // 校验通过后才复位设备、回放映射与脏页、重建队列并重启数据面。
+    // 输出 ok=1 仅当完整恢复成功。
     protected virtual task do_restore_from_migration(
         virtio_device_snapshot_t snap,
         output bit ok
@@ -1773,6 +1806,10 @@ class virtio_auto_fsm extends uvm_report_object;
             start_dataplane();
     endtask
 
+    // 后台恢复监督者：阻塞等待本代全部 dataplane worker 退出后，若恢复
+    // 请求仍属于该 epoch（未被换代/取消），清请求标志、置 FSM_ERROR 并执行
+    // 完整设备恢复（复位 + full_init + 重启数据面）。
+    // 之所以等 worker 全退，是避免复位与在途 DMA 并发。
     protected task dataplane_recovery_supervisor(int unsigned worker_epoch);
         wait (dataplane_workers_stopped_epoch == worker_epoch);
         if (recovery_requested_epoch != worker_epoch)

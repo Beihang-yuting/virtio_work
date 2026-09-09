@@ -7,13 +7,28 @@
 // not consume host backing storage.  A BAR that partially intersects the
 // aperture is rejected because silently reserving only part of it would hide
 // an address-space collision.
+//
+// 中文说明：把冻结后的 DPU 设备快照里各 Function 的 BAR 布局，降级导入为
+// Host 内存分配器的保留区（reservation）元数据，防止 host_mem 把已被 BAR
+// 占据的地址段再分配给 DMA buffer。为什么只处理落在 RAM aperture 内的
+// BAR：aperture 外的 BAR 属于独立 MMIO 空间，不消耗 host backing；而部分
+// 相交的 BAR 直接判失败——只保留相交半段会掩盖真正的地址空间冲突。
+// 本类无状态，可对多个 {snapshot, manager, host_id} 组合复用。
 class host_mem_bar_reservation_importer extends uvm_object;
     `uvm_object_utils(host_mem_bar_reservation_importer)
 
+    // 构造函数：无状态工具类，仅传名字给父类。
     function new(string name = "host_mem_bar_reservation_importer");
         super.new(name);
     endfunction
 
+    // 把 snapshot 中属于 host_id 的所有 Function BAR 逐个保留进 manager：
+    // 前置校验（快照非空且已冻结、manager 非空/已初始化/Host ID 匹配）任一
+    // 不过即失败；随后对每个 BAR——aperture 不相交跳过、部分相交或未按
+    // manager 最小 granule 对齐判失败、完全落入则以 BAR 键名为 owner 调
+    // reserve_range()。任何一步失败立即返回 0 并经 why 给出原因；注意已
+    // 成功保留的 BAR 不回滚，调用方应把失败视为致命并丢弃该 manager。
+    // 全部导入成功返回 1。
     function bit import_snapshot(
         input dpu_device_snapshot snapshot,
         input host_mem_manager manager,

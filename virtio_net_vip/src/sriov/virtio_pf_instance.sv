@@ -4,15 +4,30 @@
 // Bridges an Admin-VQ full-reset request to the owner of the real PF
 // lifecycle.  Success means normal PF queue/DMA state was invalidated after a
 // verified transport reset; Admin VQ does not own or infer this lifecycle.
+// 中文文件头：
+// 职责——本文件定义两个类：
+//   1) virtio_pf_lifecycle_reset_owner：把 Admin-VQ 的 PF 全复位请求桥接到
+//      真正持有 PF 生命周期的 virtio_function_instance（Admin VQ 自身不拥有
+//      也不推断该生命周期）；
+//   2) virtio_pf_instance：拥有一个 PF function 及其下属全部 VF function 的
+//      容器组件，负责从冻结 snapshot 批量解析/创建 PF+VF 并接线 pf_manager。
+// 依赖——dpu_device_snapshot/dpu_resource_snapshot（冻结对）、
+//   dpu_resource_manager（须由同一对 snapshot 播种）、virtio_pf_manager。
+// 所有权——PF/VF 实例组件由本类 create 并作为子组件持有；BDF/BAR/qpair
+//   资源归 snapshot+manager；pf_manager 可外部预注入，否则本类懒创建。
 class virtio_pf_lifecycle_reset_owner extends virtio_admin_full_reset_owner;
     `uvm_object_utils(virtio_pf_lifecycle_reset_owner)
 
     virtio_function_instance pf_function;
 
+    // 构造函数：仅 UVM 注册；pf_function 由 virtio_pf_instance 在
+    // connect_phase 绑定。
     function new(string name = "virtio_pf_lifecycle_reset_owner");
         super.new(name);
     endfunction
 
+    // 执行 PF 全复位：委托被绑定的 pf_function.reset_pf_lifecycle；
+    // 未绑定时报错并保持 reset_complete=0（调用方据此判定失败）。
     virtual task reset_pf_lifecycle(ref bit reset_complete);
         reset_complete = 0;
         if (pf_function == null) begin
@@ -40,12 +55,27 @@ class virtio_pf_instance extends uvm_component;
     protected bit               configuration_valid;
     protected bit               services_configured;
 
+    // 构造函数：初始化为"未配置"状态；实际拓扑必须经 configure_services
+    // 从冻结 snapshot 注入，build_phase 会对未配置实例直接 fatal。
     function new(string name, uvm_component parent);
         super.new(name, parent);
         configuration_valid = 0;
         services_configured = 0;
     endfunction
 
+    // 从冻结 snapshot 一次性解析并创建整个 PF 服务组（PF + 全部 VF）。
+    // 前置校验（全部通过前不改动任何成员，保证失败无副作用）：
+    //   - 只允许配置一次；parent 必须是 PF key（vf_id==0）；
+    //   - device/resource snapshot 均冻结、互相引用，且 manager 由同一对
+    //     snapshot 播种；能查到 virtio.qpair 资源类；
+    //   - manager 与 snapshot 的 DUT 能力（host/PF/VF/队列/MSI-X/BAR profile）
+    //     逐项一致；
+    //   - 每个 service：必须是 VIO_NET、有 qpair 绑定、owner 属于本 PF 组、
+    //     owner 不重复、PCIe id 可解析、三个 BAR 角色齐全且顺序正确、
+    //     manager 包含该 function。
+    // 通过后：记录 pf_key/host_id/pf_id，按 owner 类型创建 pf_function 或
+    // vf_functions[]（各自 configure_from_service），并把每个 service 的
+    // qpair 绑定导入 pf_manager.resource_pool；成功返回 1，失败 why 说明。
     function bit configure_services(
         input dpu_function_key_t parent_pf_key,
         input dpu_device_snapshot snapshot,
@@ -264,6 +294,8 @@ class virtio_pf_instance extends uvm_component;
         return 1;
     endfunction
 
+    // 收集本 PF 组内全部已创建的 function 实例（PF 在前、VF 按序在后），
+    // 输出前先清空调用方队列；null 槽位（未配置的 VF）被跳过。
     function void collect_functions(ref virtio_function_instance functions[$]);
         functions.delete();
         if (pf_function != null)
@@ -274,6 +306,8 @@ class virtio_pf_instance extends uvm_component;
         end
     endfunction
 
+    // build 阶段守卫：未经 configure_services 的实例直接 fatal——PF 组
+    // 不允许脱离 snapshot 声明凭空构建；补建缺失的 pf_manager 并赋 pf_index。
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
         if (!services_configured) begin
@@ -287,6 +321,9 @@ class virtio_pf_instance extends uvm_component;
         configuration_valid = 1;
     endfunction
 
+    // connect 阶段接线：把 VF 实例数组与 PF transport 交给 pf_manager，
+    // 并创建 lifecycle_reset_owner 绑定 pf_function，使 Admin-VQ 全复位
+    // 请求能路由到真实 PF 生命周期；配置无效时静默跳过（build 已报 fatal）。
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
         if (!configuration_valid)

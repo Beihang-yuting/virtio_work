@@ -32,7 +32,7 @@ package virtio_net_pkg;
   `include "pcie/pcie_tl_dpu_reg_backend.sv"
 
   // ---------------------------------------------------------------------------
-  // Phase 1 – Types and shared utilities
+  // 第 1 层 – 类型与共享基础（types/、shared/）
   // ---------------------------------------------------------------------------
   `include "types/virtio_net_types.sv"
   `include "types/virtio_net_hdr.sv"
@@ -40,12 +40,12 @@ package virtio_net_pkg;
   `include "shared/virtio_memory_barrier_model.sv"
 
   // ---------------------------------------------------------------------------
-  // Phase 2 – IOMMU model
+  // 第 2 层 – IOMMU 地址翻译模型（iommu/）
   // ---------------------------------------------------------------------------
   `include "iommu/virtio_iommu_model.sv"
 
   // ---------------------------------------------------------------------------
-  // Phase 3 – Virtqueue engine
+  // 第 3 层 – Virtqueue 队列引擎（virtqueue/：Split/Packed/Custom）
   // ---------------------------------------------------------------------------
   `include "virtqueue/virtqueue_error_injector.sv"
   `include "virtqueue/virtqueue_base.sv"
@@ -59,7 +59,7 @@ package virtio_net_pkg;
   `include "sriov/virtio_resource_client.sv"
 
   // ---------------------------------------------------------------------------
-  // Phase 4 – Transport (PCI)
+  // 第 4 层 – virtio-pci 传输层（transport/：BAR 访问/cap 解析/中断）
   // ---------------------------------------------------------------------------
   `include "transport/virtio_pci_regs.sv"
   typedef class virtio_tlm_completion_adapter;
@@ -71,7 +71,7 @@ package virtio_net_pkg;
   `include "transport/virtio_pci_transport.sv"
 
   // ---------------------------------------------------------------------------
-  // Phase 5 – Callbacks, transactions, and agent
+  // 第 5 层 – 回调、事务与驱动 agent（callbacks/、types/、agent/）
   // ---------------------------------------------------------------------------
   `include "callbacks/virtio_dataplane_callback.sv"
   `include "callbacks/virtio_scoreboard_callback.sv"
@@ -95,7 +95,7 @@ package virtio_net_pkg;
   `include "agent/virtio_driver_agent.sv"
 
   // ---------------------------------------------------------------------------
-  // Phase 6 – Dataplane
+  // 第 6 层 – 数据面（dataplane/：TX/RX 引擎与 offload）
   // ---------------------------------------------------------------------------
   `include "dataplane/virtio_csum_engine.sv"
   `include "dataplane/virtio_tso_engine.sv"
@@ -108,7 +108,7 @@ package virtio_net_pkg;
   `include "dataplane/virtio_net_dataplane.sv"
 
   // ---------------------------------------------------------------------------
-  // Phase 7 – SR-IOV
+  // 第 7 层 – SR-IOV PF/VF 编排（sriov/）
   // ---------------------------------------------------------------------------
   `include "sriov/virtio_vf_resource_pool.sv"
   `include "sriov/virtio_function_instance.sv"
@@ -117,7 +117,7 @@ package virtio_net_pkg;
   `include "sriov/virtio_pf_instance.sv"
 
   // ---------------------------------------------------------------------------
-  // Phase 8 – Environment
+  // 第 8 层 – 顶层环境（env/）
   // ---------------------------------------------------------------------------
   `include "env/virtio_net_env_config.sv"
   `include "env/virtio_virtual_sequencer.sv"
@@ -129,7 +129,7 @@ package virtio_net_pkg;
   `include "env/virtio_net_env.sv"
 
   // ---------------------------------------------------------------------------
-  // Phase 9 – Sequences
+  // 第 9 层 – 序列库（seq/）
   // ---------------------------------------------------------------------------
 
   // Base sequences

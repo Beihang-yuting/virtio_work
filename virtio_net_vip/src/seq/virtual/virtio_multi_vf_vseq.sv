@@ -27,10 +27,16 @@ class virtio_multi_vf_vseq extends uvm_sequence;
         pkts_per_vf inside {[10:100]};
     }
 
+    // 构造函数:仅透传名称;vf_seqrs[](及可选 num_vfs)由 test 在
+    // start() 前赋值。
     function new(string name = "virtio_multi_vf_vseq");
         super.new(name);
     endfunction
 
+    // 四个阶段(init / START_DP / TX+RX / STOP+RESET)各自用命名 fork +
+    // wait fork 做跨 VF 同步:同一阶段所有 VF 并行,阶段之间全局对齐。
+    // num_vfs=0 时取 vf_seqrs.size();vf_seqrs 为空或 num_vfs 越界则
+    // uvm_fatal。每 VF 固定 1 对 split 队列,TX 走队列 1(transmitq_0)。
     virtual task body();
         if (vf_seqrs.size() == 0)
             `uvm_fatal("MULTI_VF_VSEQ", "vf_seqrs[] not set -- test must assign before start()")

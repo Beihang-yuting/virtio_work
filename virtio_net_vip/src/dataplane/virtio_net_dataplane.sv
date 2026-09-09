@@ -37,6 +37,8 @@ class virtio_net_dataplane extends uvm_object;
     int unsigned     rx_buf_size = 1526;
     int unsigned     rx_refill_threshold = 16;
 
+    // 构造函数：创建下属 TX/RX/offload/failover 四个子引擎；
+    // 特性与队列引用由外部在初始化阶段注入。
     function new(string name = "virtio_net_dataplane");
         super.new(name);
         tx_engine    = virtio_tx_engine::type_id::create("tx_engine");

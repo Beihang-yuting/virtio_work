@@ -77,6 +77,7 @@ class virtqueue_error_injector extends uvm_object;
     // ------------------------------------------------------------------
     // Constructor
     // ------------------------------------------------------------------
+    // 构造函数：注入器初始为未武装状态，需 configure() 后才会产生任何故障。
     function new(string name = "virtqueue_error_injector");
         super.new(name);
     endfunction
@@ -278,6 +279,8 @@ class virtqueue_error_injector extends uvm_object;
         return history[history.size() - 1].phase;
     endfunction
 
+    // 返回已消费的语义故障注入次数（history 条目数）；只读，供测试断言
+    // 故障确实被触发过。注意不含 corrupt_descriptor 的字节级破坏计数。
     function int unsigned injection_count();
         return history.size();
     endfunction
@@ -409,6 +412,9 @@ class virtqueue_error_injector extends uvm_object;
         return 1;
     endfunction
 
+    // 返回真正落到 Host memory 的描述符字节级破坏次数。与 injection_count()
+    // 分开统计：语义请求和实际字段改写是两件事，混在一起会让覆盖率把
+    // 从未写进内存的"注入"也算数。
     function int unsigned descriptor_corruption_count();
         return corruption_history.size();
     endfunction

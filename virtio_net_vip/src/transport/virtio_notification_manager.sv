@@ -14,6 +14,18 @@
 //   - Error injection (spurious, missed, wrong-vector interrupts)
 //
 // Per virtio spec Section 4.1.4.7 (MSI-X) and Section 4.1.4.5 (ISR)
+//
+// 中文定位：transport 目录内中断路径的模型层，管理 MSI-X 表/INTx/轮询三种
+// 通知方式及其统计。
+// 职责：经 bar.write_msix_reg 真实写 MSI-X 表(受 Fabric BAR4 守卫约束)、
+// 三级降级分配向量、维护 per-vector 与 function 级 mask 的本地影子、INTx
+// 的 ISR 读清语义、NAPI 回调开关，以及三种中断错误注入。注意 mask/unmask
+// 只改本地影子状态，不回写设备端 Vector Control。
+// 依赖：virtio_bar_accessor(唯一 MMIO 通道)、msix_entry_t/interrupt_mode_e
+// 类型定义。
+// 所有权/生命周期：uvm_object，由 virtio_pci_transport 构造时创建持有；
+// bar 为借用引用(transport 交叉接线注入)。msix_table/queue_vectors 等在
+// setup_msix/allocate_irq_vectors 时重建，重跑初始化会整体覆盖。
 // ============================================================================
 
 `ifndef VIRTIO_NOTIFICATION_MANAGER_SV
@@ -58,7 +70,8 @@ class virtio_notification_manager extends uvm_object;
     virtio_bar_accessor  bar;
 
     // ========================================================================
-    // Constructor
+    // 构造：仅置零 config_vector/function_bdf；bar 引用与各动态数组留待
+    // transport 接线和 setup_msix/allocate_irq_vectors 建立。
     // ========================================================================
 
     function new(string name = "virtio_notification_manager");
@@ -232,9 +245,11 @@ class virtio_notification_manager extends uvm_object;
     endtask
 
     // ========================================================================
-    // Mask / Unmask operations
+    // mask/unmask：只更新本地 msix_mask/msix_table.masked 影子位，供
+    // on_interrupt_received 判定是否压制；不回写设备端 Vector Control 寄存器。
     // ========================================================================
 
+    // 屏蔽单个向量；越界仅告警不生效。
     virtual task mask_vector(int unsigned vector);
         if (vector >= msix_mask.size()) begin
             `uvm_warning("NOTIFY_MGR",
@@ -249,6 +264,7 @@ class virtio_notification_manager extends uvm_object;
             $sformatf("Masked MSI-X vector %0d", vector), UVM_HIGH)
     endtask
 
+    // 解除单个向量的屏蔽；越界仅告警不生效。
     virtual task unmask_vector(int unsigned vector);
         if (vector >= msix_mask.size()) begin
             `uvm_warning("NOTIFY_MGR",
@@ -263,6 +279,7 @@ class virtio_notification_manager extends uvm_object;
             $sformatf("Unmasked MSI-X vector %0d", vector), UVM_HIGH)
     endtask
 
+    // 置 function 级全局屏蔽并同时屏蔽所有向量(建模 MSI-X function mask)。
     virtual task mask_all();
         msix_function_mask = 1;
         for (int i = 0; i < msix_mask.size(); i++) begin
@@ -272,6 +289,7 @@ class virtio_notification_manager extends uvm_object;
         `uvm_info("NOTIFY_MGR", "All MSI-X vectors masked (function mask)", UVM_MEDIUM)
     endtask
 
+    // 清 function 级屏蔽并解除全部向量屏蔽；初始化流程在向量绑定完成后调用。
     virtual task unmask_all();
         msix_function_mask = 0;
         for (int i = 0; i < msix_mask.size(); i++) begin
@@ -297,9 +315,12 @@ class virtio_notification_manager extends uvm_object;
     endtask
 
     // ========================================================================
-    // Interrupt handlers
+    // 中断到达回调：由 observer/注入路径调用，按 影子mask -> config vector
+    // 的顺序分类计数；不驱动任何总线行为。
     // ========================================================================
 
+    // MSI-X 中断入口：无效向量计 spurious、被屏蔽计 suppressed、config
+    // vector 转交 on_config_change_interrupt，其余只计数并打印。
     virtual function void on_interrupt_received(int unsigned vector);
         total_interrupts++;
 
@@ -330,6 +351,9 @@ class virtio_notification_manager extends uvm_object;
             $sformatf("Interrupt received on vector %0d", vector), UVM_HIGH)
     endfunction
 
+    // config change 中断：递增专属计数并置 ISR bit1(供 INTx 读清路径观察)。
+    // 注意经 on_interrupt_received 转入时 total_interrupts 会累加两次，
+    // 保守观察：这是现状行为，统计口径以实现为准。
     virtual function void on_config_change_interrupt();
         config_change_interrupts++;
         total_interrupts++;
@@ -339,6 +363,8 @@ class virtio_notification_manager extends uvm_object;
             "Config change interrupt received", UVM_MEDIUM)
     endfunction
 
+    // INTx 中断：置 ISR bit0(队列中断)，等待 read_and_clear_isr 读清；
+    // 由 observer 在识别 ASSERT_INTx 消息后调用。
     virtual function void on_intx_interrupt();
         total_interrupts++;
         isr_status[0] = 1;
@@ -378,9 +404,11 @@ class virtio_notification_manager extends uvm_object;
     endfunction
 
     // ========================================================================
-    // Error injection
+    // 错误注入：直接操纵本地中断模型(不发真实 TLP)，用于验证上层对异常
+    // 中断行为的统计与容错。
     // ========================================================================
 
+    // 注入伪中断：预先累加 spurious/total 计数后走正常入口再分类一次。
     virtual task inject_spurious_interrupt(int unsigned vector);
         `uvm_info("NOTIFY_MGR",
             $sformatf("Injecting spurious interrupt on vector %0d", vector), UVM_LOW)
@@ -389,6 +417,7 @@ class virtio_notification_manager extends uvm_object;
         on_interrupt_received(vector);
     endtask
 
+    // 注入漏中断：只累加 suppressed 计数、不投递任何回调，模拟通知丢失。
     virtual task inject_missed_interrupt(int unsigned queue_id);
         `uvm_info("NOTIFY_MGR",
             $sformatf("Injecting missed interrupt for queue %0d", queue_id), UVM_LOW)
@@ -396,6 +425,8 @@ class virtio_notification_manager extends uvm_object;
         suppressed_notifications++;
     endtask
 
+    // 注入错向量中断：把队列期望向量最低位取反后投递(如 1->0、2->3)，
+    // 验证向量错配时的分类行为；队列越界仅告警。
     virtual task inject_wrong_vector(int unsigned queue_id);
         int unsigned wrong_vector;
         if (queue_id < queue_vectors.size()) begin

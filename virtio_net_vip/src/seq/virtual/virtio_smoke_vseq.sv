@@ -23,10 +23,13 @@ class virtio_smoke_vseq extends uvm_sequence;
     // Sequencer reference (set by test before start)
     uvm_sequencer #(virtio_transaction) vf_seqr;
 
+    // 构造函数:仅透传名称;vf_seqr 必须由 test 在 start() 前赋值。
     function new(string name = "virtio_smoke_vseq");
         super.new(name);
     endfunction
 
+    // 冒烟主流程:init -> START_DP -> TX 10 包(transmitq_0,即队列 1)->
+    // RX 等待 -> STOP_DP -> reset。vf_seqr 未设置时 uvm_fatal 终止。
     virtual task body();
         virtio_init_seq  init_s;
         virtio_tx_seq    tx_s;

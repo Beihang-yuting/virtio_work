@@ -29,8 +29,10 @@
 // 接入 RC sequencer、RC/EP monitor 和 completion adapter。
 //
 // Depends on:
-//   - All Phase 1-7 components
-//   - All Phase 8 env components (config, scoreboard, coverage, etc.)
+//   - 驱动栈全部层次：types/shared/iommu/virtqueue/transport/agent/
+//     dataplane/sriov（见 virtio_net_pkg.sv 的编译分层）
+//   - 同层 env 组件：virtio_net_env_config、scoreboard、coverage、
+//     concurrency controller、dynamic reconfig
 // ============================================================================
 
 class virtio_net_env extends uvm_env;

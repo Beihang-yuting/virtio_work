@@ -104,6 +104,9 @@ class virtio_driver_agent extends uvm_agent;
         apply_component_bindings();
     endfunction
 
+    // 仿真启动前的最终检查：对 active agent 再执行一次组件绑定，然后
+    // 校验 driver 已经拿到 ops 与 fsm 引用——缺失说明 env 接线遗漏，
+    // 提前报错比运行期空指针更易定位。
     virtual function void start_of_simulation_phase(uvm_phase phase);
         super.start_of_simulation_phase(phase);
         if (get_is_active() == UVM_ACTIVE) begin

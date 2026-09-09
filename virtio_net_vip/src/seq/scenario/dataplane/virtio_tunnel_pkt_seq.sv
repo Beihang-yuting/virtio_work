@@ -1,6 +1,17 @@
 `ifndef VIRTIO_TUNNEL_PKT_SEQ_SV
 `define VIRTIO_TUNNEL_PKT_SEQ_SV
 
+// ============================================================================
+// virtio_tunnel_pkt_seq (seq/scenario/dataplane)
+//
+// 隧道报文场景:模拟 VXLAN/GRE/GENEVE 封装报文的发送,差异体现在 net_hdr
+// 的 hdr_len 上——按各隧道外层头长(Eth+IP+UDP+VXLAN 等)给出,配合
+// NEEDS_CSUM 验证设备对内层报文的 csum 处理是否正确越过外层封装。
+// 取舍:VIP 不真正构造封装 payload,只用 hdr_len 表达"外层头有多长",
+// 足以覆盖 driver/设备对隧道头偏移的处理路径。
+// 约束意图:三种隧道类型均匀覆盖,1..16 包。
+// ============================================================================
+
 class virtio_tunnel_pkt_seq extends virtio_base_seq;
     `uvm_object_utils(virtio_tunnel_pkt_seq)
 
@@ -12,12 +23,15 @@ class virtio_tunnel_pkt_seq extends virtio_base_seq;
         num_packets inside {[1:16]};
     }
 
+    // 构造函数:默认 VXLAN、4 包。
     function new(string name = "virtio_tunnel_pkt_seq");
         super.new(name);
         tunnel_type = 0;
         num_packets = 4;
     endfunction
 
+    // init + 启动数据面后,按隧道类型选定 hdr_len 逐包发送;GSO 关闭,
+    // 只验证 csum 越过外层头的路径。
     virtual task body();
         string tunnel_name;
 

@@ -286,6 +286,8 @@ class virtio_coverage extends uvm_component;
         cov_sriov_enable        = 1;
     endfunction
 
+    // 一键关闭总开关及全部分组覆盖率开关（与 enable_all 对称），
+    // 用于不关心覆盖率的快速回归。
     function void disable_all();
         cov_enable              = 0;
         cov_feature_enable      = 0;

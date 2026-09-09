@@ -30,10 +30,15 @@ class virtio_full_init_traffic_vseq extends uvm_sequence;
         num_pairs   inside {[1:4]};
     }
 
+    // 构造函数:仅透传名称;vf_seqr 必须由 test 在 start() 前赋值。
     function new(string name = "virtio_full_init_traffic_vseq");
         super.new(name);
     endfunction
 
+    // 主流程:全 feature init -> (多队列时)ctrl-VQ 下发 MQ_VQ_PAIRS_SET
+    // (小端 2 字节)-> START_DP -> 按 32 包一批在奇数号 TX 队列间轮转发满
+    // num_packets -> RX 等待全部(超时随包数线性放大)-> STOP_DP -> reset。
+    // vf_seqr 未设置时 uvm_fatal 终止。
     virtual task body();
         virtio_init_seq  init_s;
         virtio_tx_seq    tx_s;

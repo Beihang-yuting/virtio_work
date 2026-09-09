@@ -4,13 +4,16 @@
 // ============================================================================
 // virtio_pf_manager
 //
-// Simplified PF manager that delegates SR-IOV PCIe mechanics (BDF
-// calculation, config space, BAR, VF enable/disable) to pcie_tl_vip's
+// PF manager that delegates SR-IOV PCIe mechanics (BDF calculation,
+// config space, BAR, VF enable/disable) to pcie_tl_vip's
 // pcie_tl_func_manager. This class manages only virtio-specific concerns:
 //   - Queue resource mapping (via virtio_vf_resource_pool)
 //   - VF instance lifecycle (via virtio_vf_instance references)
 //   - Failover coordination (via virtio_failover_manager)
-//   - Admin VQ placeholder (virtio 1.2+)
+//   - Admin VQ (virtio 1.2+)：完整实现——configure/clear/recover 生命
+//     周期、admin_vq_config_lock 信号量做并发命令串行化、
+//     admin_vq_bindings_are_consistent() 绑定一致性校验、
+//     pf_lifecycle_reset 全复位路径（并非占位）
 //
 // The pcie_tl_func_manager reference is stored as uvm_object and $cast
 // at runtime to avoid compile-time package dependency. This keeps the
@@ -102,6 +105,12 @@ class virtio_pf_manager extends uvm_object;
         return 1;
     endfunction
 
+    // 配置/替换 Admin VQ 上下文。在 config 锁内校验：PF transport 已配置且
+    // 与新上下文一致、新上下文有提交锁且内部绑定自洽；替换现役上下文时
+    // 还需先取得其提交锁（等待在途命令结束），且现役上下文不得持有隔离
+    // （quarantined）DMA——那是唯一的 quarantine 所有权记录，不允许被覆盖。
+    // 成功后把 PF 生命周期复位 owner 转接到新上下文；任何失败仅报错退出，
+    // 锁在出口统一归还。
     virtual task configure_admin_vq(virtio_admin_vq_context admin_context);
         virtio_admin_vq_context current_context;
         bit                     current_locked;
@@ -166,6 +175,8 @@ class virtio_pf_manager extends uvm_object;
         admin_vq_config_lock.put(1);
     endtask
 
+    // 注册 PF 生命周期复位 owner（Admin-VQ 全复位请求的真正执行者）；
+    // 若 Admin VQ 已配置则同步刷新其 full_reset_owner，null 入参被拒绝。
     virtual function void configure_pf_lifecycle_reset_owner(
         virtio_admin_full_reset_owner reset_owner
     );
@@ -178,6 +189,9 @@ class virtio_pf_manager extends uvm_object;
             admin_vq.full_reset_owner = reset_owner;
     endfunction
 
+    // 注销当前 Admin VQ：在 config 锁+提交锁保护下，确认无隔离 DMA 后
+    // 用一个全新空白上下文替换现役上下文（保留 reset owner 绑定）；
+    // 存在隔离 DMA 时拒绝清除——该记录只能走 recover_admin_vq 释放。
     virtual task clear_admin_vq();
         virtio_admin_vq_context admin_context;
 

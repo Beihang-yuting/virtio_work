@@ -1,6 +1,17 @@
 `ifndef VIRTIO_BOUNDARY_SEQ_SV
 `define VIRTIO_BOUNDARY_SEQ_SV
 
+// ============================================================================
+// virtio_boundary_seq (seq/scenario/boundary)
+//
+// 边界条件场景集合:一个序列覆盖 8 种极限用例(最小/最大队列深度、最长
+// 描述符链、indirect 表占满、全队列背压、零长报文、连续 reset、全 1
+// feature 协商被拒),由随机/定向选择的 boundary 枚举决定走哪个分支。
+// 收敛在一个类里是取舍:各用例共享 init/tx 骨架,拆成 8 个类会大量重复。
+// 依赖:virtio_queue_setup_seq / virtio_init_seq / virtio_tx_seq 子序列,
+// 全部跑在同一个 per-VF sequencer 上;结果核对交给 scoreboard/driver 报错。
+// ============================================================================
+
 typedef enum {
     BOUND_MIN_QUEUE_SIZE, BOUND_MAX_QUEUE_SIZE, BOUND_MAX_CHAIN_LEN,
     BOUND_INDIRECT_TABLE_FULL, BOUND_ALL_QUEUES_BACKPRESSURE,
@@ -12,10 +23,14 @@ class virtio_boundary_seq extends virtio_base_seq;
 
     rand boundary_case_e boundary;
 
+    // 构造函数:boundary 用例不给默认值,期望由随机化或调用方指定。
     function new(string name = "virtio_boundary_seq");
         super.new(name);
     endfunction
 
+    // 按 boundary 分支执行对应边界用例;各分支自行完成所需的 init/队列配置。
+    // 说明:BOUND_MAX_CHAIN_LEN 分支只发一条不带 packet 对象的 SEND_PKTS,
+    // 长链的构造依赖 driver 侧对该事务的处理。
     virtual task body();
         virtio_transaction req;
 

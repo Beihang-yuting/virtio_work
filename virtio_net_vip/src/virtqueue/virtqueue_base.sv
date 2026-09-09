@@ -89,6 +89,7 @@ virtual class virtqueue_base extends uvm_object;
     // ------------------------------------------------------------------
     // Constructor
     // ------------------------------------------------------------------
+    // 构造函数：仅调用父类，句柄/状态由 setup() 注入；不在此分配任何资源。
     function new(string name = "virtqueue_base");
         super.new(name);
     endfunction
@@ -143,12 +144,20 @@ virtual class virtqueue_base extends uvm_object;
     // =================================================================
 
     // ----- Lifecycle -----
+    // alloc_rings：按队列格式在 host memory 分配并清零 ring 结构，填写
+    //   desc/driver/device 三个基址；free_rings：逆向释放；reset_queue：清空
+    //   运行态（索引/token/DMA）但保留 ring 内存；detach_all_unused：摘除所有
+    //   尚未被设备消费的缓冲并把对应 token 交还调用方（tokens 输出队列）。
     pure virtual function void alloc_rings();
     pure virtual function void free_rings();
     pure virtual function void reset_queue();
     pure virtual function void detach_all_unused(ref uvm_object tokens[$]);
 
-    // ----- Driver operations -----
+    // 驱动侧核心三件套：add_buf 把 SG 列表序列化成描述符（前 n_out_sgs 个为
+    // 设备只读、后 n_in_sgs 个为设备可写，indirect=1 走间接表）并发布给设备，
+    // 返回描述符头 ID（失败约定返回超界值）；kick 是 task，按需向设备发通知
+    // （可能消耗仿真时间等待）；poll_used 非阻塞收割一条完成：命中时输出
+    // add_buf 存入的 token 与设备写入长度 len 并返回 1，空则返回 0。
     pure virtual function int unsigned add_buf(
         virtio_sg_list  sgs[],
         int unsigned    n_out_sgs,
@@ -163,17 +172,26 @@ virtual class virtqueue_base extends uvm_object;
     );
 
     // ----- Notification control (NAPI style) -----
+    // 仿 Linux NAPI 的中断抑制接口：disable_cb 关闭设备→驱动的完成通知
+    //（进入轮询模式）；enable_cb 立即重开；enable_cb_delayed 重开但把通知
+    // 阈值推迟到当前 pending 之后（减少中断风暴）；vq_poll 判断自 last_used
+    // 之后是否已有新完成，供关中断轮询循环使用。
     pure virtual function void disable_cb();
     pure virtual function void enable_cb();
     pure virtual function void enable_cb_delayed();
     pure virtual function bit  vq_poll(int unsigned last_used);
 
-    // ----- Query -----
+    // 只读查询：get_free_count 返回当前可用的空闲描述符数（决定 add_buf 能否
+    // 成功）；get_pending_count 返回已发布未收割的缓冲数；needs_notification
+    // 按事件抑制协商结果判断本次 kick 是否真的要通知设备。
     pure virtual function int unsigned get_free_count();
     pure virtual function int unsigned get_pending_count();
     pure virtual function bit          needs_notification();
 
-    // ----- DMA helpers -----
+    // 队列托管 DMA 映射：dma_map_buf 用本队列的 {host_id, bdf} 域把调用方的
+    // GPA 映射为 IOVA 并登记到 dma_mappings（GPA 所有权仍归调用方），返回
+    // IOVA；dma_unmap_buf 按 IOVA 解除映射并注销登记。经此登记的映射才会被
+    // leak_check/teardown 统一清理。
     pure virtual function bit [63:0] dma_map_buf(
         bit [63:0] gpa, int unsigned size, dma_dir_e dir
     );
@@ -218,6 +236,8 @@ virtual class virtqueue_base extends uvm_object;
         last_published_valid = 1;
     endfunction
 
+    // 清除"最近发布描述符"记录；reset/free 时调用，防止故障注入钩子改到
+    // 已回收槽位。
     protected function void clear_published_descriptor();
         last_published_desc_index = 0;
         last_published_valid = 0;
@@ -330,9 +350,14 @@ virtual class virtqueue_base extends uvm_object;
         return 1;
     endfunction
 
+    // 由子类实现的描述符级错误注入入口：按 err_type 直接破坏本队列 ring 中的
+    // 具体字段，供定向错误用例使用（区别于上面按 err_inj 配置消费的通用钩子）。
     pure virtual function void inject_desc_error(virtqueue_error_e err_type);
 
-    // ----- Migration snapshot -----
+    // 迁移快照对：save_state 把队列运行态（索引、wrap 计数、所有权记录等）
+    // 序列化进 snap，不改队列自身；restore_state 在目的端按 snap 重建运行态，
+    // 校验失败返回 0 且必须不留下半初始化状态——ring 内存与 DMA 映射需先由
+    // 上层用 map_fixed/材料化流程恢复，这里只接管队列视角。
     pure virtual function void save_state(ref virtqueue_snapshot_t snap);
     pure virtual function bit restore_state(virtqueue_snapshot_t snap);
 
@@ -494,6 +519,8 @@ virtual class virtqueue_base extends uvm_object;
         mem.write_mem(table_gpa + index * 16, data);
     endfunction
 
+    // 释放某个主描述符名下的间接表：先解 IOMMU 映射、再还 GPA、最后删登记。
+    // head_id 无登记时静默返回（完成收割与错误回滚共用此入口，允许重复调用）。
     protected function void release_indirect_table(int unsigned head_id);
         indirect_table_record_t record;
 
@@ -508,6 +535,8 @@ virtual class virtqueue_base extends uvm_object;
         indirect_table_records.delete(head_id);
     endfunction
 
+    // 释放全部间接表。先把 head_id 拷到临时队列再逐个释放：不能一边遍历
+    // 关联数组一边 delete 其元素。
     protected function void release_all_indirect_tables();
         int unsigned heads[$];
 
@@ -535,11 +564,15 @@ virtual class virtqueue_base extends uvm_object;
         dma_mappings.delete(mapping_index);
     endfunction
 
+    // 从尾部逐个释放全部队列 DMA 映射；倒序删除避免元素前移导致的下标失效。
     protected function void release_all_dma_mappings();
         while (dma_mappings.size() != 0)
             release_dma_mapping(dma_mappings.size() - 1);
     endfunction
 
+    // 迁移恢复失败时的回滚：丢弃 restore_migration_ownership() 暂存的映射与
+    // 间接表 claim。只清暂存区，不动 IOMMU/host memory——那些资源此刻仍归
+    // 上层迁移记录所有。
     protected function void discard_staged_migration_ownership();
         staged_migration_dma_mappings.delete();
         staged_indirect_table_records.delete();
@@ -809,6 +842,7 @@ virtual class virtqueue_base extends uvm_object;
         end
     endfunction
 
+    // 返回当前登记在册的间接表数量；只读，供测试断言资源回收是否干净。
     function int unsigned get_indirect_table_count();
         return indirect_table_records.size();
     endfunction

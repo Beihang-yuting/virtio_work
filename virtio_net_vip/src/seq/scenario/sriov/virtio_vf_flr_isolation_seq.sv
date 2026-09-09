@@ -1,6 +1,17 @@
 `ifndef VIRTIO_VF_FLR_ISOLATION_SEQ_SV
 `define VIRTIO_VF_FLR_ISOLATION_SEQ_SV
 
+// ============================================================================
+// virtio_vf_flr_isolation_seq (seq/scenario/sriov)
+//
+// VF FLR 隔离场景:num_vfs 个 VF 全部跑流量后,对其中一个(flr_vf)发
+// reset 模拟 Function Level Reset,再验证其余 VF 的流量不受影响——即
+// FLR 只应清掉目标 function 的状态。说明(观察事实):FLR 以
+// VIO_TXN_RESET + queue_id=flr_vf 表达,VF 身份靠 queue_id 编码
+// (VF i 用 i*2 号 TX 队列),真实 PCIe FLR 寄存器路径不在本序列内。
+// 约束意图:2..8 个 VF 且 flr_vf 必须落在有效范围内。
+// ============================================================================
+
 class virtio_vf_flr_isolation_seq extends virtio_base_seq;
     `uvm_object_utils(virtio_vf_flr_isolation_seq)
 
@@ -12,12 +23,15 @@ class virtio_vf_flr_isolation_seq extends virtio_base_seq;
         flr_vf  < num_vfs;
     }
 
+    // 构造函数:默认 4 个 VF、对 VF1 做 FLR。
     function new(string name = "virtio_vf_flr_isolation_seq");
         super.new(name);
         num_vfs = 4;
         flr_vf  = 1;
     endfunction
 
+    // 全 VF 流量 -> 对 flr_vf 发 reset -> 其余 VF 再各发 2 包验证存活;
+    // 隔离性判定依赖 scoreboard/driver 对未复位 VF 流量的核对。
     virtual task body();
         virtio_transaction req;
 

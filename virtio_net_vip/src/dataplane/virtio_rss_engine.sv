@@ -49,6 +49,8 @@ class virtio_rss_engine extends uvm_object;
     localparam int unsigned IPPROTO_TCP     = 6;
     localparam int unsigned IPPROTO_UDP     = 17;
 
+    // 构造函数：装载默认 Toeplitz key，间接表初始化为 128 项全指向
+    // queue 0，hash 类型全部使能——即"未配置也能工作"的保守默认。
     function new(string name = "virtio_rss_engine");
         super.new(name);
         init_default_key();

@@ -1,6 +1,18 @@
 `ifndef VIRTIO_LIVE_MIGRATION_SEQ_SV
 `define VIRTIO_LIVE_MIGRATION_SEQ_SV
 
+// ============================================================================
+// virtio_live_migration_seq (seq/scenario/migration)
+//
+// 热迁移(freeze/restore)场景:注入直接+indirect 两种 TX 流量制造在途
+// 状态 -> VIO_TXN_FREEZE 冻结并由 driver 填回 snapshot -> reset 模拟迁到
+// 新主机 -> VIO_TXN_RESTORE 携带同一 snapshot 恢复 -> 再发流量验证恢复后
+// 可用。restore 失败(restore_req.success=0)按 uvm_error 上报并提前返回。
+// snapshot 的所有权:由 freeze 事务的 driver 侧生成,restore 时原样传回,
+// 序列只搬运引用。依赖:virtio_tx_seq + driver 的 freeze/restore 实现。
+// 约束意图:迁移前后各 1..16 包,前半平分给直接/indirect 链。
+// ============================================================================
+
 // Keep migration traffic self-contained: virtio_tx_seq transmits the objects
 // present in packet_items, not its num_packets knob.  A concrete packet makes
 // the scenario exercise the normal DMA/TX path instead of silently freezing
@@ -10,10 +22,12 @@ class virtio_live_migration_packet extends uvm_object;
 
     byte unsigned payload[];
 
+    // 构造函数:payload 留空,由 populate_packet_items 填充。
     function new(string name = "virtio_live_migration_packet");
         super.new(name);
     endfunction
 
+    // 按字节打包 payload,供 driver/记分板对报文做序列化比较。
     virtual function void do_pack(uvm_packer packer);
         super.do_pack(packer);
         foreach (payload[i])
@@ -32,12 +46,16 @@ class virtio_live_migration_seq extends virtio_base_seq;
         post_restore_pkts inside {[1:16]};
     }
 
+    // 构造函数:默认迁移前后各 4 包。
     function new(string name = "virtio_live_migration_seq");
         super.new(name);
         pre_freeze_pkts   = 4;
         post_restore_pkts = 4;
     endfunction
 
+    // 为 tx 子序列生成 count 个 64 字节确定性 payload 的报文对象(内容由
+    // 包序号+字节序号推导,便于迁移前后比对);先清空再填,报文对象归
+    // tx_s.packet_items 持有。
     protected function void populate_packet_items(
         virtio_tx_seq tx_s,
         int unsigned count,
@@ -56,6 +74,7 @@ class virtio_live_migration_seq extends virtio_base_seq;
         end
     endfunction
 
+    // 执行完整热迁移流程:预流量 -> freeze -> reset -> restore -> 后流量。
     virtual task body();
         virtio_transaction freeze_req;
         virtio_transaction restore_req;
@@ -65,6 +84,8 @@ class virtio_live_migration_seq extends virtio_base_seq;
         int unsigned direct_count;
         int unsigned indirect_count;
 
+        // 主流程见文件头;freeze 得到的 snapshot 原样传给 restore,失败即
+        // uvm_error 并返回,不再跑恢复后流量。
         // Init and start dataplane
         do_init();
         send_txn(VIO_TXN_START_DP);

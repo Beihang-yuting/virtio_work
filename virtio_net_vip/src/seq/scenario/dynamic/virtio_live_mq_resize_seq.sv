@@ -1,6 +1,17 @@
 `ifndef VIRTIO_LIVE_MQ_RESIZE_SEQ_SV
 `define VIRTIO_LIVE_MQ_RESIZE_SEQ_SV
 
+// ============================================================================
+// virtio_live_mq_resize_seq (seq/scenario/dynamic)
+//
+// 运行中多队列(MQ)重配场景:置起 MQ+CTRL_VQ feature,以 old_pairs 初始化
+// 并跑流量,随后用 VIO_TXN_SET_MQ 把队列对数改为 new_pairs,再跑一轮流量
+// 验证新配置可用。"live"的含义(观察事实):resize 发生在数据面启动之后、
+// 两轮流量之间——同一 sequencer 上事务串行,并非与在途流量真正并发。
+// 约束意图:old != new 保证发生真实变化,覆盖扩容和缩容两个方向。
+// 依赖:virtio_init_seq / virtio_tx_seq,以及 driver 对 SET_MQ 的实现。
+// ============================================================================
+
 class virtio_live_mq_resize_seq extends virtio_base_seq;
     `uvm_object_utils(virtio_live_mq_resize_seq)
 
@@ -15,6 +26,7 @@ class virtio_live_mq_resize_seq extends virtio_base_seq;
         traffic_pkts inside {[4:16]};
     }
 
+    // 构造函数:默认 2 -> 4 对扩容、每轮 8 包。
     function new(string name = "virtio_live_mq_resize_seq");
         super.new(name);
         old_pairs    = 2;
@@ -22,6 +34,8 @@ class virtio_live_mq_resize_seq extends virtio_base_seq;
         traffic_pkts = 8;
     endfunction
 
+    // 流程:old_pairs 初始化 -> 流量 -> SET_MQ 到 new_pairs -> 流量;
+    // resize 被设备拒绝时的表现由 driver/记分板体现,本序列不回读确认。
     virtual task body();
         virtio_transaction req;
         virtio_tx_seq tx_s;

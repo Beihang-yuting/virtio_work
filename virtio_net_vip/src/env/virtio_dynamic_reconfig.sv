@@ -46,6 +46,10 @@ class virtio_dynamic_reconfig extends uvm_report_object;
         dut_caps_bound = 0;
     endfunction
 
+    // 把动态重配组件绑定到冻结 device snapshot：校验 snapshot 非空、已冻结、
+    // DUT 能力存在且自检通过后，缓存能力对象并把 MQ 上限收紧为快照声明值。
+    // 一次性所有权：重复绑定同一 snapshot 幂等成功，改绑/清绑均被拒绝
+    //（why 说明原因），保证运行期上限不随外部输入漂移。
     function bit bind_device_snapshot(
         input dpu_device_snapshot snapshot,
         output string why
@@ -93,6 +97,7 @@ class virtio_dynamic_reconfig extends uvm_report_object;
         return 1;
     endfunction
 
+    // 查询设备级 MQ 队列对上限（绑定 snapshot 前为模型缺省上限）。
     function int unsigned max_supported_qpairs();
         return enforced_max_vio_net_qpairs_per_device;
     endfunction
@@ -116,6 +121,8 @@ class virtio_dynamic_reconfig extends uvm_report_object;
         return allocated_qpairs;
     endfunction
 
+    // 判定目标队列对数是否合法：非零且不超过该 VF 的有效上限
+    //（vf==null 时退化为设备级上限）。
     function bit qpair_count_supported(
         input int unsigned count,
         input virtio_vf_instance vf = null
@@ -168,6 +175,11 @@ class virtio_dynamic_reconfig extends uvm_report_object;
         do_live_mq_resize(vf, old_pairs, new_pairs, traffic_active);
     endtask
 
+    // live_mq_resize 的实现体（入参已由外层校验）：new==old 直接返回；
+    // 否则构造 2 字节小端 pair 数，经 ops.ctrl_send 下发
+    // CTRL_MQ_VQ_PAIRS_SET。设备 ACK 后更新 drv_cfg.num_queue_pairs，
+    // 缩容时 detach 超出范围的 TX/RX 队列（不销毁，可再扩容复用）；
+    // 设备拒绝或 ops 缺失仅报错、不改本地配置。
     protected virtual task do_live_mq_resize(
         virtio_vf_instance vf,
         int unsigned old_pairs,

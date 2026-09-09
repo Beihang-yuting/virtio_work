@@ -31,12 +31,19 @@ class virtio_stress_vseq extends uvm_sequence;
     protected int unsigned total_sent;
     protected bit          stop_flag;
 
+    // 构造函数:清零内部计数/停止标志;vf_seqrs[] 由 test 在 start() 前赋值。
     function new(string name = "virtio_stress_vseq");
         super.new(name);
         total_sent = 0;
         stop_flag  = 0;
     endfunction
 
+    // 压力主流程:顺序 init + START_DP 所有 VF 后,fork 五个命名并发活动
+    // (持续 16 包/批的全 VF 流量、随机队列 reset+重建、随机 vq 错误注入、
+    // 随机 MAC/promisc 重配、以 total_sent 计数的时长看门狗),join_any +
+    // stop_flag + disable 收敛,最后逐 VF STOP_DP/RESET。发送计数按批
+    // 发起即累加,近似值仅用于时长控制。事后校验(泄漏、mismatch)由
+    // env report_phase 完成——见任务尾部注释。
     virtual task body();
         int unsigned num_vfs;
 

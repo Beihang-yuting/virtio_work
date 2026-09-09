@@ -1,6 +1,17 @@
 `ifndef VIRTIO_ADAPTIVE_IRQ_SEQ_SV
 `define VIRTIO_ADAPTIVE_IRQ_SEQ_SV
 
+// ============================================================================
+// virtio_adaptive_irq_seq (seq/scenario/interrupt)
+//
+// 自适应中断(IRQ<->polling 切换)场景:用三段流量画出速率包络——低速
+// (期望驱动走 IRQ 模式)-> 高速(期望切到 polling/NAPI)-> 降速(期望
+// 切回 IRQ)。本序列只负责制造速率变化,模式切换发生在 driver 的中断
+// 管理逻辑里,是否按预期切换由覆盖率/性能监控组件观察。
+// 约束意图:低速段 1..4 包与高速段 32..128 包拉开量级差距,保证跨过
+// 切换阈值。
+// ============================================================================
+
 class virtio_adaptive_irq_seq extends virtio_base_seq;
     `uvm_object_utils(virtio_adaptive_irq_seq)
 
@@ -14,6 +25,7 @@ class virtio_adaptive_irq_seq extends virtio_base_seq;
         ramp_down_pkts inside {[1:4]};
     }
 
+    // 构造函数:默认 2/64/2 的三段流量包络。
     function new(string name = "virtio_adaptive_irq_seq");
         super.new(name);
         low_rate_pkts  = 2;
@@ -21,6 +33,8 @@ class virtio_adaptive_irq_seq extends virtio_base_seq;
         ramp_down_pkts = 2;
     endfunction
 
+    // 依次跑低速/高速/降速三段 tx 流量;不在序列内断言中断模式,只提供
+    // 激励曲线。
     virtual task body();
         virtio_tx_seq tx_s;
 

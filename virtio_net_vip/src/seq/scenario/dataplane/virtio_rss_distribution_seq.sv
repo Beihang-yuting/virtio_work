@@ -1,6 +1,17 @@
 `ifndef VIRTIO_RSS_DISTRIBUTION_SEQ_SV
 `define VIRTIO_RSS_DISTRIBUTION_SEQ_SV
 
+// ============================================================================
+// virtio_rss_distribution_seq (seq/scenario/dataplane)
+//
+// RSS 分流场景:先用 VIO_TXN_SET_RSS 下发随机 40 字节 hash key + 128 项
+// 间接表(按 i % num_queues 均匀铺开,hash_types 选 IPv4/TCP/UDP),再发
+// num_flows 个单包 tx 序列模拟不同流。说明(观察事实):tx 侧统一走
+// queue_id 0 且未构造差异化五元组,"不同流"的散列效果依赖设备/环境侧
+// 报文生成;各队列分布是否均匀由覆盖率/记分板观察,本序列不检查。
+// 约束意图:4..64 条流、2..8 个队列,保证间接表映射到多队列。
+// ============================================================================
+
 class virtio_rss_distribution_seq extends virtio_base_seq;
     `uvm_object_utils(virtio_rss_distribution_seq)
 
@@ -12,12 +23,15 @@ class virtio_rss_distribution_seq extends virtio_base_seq;
         num_queues inside {[2:8]};
     }
 
+    // 构造函数:默认 16 条流散到 4 个队列。
     function new(string name = "virtio_rss_distribution_seq");
         super.new(name);
         num_flows  = 16;
         num_queues = 4;
     endfunction
 
+    // init -> 配置 RSS(随机 key + 均匀间接表)-> 启动数据面 -> 逐流发
+    // 单包 tx;RSS 配置失败的处理在 driver 侧。
     virtual task body();
         virtio_transaction req;
 

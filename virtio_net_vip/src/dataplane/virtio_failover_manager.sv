@@ -47,6 +47,7 @@ class virtio_failover_manager extends uvm_object;
     protected longint unsigned pre_switch_primary_rx;
     protected realtime         switch_start_time;
 
+    // 构造函数：仅 UVM 注册；failover 状态与计数器使用声明处默认值。
     function new(string name = "virtio_failover_manager");
         super.new(name);
     endfunction
