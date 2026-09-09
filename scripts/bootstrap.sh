@@ -4,13 +4,13 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "$script_dir/.." && pwd)"
 
-# 中文说明：bootstrap 只同步仍保留的 PCIe submodule，并检查项目外的
-# dpu_common、net_packet、pcie_work、host_mem 和 queue_work 是否已经位于受支持的
-# 外部 checkout；net_packet 明确跟随 origin/master，其余需要稳定回归的依赖固定版本；
-# 它不复制或修改项目外的控制面、报文生成器、Host memory 或 PCIe VIP 源码。
+# 中文说明：bootstrap 检查项目外的 dpu_common、net_packet、pcie_work、host_mem
+# 和 queue_work 是否已经位于受支持的外部 checkout；net_packet 跟随 origin/master，
+# pcie_work 跟随 origin/main，其余需要稳定回归的依赖固定版本；它不复制或修改
+# 项目外的控制面、报文生成器、Host memory 或 PCIe VIP 源码。
 dpu_common_revision="a595b5cb5ab0bf653975be68996b5d46deb5a63d"
 net_packet_url="https://github.com/Beihang-yuting/net_packet.git"
-pcie_work_revision="9aedf898f44ca260f3120a3fb162b7bb9fbafb5e"
+pcie_work_url="https://github.com/Beihang-yuting/pcie_work.git"
 host_mem_revision="365b7553fc7dac6b4ad55886a8e4869153607c28"
 host_mem_url="https://github.com/Beihang-yuting/host_mem.git"
 if [[ -z "${QUEUE_WORK_ROOT:-}" ]]; then
@@ -94,11 +94,41 @@ pcie_work_root="$(cd "$PCIE_WORK_ROOT" 2>/dev/null && pwd)" || {
   echo "PCIE_WORK_ROOT is not a readable directory: ${PCIE_WORK_ROOT}" >&2
   exit 2
 }
-pcie_work_actual="$(git -C "$pcie_work_root" rev-parse HEAD 2>/dev/null || true)"
-if [[ "$pcie_work_actual" != "$pcie_work_revision" ]]; then
-  echo "pcie_work revision mismatch: expected $pcie_work_revision actual $pcie_work_actual" >&2
+if [[ "$pcie_work_root" == "$root_dir"/* ]]; then
+  echo "local pcie_work checkout is forbidden; use external PCIE_WORK_ROOT=$pcie_work_root" >&2
+  exit 7
+fi
+if [[ -e "$root_dir/virtio_net_vip/ext/pcie_tl_vip" ]]; then
+  echo "local PCIe extension is forbidden; remove virtio_net_vip/ext/pcie_tl_vip and use PCIE_WORK_ROOT" >&2
+  exit 7
+fi
+for source_file in \
+    pcie_tl_vip/src/pcie_tl_if.sv \
+    pcie_tl_vip/src/shared/pcie_tl_bdf_utils_pkg.sv \
+    pcie_tl_vip/src/shared/pcie_tl_device_profile_pkg.sv \
+    pcie_tl_vip/src/topology/pcie_topology_pkg.sv \
+    pcie_tl_vip/src/pcie_tl_pkg.sv; do
+  if [[ ! -f "$pcie_work_root/$source_file" ]]; then
+    echo "external pcie_work checkout is missing $source_file: $pcie_work_root" >&2
+    exit 2
+  fi
+done
+pcie_work_origin="$(git -C "$pcie_work_root" remote get-url origin 2>/dev/null || true)"
+if [[ "$pcie_work_origin" != "$pcie_work_url" ]]; then
+  echo "pcie_work origin mismatch: expected $pcie_work_url actual $pcie_work_origin" >&2
+  exit 6
+fi
+pcie_work_branch="$(git -C "$pcie_work_root" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+if [[ "$pcie_work_branch" != "main" ]]; then
+  echo "pcie_work checkout must be on remote main branch: actual ${pcie_work_branch:-detached}" >&2
   exit 5
 fi
+pcie_work_upstream="$(git -C "$pcie_work_root" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+if [[ "$pcie_work_upstream" != "origin/main" ]]; then
+  echo "pcie_work main must track origin/main: actual ${pcie_work_upstream:-none}" >&2
+  exit 5
+fi
+pcie_work_actual="$(git -C "$pcie_work_root" rev-parse HEAD 2>/dev/null || true)"
 
 if [[ -z "${HOST_MEM_ROOT:-}" ]]; then
   echo "HOST_MEM_ROOT must point to the external host_mem checkout" >&2
@@ -134,9 +164,7 @@ if [[ "$host_mem_origin" != "$host_mem_url" ]]; then
 fi
 export HOST_MEM_ROOT="$host_mem_root"
 
-git -C "$root_dir" submodule sync --recursive
-git -C "$root_dir" submodule status --recursive
 echo "dpu_common=$dpu_common_revision (external: $dpu_common_root)"
-echo "pcie_work=$pcie_work_revision (external: $pcie_work_root)"
+echo "pcie_work=$pcie_work_actual (external main: $pcie_work_root)"
 echo "net_packet=$net_packet_actual (external master: $net_packet_root)"
 echo "host_mem=$host_mem_revision (external: $host_mem_root)"

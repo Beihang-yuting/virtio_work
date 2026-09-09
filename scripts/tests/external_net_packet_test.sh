@@ -13,7 +13,7 @@ local_extension_guard+='net_packet'
 old_revision_token='net_packet_'
 old_revision_token+='revision'
 
-if grep -q 'net_packet' "$repo_root/.gitmodules"; then
+if [[ -e "$repo_root/.gitmodules" ]] && grep -q 'net_packet' "$repo_root/.gitmodules"; then
   echo "net_packet must not remain a repository submodule" >&2
   exit 1
 fi

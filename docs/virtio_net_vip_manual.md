@@ -114,17 +114,17 @@ disable fork;  // 杀死调用线程中的所有子进程!
 
 | 组件 | 路径 | 角色 | 集成方式 |
 |------|------|------|----------|
-| `pcie_tl_vip` | `$PCIE_WORK_ROOT/pcie_tl_vip` | PCIe TL 子环境（RC/EP Agent, func_manager, SR-IOV） | 外部固定 checkout，作为子环境零修改 |
+| `pcie_tl_vip` | `$PCIE_WORK_ROOT/pcie_tl_vip` | PCIe TL 子环境（RC/EP Agent, func_manager, SR-IOV） | 外部 `main` checkout，作为子环境零修改 |
 | `host_mem_manager` | `$HOST_MEM_ROOT`（项目外固定 checkout） | Buddy 分配器，用于描述符环和数据缓冲区 | 共享实例 |
 | `net_packet` | `$NET_PACKET_ROOT`（项目外 checkout） | 跟随远程 `master`；协议报文生成器（L2-L4、隧道、RDMA、存储） | `packet_item` UVM 封装 |
 | `dpu_common` | `$DPU_COMMON_ROOT`（项目外 checkout） | DPU 全局拓扑、资源快照和寄存器计划 | 固定 SHA 的独立仓库 |
 
 本版本固定使用 `dpu_common@a595b5cb5ab0bf653975be68996b5d46deb5a63d`、
-`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28`、
-`pcie_work@9aedf898f44ca260f3120a3fb162b7bb9fbafb5e`（其
-`pcie_tl_vip` 位于 `pcie_work/pcie_tl_vip`）；`make check-deps` 会在编译前验证
-这些依赖版本。`dpu_common`、`host_mem` 和 `pcie_work` 不允许复制到本项目根目录，
-编译前必须分别设置 `DPU_COMMON_ROOT`、`HOST_MEM_ROOT` 和 `PCIE_WORK_ROOT`。
+`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28`；PCIe TL VIP 使用项目外
+`pcie_work/main`（其 `pcie_tl_vip` 位于 `pcie_work/pcie_tl_vip`），并要求跟踪
+`origin/main`。`make check-deps` 会在编译前验证固定依赖以及 PCIe 的远程/分支契约。
+`dpu_common`、`host_mem` 和 `pcie_work` 不允许复制到本项目根目录，编译前必须分别设置
+`DPU_COMMON_ROOT`、`HOST_MEM_ROOT` 和 `PCIE_WORK_ROOT`。
 
 ---
 
@@ -439,9 +439,6 @@ virtio_net_vip/
 |   +-- virtio_e2e_test.sv                  -- 端到端集成测试 (PCIe TLM loopback)
 |   +-- virtio_full_test.sv                 -- 完整集成测试 (Completion Bridge)
 |   +-- virtio_dual_test.sv                 -- 双 VIP 互打测试
-+-- ext/
-    +-- pcie_tl_vip              (历史 gitlink；主 filelist 不使用)
-
 # 控制面、Host memory、PCIe VIP 和报文生成器均位于项目外独立 checkout，
 # 分别由 $DPU_COMMON_ROOT、$HOST_MEM_ROOT、$PCIE_WORK_ROOT、$NET_PACKET_ROOT 指定。
 ```
@@ -464,7 +461,6 @@ virtio_net_vip/
 | `src/env/` | 顶层环境：配置、scoreboard、coverage、性能监控 |
 | `src/seq/` | 序列库：基础序列、场景序列、虚拟序列 |
 | `tests/` | 测试用例和 testbench 顶层 |
-| `ext/` | 仅保留待清理的 PCIe 历史 gitlink；Host memory、net_packet、pcie_work 均由环境变量指向项目外 checkout |
 
 ---
 
@@ -1505,8 +1501,7 @@ Host 即使使用相同 GPA 数值也不会串扰，因为 Root
 持有不同 manager 对象。manager 已初始化时 PCIe 环境不再调用 `init_region()`；
 未初始化的旧单 Root config-db manager 仍使用原有 0..4-GiB 默认 aperture。
 `PCIE_TL_MEM_PREMAP` 针对唯一 manager handle 只分配一次；多个 Root 共享同一
-Host manager 时不会重复消耗 aperture。当前固定的
-`pcie_work@9aedf898f44ca260f3120a3fb162b7bb9fbafb5e` 在空间不足时会先由
+Host manager 时不会重复消耗 aperture。当前 `pcie_work/main` 在空间不足时会先由
 `host_mem_manager.alloc()` 报告 `HOST_MEM` allocator error，但该版本的
 PREMAP 初始化没有检查失败哨兵，因此不保证额外产生 `PCIE_TL_HOST_MEM` fatal。
 验证环境应把任一 allocator 失败视为配置失败，并在后续依赖升级后重新核对报告
@@ -1765,9 +1760,8 @@ snapshot pair 保持不变。notify、MSI-X、port/route 和 scheduler builders 
 #### 6.1.1 环境准备
 
 确保以下组件已就位。`host_mem` 使用项目外的固定 checkout，`net_packet` 跟踪远程
-`master` 分支；二者都不复制到
-`virtio_work` 内；PCIe TL VIP 使用项目外的 `pcie_work`，源码树中的历史 gitlink
-不参与主 filelist：
+`master` 分支，PCIe TL VIP 跟踪 `pcie_work/main`；这些依赖都不复制到
+`virtio_work` 内：
 
 ```bash
 # 外部 host_mem
@@ -1783,9 +1777,16 @@ git -C "$NET_PACKET_ROOT" switch master 2>/dev/null || \
   git -C "$NET_PACKET_ROOT" switch --track -c master origin/master
 git -C "$NET_PACKET_ROOT" branch --set-upstream-to=origin/master master
 
-# dpu_common、host_mem 和 pcie_work 均位于项目外
-export DPU_COMMON_ROOT=/path/to/dpu_common
+# 外部 pcie_work main
 export PCIE_WORK_ROOT=/path/to/pcie_work
+git clone --branch main https://github.com/Beihang-yuting/pcie_work.git "$PCIE_WORK_ROOT"  # 首次 clone 时执行
+git -C "$PCIE_WORK_ROOT" fetch origin main
+git -C "$PCIE_WORK_ROOT" switch main 2>/dev/null || \
+  git -C "$PCIE_WORK_ROOT" switch --track -c main origin/main
+git -C "$PCIE_WORK_ROOT" branch --set-upstream-to=origin/main main
+
+# dpu_common 位于项目外
+export DPU_COMMON_ROOT=/path/to/dpu_common
 scripts/check_deps.sh
 ```
 

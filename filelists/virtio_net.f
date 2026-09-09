@@ -27,9 +27,8 @@
 +incdir+$HOST_MEM_ROOT/src
 $HOST_MEM_ROOT/src/host_mem_pkg.sv
 
-// PCIe TL VIP is an external checkout.  Keep the interface and package
-// compile order explicit so this project cannot silently fall back to the
-// historical local copy under virtio_net_vip/ext/pcie_tl_vip.
+// PCIe TL VIP is an external checkout. Keep the interface and package compile
+// order explicit so this project cannot silently fall back to a local copy.
 +incdir+$PCIE_WORK_ROOT/pcie_tl_vip/src
 +incdir+$PCIE_WORK_ROOT/pcie_tl_vip/src/types
 +incdir+$PCIE_WORK_ROOT/pcie_tl_vip/src/shared

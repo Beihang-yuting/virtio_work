@@ -1,3 +1,0 @@
-[submodule "virtio_net_vip/ext/pcie_tl_vip"]
-	path = virtio_net_vip/ext/pcie_tl_vip
-	url = https://github.com/Beihang-yuting/pcie_work.git

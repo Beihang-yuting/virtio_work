@@ -7,6 +7,7 @@ bootstrap:
 
 dependency-contract:
 	bash ./scripts/tests/external_net_packet_test.sh
+	bash ./scripts/tests/external_pcie_work_test.sh
 
 check-deps: dependency-contract
 	./scripts/check_deps.sh

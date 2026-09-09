@@ -116,7 +116,7 @@ direct-GPA 集成时才跳过 IOMMU；不能把普通 REAL_DUT 的 IOVA 误当�
 必须绑定不同 manager，但可合法使用相同的数值 GPA。已初始化 manager 的 64-bit
 aperture 不会被 PCIe 环境重置；旧的 `"host_mem"` config-db 注入只保留给单 Root
 兼容测试。PREMAP 按唯一 manager handle 分配：多个 Root 绑定同一 Host manager
-只占用一次 backing allocation。固定版 `pcie_work` 在 PREMAP 空间不足时会保留
+只占用一次 backing allocation。当前 `pcie_work/main` 在 PREMAP 空间不足时会保留
 `host_mem_manager.alloc()` 的 `HOST_MEM` 错误报告，但尚未把失败哨兵转换成
 `PCIE_TL_HOST_MEM` fatal；测试必须把该情况视为配置失败，而不能依赖某一个报告级别。
 后续
@@ -296,8 +296,6 @@ virtio_net_vip/
 │   ├── virtio_real_driver_rx_test.sv       ← MODEL RX 闭环；REAL_DUT 需平台 ingress callback
 │   ├── virtio_dual_test.sv                 ← 双 VIP 互打测试（2 万包 + 带宽控制）
 │   └── host_mem_random_tb.sv               ← Host memory 随机布局/reservation 聚焦测试
-└── ext/                                    ← 仅保留待清理的 PCIe 历史 gitlink，不参与主 filelist
-    └── pcie_tl_vip   → 已由 PCIE_WORK_ROOT 替代
 ```
 
 ---
@@ -311,7 +309,7 @@ memory 在本工程中增加了随机布局与 reservation/pool 适配层：
 
 | 组件 | 功能 | 主要接口 |
 |------|------|---------|
-| **pcie_work/pcie_tl_vip** | PCIe TL 层 VIP，提供 RC/EP Agent、TLM 回环、SR-IOV func_manager | `$PCIE_WORK_ROOT/pcie_tl_vip`；`pcie_tl_env`（子环境）、`uvm_sequencer #(pcie_tl_tlp)`（RC 序列器） |
+| **pcie_work/pcie_tl_vip** | PCIe TL 层 VIP，提供 RC/EP Agent、TLM 回环、SR-IOV func_manager | `$PCIE_WORK_ROOT/pcie_tl_vip`（外部 `main`）；`pcie_tl_env`（子环境）、`uvm_sequencer #(pcie_tl_tlp)`（RC 序列器） |
 | **host_mem_manager** | Buddy Allocator 内存管理，提供分配/释放/读写/泄漏检查 | `alloc()`、`free()`、`write_mem()`、`read_mem()`、`leak_check()` |
 | **net_packet** | 项目外 `NET_PACKET_ROOT`，跟随远程 `master`；支持 L2-L4、隧道、RDMA、存储协议 | `packet_item`（UVM sequence item 封装） |
 | **dpu_common** | 独立 DPU 控制面：拓扑、快照、资源解析和寄存器计划 | `$DPU_COMMON_ROOT` 外部 checkout，固定 SHA |
@@ -329,8 +327,8 @@ memory 在本工程中增加了随机布局与 reservation/pool 适配层：
 - 项目外 `net_packet` master checkout（`NET_PACKET_ROOT`，工作树跟踪
   `origin/master`）
 - 独立的 `dpu_common` checkout（固定提交 `a595b5cb5ab0bf653975be68996b5d46deb5a63d`）
-- 独立的 `pcie_work` checkout（`PCIE_WORK_ROOT`，固定提交
-  `9aedf898f44ca260f3120a3fb162b7bb9fbafb5e`）
+- 独立的 `pcie_work` `main` checkout（`PCIE_WORK_ROOT`，跟踪
+  `origin/main`）
 
 ### 远程 UVM 验证环境
 
@@ -356,14 +354,20 @@ git -C "$NET_PACKET_ROOT" fetch origin master
 git -C "$NET_PACKET_ROOT" switch master 2>/dev/null || \
   git -C "$NET_PACKET_ROOT" switch --track -c master origin/master
 git -C "$NET_PACKET_ROOT" branch --set-upstream-to=origin/master master
+export PCIE_WORK_ROOT=/home/ryan/workspace/ryan/pcie_work
+git -C "$PCIE_WORK_ROOT" fetch origin main
+git -C "$PCIE_WORK_ROOT" switch main 2>/dev/null || \
+  git -C "$PCIE_WORK_ROOT" switch --track -c main origin/main
+git -C "$PCIE_WORK_ROOT" branch --set-upstream-to=origin/main main
 ```
 
-首次准备环境时，在项目外 clone 并固定版本：
+首次准备环境时，在项目外 clone 依赖：
 
 ```bash
 git clone https://github.com/Beihang-yuting/dpu_common.git "$DPU_COMMON_ROOT"
 git -C "$DPU_COMMON_ROOT" checkout --detach a595b5cb5ab0bf653975be68996b5d46deb5a63d
 git clone --branch master https://github.com/Beihang-yuting/net_packet.git "$NET_PACKET_ROOT"
+git clone --branch main https://github.com/Beihang-yuting/pcie_work.git "$PCIE_WORK_ROOT"
 ```
 
 访问凭据不写入仓库；使用已获授权的交互式 SSH 认证。
@@ -396,8 +400,8 @@ make test TEST=virtio_unit_test
 `host_mem_random_test`、`virtio_pcie_host_mem_test` 和
 `dpu_pcie_tl_executor_integration_test`，共 37 项。
 `make check-deps` 会验证 `host_mem` 外部 checkout 固定 SHA、VCS 环境以及
-`dpu_common`、`pcie_work` 的固定版本；同时要求 `net_packet` 外部 checkout
-来自指定远程并处于 `master`/`origin/master` 跟踪状态。
+`dpu_common` 的固定版本；同时要求 `net_packet` 处于 `master`/`origin/master`、
+`pcie_work` 处于 `main`/`origin/main`，并且二者都来自指定远程。
 
 `virtio_host_mem_reclaim_test` 使用外部 `host_mem` 项目的 `host_mem_pool`，验证
 同一 Host 的 manager 共享、随机 alloc/free、队列 reset/teardown 回收以及多 Host
@@ -407,11 +411,11 @@ make test TEST=virtio_unit_test
 没有泄漏。`virtio_traffic_test` 和 `virtio_net_packet_multi_queue_test` 也从
 同一个 Host manager 分配 ring 和 packet buffer。
 
-`pcie_work/pcie_tl_vip@9aedf898f44ca260f3120a3fb162b7bb9fbafb5e` 和
-`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28` 均为项目外固定依赖；其中
-`host_mem` 提供 `host_mem_pkg.sv`、`host_mem_manager.sv` 和 `host_mem_pool.sv`，
-PCIe package 由 `$PCIE_WORK_ROOT/pcie_tl_vip` 提供。固定 SHA 使依赖可复现；实际的 VCS
-编译和动态 UVM 回归结果仍取决于运行环境。
+`pcie_work/main` 和 `net_packet/master` 是项目外的滚动分支依赖，
+`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28` 仍固定以保证 Host-memory
+分配器接口稳定；其中 `host_mem` 提供 `host_mem_pkg.sv`、`host_mem_manager.sv` 和
+`host_mem_pool.sv`，PCIe package 由 `$PCIE_WORK_ROOT/pcie_tl_vip` 提供。构建前的
+分支/远程检查保证来源明确；实际的 VCS 编译和动态 UVM 回归结果仍取决于运行环境。
 
 ---
 
