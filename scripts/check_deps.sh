@@ -8,7 +8,7 @@ root_dir="$(cd "$script_dir/.." && pwd)"
 # dpu_common/net_packet/pcie_work/host_mem 的外部路径、远程地址和受支持版本，
 # 以及 queue_work 依赖，从入口阻止本地复制源码和多份协议实现混用。net_packet
 # 跟随远程 master，pcie_work 跟随远程 main；dpu_common/host_mem 仍固定 SHA。
-dpu_common_revision="a595b5cb5ab0bf653975be68996b5d46deb5a63d"
+dpu_common_revision="4d739965eb47d90b47cc048fc71fd8d7d76a77ca"
 dpu_common_url="https://github.com/Beihang-yuting/dpu_common.git"
 net_packet_url="https://github.com/Beihang-yuting/net_packet.git"
 pcie_work_url="https://github.com/Beihang-yuting/pcie_work.git"

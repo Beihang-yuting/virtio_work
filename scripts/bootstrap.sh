@@ -8,7 +8,7 @@ root_dir="$(cd "$script_dir/.." && pwd)"
 # 和 queue_work 是否已经位于受支持的外部 checkout；net_packet 跟随 origin/master，
 # pcie_work 跟随 origin/main，其余需要稳定回归的依赖固定版本；它不复制或修改
 # 项目外的控制面、报文生成器、Host memory 或 PCIe VIP 源码。
-dpu_common_revision="a595b5cb5ab0bf653975be68996b5d46deb5a63d"
+dpu_common_revision="4d739965eb47d90b47cc048fc71fd8d7d76a77ca"
 net_packet_url="https://github.com/Beihang-yuting/net_packet.git"
 pcie_work_url="https://github.com/Beihang-yuting/pcie_work.git"
 host_mem_revision="365b7553fc7dac6b4ad55886a8e4869153607c28"

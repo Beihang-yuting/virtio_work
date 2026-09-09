@@ -326,7 +326,7 @@ memory 在本工程中增加了随机布局与 reservation/pool 适配层：
   `365b7553fc7dac6b4ad55886a8e4869153607c28`）
 - 项目外 `net_packet` master checkout（`NET_PACKET_ROOT`，工作树跟踪
   `origin/master`）
-- 独立的 `dpu_common` checkout（固定提交 `a595b5cb5ab0bf653975be68996b5d46deb5a63d`）
+- 独立的 `dpu_common` checkout（固定提交 `4d739965eb47d90b47cc048fc71fd8d7d76a77ca`）
 - 独立的 `pcie_work` `main` checkout（`PCIE_WORK_ROOT`，跟踪
   `origin/main`）
 
@@ -346,7 +346,7 @@ $VCS_HOME/bin/vcs -ID
 
 ```bash
 export DPU_COMMON_ROOT=/home/ryan/workspace/ryan/dpu_common
-git -C "$DPU_COMMON_ROOT" checkout --detach a595b5cb5ab0bf653975be68996b5d46deb5a63d
+git -C "$DPU_COMMON_ROOT" checkout --detach 4d739965eb47d90b47cc048fc71fd8d7d76a77ca
 export HOST_MEM_ROOT=/home/ryan/workspace/ryan/host_mem
 git -C "$HOST_MEM_ROOT" checkout --detach 365b7553fc7dac6b4ad55886a8e4869153607c28
 export NET_PACKET_ROOT=/home/ryan/workspace/ryan/net_packet
@@ -365,7 +365,7 @@ git -C "$PCIE_WORK_ROOT" branch --set-upstream-to=origin/main main
 
 ```bash
 git clone https://github.com/Beihang-yuting/dpu_common.git "$DPU_COMMON_ROOT"
-git -C "$DPU_COMMON_ROOT" checkout --detach a595b5cb5ab0bf653975be68996b5d46deb5a63d
+git -C "$DPU_COMMON_ROOT" checkout --detach 4d739965eb47d90b47cc048fc71fd8d7d76a77ca
 git clone --branch master https://github.com/Beihang-yuting/net_packet.git "$NET_PACKET_ROOT"
 git clone --branch main https://github.com/Beihang-yuting/pcie_work.git "$PCIE_WORK_ROOT"
 ```

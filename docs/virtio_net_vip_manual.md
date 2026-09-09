@@ -119,7 +119,7 @@ disable fork;  // 杀死调用线程中的所有子进程!
 | `net_packet` | `$NET_PACKET_ROOT`（项目外 checkout） | 跟随远程 `master`；协议报文生成器（L2-L4、隧道、RDMA、存储） | `packet_item` UVM 封装 |
 | `dpu_common` | `$DPU_COMMON_ROOT`（项目外 checkout） | DPU 全局拓扑、资源快照和寄存器计划 | 固定 SHA 的独立仓库 |
 
-本版本固定使用 `dpu_common@a595b5cb5ab0bf653975be68996b5d46deb5a63d`、
+本版本固定使用 `dpu_common@4d739965eb47d90b47cc048fc71fd8d7d76a77ca`、
 `host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28`；PCIe TL VIP 使用项目外
 `pcie_work/main`（其 `pcie_tl_vip` 位于 `pcie_work/pcie_tl_vip`），并要求跟踪
 `origin/main`。`make check-deps` 会在编译前验证固定依赖以及 PCIe 的远程/分支契约。
