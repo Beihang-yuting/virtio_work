@@ -123,6 +123,13 @@ class virtqueue_manager extends uvm_object;
         return queues[queue_id];
     endfunction
 
+    // Non-reporting lookup used by optional responder/fault hooks.  Unlike
+    // get_queue(), this does not raise a UVM error when a queue is owned by an
+    // external REAL_DUT driver rather than by the local queue model.
+    function bit has_queue(int unsigned queue_id);
+        return queues.exists(queue_id);
+    endfunction
+
     // ------------------------------------------------------------------
     // destroy_queue -- Free rings and remove a single queue
     // ------------------------------------------------------------------

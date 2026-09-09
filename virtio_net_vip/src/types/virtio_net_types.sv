@@ -125,6 +125,15 @@ typedef enum { DRV_MODE_AUTO, DRV_MODE_MANUAL, DRV_MODE_HYBRID } driver_mode_e;
 typedef enum { RX_MODE_MERGEABLE, RX_MODE_BIG, RX_MODE_SMALL } rx_buf_mode_e;
 typedef enum { IRQ_MSIX_PER_QUEUE, IRQ_MSIX_SHARED, IRQ_INTX, IRQ_POLLING } interrupt_mode_e;
 typedef enum { DMA_TO_DEVICE, DMA_FROM_DEVICE, DMA_BIDIRECTIONAL } dma_dir_e;
+// 设备执行主体和完成通知机制分开建模，避免两种设备行为同时驱动队列。
+typedef enum bit [1:0] {
+    VIRTIO_EXEC_MODEL    = 2'd0,
+    VIRTIO_EXEC_REAL_DUT = 2'd1
+} virtio_execution_mode_e;
+typedef enum bit [1:0] {
+    VIRTIO_COMPLETION_MSIX    = 2'd0,
+    VIRTIO_COMPLETION_POLLING = 2'd1
+} virtio_completion_mode_e;
 // IOVA allocation policy is independent from Host-GPA allocation.  RANDOM is
 // the verification default; FIRST_FIT remains available for deterministic
 // debug and characterization runs.
@@ -167,6 +176,33 @@ typedef enum {
     VQ_ERR_WRONG_WRAP_COUNTER, VQ_ERR_AVAIL_USED_FLAG_CORRUPT,
     VQ_ERR_KICK_AFTER_DISABLE, VQ_ERR_SPURIOUS_INTERRUPT, VQ_ERR_EVENT_IDX_BACKWARD
 } virtqueue_error_e;
+
+// Descriptor/virtqueue fault timing.  The first two points are owned by the
+// driver-side queue object; PRE_DEVICE_READ and BEFORE_USED are exposed for a
+// model responder or a REAL_DUT Host-memory fault provider.  ANY preserves a
+// convenient opt-in mode for users that do not care which boundary consumes
+// the configured fault.
+typedef enum {
+    VQ_FAULT_PRE_NOTIFY,
+    VQ_FAULT_POST_NOTIFY,
+    VQ_FAULT_PRE_DEVICE_READ,
+    VQ_FAULT_BEFORE_USED,
+    VQ_FAULT_ANY
+} virtqueue_error_phase_e;
+
+// Fields that may be overwritten after a descriptor has been published.  This
+// is deliberately separate from virtqueue_error_e: the latter describes the
+// semantic fault expected by a test, while this enum describes the exact wire
+// bytes changed in shared Host memory.  The split and packed layouts support
+// different fields (split has NEXT; packed has ID), and unsupported requests
+// are rejected instead of silently changing an unrelated byte.
+typedef enum {
+    VQ_DESC_FIELD_ADDR,
+    VQ_DESC_FIELD_LEN,
+    VQ_DESC_FIELD_FLAGS,
+    VQ_DESC_FIELD_NEXT,
+    VQ_DESC_FIELD_ID
+} virtio_desc_corruption_field_e;
 
 typedef enum {
     VIO_TXN_INIT, VIO_TXN_RESET, VIO_TXN_SHUTDOWN,

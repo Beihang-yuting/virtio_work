@@ -5,6 +5,8 @@
 // virtio_net_env_config
 //
 // Unified configuration object for the virtio-net UVM environment.
+// 中文说明：本对象只描述 virtio 驱动行为、内存和验证策略；Host/PF/VF/BDF/BAR
+// 拓扑以及 qpair 归属必须由全局 dpu_common snapshot 提供。
 // Provides VIO service behavior, memory regions, IOMMU policy, performance
 // limits, and verification component enables. Device topology and placement
 // belong exclusively to the frozen global device snapshot.
@@ -41,7 +43,13 @@ class virtio_net_env_config extends uvm_object;
     int unsigned         default_mss = 1460;
     driver_mode_e        default_driver_mode = DRV_MODE_AUTO;
 
+    // 默认由环境模拟设备行为；接入真实 PCIe DUT 时切换为 REAL_DUT。
+    virtio_execution_mode_e execution_mode = VIRTIO_EXEC_MODEL;
+    virtio_completion_mode_e completion_mode = VIRTIO_COMPLETION_MSIX;
+
     // ===== Memory =====
+    // mem_base/mem_end 是 Host GPA aperture；实际分配器由 host_mem_pool 注入，
+    // 业务环境不会为同一个 Host 再创建第二份 backing storage。
     bit [63:0]           mem_base = 64'h0000_0001_0000_0000;
     bit [63:0]           mem_end  = 64'h0000_0001_FFFF_FFFF;
     // Host address-domain selection.  A top-level DPU environment can inject
@@ -56,6 +64,8 @@ class virtio_net_env_config extends uvm_object;
     host_mem_pool        host_mem_pool_binding = null;
 
     // ===== IOMMU =====
+    // IOVA 属于设备可见地址空间，与 GPA/BAR 数值空间独立；随机策略用于压力
+    // 验证，FIRST_FIT 仅用于需要稳定布局的调试场景。
     bit                  iommu_strict = 1;
     // IOVA is a device-visible address space and is intentionally configured
     // independently from Host GPA/BAR apertures.  The default keeps the
@@ -82,6 +92,7 @@ class virtio_net_env_config extends uvm_object;
     // Constructor
     // ========================================================================
 
+    // 仅初始化 UVM 配置对象；默认字段在声明处设定，构造函数不创建外部资源。
     function new(string name = "virtio_net_env_config");
         super.new(name);
     endfunction
@@ -93,6 +104,8 @@ class virtio_net_env_config extends uvm_object;
     // authority supplied by the caller.
     // ========================================================================
 
+    // 根据环境默认字段生成单个 service 的驱动行为，并把 qpair 上限限制为
+    // snapshot 传入的 max_pairs；不修改环境配置本身。
     function virtio_driver_config_t make_default_driver_config(
         input int unsigned max_pairs
     );
@@ -107,7 +120,8 @@ class virtio_net_env_config extends uvm_object;
         cfg.rx_buf_mode         = default_rx_mode;
         cfg.rx_buf_size         = default_rx_buf_size;
         cfg.rx_refill_threshold = default_rx_refill_threshold;
-        cfg.irq_mode            = default_irq_mode;
+        cfg.irq_mode            = (completion_mode == VIRTIO_COMPLETION_POLLING) ?
+                                  IRQ_POLLING : default_irq_mode;
         cfg.napi_budget         = default_napi_budget;
         cfg.coal_max_packets    = 0;
         cfg.coal_max_usecs      = 0;
@@ -117,6 +131,60 @@ class virtio_net_env_config extends uvm_object;
         return cfg;
     endfunction
 
+    // 读取命令行覆盖，非法值返回可读原因并保持原配置不变。
+    function bit apply_plusargs(output string why);
+        string mode_name;
+        string completion_name;
+
+        why = "";
+        if ($value$plusargs("VIRTIO_EXEC_MODE=%s", mode_name)) begin
+            if ((mode_name == "MODEL") || (mode_name == "model"))
+                execution_mode = VIRTIO_EXEC_MODEL;
+            else if ((mode_name == "REAL_DUT") || (mode_name == "real_dut"))
+                execution_mode = VIRTIO_EXEC_REAL_DUT;
+            else begin
+                why = {"unsupported VIRTIO_EXEC_MODE=", mode_name,
+                       "; expected MODEL or REAL_DUT"};
+                return 0;
+            end
+        end
+        if ($value$plusargs("VIRTIO_COMPLETION_MODE=%s", completion_name)) begin
+            if ((completion_name == "MSIX") || (completion_name == "msix"))
+                completion_mode = VIRTIO_COMPLETION_MSIX;
+            else if ((completion_name == "POLLING") ||
+                     (completion_name == "polling"))
+                completion_mode = VIRTIO_COMPLETION_POLLING;
+            else begin
+                why = {"unsupported VIRTIO_COMPLETION_MODE=", completion_name,
+                       "; expected MSIX or POLLING"};
+                return 0;
+            end
+        end
+        return validate_execution_mode(why);
+    endfunction
+
+    // 枚举底层值仍可能被强制赋成保留值，因此在环境创建前显式校验。
+    function bit validate_execution_mode(output string why);
+        why = "";
+        case (execution_mode)
+            VIRTIO_EXEC_MODEL, VIRTIO_EXEC_REAL_DUT: begin end
+            default: begin
+                why = "invalid virtio execution mode";
+                return 0;
+            end
+        endcase
+        case (completion_mode)
+            VIRTIO_COMPLETION_MSIX, VIRTIO_COMPLETION_POLLING: begin end
+            default: begin
+                why = "invalid virtio completion mode";
+                return 0;
+            end
+        endcase
+        return 1;
+    endfunction
+
+    // 校验 queue 数量、队列大小和带宽参数等本地行为约束；失败时通过 why
+    // 返回可读原因，不产生状态副作用。
     protected function bit validate_driver_behavior(
         input virtio_driver_config_t driver_cfg,
         input string label,
@@ -139,6 +207,8 @@ class virtio_net_env_config extends uvm_object;
         return 1;
     endfunction
 
+    // 为一个完整 service key 注册显式驱动行为；拒绝重复 service、同 Function
+    // 多份配置和非法行为，成功后由本对象拥有该配置副本。
     function bit add_service_config(
         input dpu_service_key_t key,
         input virtio_driver_config_t driver_cfg,
@@ -173,6 +243,8 @@ class virtio_net_env_config extends uvm_object;
         return 1;
     endfunction
 
+    // 按 service key 查询行为配置；未显式注册时生成默认配置，并将 qpair 数量
+    // 截断到 resource snapshot 实际分配值，失败通过 why 返回。
     function bit get_service_config(
         input dpu_service_key_t key,
         input int unsigned max_pairs,
@@ -204,6 +276,8 @@ class virtio_net_env_config extends uvm_object;
         return 1;
     endfunction
 
+    // 检查内存/IOVA aperture、默认行为和显式 service 配置的本地约束；不依赖
+    // 外部 snapshot，失败原因写入 why。
     function bit validate_local(output string why);
         virtio_driver_config_t default_cfg;
 
@@ -238,6 +312,8 @@ class virtio_net_env_config extends uvm_object;
         return 1;
     endfunction
 
+    // 将本地业务行为与冻结 device snapshot 的 capability 和 service 声明对照，
+    // 防止环境越权创建拓扑或请求超过 DUT 单 Function qpair 上限。
     function bit validate_against_snapshot(
         input dpu_device_snapshot snapshot,
         output string why
@@ -294,6 +370,7 @@ class virtio_net_env_config extends uvm_object;
     // convert2string
     // ========================================================================
 
+    // 生成调试字符串，覆盖 Host memory、IOVA、默认驱动和验证开关；无状态副作用。
     virtual function string convert2string();
         string s;
         s = $sformatf("virtio_net_env_config:\n");
@@ -305,6 +382,8 @@ class virtio_net_env_config extends uvm_object;
         s = {s, $sformatf("  iommu_strict=%0b, iova=[0x%016h,0x%016h), policy=%s\n",
                           iommu_strict, iova_base, iova_limit,
                           iova_alloc_policy.name())};
+        s = {s, $sformatf("  execution=%s, completion=%s\n",
+                          execution_mode.name(), completion_mode.name())};
         s = {s, $sformatf("  default: pairs=%0d, qsize=%0d, vq_type=%s, mode=%s\n",
                           default_num_pairs, default_queue_size,
                           default_vq_type.name(), default_driver_mode.name())};

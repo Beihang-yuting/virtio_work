@@ -13,7 +13,7 @@ import virtio_net_pkg::*;
 // represent traffic through a real DUT.
 //
 // Tests:
-//   1. test_large_traffic       — 1000 packet TX/RX loopback
+//   1. test_large_traffic       — configurable packet TX/RX loopback
 //   2. test_bandwidth_control   — rate limiting verification
 //   3. test_protocol_integrity  — checksum/TSO/RSS correctness
 //   4. test_queue_stress        — 256-entry fill/drain x10 cycles
@@ -29,6 +29,11 @@ class virtio_traffic_test extends uvm_test;
     // Error counter
     int unsigned total_errors = 0;
 
+    // 中文说明：所有 traffic/queue 子测试共享外部 host_mem 项目创建的
+    // Host-0 manager。子 task 只取得 handle，不再私自创建或初始化 manager。
+    virtio_shared_mem_fixture mem_fixture;
+    host_mem_manager           shared_mem;
+
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
@@ -36,6 +41,17 @@ class virtio_traffic_test extends uvm_test;
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
         pm = virtio_perf_monitor::type_id::create("pm", this);
+        mem_fixture = virtio_shared_mem_fixture::type_id::create(
+            "traffic_mem_fixture");
+        if (!mem_fixture.create_host(
+                0, 64'h0000_0001_0000_0000,
+                64'h0000_0001_03FF_FFFF, HOST_MEM_RANDOM)) begin
+            `uvm_fatal("TRAFFIC_TEST", "failed to create shared Host-0 memory")
+            return;
+        end
+        shared_mem = mem_fixture.get_host(0);
+        if (shared_mem == null)
+            `uvm_fatal("TRAFFIC_TEST", "shared Host-0 memory handle is null")
     endfunction
 
     virtual task run_phase(uvm_phase phase);
@@ -46,6 +62,12 @@ class virtio_traffic_test extends uvm_test;
         test_protocol_integrity();
         test_queue_stress();
         test_mixed_queue_types();
+
+        // All traffic tasks have completed their queue teardown and data-buffer
+        // frees before this final check.  This is the authoritative check for
+        // the shared manager used by the whole test.
+        if (shared_mem != null)
+            shared_mem.leak_check();
 
         if (total_errors == 0)
             `uvm_info("TRAFFIC_TEST", "All traffic tests PASSED (0 errors)", UVM_NONE)
@@ -429,15 +451,23 @@ class virtio_traffic_test extends uvm_test;
 
         // Track RX buffer addresses for pre-fill
         bit [63:0] rx_buf_addrs[int unsigned];  // desc_id -> addr
+        bit [63:0] tx_buf_addrs[int unsigned];  // packet index -> addr
 
-        mem = host_mem_manager::type_id::create("lt_mem");
+        // 中文说明：默认保持原有 1000 包回归；大流量由 plusarg 覆盖，
+        // 这样 2 万/5 万包压力测试不会改变普通回归时长。
+        void'($value$plusargs("TRAFFIC_PACKETS=%d", num_packets));
+        if (num_packets == 0) begin
+            `uvm_fatal("TRAFFIC_TEST", "TRAFFIC_PACKETS must be greater than zero")
+        end
+
+        mem = shared_mem;
+        if (mem == null)
+            `uvm_fatal("TRAFFIC_TEST", "large traffic has no shared Host memory")
         iommu = virtio_iommu_model::type_id::create("lt_iommu");
         barrier = virtio_memory_barrier_model::type_id::create("lt_bar");
         err_inj = virtqueue_error_injector::type_id::create("lt_einj");
         wait_pol = virtio_wait_policy::type_id::create("lt_wp");
 
-        // Large memory region for 1000 packets
-        mem.init_region(64'hA000_0000, 64'hA0FF_FFFF);  // 16MB
         iommu.strict_permission_check = 0;
 
         // Create TX queue (queue_id=1 = transmitq)
@@ -449,7 +479,6 @@ class virtio_traffic_test extends uvm_test;
         rxq = split_virtqueue::type_id::create("lt_rxq");
         rxq.setup(0, queue_size, mem, iommu, barrier, err_inj, wait_pol, 16'h0100);
         rxq.alloc_rings();
-
         start_time = $realtime;
 
         // Process in batches of queue_size
@@ -548,6 +577,7 @@ class virtio_traffic_test extends uvm_test;
 
                     tx_desc_ids.push_back(desc_id);
                     tx_packets[pkt_idx_global] = pkt_data;
+                    tx_buf_addrs[pkt_idx_global] = buf_addr;
                     total_bytes += pkt_size;
                     tx_submitted++;
                 end
@@ -578,6 +608,17 @@ class virtio_traffic_test extends uvm_test;
                     while (txq.poll_used(token, used_len)) begin
                         tx_polled++;
                     end
+                    assert(tx_polled == tx_desc_ids.size())
+                        else `uvm_error("TRAFFIC_TEST", $sformatf(
+                            "TX completion count mismatch: %0d/%0d",
+                            tx_polled, tx_desc_ids.size()))
+                    foreach (tx_desc_ids[i]) begin
+                        int unsigned pkt_idx_global = batch_num * queue_size + i;
+                        if (tx_buf_addrs.exists(pkt_idx_global)) begin
+                            mem.free(tx_buf_addrs[pkt_idx_global]);
+                            tx_buf_addrs.delete(pkt_idx_global);
+                        end
+                    end
                 end
 
                 // Poll RX used ring and verify data
@@ -602,12 +643,28 @@ class virtio_traffic_test extends uvm_test;
                             end else begin
                                 data_matched++;
                             end
+                            // Do not retain every payload in the simulator
+                            // heap once this packet has been checked.
+                            tx_packets.delete(pkt_idx_global);
                         end
 
                         rx_polled++;
                         rx_received++;
                     end
+                    foreach (rx_buf_addrs[rx_desc_id]) begin
+                        mem.free(rx_buf_addrs[rx_desc_id]);
+                    end
+                    rx_buf_addrs.delete();
                 end
+
+                // 当前 direct-memory loopback 每批都会重新分配 ring；所有
+                // 数据 buffer 必须在 used ring 消费后释放。共享 manager
+                // 的最终 leak_check 会检查 ring 本身，以下检查确保本批
+                // 的业务 buffer tracking 也已经完全清空。
+                assert(tx_buf_addrs.size() == 0 && rx_buf_addrs.size() == 0)
+                    else `uvm_error("TRAFFIC_TEST", $sformatf(
+                        "memory reclamation tracking failed after batch %0d: tx=%0d rx=%0d",
+                        batch_num, tx_buf_addrs.size(), rx_buf_addrs.size()))
 
                 remaining -= batch_size;
                 batch_num++;
@@ -641,7 +698,10 @@ class virtio_traffic_test extends uvm_test;
         // Cleanup
         txq.free_rings();
         rxq.free_rings();
+        mem.leak_check();
         tx_packets.delete();
+        tx_buf_addrs.delete();
+        rx_buf_addrs.delete();
     endtask
 
     // ========================================================================
@@ -895,8 +955,9 @@ class virtio_traffic_test extends uvm_test;
             bit [63:0] features_10, features_12, features_20;
             int unsigned hdr_errors = 0;
 
-            hdr_mem = host_mem_manager::type_id::create("hdr_mem");
-            hdr_mem.init_region(64'hB000_0000, 64'hB000_FFFF);
+            hdr_mem = shared_mem;
+            if (hdr_mem == null)
+                `uvm_fatal("TRAFFIC_TEST", "header test has no shared Host memory")
 
             features_10 = (64'h1 << VIRTIO_F_VERSION_1);
             features_12 = features_10 | (64'h1 << VIRTIO_NET_F_MRG_RXBUF);
@@ -1020,18 +1081,20 @@ class virtio_traffic_test extends uvm_test;
         int unsigned total_ops = 0;
         int unsigned cycle_errors = 0;
 
-        mem = host_mem_manager::type_id::create("qs_mem");
+        mem = shared_mem;
+        if (mem == null)
+            `uvm_fatal("TRAFFIC_TEST", "queue stress has no shared Host memory")
         iommu = virtio_iommu_model::type_id::create("qs_iommu");
         barrier = virtio_memory_barrier_model::type_id::create("qs_bar");
         err_inj = virtqueue_error_injector::type_id::create("qs_einj");
         wait_pol = virtio_wait_policy::type_id::create("qs_wp");
 
-        mem.init_region(64'hC000_0000, 64'hC07F_FFFF);  // 8MB
         iommu.strict_permission_check = 0;
 
         for (int unsigned cycle = 0; cycle < num_cycles; cycle++) begin
             int unsigned used_idx = 0;
             int unsigned desc_ids[$];
+            bit [63:0] buf_addrs[$];
 
             // Create fresh queue each cycle
             vq = split_virtqueue::type_id::create($sformatf("qs_vq_%0d", cycle));
@@ -1053,6 +1116,7 @@ class virtio_traffic_test extends uvm_test;
                     cycle_errors++;
                     break;
                 end
+                buf_addrs.push_back(buf_addr);
 
                 e.addr = buf_addr;
                 e.len = 128;
@@ -1129,6 +1193,9 @@ class virtio_traffic_test extends uvm_test;
                 cycle_errors++;
             end
 
+            foreach (buf_addrs[i])
+                mem.free(buf_addrs[i]);
+            buf_addrs.delete();
             vq.free_rings();
             desc_ids = {};
             #1ns;
@@ -1166,14 +1233,17 @@ class virtio_traffic_test extends uvm_test;
         int unsigned split_polled = 0;
         int unsigned packed_polled = 0;
         int unsigned mix_errors = 0;
+        bit [63:0] split_buf_addrs[$];
+        bit [63:0] packed_buf_addrs[$];
 
-        mem = host_mem_manager::type_id::create("mq_mem");
+        mem = shared_mem;
+        if (mem == null)
+            `uvm_fatal("TRAFFIC_TEST", "mixed queue test has no shared Host memory")
         iommu = virtio_iommu_model::type_id::create("mq_iommu");
         barrier = virtio_memory_barrier_model::type_id::create("mq_bar");
         err_inj = virtqueue_error_injector::type_id::create("mq_einj");
         wait_pol = virtio_wait_policy::type_id::create("mq_wp");
 
-        mem.init_region(64'hD000_0000, 64'hD03F_FFFF);  // 4MB
         iommu.strict_permission_check = 0;
 
         mgr = virtqueue_manager::type_id::create("mq_mgr");
@@ -1222,6 +1292,7 @@ class virtio_traffic_test extends uvm_test;
                     mix_errors++;
                     break;
                 end
+                split_buf_addrs.push_back(buf_addr);
 
                 test_data = new[256];
                 foreach (test_data[j]) test_data[j] = (i + j) & 8'hFF;
@@ -1277,6 +1348,9 @@ class virtio_traffic_test extends uvm_test;
                     split_polled++;
                 end
             end
+            foreach (split_buf_addrs[i])
+                mem.free(split_buf_addrs[i]);
+            split_buf_addrs.delete();
         end
 
         // Submit 100 packets to packed queue
@@ -1297,6 +1371,7 @@ class virtio_traffic_test extends uvm_test;
                     mix_errors++;
                     break;
                 end
+                packed_buf_addrs.push_back(buf_addr);
 
                 test_data = new[256];
                 foreach (test_data[j]) test_data[j] = (i + j + 8'h80) & 8'hFF;
@@ -1349,6 +1424,9 @@ class virtio_traffic_test extends uvm_test;
                     packed_polled++;
                 end
             end
+            foreach (packed_buf_addrs[i])
+                mem.free(packed_buf_addrs[i]);
+            packed_buf_addrs.delete();
         end
 
         // Verify results

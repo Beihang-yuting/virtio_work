@@ -4,8 +4,13 @@
 import uvm_pkg::*;
 `include "uvm_macros.svh"
 import dpu_resource_pkg::*;
+import gq_pkg::*;
+import pcie_tl_pkg::*;
 import virtio_net_pkg::*;
 
+// 中文说明：本测试验证冻结 DPU 拓扑、PF/VF/BAR/qpair 资源以及 queue_work
+// binder 的 Host/PCIe domain 隔离关系；测试只消费快照和共享 Host memory 接口，
+// 不在业务环境内重新分配设备身份，也不把两个 Host 的 backing storage 混用。
 // A config-space-only endpoint model lets the focused Fabric test exercise
 // real virtio capability discovery without taking ownership of PCIe binding.
 class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
@@ -21,12 +26,14 @@ class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
     config_write_t config_writes[$];
     bit discovery_started_before_bar_programming;
 
+    // 创建配置空间 stub 并清零写入计数；不创建真实 PCIe endpoint。
     function new(string name = "virtio_fabric_cfg_stub_accessor");
         super.new(name);
         config_write_count = 0;
         discovery_started_before_bar_programming = 0;
     endfunction
 
+    // 按测试所需 capability 表返回配置读数据，并记录 BAR 编程前的非法访问。
     virtual task config_read(bit [11:0] addr, ref bit [31:0] data);
         if (config_write_count != 6)
             discovery_started_before_bar_programming = 1;
@@ -38,7 +45,9 @@ class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
             12'h048: data = 32'h0000_0000;
             12'h04c: data = 32'h0000_0100;
             12'h050: data = {8'd2, 8'd20, 8'h64, PCI_CAP_ID_VENDOR};
-            12'h054: data = 32'h0000_0000;
+            // Fabric profile places the virtio notification capability in
+            // BAR2/3 (mailbox); BAR0/1 remains common/ISR/device config.
+            12'h054: data = 32'h0000_0002;
             12'h058: data = 32'h0000_0100;
             12'h05c: data = 32'h0000_0100;
             12'h060: data = 32'h0000_0004;
@@ -54,6 +63,7 @@ class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
         endcase
     endtask
 
+    // 记录配置写地址、payload 和 byte-enable，供后续断言 BAR 编程序列。
     virtual task config_write(
         bit [11:0] addr, bit [31:0] data, bit [3:0] be
     );
@@ -66,6 +76,7 @@ class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
         config_writes.push_back(write);
     endtask
 
+    // 向测试暴露受保护的 functional BAR 访问策略；只读查询，不改变 accessor 状态。
     // Exposes the accessor's protected functional-access policy to this
     // focused test without changing the production API.
     function bit probe_functional_bar_access(input int unsigned bar_id);
@@ -82,14 +93,17 @@ class virtio_fabric_cfg_tlp_capture_driver extends uvm_driver #(pcie_tl_tlp);
 
     pcie_tl_tlp captured_tlps[$];
 
+    // 构造 TLP 捕获 driver；parent 为空时仍可被工厂创建为独立组件。
     function new(string name, uvm_component parent = null);
         super.new(name, parent);
     endfunction
 
+    // 清空已捕获 TLP，供多个负向/正向子场景复用同一 driver。
     function void clear();
         captured_tlps.delete();
     endfunction
 
+    // 持续接收 sequencer item 并保存到 captured_tlps；phase 结束由 UVM 回收线程。
     virtual task run_phase(uvm_phase phase);
         pcie_tl_tlp tlp;
 
@@ -110,6 +124,7 @@ class virtio_expected_bar_report_catcher extends uvm_report_catcher;
     int unsigned caught_count;
     string last_message;
 
+    // 创建限定一次报告的 catcher；输入期望 ID/严重级别，命中后降为 INFO 保持测试继续。
     function new(
         string name,
         string expected_report_id,
@@ -122,6 +137,7 @@ class virtio_expected_bar_report_catcher extends uvm_report_catcher;
         last_message = "";
     endfunction
 
+    // 检查当前报告是否是预期负向路径，记录次数/消息并返回 THROW 交回 UVM。
     function action_e catch();
         if ((get_id() == expected_id) &&
             (get_severity() == expected_severity)) begin
@@ -147,15 +163,22 @@ class virtio_fabric_resource_test extends uvm_test;
     dpu_device_env             device_env;
     dpu_device_snapshot        device_snapshot;
     dpu_resource_snapshot      resource_snapshot;
+    // binder_pool 只供本测试验证 queue_work 的 Host 资源绑定，不替代
+    // virtio_net_env 内部已经验证过的设备内存管理器。
+    host_mem_pool              binder_pool;
+    dpu_queue_resource_binder queue_binder;
+    virtio_queue_host_mem_provider_adapter binder_mem_provider;
     virtio_net_env_config      cfg;
     virtio_net_env             env;
     uvm_sequencer #(pcie_tl_tlp) fabric_cfg_tlp_seqr;
     virtio_fabric_cfg_tlp_capture_driver fabric_cfg_tlp_capture;
 
+    // 初始化 Fabric 资源测试；真正的 device/resource snapshot 在 build_phase 生成。
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
 
+    // 给 builder 增加真实 DUT BAR 描述和 VIO service 能力，返回可继续编辑的配置。
     protected function dpu_function_cfg author_vio_function(
         input dpu_function_cfg function_cfg
     );
@@ -164,6 +187,7 @@ class virtio_fabric_resource_test extends uvm_test;
         return function_cfg;
     endfunction
 
+    // 构造带稀疏 local/global qid 的 placement request，验证 resolver 到 snapshot 的映射。
     protected function void author_snapshot_qpair_placement(
         input dpu_function_key_t sparse_owner
     );
@@ -205,6 +229,7 @@ class virtio_fabric_resource_test extends uvm_test;
         device_cfg.placement_cfg.vio_requests.push_back(request);
     endfunction
 
+    // 将 Function 的三个真实 DUT BAR 固定到指定地址，供冲突和 PCIe 编程测试复用。
     protected function void pin_real_dut_bars(
         input virtio_test_device_builder builder,
         input dpu_function_cfg function_cfg,
@@ -224,6 +249,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endfunction
 
+    // 组装 Host/PF/VF 身份键；该纯函数不分配资源、不修改调用者状态。
     protected function automatic dpu_function_key_t make_function_key(
         input int unsigned host_id,
         input int unsigned parent_id,
@@ -239,6 +265,7 @@ class virtio_fabric_resource_test extends uvm_test;
         return key;
     endfunction
 
+    // 同步追加期望 Function key 与 BDF，供 snapshot 顺序和反查断言使用。
     protected function void append_expected_function(
         ref dpu_function_key_t keys[$],
         ref bit [15:0] bdfs[$],
@@ -253,6 +280,7 @@ class virtio_fabric_resource_test extends uvm_test;
         bdfs.push_back(bdf);
     endfunction
 
+    // 判断两个半开地址区间是否重叠；size 为零或溢出由调用方负责规避。
     protected function bit ranges_overlap(
         input bit [63:0] lhs_base,
         input bit [63:0] lhs_size,
@@ -263,6 +291,7 @@ class virtio_fabric_resource_test extends uvm_test;
                (rhs_base < (lhs_base + lhs_size));
     endfunction
 
+    // 创建一个带 role/even-BAR/base/size 的 Fabric lease 值对象，不注册到 accessor。
     protected function automatic dpu_bar_pair_lease_t make_fabric_bar_pair(
         input dpu_bar_role_e role,
         input int unsigned even_bar_id,
@@ -278,6 +307,7 @@ class virtio_fabric_resource_test extends uvm_test;
         return pair;
     endfunction
 
+    // 判断 haystack 是否包含 needle，空 needle 视为匹配，供错误上下文断言使用。
     protected function bit string_contains(
         input string haystack,
         input string needle
@@ -295,6 +325,7 @@ class virtio_fabric_resource_test extends uvm_test;
         return 0;
     endfunction
 
+    // 生成乱序但合法的三类 Fabric BAR lease，验证 accessor 按 role/id 而非数组位置识别。
     // Deliberately return the valid leases out of BAR order.  The accessor
     // must recognize the required {role, even-BAR} set rather than treating
     // the input queue position as configuration.
@@ -312,6 +343,7 @@ class virtio_fabric_resource_test extends uvm_test;
             64'h0000_0000_0001_0000));
     endfunction
 
+    // 断言非法 lease 集合产生带上下文的 UVM_ERROR 且不会激活布局；失败立即 fatal。
     task assert_fabric_lease_set_rejected(
         input string case_name,
         input dpu_bar_pair_lease_t bars[$],
@@ -345,6 +377,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 断言非法 BAR 编程输入产生 UVM_FATAL，并验证配置空间访问没有继续执行。
     task assert_fabric_bar_programming_rejected(
         input string case_name,
         input dpu_bar_pair_lease_t bars[$],
@@ -381,6 +414,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 通过真实 base config_write() 路径检查六个 Type-0 TLP 的地址、BDF、BE 和 payload。
     // Verify the base config_write() sequence reaches a sequencer/driver and
     // emits complete Config Write Type-0 TLPs.  Recording a virtual override
     // alone cannot establish this transport serialization contract.
@@ -463,6 +497,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 依次覆盖缺失、重复、额外、role/id 错配及非法 size/base，确认拒绝发生在配置 I/O 前。
     task assert_fabric_bar_hardening_rejections();
         dpu_bar_pair_lease_t bars[$];
 
@@ -504,6 +539,7 @@ class virtio_fabric_resource_test extends uvm_test;
             "low_nibble_base", bars, "low address nibble");
     endtask
 
+    // 校验 Function 的三组 BAR role/id/size/alignment，并确认 transport 已导入 lease。
     task assert_bar_layout(input virtio_function_instance function_instance);
         dpu_bar_pair_lease_t bars[$];
         bit [63:0] device_size;
@@ -552,6 +588,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 在相同 PCIe domain 内检查当前 Function BAR 与已收集区间不重叠，跨 domain 允许复用数值。
     task assert_unique_bars(
         input virtio_function_instance function_instance,
         ref bar_range_t all_bars[$]
@@ -583,6 +620,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 将 Function 的 local qpair 解析为 global qpair，断言不同 Function 不共享全局编号。
     task assert_unique_qpair(
         input virtio_function_instance function_instance,
         ref int unsigned global_qpair_ids[$]
@@ -603,6 +641,7 @@ class virtio_fabric_resource_test extends uvm_test;
         global_qpair_ids.push_back(global_qpair_id);
     endtask
 
+    // 检查稀疏 local/global qid 映射来自 resource snapshot，且 TX/RX 共享同一 pair global id。
     task assert_sparse_snapshot_mapping(
         input virtio_function_instance function_instance,
         input string lifecycle
@@ -658,6 +697,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 对 discovery 产生的六次 BAR 配置写逐项检查地址、payload、BE 及编程顺序。
     task assert_fabric_bar_config_writes(
         input virtio_function_instance function_instance,
         input virtio_fabric_cfg_stub_accessor config_stub
@@ -716,6 +756,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 为指定 Function 接入配置空间 stub，执行真实 capability discovery 并检查 BAR 访问策略。
     task discover_fabric_function(input virtio_function_instance function_instance);
         virtio_fabric_cfg_stub_accessor config_stub;
         virtio_expected_bar_report_catcher msix_only_error;
@@ -776,6 +817,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 构造同 domain 的重复 BDF 和 BAR overlap，验证 resolver 原子拒绝而不发布 snapshot。
     task assert_same_domain_collisions_rejected();
         virtio_test_device_builder collision_builder;
         dpu_function_cfg first_function;
@@ -839,6 +881,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 验证 snapshot 的 canonical Function 顺序、BDF 正向/反向查询、DMA identity 和 BAR 反查。
     task assert_snapshot_order_and_reverse_lookup();
         dpu_function_key_t expected_keys[$];
         dpu_function_key_t actual_keys[$];
@@ -962,6 +1005,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 验证不同 Host/domain 可以复用数值 BDF/BAR，同时 resolve 仍路由到各自 Function。
     task assert_independent_domain_numeric_reuse();
         dpu_function_key_t host0_key;
         dpu_function_key_t host1_key;
@@ -1011,6 +1055,7 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 验证已绑定 Function 拒绝第二份 snapshot/service，且原有 BDF/BAR/transport 不被改变。
     // Break caught: a function already owned by one frozen device snapshot
     // accepts the same service identity from a second snapshot and silently
     // replaces its BDF/BAR transport placement.
@@ -1104,6 +1149,149 @@ class virtio_fabric_resource_test extends uvm_test;
         end
     endtask
 
+    // 设计意图：顶层快照已经同时包含 Host 0/1 的 segment 0；这里直接调用
+    // queue_work 的真实 binder，证明相同 segment 数值不会把两个 Host 折叠成
+    // 同一个 PCIe Root，同时证明 ring 所需 Host memory 句柄不会跨 Host 复用。
+    // 功能：验证 binder 的配置、PF/VF owner 映射、Host memory 映射及负向查询。
+    // 输入：build_phase/run_phase 产生的冻结 device/resource snapshot；无显式参数。
+    // 输出：断言全部通过时无返回值；任一身份、Root、memory 或错误路径不符合
+    // 约定即通过 UVM_FATAL 终止测试。
+    // 副作用与边界：仅创建两个独立 Host memory manager 并读取快照；不写 PCIe
+    // 寄存器、不启动 queue engine，也不修改已有 virtio 环境的资源所有权。
+    task assert_queue_binder_mapping();
+        dpu_service_key_t services[$];
+        dpu_function_key_t host0_pf0;
+        dpu_function_key_t host1_pf0;
+        dpu_function_key_t host0_vf0;
+        dpu_function_key_t host1_vf0;
+        string host0_service_name;
+        string host1_service_name;
+        string host0_vf_service_name;
+        string host1_vf_service_name;
+        gq_queue_owner_t host0_owner;
+        gq_queue_owner_t host1_owner;
+        gq_queue_owner_t host0_vf_owner;
+        gq_queue_owner_t host1_vf_owner;
+        host_mem_api host0_mem_api;
+        host_mem_api host1_mem_api;
+        string why;
+
+        host0_pf0 = make_function_key(0, 0, DPU_FUNCTION_PF, 0);
+        host1_pf0 = make_function_key(1, 0, DPU_FUNCTION_PF, 0);
+        host0_vf0 = make_function_key(0, 0, DPU_FUNCTION_VF, 0);
+        host1_vf0 = make_function_key(1, 0, DPU_FUNCTION_VF, 0);
+        device_snapshot.list_services(DPU_SERVICE_VIO_NET, services);
+        foreach (services[index]) begin
+            if (dpu_same_function_key(services[index].function_key,
+                                       host0_pf0))
+                host0_service_name = dpu_service_key_name(services[index]);
+            if (dpu_same_function_key(services[index].function_key,
+                                       host1_pf0))
+                host1_service_name = dpu_service_key_name(services[index]);
+            if (dpu_same_function_key(services[index].function_key,
+                                       host0_vf0))
+                host0_vf_service_name = dpu_service_key_name(services[index]);
+            if (dpu_same_function_key(services[index].function_key,
+                                       host1_vf0))
+                host1_vf_service_name = dpu_service_key_name(services[index]);
+        end
+        if ((host0_service_name.len() == 0) ||
+            (host1_service_name.len() == 0) ||
+            (host0_vf_service_name.len() == 0) ||
+            (host1_vf_service_name.len() == 0)) begin
+            `uvm_fatal("QUEUE_BINDER", $sformatf(
+                "frozen snapshot lacks Host 0/1 PF0/VF0 VIO services: %0d services",
+                services.size()))
+        end
+
+        binder_pool = host_mem_pool::type_id::create("binder_host_pool");
+        if (!binder_pool.create_host(
+                0, 64'h0000_1000_0000_0000,
+                64'h0000_1000_001f_ffff) ||
+            !binder_pool.create_host(
+                1, 64'h0000_1000_0000_0000,
+                64'h0000_1000_001f_ffff)) begin
+            `uvm_fatal("QUEUE_BINDER",
+                "could not construct independent Host 0/1 binder memory managers")
+        end
+
+        binder_mem_provider = virtio_queue_host_mem_provider_adapter::type_id::create(
+            "queue_resource_mem_provider");
+        binder_mem_provider.bind_pool(binder_pool);
+
+        queue_binder = dpu_queue_resource_binder::type_id::create(
+            "queue_resource_binder");
+        if (!queue_binder.configure(
+                device_snapshot, resource_snapshot, binder_mem_provider, why)) begin
+            `uvm_fatal("QUEUE_BINDER", {"binder configure failed: ", why})
+        end
+        if (!queue_binder.resolve_queue_owner(
+                host0_service_name, 0, host0_owner, why)) begin
+            `uvm_fatal("QUEUE_BINDER", {"Host 0 owner resolution failed: ", why})
+        end
+        if (!queue_binder.resolve_queue_owner(
+                host1_service_name, 0, host1_owner, why)) begin
+            `uvm_fatal("QUEUE_BINDER", {"Host 1 owner resolution failed: ", why})
+        end
+        if (!queue_binder.resolve_queue_owner(
+                host0_vf_service_name, 0, host0_vf_owner, why) ||
+            !queue_binder.resolve_queue_owner(
+                host1_vf_service_name, 0, host1_vf_owner, why)) begin
+            `uvm_fatal("QUEUE_BINDER", {"VF owner resolution failed: ", why})
+        end
+        if (!host0_owner.valid || !host1_owner.valid ||
+            (host0_owner.service_key.function_key.host_id != 0) ||
+            (host1_owner.service_key.function_key.host_id != 1) ||
+            (host0_owner.pcie_segment_id != 0) ||
+            (host1_owner.pcie_segment_id != 0) ||
+            (host0_owner.pcie_root_index == host1_owner.pcie_root_index) ||
+            (host0_owner.bdf != host1_owner.bdf)) begin
+            `uvm_fatal("QUEUE_BINDER", $sformatf(
+                "same-segment multi-Host owner collision: h0 root=%0d bdf=0x%04h, h1 root=%0d bdf=0x%04h",
+                host0_owner.pcie_root_index, host0_owner.bdf,
+                host1_owner.pcie_root_index, host1_owner.bdf))
+        end
+        if (!host0_vf_owner.valid || !host1_vf_owner.valid ||
+            (host0_vf_owner.service_key.function_key.kind != GQ_FUNCTION_VF) ||
+            (host1_vf_owner.service_key.function_key.kind != GQ_FUNCTION_VF) ||
+            (host0_vf_owner.service_key.function_key.vf_id != 0) ||
+            (host1_vf_owner.service_key.function_key.vf_id != 0) ||
+            (host0_vf_owner.pcie_root_index != host0_owner.pcie_root_index) ||
+            (host1_vf_owner.pcie_root_index != host1_owner.pcie_root_index)) begin
+            `uvm_fatal("QUEUE_BINDER", $sformatf(
+                "VF owner identity/root mismatch: h0 kind=%0d vf=%0d root=%0d, h1 kind=%0d vf=%0d root=%0d",
+                host0_vf_owner.service_key.function_key.kind,
+                host0_vf_owner.service_key.function_key.vf_id,
+                host0_vf_owner.pcie_root_index,
+                host1_vf_owner.service_key.function_key.kind,
+                host1_vf_owner.service_key.function_key.vf_id,
+                host1_vf_owner.pcie_root_index))
+        end
+        if (!queue_binder.get_host_mem(0, host0_mem_api, why) ||
+            !queue_binder.get_host_mem(1, host1_mem_api, why) ||
+            (host0_mem_api == null) || (host1_mem_api == null) ||
+            (host0_mem_api == host1_mem_api) ||
+            (host0_mem_api.get_host_id() != 0) ||
+            (host1_mem_api.get_host_id() != 1)) begin
+            `uvm_fatal("QUEUE_BINDER",
+                "binder returned an aliased or misidentified Host memory manager")
+        end
+
+        if (queue_binder.resolve_queue_owner(
+                host0_service_name, 999, host0_owner, why) ||
+            (why.len() == 0)) begin
+            `uvm_fatal("QUEUE_BINDER",
+                "unknown local qpair was accepted by binder")
+        end
+        if (queue_binder.resolve_queue_owner(
+                "h99.pf0.k0.vf0.svc0.i0", 0, host0_owner, why) ||
+            (why.len() == 0)) begin
+            `uvm_fatal("QUEUE_BINDER",
+                "unknown service was accepted by binder")
+        end
+    endtask
+
+    // 创建双 Host、多 PF/VF 的 authoring 配置，发布 device/resource snapshot 及业务 env。
     virtual function void build_phase(uvm_phase phase);
         dpu_function_cfg selected_af;
         dpu_function_cfg reused_domain_pf;
@@ -1173,6 +1361,7 @@ class virtio_fabric_resource_test extends uvm_test;
             "fabric_cfg_tlp_capture", this);
     endfunction
 
+    // 将 TLP capture driver 接到配置 sequencer；无 PCIe 业务数据面连接副作用。
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
         fabric_cfg_tlp_capture.seq_item_port.connect(
@@ -1180,6 +1369,7 @@ class virtio_fabric_resource_test extends uvm_test;
         );
     endfunction
 
+    // 按“非法输入→真实 TLP→冻结 snapshot→binder”顺序执行全部 Fabric/Host 隔离断言。
     virtual task run_phase(uvm_phase phase);
         int unsigned global_qpair_ids[$];
         bar_range_t all_bars[$];
@@ -1203,6 +1393,7 @@ class virtio_fabric_resource_test extends uvm_test;
         assert_snapshot_order_and_reverse_lookup();
         assert_independent_domain_numeric_reuse();
         assert_snapshot_function_binding_is_immutable();
+        assert_queue_binder_mapping();
 
         if ((env.pf_instances.size() != 4) ||
             (env.vf_instances.size() != 22)) begin

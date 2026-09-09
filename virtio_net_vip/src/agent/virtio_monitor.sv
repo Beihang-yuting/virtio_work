@@ -108,16 +108,23 @@ class virtio_monitor extends uvm_monitor;
         input bit is_write,
         input int unsigned size_bytes,
         input bit [63:0] data,
-        input int unsigned bar_offset
+        input int unsigned bar_offset,
+        input int unsigned bar_id = 32'hffff_ffff
     );
         virtio_transaction txn;
         bit [7:0] new_status;
         bit valid;
 
         txn = new_monitor_txn(VIRTIO_MON_BAR_ACCESS, address, size_bytes, is_write);
+        txn.monitor_data = data;
+        txn.monitor_bar_offset = bar_offset;
+        txn.monitor_bar_id = bar_id;
         txn.txn_type = VIO_TXN_INIT;
         txn.status_val = data[7:0];
-        if (is_write && (bar_offset == VIRTIO_PCI_COMMON_STATUS)) begin
+        if (is_write && (bar_offset == VIRTIO_PCI_COMMON_STATUS) &&
+            ((bar_id == 32'hffff_ffff) || (transport == null) ||
+             (transport.cap_mgr == null) || !transport.cap_mgr.common_cfg_found ||
+             (bar_id == transport.cap_mgr.common_cfg_cap.bar))) begin
             new_status = data[7:0];
             txn.status_old = last_status;
             valid = status_transition_valid(last_status, new_status);
@@ -201,7 +208,10 @@ class virtio_monitor extends uvm_monitor;
     virtual function void observe_queue_state(
         input int unsigned queue_id,
         input bit configured,
-        input bit enabled
+        input bit enabled,
+        input int unsigned bar_offset = 0,
+        input bit [63:0] data = '0,
+        input bit is_write = 1'b1
     );
         virtio_transaction txn;
 
@@ -209,6 +219,9 @@ class virtio_monitor extends uvm_monitor;
         txn.txn_type = VIO_TXN_SETUP_QUEUE;
         txn.queue_id = queue_id;
         txn.queue_size = configured ? 1 : 0;
+        txn.monitor_bar_offset = bar_offset;
+        txn.monitor_data = data;
+        txn.monitor_is_write = is_write;
         if (enabled && !configured) begin
             mark_error(txn, $sformatf("Queue %0d enabled before configuration", queue_id));
         end
@@ -220,7 +233,12 @@ class virtio_monitor extends uvm_monitor;
         publish_event(txn);
     endfunction
 
-    virtual function void observe_queue_notify(input int unsigned queue_id);
+    virtual function void observe_queue_notify(
+        input int unsigned queue_id,
+        input bit [15:0] notify_payload = '0,
+        input int unsigned notify_offset = 0,
+        input bit [63:0] notify_address = '0
+    );
         virtio_transaction txn;
         virtqueue_base vq;
         bit valid;
@@ -231,9 +249,35 @@ class virtio_monitor extends uvm_monitor;
         txn.txn_type = VIO_TXN_ATOMIC_OP;
         txn.atomic_op = ATOMIC_KICK;
         txn.queue_id = queue_id;
+        txn.monitor_data = notify_payload;
+        txn.monitor_bar_offset = notify_offset;
+        txn.monitor_addr = notify_address;
         configured = queue_configured.exists(queue_id) && queue_configured[queue_id];
         enabled = queue_enabled.exists(queue_id) && queue_enabled[queue_id];
         valid = configured && enabled;
+        // The queue number in the notify payload is not sufficient: a real
+        // virtio-pci device also decodes the queue-specific notify offset.
+        // When discovery has populated queue_notify_off, reject a kick sent
+        // to another queue's doorbell even if its payload names an enabled
+        // queue.  Unit callers that do not provide an address retain the
+        // legacy semantic-only check.
+        if (valid && (notify_address != 0) && (transport != null) &&
+            (transport.cap_mgr != null) && transport.cap_mgr.notify_found &&
+            (queue_id < transport.queue_notify_off.size())) begin
+            bit [63:0] expected_offset;
+            // notify_offset is relative to the notify capability base (the
+            // observer subtracts BAR+cap_offset), so compare only the
+            // queue-specific multiplier portion here.
+            expected_offset = transport.queue_notify_off[queue_id] *
+                              transport.cap_mgr.notify_off_multiplier;
+            if (notify_offset != expected_offset) begin
+                valid = 0;
+                txn.vq_error_type = VQ_ERR_KICK_BEFORE_ENABLE;
+                mark_error(txn, $sformatf(
+                    "Notify offset mismatch queue=%0d actual=0x%0h expected=0x%0h",
+                    queue_id, notify_offset, expected_offset));
+            end
+        end
         if ((vq_mgr != null) && valid) begin
             vq = vq_mgr.get_queue(queue_id);
             valid = (vq != null) && vq.queue_enable;
@@ -309,6 +353,10 @@ class virtio_monitor extends uvm_monitor;
         txn.monitor_addr = address;
         txn.monitor_length = size_bytes;
         txn.monitor_is_write = is_write;
+        txn.monitor_bdf = (transport == null) ? '0 : transport.bdf;
+        txn.monitor_host_id = (transport == null) ? 0 : transport.iommu_host_id();
+        txn.monitor_segment_id = (transport == null || !transport.pcie_id_valid) ?
+                                 0 : transport.pcie_id.domain.segment_id;
         return txn;
     endfunction
 

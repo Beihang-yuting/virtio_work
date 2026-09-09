@@ -190,6 +190,7 @@ class split_virtqueue extends virtqueue_base;
         desc_table_addr  = 0;
         driver_ring_addr = 0;
         device_ring_addr = 0;
+        clear_published_descriptor();
         state            = VQ_RESET;
 
         `uvm_info("SPLIT_VQ",
@@ -365,6 +366,7 @@ class split_virtqueue extends virtqueue_base;
 
         // Store token for later retrieval
         token_map[head] = token;
+        mark_published_descriptor(head);
 
         total_add_buf_ops++;
 
@@ -381,10 +383,15 @@ class split_virtqueue extends virtqueue_base;
     // ------------------------------------------------------------------
     virtual task kick();
         total_kick_ops++;
+        // PRE/POST hooks bracket the actual notify boundary.  A REAL_DUT
+        // provider may override the transport side of kick(), while the
+        // shared Host-memory mutation contract remains unchanged.
+        void'(process_error_injection(VQ_FAULT_PRE_NOTIFY));
         `uvm_info("SPLIT_VQ",
             $sformatf("kick: queue_id=%0d avail_idx=%0d", queue_id, avail_idx),
             UVM_HIGH)
         // Actual transport kick (PCIe TLP) will be connected externally
+        void'(process_error_injection(VQ_FAULT_POST_NOTIFY));
     endtask
 
     // ------------------------------------------------------------------
@@ -621,6 +628,10 @@ class split_virtqueue extends virtqueue_base;
     // Error injection
     // =================================================================
 
+    virtual function virtqueue_type_e descriptor_format();
+        return VQ_SPLIT;
+    endfunction
+
     virtual function void inject_desc_error(virtqueue_error_e err_type);
         case (err_type)
             VQ_ERR_SKIP_WMB_BEFORE_AVAIL,
@@ -630,7 +641,10 @@ class split_virtqueue extends virtqueue_base;
             end
             default: begin
                 if (err_inj != null)
-                    err_inj.configure(err_type);
+                    // Scope the default request to this queue.  The old
+                    // zero-argument form silently targeted queue 0 even when
+                    // a fault was requested through a VF/PF queue object.
+                    err_inj.configure(err_type, 0, queue_id);
                 else
                     `uvm_warning("SPLIT_VQ",
                         $sformatf("inject_desc_error: queue_id=%0d err_inj is null, cannot inject %s",

@@ -31,10 +31,9 @@
 // ============================================================================
 // virtio_rx_pkt_wrapper
 //
-// Lightweight uvm_object that carries a received packet's payload and
-// parsed virtio_net_hdr back to the caller. In a full net_packet
-// integration, this would be replaced by packet_item with proper
-// protocol parsing via $cast.
+// Lightweight fallback object that carries a received packet's payload and
+// parsed virtio_net_hdr back to the caller when the protocol parser rejects
+// malformed data. Valid packets are returned as net_packet::packet_item.
 // ============================================================================
 
 class virtio_rx_pkt_wrapper extends uvm_object;
@@ -85,6 +84,26 @@ class virtio_rx_engine extends uvm_object;
     function new(string name = "virtio_rx_engine");
         super.new(name);
         negotiated_features = 64'h0;
+    endfunction
+
+    // 中文说明：优先把真实线速 payload 解析为 net_packet packet_item；
+    // 对故意注入的 malformed/非 Ethernet 数据保留 wrapper，便于错误场景
+    // 继续观察原始字节和 virtio header。
+    protected function uvm_object build_received_packet(
+        input byte unsigned payload[$],
+        input virtio_net_hdr_t net_hdr
+    );
+        packet_item packet_obj;
+        virtio_rx_pkt_wrapper fallback_obj;
+
+        if (virtio_net_packet_adapter::unpack(payload, packet_obj))
+            return packet_obj;
+
+        fallback_obj = virtio_rx_pkt_wrapper::type_id::create("rx_pkt");
+        fallback_obj.payload   = payload;
+        fallback_obj.net_hdr   = net_hdr;
+        fallback_obj.pkt_len   = payload.size();
+        return fallback_obj;
     endfunction
 
     // ==================================================================
@@ -337,18 +356,8 @@ class virtio_rx_engine extends uvm_object;
                 end
             end
 
-            // 9. Build received packet object.
-            //    In a full net_packet integration this would $cast to packet_item
-            //    and call pkt.pkt.unpack(payload). We use virtio_rx_pkt_wrapper
-            //    as a lightweight carrier for the raw bytes and parsed header.
-            begin
-                virtio_rx_pkt_wrapper rx_pkt;
-                rx_pkt = virtio_rx_pkt_wrapper::type_id::create("rx_pkt");
-                rx_pkt.payload   = payload;
-                rx_pkt.net_hdr   = net_hdr;
-                rx_pkt.pkt_len   = payload.size();
-                received.push_back(rx_pkt);
-            end
+            // 9. Return a real net_packet item for valid Ethernet payloads.
+            received.push_back(build_received_packet(payload, net_hdr));
 
             total_rx_packets++;
             total_rx_bytes += payload.size();
@@ -467,15 +476,9 @@ class virtio_rx_engine extends uvm_object;
                 end
             end
 
-            // Build received packet
-            begin
-                virtio_rx_pkt_wrapper rx_pkt;
-                rx_pkt = virtio_rx_pkt_wrapper::type_id::create("rx_pkt");
-                rx_pkt.payload   = payload;
-                rx_pkt.net_hdr   = net_hdr;
-                rx_pkt.pkt_len   = payload.size();
-                received.push_back(rx_pkt);
-            end
+            // Build a real net_packet item, preserving a wrapper for malformed
+            // payloads that the protocol parser cannot decode.
+            received.push_back(build_received_packet(payload, net_hdr));
 
             total_rx_packets++;
             total_rx_bytes += payload.size();

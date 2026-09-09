@@ -817,8 +817,13 @@ class virtio_pci_transport extends uvm_object;
             why = "mandatory virtio capabilities were not discovered";
             return 0;
         end
+        // The Fabric profile has a split functional layout: BAR0/1 carries
+        // common/ISR/device configuration, while BAR2/3 is the mailbox and
+        // therefore owns the virtio notification capability.  Do not force
+        // notify into BAR0; doing so rejects the real-DUT profile even though
+        // the discovered BAR role and notify address are correct.
         if ((cap_mgr.common_cfg_cap.bar != 0) ||
-            (cap_mgr.notify_cap.bar != 0) ||
+            (cap_mgr.notify_cap.bar != 2) ||
             (cap_mgr.isr_cap.bar != 0) ||
             (cap_mgr.device_cfg_found && (cap_mgr.device_cfg_cap.bar != 0)) ||
             (cap_mgr.pci_cfg_found && (cap_mgr.pci_cfg_cap.bar != 0))) begin

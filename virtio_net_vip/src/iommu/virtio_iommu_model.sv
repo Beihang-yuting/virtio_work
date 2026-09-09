@@ -458,6 +458,23 @@ class virtio_iommu_model extends uvm_object;
                                   gpa, fault);
     endfunction
 
+    // Validate a device-to-Host access without mutating Host memory.  The
+    // normal translate_for_host() API intentionally rejects FROM_DEVICE so
+    // callers cannot bypass write_from_device() dirty tracking.  PCIe-TL
+    // responders need the same permission/range check before issuing an EP
+    // Memory Write; the PCIe RC backend performs the actual write after this
+    // preflight succeeds.
+    function bit validate_for_host(int unsigned host_id,
+                           bit [15:0] bdf,
+                           bit [63:0] iova,
+                           int unsigned size,
+                           dma_dir_e access_dir,
+                           ref bit [63:0] gpa,
+                           ref iommu_fault_e fault);
+        return translate_internal(host_id, bdf, iova, size, access_dir,
+                                  gpa, fault);
+    endfunction
+
     // write_from_device() is the sole device-write boundary.  Keeping this
     // primitive protected prevents callers from translating a writable DMA
     // range and updating host memory without producing a dirty record.

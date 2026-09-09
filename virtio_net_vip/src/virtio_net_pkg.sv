@@ -18,6 +18,14 @@ package virtio_net_pkg;
   import host_mem_pkg::*;
   import pcie_tl_pkg::*;
   import dpu_resource_pkg::*;
+
+  // External net_packet master is intentionally included in this package.
+  // This keeps packet_item/packet in the same visibility domain as the TX/RX
+  // adapter and avoids a duplicate compilation-unit definition.
+  `include "uvm_wrapper/packet_item.sv"
+  `include "uvm_wrapper/packet_sequence.sv"
+  `include "uvm_wrapper/protocol_seq_wrapper.sv"
+
   `include "host_mem_manager.sv"
   `include "host_mem_pool.sv"
   `include "shared/host_mem_bar_reservation_importer.sv"
@@ -69,10 +77,19 @@ package virtio_net_pkg;
   `include "callbacks/virtio_scoreboard_callback.sv"
   `include "callbacks/virtio_coverage_callback.sv"
   `include "types/virtio_transaction.sv"
+  // The RX responder accepts external net_packet objects, so the byte-stream
+  // adapter must be visible before the agent/responder classes are compiled.
+  `include "dataplane/virtio_net_packet_adapter.sv"
   `include "agent/virtio_atomic_ops.sv"
   `include "agent/virtio_auto_fsm.sv"
   `include "agent/virtio_driver.sv"
   `include "agent/virtio_monitor.sv"
+  `include "pcie/virtio_pcie_model_dma_adapter.sv"
+  `include "pcie/virtio_pcie_iova_host_mem_proxy.sv"
+  `include "pcie/virtio_pcie_dut_responder.sv"
+  // REAL_DUT 可选的 RC 侧 Host-memory DMA responder；不生成 virtio
+  // 设备行为，只把 EP-originated MemRd/MemWr 交给 RC driver/backend。
+  `include "pcie/virtio_pcie_real_dut_host_mem_responder.sv"
   `include "transport/virtio_pcie_observer_adapter.sv"
   `include "agent/virtio_sequencer.sv"
   `include "agent/virtio_driver_agent.sv"

@@ -2,7 +2,9 @@
 
 面向 DPU/SmartNIC virtio 硬件加速引擎验证的 UVM virtio-net 驱动模拟组件。
 
-工作在 PCIe Transaction Layer，模拟完整的 Guest OS virtio-net 驱动行为，通过真实的 PCIe TLP 流量对 DUT 进行协议合规性和数据正确性验证。
+工作在 PCIe Transaction Layer，模拟完整的 Guest OS virtio-net 驱动行为。MODEL
+模式通过 TLM/本地 responder 完成可复现的协议与数据闭环；只有 REAL_DUT 模式才
+通过真实的 PCIe TLP 对 RTL DUT 做协议合规性和数据正确性验证。
 
 ---
 
@@ -47,7 +49,7 @@ virtio_net_env（顶层环境）
 │
 ├── host_mem_manager（外部组件）               ← Buddy/Linear Host memory 后端
 ├── host_mem_pool                              ← 按 host-id 共享 manager 的所有权池
-├── net_packet（外部组件）                     ← 协议报文产生器（L2-L4 + 隧道）
+├── net_packet（项目外 checkout）              ← 协议报文产生器（跟随远程 master）
 └── pcie_tl_env（外部组件，作为子环境）         ← PCIe TL 层 VIP
 ```
 
@@ -104,12 +106,20 @@ if (!pcie_cfg.bind_host_memory(0, 0, host0_mem, why))
 ```
 
 `root_index` 选择 PCIe RC/Root，`host_id` 选择 Host 地址域；多 Root 模式要求每个
-Root 都有一条绑定。PCIe responder 直接以 DUT TLP 中的 Host GPA 访问该 manager，
-因此它与 VIO 的 ring/buffer 分配看到完全相同的 backing storage。不同 Host 必须
-绑定不同 manager，但可合法使用相同的数值 GPA。已初始化 manager 的 64-bit
+Root 都有一条绑定。MODEL responder 通过 IOMMU 模型把设备可见 IOVA 翻译为 Host
+GPA，再访问这个 manager；REAL_DUT 启用本地
+`virtio_pcie_real_dut_host_mem_responder` 时安装同一条
+`virtio_pcie_iova_host_mem_proxy`，对 Endpoint→RC 的 Memory Read/Write TLP 执行
+IOVA→GPA 翻译、权限检查和 dirty-page 记录。它与 VIO 的 ring/buffer 分配看到
+完全相同的 backing storage，不会创建第二个 allocator。只有明确配置 legacy
+direct-GPA 集成时才跳过 IOMMU；不能把普通 REAL_DUT 的 IOVA 误当成 GPA。不同 Host
+必须绑定不同 manager，但可合法使用相同的数值 GPA。已初始化 manager 的 64-bit
 aperture 不会被 PCIe 环境重置；旧的 `"host_mem"` config-db 注入只保留给单 Root
 兼容测试。PREMAP 按唯一 manager handle 分配：多个 Root 绑定同一 Host manager
-只占用一次 backing allocation，空间不足会作为 PCIe 配置错误终止。后续
+只占用一次 backing allocation。固定版 `pcie_work` 在 PREMAP 空间不足时会保留
+`host_mem_manager.alloc()` 的 `HOST_MEM` 错误报告，但尚未把失败哨兵转换成
+`PCIE_TL_HOST_MEM` fatal；测试必须把该情况视为配置失败，而不能依赖某一个报告级别。
+后续
 RDMA/VBLK 只需从 pool 取得本 Host 的同一 handle，无需修改 PCIe package。
 
 ---
@@ -128,10 +138,12 @@ VIP 提供两种驱动模式，可在运行时切换：
 
 ### 二、完整的 virtio 初始化流程
 
-整个初始化序列严格按照 virtio 规范执行，每一步都通过真实的 PCIe TLP 完成：
+整个初始化序列严格按照 virtio 规范执行；REAL_DUT 下每一步通过真实 PCIe TLP
+完成，MODEL 下由同一 transport API 经过 TLM 回环和 endpoint image 完成：
 
 ```
-PCIe BAR 枚举 → Capability 发现 → 设备复位（写 status=0，轮询确认）
+BAR 配置/发现（Fabric: program frozen lease；legacy: enumerate）
+→ Capability 发现 → 设备复位（写 status=0，轮询确认）
 → 设置 ACKNOWLEDGE → 设置 DRIVER → Feature 协商（64 位读写）
 → 设置 FEATURES_OK（回读确认设备未拒绝）→ 队列配置
 → MSI-X 中断配置 → 设置 DRIVER_OK → RX Buffer 预填充 → 数据面运行
@@ -279,26 +291,30 @@ virtio_net_vip/
 │   ├── virtio_e2e_test.sv                  ← 端到端集成测试
 │   ├── virtio_full_test.sv                 ← 完整集成测试（含 Completion Bridge）
 │   ├── virtio_traffic_test.sv              ← 大流量测试（1000 包）
+│   ├── virtio_net_packet_multi_queue_test.sv ← net_packet 四队列 dataplane 语义
+│   ├── virtio_real_driver_multiqueue_test.sv ← MODEL 闭环；REAL_DUT 被动多队列 TX
+│   ├── virtio_real_driver_rx_test.sv       ← MODEL RX 闭环；REAL_DUT 需平台 ingress callback
 │   ├── virtio_dual_test.sv                 ← 双 VIP 互打测试（2 万包 + 带宽控制）
 │   └── host_mem_random_tb.sv               ← Host memory 随机布局/reservation 聚焦测试
-└── ext/                                    ← 固定版本的外部 Git submodule
-    ├── host_mem       → 内存管理组件
-    ├── net_packet     → 协议报文产生器
-    └── pcie_tl_vip    → PCIe TL 层 VIP
+└── ext/                                    ← 仅保留待清理的 PCIe 历史 gitlink，不参与主 filelist
+    └── pcie_tl_vip   → 已由 PCIE_WORK_ROOT 替代
 ```
 
 ---
 
 ## 外部依赖
 
-本 VIP 依赖三个外部组件，通过 `ext/` 目录中的固定 Git submodule 集成；Host memory
-在本工程中增加了随机布局与 reservation/pool 适配层：
+本 VIP 依赖 PCIe TL VIP、Host memory 和项目外的 `net_packet`。PCIe TL VIP 使用
+项目外 `pcie_work` checkout，Host memory 使用项目外的 `host_mem` checkout；
+`net_packet` 也使用独立 checkout，避免主项目内出现第二套协议报文源码。Host
+memory 在本工程中增加了随机布局与 reservation/pool 适配层：
 
 | 组件 | 功能 | 主要接口 |
 |------|------|---------|
-| **pcie_tl_vip** | PCIe TL 层 VIP，提供 RC/EP Agent、TLM 回环、SR-IOV func_manager | `pcie_tl_env`（子环境）、`uvm_sequencer #(pcie_tl_tlp)`（RC 序列器） |
+| **pcie_work/pcie_tl_vip** | PCIe TL 层 VIP，提供 RC/EP Agent、TLM 回环、SR-IOV func_manager | `$PCIE_WORK_ROOT/pcie_tl_vip`；`pcie_tl_env`（子环境）、`uvm_sequencer #(pcie_tl_tlp)`（RC 序列器） |
 | **host_mem_manager** | Buddy Allocator 内存管理，提供分配/释放/读写/泄漏检查 | `alloc()`、`free()`、`write_mem()`、`read_mem()`、`leak_check()` |
-| **net_packet** | 协议报文产生器，支持 L2-L4、隧道（VXLAN/GRE/Geneve）、RDMA、存储协议 | `packet_item`（UVM sequence item 封装） |
+| **net_packet** | 项目外 `NET_PACKET_ROOT`，跟随远程 `master`；支持 L2-L4、隧道、RDMA、存储协议 | `packet_item`（UVM sequence item 封装） |
+| **dpu_common** | 独立 DPU 控制面：拓扑、快照、资源解析和寄存器计划 | `$DPU_COMMON_ROOT` 外部 checkout，固定 SHA |
 
 ---
 
@@ -307,7 +323,14 @@ virtio_net_vip/
 ### 环境要求
 
 - Synopsys VCS（通过 `$VCS_HOME` 提供）和 UVM 1.2
-- 可访问 Git submodule 远端
+- 可访问外部依赖 checkout 的 Git 远端
+- 项目外 `host_mem` checkout（`HOST_MEM_ROOT`，固定提交
+  `365b7553fc7dac6b4ad55886a8e4869153607c28`）
+- 项目外 `net_packet` master checkout（`NET_PACKET_ROOT`，工作树跟踪
+  `origin/master`）
+- 独立的 `dpu_common` checkout（固定提交 `a595b5cb5ab0bf653975be68996b5d46deb5a63d`）
+- 独立的 `pcie_work` checkout（`PCIE_WORK_ROOT`，固定提交
+  `9aedf898f44ca260f3120a3fb162b7bb9fbafb5e`）
 
 ### 远程 UVM 验证环境
 
@@ -317,6 +340,30 @@ virtio_net_vip/
 ```bash
 export VCS_HOME=/home/ubuntu/synopsys/vcs/W-2024.09-SP1
 $VCS_HOME/bin/vcs -ID
+```
+
+`dpu_common` 是独立的控制面仓库，不再复制到本项目目录内。编译前必须将
+`DPU_COMMON_ROOT` 指向项目外的 checkout；依赖检查会同时校验其远程地址和固定提交，
+避免主项目和控制面出现两套源码：
+
+```bash
+export DPU_COMMON_ROOT=/home/ryan/workspace/ryan/dpu_common
+git -C "$DPU_COMMON_ROOT" checkout --detach a595b5cb5ab0bf653975be68996b5d46deb5a63d
+export HOST_MEM_ROOT=/home/ryan/workspace/ryan/host_mem
+git -C "$HOST_MEM_ROOT" checkout --detach 365b7553fc7dac6b4ad55886a8e4869153607c28
+export NET_PACKET_ROOT=/home/ryan/workspace/ryan/net_packet
+git -C "$NET_PACKET_ROOT" fetch origin master
+git -C "$NET_PACKET_ROOT" switch master 2>/dev/null || \
+  git -C "$NET_PACKET_ROOT" switch --track -c master origin/master
+git -C "$NET_PACKET_ROOT" branch --set-upstream-to=origin/master master
+```
+
+首次准备环境时，在项目外 clone 并固定版本：
+
+```bash
+git clone https://github.com/Beihang-yuting/dpu_common.git "$DPU_COMMON_ROOT"
+git -C "$DPU_COMMON_ROOT" checkout --detach a595b5cb5ab0bf653975be68996b5d46deb5a63d
+git clone --branch master https://github.com/Beihang-yuting/net_packet.git "$NET_PACKET_ROOT"
 ```
 
 访问凭据不写入仓库；使用已获授权的交互式 SSH 认证。
@@ -335,21 +382,36 @@ make test TEST=virtio_unit_test
 按该顺序运行 `dpu_resource_manager_test`、`dpu_reg_plan_test`、
 `dpu_pcie_reg_executor_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
 `dpu_resource_resolver_test`、`dpu_device_bootstrap_plan_test`、`dpu_vio_reg_plan_test`、`virtio_dut_caps_test`、
-`virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_stress_unit_test`、
-`virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_admin_vq_test`、
+`virtio_execution_mode_test`、`virtio_real_dut_iova_dma_test`、
+`virtio_fabric_resource_test`、`virtio_unit_test`、
+`virtio_host_mem_reclaim_test`、`virtio_queue_semantics_test`、
+`virtio_stress_unit_test`、
+`virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_desc_corruption_test`、`virtio_admin_vq_test`、
 `virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、
 `virtio_e2e_test`、`virtio_full_integration_test`、`virtio_pf_lifecycle_reset_test`、
 `virtio_monitor_routing_test`、`virtio_dual_test`、`virtio_smoke_test`、
-`virtio_traffic_test`、`host_mem_random_test`、`virtio_pcie_host_mem_test` 和
-`dpu_pcie_tl_executor_integration_test`，共 28 项。
-`make check-deps` 会验证 submodule 固定 SHA、VCS 环境以及外部源码完整性。
+`virtio_traffic_test`、`virtio_net_packet_multi_queue_test`、
+`virtio_real_driver_flow_test`、`virtio_real_driver_multiqueue_test`、
+`virtio_real_driver_rx_test`、
+`host_mem_random_test`、`virtio_pcie_host_mem_test` 和
+`dpu_pcie_tl_executor_integration_test`，共 37 项。
+`make check-deps` 会验证 `host_mem` 外部 checkout 固定 SHA、VCS 环境以及
+`dpu_common`、`pcie_work` 的固定版本；同时要求 `net_packet` 外部 checkout
+来自指定远程并处于 `master`/`origin/master` 跟踪状态。
 
-`pcie_tl_vip@854d4964e217a48bd65a4968c03fc4567ce885bd` 和
-`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28` 均为固定依赖；仅
-`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28` 提供
-`host_mem_pkg.sv` 和 `host_mem_manager.sv`。filelist 在 PCIe package 前编译
-`host_mem_pkg.sv`，而 `virtio_net_pkg` 在自身 package 内包含 manager。
-固定 SHA 使依赖可复现；实际的 VCS 编译和动态 UVM 回归结果仍取决于运行环境。
+`virtio_host_mem_reclaim_test` 使用外部 `host_mem` 项目的 `host_mem_pool`，验证
+同一 Host 的 manager 共享、随机 alloc/free、队列 reset/teardown 回收以及多 Host
+隔离。`virtio_queue_semantics_test` 专门覆盖 split/packed queue 的满队列、消费、
+回绕和 descriptor 复用；`virtio_indirect_desc_test` 覆盖 indirect table、非法
+嵌套/长度、feature gate、queue-full cleanup，并在测试结束检查共享 Host memory
+没有泄漏。`virtio_traffic_test` 和 `virtio_net_packet_multi_queue_test` 也从
+同一个 Host manager 分配 ring 和 packet buffer。
+
+`pcie_work/pcie_tl_vip@9aedf898f44ca260f3120a3fb162b7bb9fbafb5e` 和
+`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28` 均为项目外固定依赖；其中
+`host_mem` 提供 `host_mem_pkg.sv`、`host_mem_manager.sv` 和 `host_mem_pool.sv`，
+PCIe package 由 `$PCIE_WORK_ROOT/pcie_tl_vip` 提供。固定 SHA 使依赖可复现；实际的 VCS
+编译和动态 UVM 回归结果仍取决于运行环境。
 
 ---
 
@@ -696,11 +758,42 @@ virtio 驱动 VIP → PCIe RC Agent → SV Interface → DUT RTL（virtio 设备
 
 对接步骤：
 
-1. 在 `virtio_tb_top.sv` 中实例化 `pcie_tl_if` 并连接到 DUT 的 PCIe 接口
+1. 在平台 wrapper 中实例化 RC→EP、EP→RC 两条 `pcie_tl_if` 并连接到 DUT
 2. 设置 `pcie_tl_env_config.if_mode = SV_IF_MODE`
-3. 通过 `uvm_config_db` 将 interface 传递给 `pcie_tl_env`
+3. 通过 `uvm_config_db` 分别发布 `pcie_tl_rc_vif` 和 `pcie_tl_ep_vif`
 4. 确保 DUT 的 virtio 设备端正确响应 Config/Memory Read/Write TLP
 5. DUT 需要实现 virtio PCI Capability 结构、Common Config 寄存器、通知门铃等
+
+#### MODEL 与 REAL_DUT 的边界
+
+`virtio_net_env_config.execution_mode` 目前只保留两个可执行值：
+`VIRTIO_EXEC_MODEL`（默认）和 `VIRTIO_EXEC_REAL_DUT`。两者都使用同一套生产
+driver/queue/Host-memory API，但设备侧责任不同：
+
+- MODEL 由 `virtio_pcie_dut_responder` 消费 notify、读取/写入共享 Host memory、
+  更新 used ring，并通过 notification manager sideband 模拟 MSI-X/INTx 事件；该
+  事件不是 RTL 发出的真实 PCIe MSI-X TLP，但可在没有 RTL 的 TLM 回环中完成闭环。
+- REAL_DUT 不创建该 responder；PCIe EP agent 被动观察真实 RTL 的 TLP，RC 侧必须
+  同时提供 `pcie_tl_rc_vif`（RC→EP）和 `pcie_tl_ep_vif`（EP→RC）。如果使用
+  plain `pcie_work` 链路，还必须显式加
+  `+VIRTIO_REAL_DUT_HOST_MEM_RESPONDER=1`，由
+  `virtio_pcie_real_dut_host_mem_responder` 响应 EP-originated Host-memory DMA；
+  已经提供完整 backend bridge 时不能再打开这个 plusarg，否则会产生重复
+  Completion/写入。
+- REAL_DUT 的 Host-memory responder 只负责 EP→RC DMA，不是 virtio 设备模型，
+  不会生成 notify、used ring 或 RX ingress。当前 `virtio_real_driver_rx_test` 在
+  REAL_DUT 下会明确报告 `REAL_DUT_RX_SOURCE_UNAVAILABLE`，直到平台通过
+  `net_packet`/物理 ingress callback 提供真实入包路径。
+
+本地 REAL_DUT Host-memory responder 一次只绑定一个 `{host_id, BDF}`。多 PF/VF
+平台应为每个 Function 创建独立 responder，或由外部 backend 按 requester BDF
+分派到对应 IOMMU/Host-memory 域；不能把一个绑定静默复用于其他 Function。
+
+上述条件任一缺失时，fixture 会在 `build_flow()` 阶段失败；不能把 MODEL responder
+计数当作真实 RTL 数据面已经通过的证据。
+仓库自带的 `virtio_tb_top.sv` 目前只保留 REAL_DUT 接线说明，并未实例化或发布这两
+条 VIF，因此默认顶层只能运行 MODEL。真实平台 wrapper 必须自行实例化双向
+`pcie_tl_if`，并在 `run_test()` 前通过 `uvm_config_db` 发布上述两个键。
 
 ---
 
@@ -796,7 +889,11 @@ disable fork;             // 会杀死调用线程下的所有子进程！
 
 - 功能覆盖率：Feature 组合交叉 > 80%
 - 代码覆盖率：行覆盖 > 90%、分支覆盖 > 85%
-- 错误注入覆盖：所有 27 种错误类型 × 4 个注入阶段（初始化/运行/迁移/复位）
+- 错误注入覆盖：定义 27 种语义错误类型；当前通用队列路径只自动实现可映射到
+  描述符字节的错误变异（ADDR/LEN/FLAGS/NEXT/ID），其余 ring、状态、IOMMU
+  和中断错误需要各自的专用 hook。`fault_phase` 提供
+  `PRE_NOTIFY`、`POST_NOTIFY`、`PRE_DEVICE_READ`、`BEFORE_USED` 和
+  `ANY` 五个队列/响应边界选择，不应将其理解为 27 种错误均已在所有阶段自动实现。
 
 ---
 

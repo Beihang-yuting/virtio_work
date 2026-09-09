@@ -43,8 +43,8 @@ typedef byte unsigned virtio_byte_queue_t[$];
 //   4. Handles TX completion: polls used ring, unmaps DMA, frees memory.
 //
 // The packet is passed as a uvm_object handle (packet_item from net_packet).
-// Runtime $cast is used for type-safe access; if cast fails the engine
-// treats raw_data as an opaque byte queue.
+// The adapter extracts packet.pkt.raw_data so the UVM length prefix is never
+// sent to the device; non-net_packet test objects keep the legacy do_pack path.
 //
 // Depends on:
 //   - virtqueue_manager, virtqueue_base (add_buf, poll_used, kick)
@@ -391,6 +391,12 @@ class virtio_tx_engine extends uvm_object;
             `uvm_error("TX_ENG", "extract_pkt_data: null packet handle")
             return data;
         end
+
+        // net_packet::packet_item.do_pack() is a UVM object serialization
+        // format ([size][raw bytes]), not a wire packet.  Use the explicit
+        // adapter first to send only packet.pkt.raw_data.
+        if (virtio_net_packet_adapter::pack(pkt, data))
+            return data;
 
         packer = new();
         pkt.do_pack(packer);

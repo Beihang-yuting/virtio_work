@@ -1,11 +1,14 @@
 TEST ?= virtio_unit_test
 
-.PHONY: bootstrap check-deps compile test regression strict-regression
+.PHONY: bootstrap check-deps dependency-contract compile test regression strict-regression
 
 bootstrap:
 	./scripts/bootstrap.sh
 
-check-deps:
+dependency-contract:
+	bash ./scripts/tests/external_net_packet_test.sh
+
+check-deps: dependency-contract
 	./scripts/check_deps.sh
 
 compile:

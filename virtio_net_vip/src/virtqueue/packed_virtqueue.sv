@@ -199,6 +199,7 @@ class packed_virtqueue extends virtqueue_base;
         device_ring_addr  = 0;
         driver_event_addr = 0;
         device_event_addr = 0;
+        clear_published_descriptor();
         state             = VQ_RESET;
 
         `uvm_info("PACKED_VQ",
@@ -387,6 +388,7 @@ class packed_virtqueue extends virtqueue_base;
 
         // Store token keyed by head buffer ID
         token_map[head_id] = token;
+        mark_published_descriptor(head_idx);
 
         total_add_buf_ops++;
 
@@ -405,11 +407,16 @@ class packed_virtqueue extends virtqueue_base;
     // ------------------------------------------------------------------
     virtual task kick();
         total_kick_ops++;
+        // PRE/POST hooks bracket the actual notify boundary.  A REAL_DUT
+        // provider may replace the transport notification while retaining
+        // the same shared Host-memory fault contract.
+        void'(process_error_injection(VQ_FAULT_PRE_NOTIFY));
         `uvm_info("PACKED_VQ",
             $sformatf("kick: queue_id=%0d next_avail_idx=%0d wrap=%0b",
                       queue_id, next_avail_idx, avail_wrap_counter),
             UVM_HIGH)
         // Actual transport kick (PCIe TLP) connected externally
+        void'(process_error_injection(VQ_FAULT_POST_NOTIFY));
     endtask
 
     // ------------------------------------------------------------------
@@ -681,6 +688,10 @@ class packed_virtqueue extends virtqueue_base;
     // Error injection
     // =================================================================
 
+    virtual function virtqueue_type_e descriptor_format();
+        return VQ_PACKED;
+    endfunction
+
     virtual function void inject_desc_error(virtqueue_error_e err_type);
         case (err_type)
             VQ_ERR_SKIP_WMB_BEFORE_AVAIL,
@@ -690,7 +701,10 @@ class packed_virtqueue extends virtqueue_base;
             end
             default: begin
                 if (err_inj != null)
-                    err_inj.configure(err_type);
+                    // Scope the default request to this queue; otherwise a
+                    // fault injected through a non-zero PF/VF queue would be
+                    // consumed only by queue 0.
+                    err_inj.configure(err_type, 0, queue_id);
                 else
                     `uvm_warning("PACKED_VQ",
                         $sformatf({"inject_desc_error: queue_id=%0d err_inj is null, ",

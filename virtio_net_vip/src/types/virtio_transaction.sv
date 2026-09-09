@@ -14,6 +14,17 @@ class virtio_transaction extends uvm_sequence_item;
     bit [63:0]               monitor_addr;
     int unsigned             monitor_length;
     bit                      monitor_is_write;
+    // Raw MMIO payload/offset and function identity are retained for device
+    // responders.  Older monitor consumers only use the fields above, so the
+    // metadata is additive and keeps the transaction FIFO as the public API.
+    bit [63:0]               monitor_data;
+    int unsigned             monitor_bar_offset;
+    // BAR number owning monitor_bar_offset.  32'hffff_ffff means the caller
+    // did not provide a BAR identity (legacy/unit-test path).
+    int unsigned             monitor_bar_id;
+    bit [15:0]               monitor_bdf;
+    int unsigned             monitor_host_id;
+    int unsigned             monitor_segment_id;
     bit [7:0]                status_old;
     int unsigned             interrupt_vector;
     interrupt_mode_e         irq_mode;
@@ -76,6 +87,12 @@ class virtio_transaction extends uvm_sequence_item;
         monitor_addr = '0;
         monitor_length = 0;
         monitor_is_write = 0;
+        monitor_data = '0;
+        monitor_bar_offset = 0;
+        monitor_bar_id = 32'hffff_ffff;
+        monitor_bdf = '0;
+        monitor_host_id = 0;
+        monitor_segment_id = 0;
         status_old = '0;
         interrupt_vector = 0;
         irq_mode = IRQ_MSIX_PER_QUEUE;
@@ -105,6 +122,12 @@ class virtio_transaction extends uvm_sequence_item;
             monitor_addr   = rhs_t.monitor_addr;
             monitor_length = rhs_t.monitor_length;
             monitor_is_write = rhs_t.monitor_is_write;
+            monitor_data = rhs_t.monitor_data;
+            monitor_bar_offset = rhs_t.monitor_bar_offset;
+            monitor_bar_id = rhs_t.monitor_bar_id;
+            monitor_bdf = rhs_t.monitor_bdf;
+            monitor_host_id = rhs_t.monitor_host_id;
+            monitor_segment_id = rhs_t.monitor_segment_id;
             status_old     = rhs_t.status_old;
             interrupt_vector = rhs_t.interrupt_vector;
             irq_mode       = rhs_t.irq_mode;

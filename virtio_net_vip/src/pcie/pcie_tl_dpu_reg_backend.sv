@@ -5,6 +5,9 @@
 // a generic operation into the existing RC config/MMIO sequences, waits for a
 // real Completion on reads/writes, and leaves root selection injectable for
 // multi-host/multi-segment environments.
+// 中文说明：该 backend 是控制面寄存器计划到 PCIe TLP 的最后适配层。它只根据
+// snapshot 将 BAR-relative offset 解析成绝对地址，再按 host/domain 选择 RC root；
+// 不负责重新分配 BAR，也不复制 Host memory。
 class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
     `uvm_object_utils(pcie_tl_dpu_reg_backend)
 
@@ -21,6 +24,8 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
     int unsigned root_by_domain[longint unsigned];
     int unsigned completion_poll_limit;
 
+    // 初始化 backend 的 root 选择和 Completion 轮询上限；此时不绑定 snapshot
+    // 或 PCIe sequencer，后续由 test 显式注入。
     function new(string name = "pcie_tl_dpu_reg_backend");
         super.new(name);
         virtual_sequencer = null;
@@ -29,12 +34,15 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         completion_poll_limit = 50000;
     endfunction
 
+    // 注入实际 PCIe virtual sequencer；null 句柄会在后续寄存器执行时被拒绝。
     function void bind_virtual_sequencer(
         input pcie_tl_virtual_sequencer sequencer
     );
         virtual_sequencer = sequencer;
     endfunction
 
+    // 将通用 topology 引用转换为冻结 device snapshot；类型不匹配时清空绑定，
+    // 防止用未知对象解释 BAR/BDF 映射。
     virtual function void bind_topology(input uvm_object topology);
         dpu_device_snapshot snapshot;
 
@@ -45,12 +53,15 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         device_snapshot = snapshot;
     endfunction
 
+    // device snapshot 的类型安全便捷入口，供 dpu_common executor 注入权威拓扑。
     function void bind_device_snapshot(
         input dpu_device_snapshot snapshot
     );
         bind_topology(snapshot);
     endfunction
 
+    // 按 operation 的 host/segment/BDF/BAR 查找 snapshot lease，并将 BAR-relative
+    // offset 转成绝对 PCIe 地址；越界、未冻结或未知 Function 时返回 0 和原因。
     protected function bit resolve_mmio_address(
         input dpu_reg_op operation,
         output bit [63:0] absolute_address,
@@ -114,11 +125,13 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         return 1;
     endfunction
 
+    // 设置 Host 级 RC root 后备映射；同 Host 多 segment 时应优先使用 domain 映射。
     function void bind_host_root(input int unsigned host_id,
                                  input int unsigned root_index);
         root_by_host[host_id] = root_index;
     endfunction
 
+    // 将 host_id/segment_id 压缩为关联数组键，保证不同 Host 的相同 segment 不碰撞。
     protected function longint unsigned domain_map_key(
         input int unsigned host_id,
         input int unsigned segment_id
@@ -126,12 +139,14 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         return (longint'(host_id) << 32) | longint'(segment_id);
     endfunction
 
+    // 设置精确 PCIe domain 到 RC root 的映射，优先级高于 Host 级后备映射。
     function void bind_domain_root(input int unsigned host_id,
                                    input int unsigned segment_id,
                                    input int unsigned root_index);
         root_by_domain[domain_map_key(host_id, segment_id)] = root_index;
     endfunction
 
+    // 按 domain→host→default 的优先级选取 RC sequencer；不存在或越界时返回 0。
     protected function bit get_root_sequencer(
         input int unsigned host_id,
         input int unsigned segment_id,
@@ -169,6 +184,7 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         return 1;
     endfunction
 
+    // 根据字节地址和宽度生成 DWORD 首段 byte-enable；跨 DWORD 的尾段由调用者计算。
     protected function bit [3:0] byte_enable_at_address(
         input bit [63:0] address,
         input int unsigned width_bytes
@@ -185,6 +201,12 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         return enable;
     endfunction
 
+    // 中文：输入绝对地址和字节宽度，输出 DWORD 地址、长度及首尾 BE；不发送 TLP，
+    // 仅供 read/write 计算请求形状。
+    // 从字节粒度 operation 计算 DWORD 对齐地址、长度和首尾 byte-enable；遇到
+    // 非页对齐 BAR 也保持真实绝对地址的 lane 语义。
+    // 中文接口说明：输入 absolute_address/width_bytes，输出 aligned_address、
+    // length_dw、first_be、last_be，仅计算不发包。
     // Derive the DWORD-aligned PCIe request shape from a byte-granular
     // operation.  BAR-relative offsets are validated by dpu_reg_op, while
     // the actual TLP must use the absolute BAR address (important when a
@@ -217,6 +239,7 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         end
     endfunction
 
+    // 将配置空间写数据按地址低 lane 左移到 PCIe CFG TLP payload 位置。
     protected function bit [31:0] config_payload(input dpu_reg_op operation);
         bit [31:0] value;
         value = operation.payload[31:0];
@@ -224,6 +247,7 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         return value;
     endfunction
 
+    // 从 Completion 返回字节数组中按 lane 提取最多 64-bit 的寄存器值。
     protected function bit [63:0] payload_value(
         input bit [7:0] bytes[],
         input int unsigned width,
@@ -238,6 +262,8 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         return value;
     endfunction
 
+    // 轮询已发 TLP 的 Completion 状态；成功置 ok，非 SC 状态、空 TLP 或超时
+    // 均通过 why 返回，并受 completion_poll_limit 限制仿真时间。
     protected task wait_for_completion(
         input pcie_tl_tlp issued_tlp,
         output bit ok,
@@ -267,6 +293,8 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
             completion_poll_limit);
     endtask
 
+    // 把配置空间或 BAR-relative MMIO 写计划序列化为 PCIe CFG/MEM TLP；配置读写
+    // 等待 Completion，posted MMIO write 只确认 TLP 已被 sequencer 接收。
     virtual task write(input dpu_reg_op operation,
                        output bit ok, output string why);
         uvm_sequencer #(pcie_tl_tlp) sequencer;
@@ -294,7 +322,10 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
             seq_obj.is_type1 = 0;
             seq_obj.mode = CONSTRAINT_LEGAL;
             seq_obj.start(sequencer);
-            wait_for_completion(seq_obj.issued_tlp, ok, why);
+            ok = (seq_obj.status == PCIE_RW_OK);
+            if (!ok)
+                why = $sformatf("PCIe config write returned status %s",
+                                seq_obj.status.name());
             return;
         end
 
@@ -306,53 +337,38 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
             return;
         end
         begin
-            pcie_tl_mem_wr_seq seq_obj;
-            int unsigned length_dw;
+            pcie_tl_rw_seq seq_obj;
             bit [7:0] data[];
             bit [63:0] absolute_address;
-            bit [63:0] aligned_address;
-            bit [3:0] first_be;
-            bit [3:0] last_be;
 
             if (!resolve_mmio_address(operation, absolute_address, why))
                 return;
 
-            calc_mem_transfer(absolute_address, operation.width_bytes,
-                              aligned_address, length_dw, first_be, last_be);
-            if ((aligned_address[11:0] + (length_dw * 4)) > 4096) begin
+            if ((absolute_address[11:0] + operation.width_bytes) > 4096) begin
                 why = $sformatf(
                     "PCIe register write %s crosses a 4KB TLP boundary",
                     operation.op_id);
                 return;
             end
-            seq_obj = pcie_tl_mem_wr_seq::type_id::create(
+            seq_obj = pcie_tl_rw_seq::type_id::create(
                 {operation.op_id, ".mmio_wr"});
-            seq_obj.addr = aligned_address;
-            seq_obj.length = length_dw;
-            seq_obj.first_be = first_be;
-            seq_obj.last_be = last_be;
-            seq_obj.is_64bit = (absolute_address[63:32] != 0);
-            seq_obj.mode = CONSTRAINT_LEGAL;
-            data = new[length_dw * 4];
-            foreach (data[index]) begin
-                data[index] = 8'h00;
-                if ((index >= absolute_address[1:0]) &&
-                    ((index - absolute_address[1:0]) < operation.width_bytes))
-                    data[index] = operation.payload[
-                        (index - absolute_address[1:0]) * 8 +: 8];
-            end
-            seq_obj.write_data = data;
+            seq_obj.op = PCIE_RW_WRITE;
+            seq_obj.addr = absolute_address;
+            seq_obj.byte_len = operation.width_bytes;
+            data = new[operation.width_bytes];
+            foreach (data[index])
+                data[index] = operation.payload[index * 8 +: 8];
+            seq_obj.wdata = data;
             seq_obj.start(sequencer);
-            // Memory writes are posted PCIe transactions and therefore do
-            // not carry a Completion.  finish_item() means the TLP has been
-            // accepted by the RC sequencer; delivery ordering is established
-            // by a subsequent readback or an explicit barrier operation.
-            ok = (seq_obj.issued_tlp != null);
+            ok = (seq_obj.status == PCIE_RW_OK);
             if (!ok)
-                why = "PCIe memory write sequence did not publish its TLP";
+                why = $sformatf("PCIe memory write returned status %s",
+                                seq_obj.status.name());
         end
     endtask
 
+    // 把配置空间或 MMIO 读计划发送到按 domain 选择的 RC，并从 Completion payload
+    // 提取结果；越界、4KB 跨界和 Completion 错误均通过 ok/why 返回。
     virtual task read(input dpu_reg_op operation,
                       output bit [63:0] value,
                       output bit ok, output string why);
@@ -382,49 +398,66 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
             seq_obj.is_type1 = 0;
             seq_obj.mode = CONSTRAINT_LEGAL;
             seq_obj.start(sequencer);
-            wait_for_completion(seq_obj.issued_tlp, ok, why);
-            if (ok)
-                value = payload_value(seq_obj.issued_tlp.rb_data,
-                                      operation.width_bytes,
-                                      operation.address[1:0]);
+            ok = (seq_obj.status == PCIE_RW_OK);
+            if (ok) begin
+                // pcie_tl_cfg_rd_seq 返回 Completion 中的完整 DWORD；
+                // first_be 只控制请求的有效 lane，并不会替调用方截取
+                // rd_data。因此必须按原始配置地址 lane 提取真正的
+                // byte/word，避免 BAR0 的 type bits 被误当成 byte1。
+                if ((operation.address[1:0] + operation.width_bytes) > 4) begin
+                    ok = 1'b0;
+                    why = $sformatf(
+                        "PCIe config read %s crosses a configuration DWORD",
+                        operation.op_id);
+                end else begin
+                    value = '0;
+                    for (int unsigned index = 0;
+                         (index < operation.width_bytes) && (index < 8);
+                         index++) begin
+                        value[index * 8 +: 8] = seq_obj.rd_data[
+                            (operation.address[1:0] + index) * 8 +: 8];
+                    end
+                end
+            end else begin
+                why = $sformatf("PCIe config read returned status %s",
+                                seq_obj.status.name());
+            end
             return;
         end
         begin
-            pcie_tl_mem_rd_seq seq_obj;
-            int unsigned length_dw;
+            pcie_tl_rw_seq seq_obj;
             bit [63:0] absolute_address;
-            bit [63:0] aligned_address;
-            bit [3:0] first_be;
-            bit [3:0] last_be;
 
             if (!resolve_mmio_address(operation, absolute_address, why))
                 return;
 
-            calc_mem_transfer(absolute_address, operation.width_bytes,
-                              aligned_address, length_dw, first_be, last_be);
-            if ((aligned_address[11:0] + (length_dw * 4)) > 4096) begin
+            if ((absolute_address[11:0] + operation.width_bytes) > 4096) begin
                 why = $sformatf(
                     "PCIe register read %s crosses a 4KB TLP boundary",
                     operation.op_id);
                 return;
             end
-            seq_obj = pcie_tl_mem_rd_seq::type_id::create(
+            seq_obj = pcie_tl_rw_seq::type_id::create(
                 {operation.op_id, ".mmio_rd"});
-            seq_obj.addr = aligned_address;
-            seq_obj.length = length_dw;
-            seq_obj.first_be = first_be;
-            seq_obj.last_be = last_be;
-            seq_obj.is_64bit = (absolute_address[63:32] != 0);
-            seq_obj.mode = CONSTRAINT_LEGAL;
+            seq_obj.op = PCIE_RW_READ;
+            seq_obj.addr = absolute_address;
+            seq_obj.byte_len = operation.width_bytes;
             seq_obj.start(sequencer);
-            wait_for_completion(seq_obj.issued_tlp, ok, why);
-            if (ok)
-                value = payload_value(seq_obj.issued_tlp.rb_data,
-                                      operation.width_bytes,
-                                      absolute_address[1:0]);
+            ok = (seq_obj.status == PCIE_RW_OK);
+            if (ok) begin
+                value = '0;
+                foreach (seq_obj.rdata[index])
+                    if (index < 8)
+                        value[index * 8 +: 8] = seq_obj.rdata[index];
+            end else begin
+                why = $sformatf("PCIe memory read returned status %s",
+                                seq_obj.status.name());
+            end
         end
     endtask
 
+    // 当前 PCIe backend 的 barrier 由调用方时序保证；接口保持成功返回以便后续
+    // 接入真实 flush/readback 语义而不改变 dpu_common executor 合约。
     virtual task barrier(input dpu_reg_op operation,
                          output bit ok, output string why);
         ok = 1;
@@ -438,6 +471,7 @@ endclass : pcie_tl_dpu_reg_backend
 class pcie_tl_dpu_reg_executor extends dpu_pcie_reg_executor;
     `uvm_object_utils(pcie_tl_dpu_reg_executor)
 
+    // 创建使用上述 PCIe backend 的具体 executor；不在构造阶段绑定任何 RC。
     function new(string name = "pcie_tl_dpu_reg_executor");
         super.new(name);
     endfunction

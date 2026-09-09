@@ -4,6 +4,8 @@
 // One independently addressable virtio function.  A PF and every VF own the
 // same driver, transport, queue-manager, dataplane, Fabric identity, and BAR
 // leases; only their function key and transport VF bit differ.
+// 中文说明：实例不保存一份可变的拓扑副本，而是绑定到全局冻结 snapshot；
+// 这样 PF/VF 的 BDF、BAR 和资源映射在整个测试生命周期内保持一致。
 class virtio_function_instance extends uvm_component;
     `uvm_component_utils(virtio_function_instance)
 
@@ -43,6 +45,8 @@ class virtio_function_instance extends uvm_component;
     local virtio_atomic_ops pending_pcie_ops;
     local bit              pcie_bind_prepared;
 
+    // 创建一个尚未绑定拓扑的 Function 组件；资源、BDF、BAR 和 Host 所有权
+    // 由后续 configure_from_service 从冻结 snapshot 注入。
     function new(string name, uvm_component parent);
         super.new(name, parent);
         function_kind = DPU_FUNCTION_PF;
@@ -52,6 +56,8 @@ class virtio_function_instance extends uvm_component;
         pcie_bind_prepared = 0;
     endfunction
 
+    // 创建该 Function 独占的 driver/queue/dataplane/transport 对象，并应用当前
+    // 已解析的身份；不在此阶段自行分配 BDF、BAR 或 Host memory。
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
         driver_agent = virtio_driver_agent::type_id::create("driver_agent", this);
@@ -62,6 +68,10 @@ class virtio_function_instance extends uvm_component;
         apply_function_configuration();
     endfunction
 
+    // 从同一份冻结、按 service-key 索引的 snapshot 解析身份和资源。
+    // 调用方不能直接传入 raw BDF/BAR，也不能把已绑定实例迁移到另一份 snapshot。
+    // 中文：输入冻结 device/resource snapshot 和 service key，输出本实例的身份、BAR
+    // 与资源句柄；快照不匹配、服务未声明或 manager 不属于同一 pair 时失败。
     // Resolve all identity and placement from one frozen, service-keyed device
     // snapshot. Callers cannot provide raw BDF/BAR values, and an established
     // function binding cannot move to a different snapshot.
@@ -162,6 +172,10 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
+    // 预检 RC sequencer、transport、FSM/ops 和本 Function 的 qpair 上限；成功只
+    // 暂存候选对象，不修改已经提交的共享连接，失败返回 0 并保留 why/fatal 诊断。
+    // 中文：输入 RC sequencer，输出可提交的 FSM/ops 候选；任何依赖缺失只返回失败，
+    // 不修改已提交共享对象。
     // Side-effect-free half of PCIe binding.  The environment preflights all
     // active functions before any one-shot FSM, observer, or monitor state is
     // committed, so a later function cannot leave earlier functions bound.
@@ -228,20 +242,25 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
+    // 返回预检阶段暂存的 FSM 候选，仅供环境在提交前检查；未预检时返回 null。
     function virtio_auto_fsm pending_pcie_fsm_candidate();
         return pending_pcie_fsm;
     endfunction
 
+    // 返回预检阶段暂存的原子操作对象；调用者不得把它绑定到另一份 snapshot。
     function virtio_atomic_ops pending_pcie_ops_candidate();
         return pending_pcie_ops;
     endfunction
 
+    // 丢弃尚未提交的 FSM/ops 候选，供批量绑定失败回滚；不触碰已经提交的连接。
     function void cancel_preflight_bind_pcie();
         pending_pcie_fsm = null;
         pending_pcie_ops = null;
         pcie_bind_prepared = 0;
     endfunction
 
+    // 将成功预检的候选一次性接入共享 Host/IOMMU/PCIe 资源；缺少预检状态时
+    // 拒绝提交并返回 0，成功后清除暂存句柄。
     function bit commit_preflight_bind_pcie(
         input host_mem_manager hmem,
         input virtio_iommu_model iommu_mdl,
@@ -277,6 +296,10 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
+    // 统一提交已经通过空句柄、factory 和 qpair 上限检查的组件；失败只返回 0，
+    // 不接受半初始化的 driver/transport。
+    // 中文：输入已验证的 transport、queue、driver 和共享资源，执行最终接线；边界
+    // 检查未通过时返回 0，不创建半初始化的数据面。
     // Commit only handles that have passed all null/factory/MQ checks.  The
     // environment reaches this helper through preflight; the standalone API
     // below performs the same checks before calling it.
@@ -356,6 +379,8 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
+    // 对单个 Function 提供可复用的公开绑定原语；内部先完成候选检查，再接线
+    // transport、virtqueue、driver 和可选 dataplane，任一输入为空即失败。
     // Public binding primitive.  The environment uses it for each active
     // PF/VF; standalone TLM tests use a compatible function instance too.
     function bit bind_pcie_components(
@@ -432,6 +457,8 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
+    // 兼容旧 standalone 调用方，将共享基础设施注入本实例并委托统一 PCIe
+    // 绑定原语；环境路径通常使用 preflight/commit 两阶段接口。
     function bit wire_shared(
         host_mem_manager hmem,
         virtio_iommu_model iommu_mdl,
@@ -464,6 +491,7 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
+    // standalone 便捷入口：使用实例当前保存的共享对象绑定一个 RC sequencer。
     function bit bind_pcie(
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
     );
@@ -471,6 +499,7 @@ class virtio_function_instance extends uvm_component;
             mem, iommu, barrier, err_inj, wait_pol, pcie_rc_seqr);
     endfunction
 
+    // 保存驱动行为并将 Function 置为 CONFIGURED；真正启动由 driver FSM 负责。
     virtual task init(virtio_driver_config_t cfg);
         drv_cfg = cfg;
         state = VF_CONFIGURED;
@@ -480,6 +509,8 @@ class virtio_function_instance extends uvm_component;
     // PF lifecycle owner, not to the separate Admin VQ.  Quiesce any running
     // FSM before the verified device reset; only confirmed completion permits
     // the function and FSM to become eligible for a fresh initialization.
+    // 执行 PF 独有的完整设备复位生命周期；先停数据面，再验证 reset，失败时
+    // 进入 RESET_FAILED，成功时进入 REINIT_REQUIRED 并通过引用返回结果。
     virtual task reset_pf_lifecycle(ref bit reset_complete);
         virtio_atomic_ops pf_ops;
         virtio_auto_fsm   pf_fsm;
@@ -516,6 +547,8 @@ class virtio_function_instance extends uvm_component;
         pf_fsm.state = FSM_REINIT_REQUIRED;
     endtask
 
+    // 停止活动数据面、释放运行时资源并把 Function 标记为 DISABLED；不释放
+    // snapshot 所有的静态 BDF/BAR lease。
     virtual task shutdown();
         if ((state == VF_ACTIVE) && (driver_agent.fsm != null))
             driver_agent.fsm.stop_dataplane();
@@ -526,6 +559,8 @@ class virtio_function_instance extends uvm_component;
         state = VF_DISABLED;
     endtask
 
+    // 响应 VF/PF FLR：分离队列、清理数据面和运行时 resource-client 状态，
+    // 保留静态 Function 身份并进入 FLR 状态。
     virtual function void on_flr();
         vq_mgr.detach_all_queues();
         dataplane.cleanup_all();
@@ -534,15 +569,18 @@ class virtio_function_instance extends uvm_component;
         state = VF_FLR;
     endfunction
 
+    // 在 FLR 后重新装载驱动配置；调用者负责确保硬件侧 FLR 已完成。
     virtual task reinit_after_flr(virtio_driver_config_t cfg);
         state = VF_CREATED;
         init(cfg);
     endtask
 
+    // 返回当前生命周期状态，供 PF manager、测试和并发控制器只读查询。
     virtual function vf_state_e get_state();
         return state;
     endfunction
 
+    // 将已配置 Function 置为 ACTIVE；复位失败或要求重新初始化时拒绝激活。
     virtual function void set_active();
         if ((state == VF_REINIT_REQUIRED) || (state == VF_RESET_FAILED)) begin
             `uvm_error("FUNCTION_INSTANCE", $sformatf(
@@ -560,6 +598,9 @@ class virtio_function_instance extends uvm_component;
         state = VF_ACTIVE;
     endfunction
 
+    // 把 snapshot 的 PCIe identity、BAR lease、Host-qualified DMA identity 和
+    // service resources 同步到 transport/queue/dataplane；未绑定 snapshot 时仅
+    // 保留 standalone 兼容路径，不创建新的资源所有权。
     protected function void apply_function_configuration();
         string why;
 

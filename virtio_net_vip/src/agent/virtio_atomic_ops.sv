@@ -903,7 +903,9 @@ class virtio_atomic_ops extends uvm_object;
         byte unsigned    hdr_bytes[$];
         byte unsigned    pkt_bytes[];
         int unsigned     hdr_size;
+        int unsigned     hdr_dma_size;
         int unsigned     pkt_size;
+        int unsigned     pkt_dma_size;
         bit [63:0]       hdr_gpa;
         bit [63:0]       pkt_gpa;
         bit [63:0]       hdr_iova;
@@ -938,6 +940,11 @@ class virtio_atomic_ops extends uvm_object;
         // 1. Pack net_hdr to bytes
         virtio_net_hdr_util::pack_hdr(net_hdr, negotiated_features, hdr_bytes);
         hdr_size = hdr_bytes.size();
+        // PCIe Memory Read completions are DWORD based.  Keep the descriptor
+        // length byte-accurate, but give the model/RC responder a DWORD-padded
+        // backing allocation so a final partial DWORD never crosses an exact
+        // host_mem block boundary.
+        hdr_dma_size = (hdr_size + 3) & ~3;
 
         // 2. Get raw packet data from pkt via do_pack
         begin
@@ -951,15 +958,20 @@ class virtio_atomic_ops extends uvm_object;
         // If packet has no data from do_pack, use minimum Ethernet frame size
         if (pkt_size == 0)
             pkt_size = 64;
+        // Keep the backing allocation DWORD padded after the minimum-size
+        // fallback as well; otherwise an empty packet would request a
+        // zero-byte host_mem allocation even though the descriptor carries
+        // the 64-byte minimum frame.
+        pkt_dma_size = (pkt_size + 3) & ~3;
 
         // 3. Allocate host_mem for hdr + data buffers
-        hdr_gpa = mem.alloc(hdr_size, .align(1));
+        hdr_gpa = mem.alloc(hdr_dma_size, .align(1));
         if (hdr_gpa == '1) begin
             `uvm_error("ATOMIC_OPS",
                 $sformatf("tx_submit: host_mem alloc failed for queue %0d", queue_id))
             return;
         end
-        pkt_gpa = mem.alloc(pkt_size, .align(1));
+        pkt_gpa = mem.alloc(pkt_dma_size, .align(1));
         if (pkt_gpa == '1) begin
             // No DMA mapping or descriptor owns the header yet, so rollback
             // the sole successful allocation exactly once.
@@ -982,7 +994,7 @@ class virtio_atomic_ops extends uvm_object;
 
         // 5. Map through IOMMU (DMA_TO_DEVICE -- device reads these buffers)
         hdr_iova = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, hdr_gpa, hdr_size, DMA_TO_DEVICE);
+            transport.bdf, hdr_gpa, hdr_dma_size, DMA_TO_DEVICE);
         if ((hdr_iova == '1) || (hdr_iova == 0)) begin
             mem.free(hdr_gpa);
             mem.free(pkt_gpa);
@@ -991,7 +1003,7 @@ class virtio_atomic_ops extends uvm_object;
             return;
         end
         pkt_iova = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, pkt_gpa, pkt_size, DMA_TO_DEVICE);
+            transport.bdf, pkt_gpa, pkt_dma_size, DMA_TO_DEVICE);
         if ((pkt_iova == '1) || (pkt_iova == 0)) begin
             iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
                                  hdr_iova);
@@ -1048,7 +1060,14 @@ class virtio_atomic_ops extends uvm_object;
 
         // 8. Kick if device needs notification
         if (vq.needs_notification()) begin
+            // The production atomic path owns the PCIe notify, so it does
+            // not call virtqueue::kick().  Keep the queue fault boundary
+            // around the real transport write; otherwise configured
+            // descriptor corruption is consumed only by legacy callers that
+            // invoke kick() directly and never reaches normal TX flows.
+            void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
             transport.kick(queue_id, vq.total_add_buf_ops, 0);
+            void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
         end
 
         `uvm_info("ATOMIC_OPS",
@@ -1111,6 +1130,7 @@ class virtio_atomic_ops extends uvm_object;
     );
         virtqueue_base   vq;
         int unsigned     buf_size;
+        int unsigned     buf_dma_size;
         int unsigned     hdr_size;
         int unsigned     filled = 0;
 
@@ -1122,6 +1142,7 @@ class virtio_atomic_ops extends uvm_object;
 
         // Use reasonable default: header + 1514 (standard Ethernet MTU)
         buf_size = hdr_size + 1514;
+        buf_dma_size = (buf_size + 3) & ~3;
 
         while (filled < num_bufs && vq.get_free_count() > 0) begin
             bit [63:0]       buf_gpa;
@@ -1132,7 +1153,7 @@ class virtio_atomic_ops extends uvm_object;
             normal_dma_record_t dma_record;
 
             // Allocate RX buffer from host memory
-            buf_gpa = mem.alloc(buf_size, .align(1));
+            buf_gpa = mem.alloc(buf_dma_size, .align(1));
             if (buf_gpa == '1) begin
                 `uvm_warning("ATOMIC_OPS",
                     $sformatf("rx_refill: host_mem alloc failed at buffer %0d", filled))
@@ -1140,11 +1161,11 @@ class virtio_atomic_ops extends uvm_object;
             end
 
             // Zero-fill the buffer
-            mem.mem_set(buf_gpa, 0, buf_size);
+            mem.mem_set(buf_gpa, 0, buf_dma_size);
 
             // Map through IOMMU (DMA_FROM_DEVICE -- device writes to this buffer)
             buf_iova = iommu.map_for_host(get_iommu_host_id(transport),
-                transport.bdf, buf_gpa, buf_size, DMA_FROM_DEVICE);
+                transport.bdf, buf_gpa, buf_dma_size, DMA_FROM_DEVICE);
             if ((buf_iova == '1) || (buf_iova == 0)) begin
                 mem.free(buf_gpa);
                 `uvm_error("ATOMIC_OPS", $sformatf(
@@ -1182,7 +1203,11 @@ class virtio_atomic_ops extends uvm_object;
 
         // Kick if device needs notification
         if (filled > 0 && vq.needs_notification()) begin
+            // Mirror tx_submit(): rx_refill also bypasses virtqueue::kick()
+            // and emits the notify through the PCI transport directly.
+            void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
             transport.kick(queue_id, vq.total_add_buf_ops, 0);
+            void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
         end
 
         `uvm_info("ATOMIC_OPS",
@@ -1211,32 +1236,74 @@ class virtio_atomic_ops extends uvm_object;
 
         while (count < max_budget) begin
             if (vq.poll_used(token, len)) begin
-                // The used ring len tells us the actual bytes written by the
-                // device. In a full implementation we would:
-                //   1. Read buffer from host_mem
-                //   2. Unpack virtio_net_hdr from buffer head
-                //   3. Parse remaining data as packet
-                //   4. Handle MRG_RXBUF: if num_buffers > 1, consume more entries
-                // For the VIP we track the completion event.
+                normal_dma_record_t record;
+                byte buf_data[];
+                byte unsigned payload[$];
+                byte unsigned first_bytes[$];
+                virtio_net_hdr_t net_hdr;
+                packet_item parsed_item;
+                int unsigned num_buffers;
 
-                if (token != null)
+                if (!rx_dma_map.exists(queue_id) ||
+                    (rx_dma_map[queue_id].size() == 0)) begin
+                    `uvm_error("ATOMIC_OPS", $sformatf(
+                        "rx_receive: used entry has no DMA ownership queue=%0d",
+                        queue_id))
+                    break;
+                end
+                record = rx_dma_map[queue_id].pop_front();
+                mem.read_mem(record.gpa, len, buf_data);
+                foreach (buf_data[i]) first_bytes.push_back(buf_data[i]);
+                if (buf_data.size() < hdr_size) begin
+                    `uvm_error("ATOMIC_OPS", $sformatf(
+                        "rx_receive: buffer shorter than virtio header queue=%0d len=%0d hdr=%0d",
+                        queue_id, buf_data.size(), hdr_size))
+                    retire_normal_dma_record(record);
+                    break;
+                end
+                virtio_net_hdr_util::unpack_hdr(first_bytes,
+                                                negotiated_features, net_hdr);
+                for (int unsigned i = hdr_size; i < buf_data.size(); i++)
+                    payload.push_back(buf_data[i]);
+                num_buffers = (net_hdr.num_buffers == 0) ? 1 :
+                              net_hdr.num_buffers;
+                retire_normal_dma_record(record);
+
+                // Merge continuation buffers exactly as the production RX
+                // engine does.  Every consumed descriptor retires its own
+                // IOVA/GPA ownership only after its bytes are copied.
+                for (int unsigned merge = 1; merge < num_buffers; merge++) begin
+                    normal_dma_record_t merge_record;
+                    byte merge_data[];
+                    uvm_object merge_token;
+                    int unsigned merge_len;
+                    if (!vq.poll_used(merge_token, merge_len) ||
+                        !rx_dma_map.exists(queue_id) ||
+                        (rx_dma_map[queue_id].size() == 0)) begin
+                        `uvm_error("ATOMIC_OPS", $sformatf(
+                            "rx_receive: missing merged buffer queue=%0d expected=%0d got=%0d",
+                            queue_id, num_buffers, merge))
+                        break;
+                    end
+                    merge_record = rx_dma_map[queue_id].pop_front();
+                    mem.read_mem(merge_record.gpa, merge_len, merge_data);
+                    foreach (merge_data[i]) payload.push_back(merge_data[i]);
+                    retire_normal_dma_record(merge_record);
+                end
+
+                if (virtio_net_packet_adapter::unpack(payload, parsed_item))
+                    received_pkts.push_back(parsed_item);
+                else if (token != null)
                     received_pkts.push_back(token);
-
                 count++;
             end else begin
                 break;
             end
         end
 
-        // Clean up IOMMU mappings for consumed RX buffers
-        if (rx_dma_map.exists(queue_id)) begin
-            for (int unsigned i = 0; i < count && rx_dma_map[queue_id].size() > 0; i++) begin
-                normal_dma_record_t record = rx_dma_map[queue_id].pop_front();
-                retire_normal_dma_record(record);
-            end
-            if (rx_dma_map[queue_id].size() == 0)
-                rx_dma_map.delete(queue_id);
-        end
+        if (rx_dma_map.exists(queue_id) &&
+            (rx_dma_map[queue_id].size() == 0))
+            rx_dma_map.delete(queue_id);
 
         if (count > 0)
             `uvm_info("ATOMIC_OPS",
@@ -1411,8 +1478,12 @@ class virtio_atomic_ops extends uvm_object;
                         admin_context.queue_id))
                 end else begin
                     submitted = 1;
+                    void'(admin_context.vq.process_error_injection(
+                        VQ_FAULT_PRE_NOTIFY));
                     admin_context.transport.kick(admin_context.queue_id,
                                                  admin_context.vq.total_add_buf_ops, 0);
+                    void'(admin_context.vq.process_error_injection(
+                        VQ_FAULT_POST_NOTIFY));
 
                     // Both timeout and interval derive from the shared wait policy;
                     // there is no operation-specific arbitrary delay here.
@@ -1633,8 +1704,11 @@ class virtio_atomic_ops extends uvm_object;
         result = ctrl_vq.add_buf(sgs, 2, 1, null, 0);
 
         // 6. Kick control queue
-        if (ctrl_vq.needs_notification())
+        if (ctrl_vq.needs_notification()) begin
+            void'(ctrl_vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
             transport.kick(ctrl_qid, ctrl_vq.total_add_buf_ops, 0);
+            void'(ctrl_vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
+        end
 
         // 7. Poll used ring until ack buffer is filled
         got_used = 0;

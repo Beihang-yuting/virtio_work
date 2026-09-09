@@ -51,36 +51,43 @@ class virtio_bar_mem_rd_seq extends uvm_sequence #(pcie_tl_tlp);
     endfunction
 
     virtual task body();
-        pcie_tl_mem_rd_seq rd_seq;
-        rd_seq = pcie_tl_mem_rd_seq::type_id::create("rd_seq");
-        rd_seq.addr     = addr;
-        rd_seq.length   = 10'h1;   // 1 DW
-        rd_seq.first_be = first_be;
-        rd_seq.last_be  = last_be;
-        rd_seq.is_64bit = is_64bit;
-        rd_seq.start(m_sequencer);
+        pcie_tl_mem_tlp tlp;
 
-        // Extract completion data from the sequence response.
-        // The pcie_tl_vip stores the completion payload in the TLP item
-        // accessible via the response queue after the sequence completes.
-        begin
-            pcie_tl_tlp rsp;
-            get_response(rsp);
-            if (rsp != null) begin
-                cpl_ok = 1;
-                rdata = '0;
-                if (rsp.payload.size() >= 4) begin
-                    // Little-endian assembly from payload bytes
-                    rdata = {rsp.payload[3], rsp.payload[2],
-                             rsp.payload[1], rsp.payload[0]};
-                end else begin
-                    for (int i = 0; i < rsp.payload.size(); i++)
-                        rdata[i*8 +: 8] = rsp.payload[i];
-                end
-            end else begin
-                cpl_ok = 0;
-                rdata  = '0;
+        // Build the request directly instead of relying on fields that were
+        // removed from the external pcie_work helper sequences.  This keeps
+        // the BAR accessor on the stable public TLP/sequence contract and
+        // preserves explicit byte enables for error-injection tests.
+        tlp = pcie_tl_mem_tlp::type_id::create("bar_mem_rd_tlp");
+        start_item(tlp);
+        if (!tlp.randomize() with {
+            tlp.kind == TLP_MEM_RD;
+            tlp.addr == local::addr;
+            tlp.length == 10'h1;
+            tlp.first_be == local::first_be;
+            tlp.last_be == local::last_be;
+            tlp.is_64bit == local::is_64bit;
+            tlp.constraint_mode_sel == ((local::first_be == 0) ?
+                                        CONSTRAINT_ILLEGAL : CONSTRAINT_LEGAL);
+        }) begin
+            `uvm_fatal("BAR_ACCESSOR", "could not randomize BAR memory read TLP")
+        end
+        finish_item(tlp);
+
+        fork : bar_mem_read_wait
+            begin
+                wait (tlp.rb_done);
             end
+            begin
+                #(50000 * 1ns);
+            end
+        join_any
+        disable bar_mem_read_wait;
+        cpl_ok = tlp.rb_done && (tlp.rb_status == CPL_STATUS_SC);
+        rdata = '0;
+        if (cpl_ok) begin
+            foreach (tlp.rb_data[index])
+                if (index < 4)
+                    rdata[index * 8 +: 8] = tlp.rb_data[index];
         end
     endtask
 
@@ -113,14 +120,37 @@ class virtio_bar_mem_wr_seq extends uvm_sequence #(pcie_tl_tlp);
     endfunction
 
     virtual task body();
-        pcie_tl_mem_wr_seq wr_seq;
-        wr_seq = pcie_tl_mem_wr_seq::type_id::create("wr_seq");
-        wr_seq.addr     = addr;
-        wr_seq.length   = 10'h1;
-        wr_seq.first_be = first_be;
-        wr_seq.last_be  = last_be;
-        wr_seq.is_64bit = is_64bit;
-        wr_seq.start(m_sequencer);
+        pcie_tl_mem_tlp tlp;
+
+        tlp = pcie_tl_mem_tlp::type_id::create("bar_mem_wr_tlp");
+        start_item(tlp);
+        if (!tlp.randomize() with {
+            tlp.kind == TLP_MEM_WR;
+            tlp.addr == local::addr;
+            tlp.length == 10'h1;
+            tlp.first_be == local::first_be;
+            tlp.last_be == local::last_be;
+            tlp.is_64bit == local::is_64bit;
+            tlp.constraint_mode_sel == ((local::first_be == 0) ?
+                                        CONSTRAINT_ILLEGAL : CONSTRAINT_LEGAL);
+        }) begin
+            `uvm_fatal("BAR_ACCESSOR", "could not randomize BAR memory write TLP")
+        end
+        tlp.payload = new[4];
+        foreach (tlp.payload[index])
+            tlp.payload[index] = 8'h00;
+        begin
+            int unsigned lane;
+            lane = 0;
+            for (int unsigned index = 0; index < 4; index++) begin
+                if (first_be[index]) begin
+                    if (lane < 4)
+                        tlp.payload[index] = wdata[lane * 8 +: 8];
+                    lane++;
+                end
+            end
+        end
+        finish_item(tlp);
     endtask
 
 endclass : virtio_bar_mem_wr_seq
@@ -153,32 +183,29 @@ class virtio_bar_cfg_rd_seq extends uvm_sequence #(pcie_tl_tlp);
     endfunction
 
     virtual task body();
-        pcie_tl_cfg_rd_seq rd_seq;
-        rd_seq = pcie_tl_cfg_rd_seq::type_id::create("cfg_rd_seq");
-        rd_seq.target_bdf = target_bdf;
-        rd_seq.reg_num    = reg_num;
-        rd_seq.first_be   = first_be;
-        rd_seq.is_type1   = 0;   // Type 0 for local device
-        rd_seq.start(m_sequencer);
-
-        begin
-            pcie_tl_tlp rsp;
-            get_response(rsp);
-            if (rsp != null) begin
-                cpl_ok = 1;
-                rdata = '0;
-                if (rsp.payload.size() >= 4) begin
-                    rdata = {rsp.payload[3], rsp.payload[2],
-                             rsp.payload[1], rsp.payload[0]};
-                end else begin
-                    for (int i = 0; i < rsp.payload.size(); i++)
-                        rdata[i*8 +: 8] = rsp.payload[i];
-                end
-            end else begin
-                cpl_ok = 0;
-                rdata  = '0;
-            end
+        pcie_tl_cfg_tlp tlp;
+        tlp = pcie_tl_cfg_tlp::type_id::create("bar_cfg_rd_tlp");
+        start_item(tlp);
+        if (!tlp.randomize() with {
+            tlp.kind == TLP_CFG_RD0;
+            tlp.completer_id == local::target_bdf;
+            tlp.reg_num == local::reg_num;
+            tlp.first_be == local::first_be;
+            tlp.constraint_mode_sel == CONSTRAINT_LEGAL;
+        }) begin
+            `uvm_fatal("BAR_ACCESSOR", "could not randomize BAR config read TLP")
         end
+        finish_item(tlp);
+        fork : bar_cfg_read_wait
+            begin wait (tlp.rb_done); end
+            begin #(50000 * 1ns); end
+        join_any
+        disable bar_cfg_read_wait;
+        cpl_ok = tlp.rb_done && (tlp.rb_status == CPL_STATUS_SC);
+        rdata = '0;
+        if (cpl_ok)
+            foreach (tlp.rb_data[index])
+                if (index < 4) rdata[index * 8 +: 8] = tlp.rb_data[index];
     endtask
 
 endclass : virtio_bar_cfg_rd_seq
@@ -209,10 +236,6 @@ class virtio_bar_cfg_wr_seq extends uvm_sequence #(pcie_tl_tlp);
     virtual task body();
         pcie_tl_cfg_tlp wr_tlp;
 
-        // Do not delegate this write to pcie_tl_cfg_wr_seq: its public
-        // wr_data field is not copied into the Config TLP payload.  Program
-        // the payload before finish_item() so the PCIe transport observes the
-        // requested DWORD, including in TLM adapter mode.
         wr_tlp = pcie_tl_cfg_tlp::type_id::create("cfg_wr_tlp");
         start_item(wr_tlp);
         if (!wr_tlp.randomize() with {
@@ -231,6 +254,11 @@ class virtio_bar_cfg_wr_seq extends uvm_sequence #(pcie_tl_tlp);
         wr_tlp.payload[2] = wdata[23:16];
         wr_tlp.payload[3] = wdata[31:24];
         finish_item(wr_tlp);
+        fork : bar_cfg_write_wait
+            begin wait (wr_tlp.rb_done); end
+            begin #(50000 * 1ns); end
+        join_any
+        disable bar_cfg_write_wait;
     endtask
 
 endclass : virtio_bar_cfg_wr_seq

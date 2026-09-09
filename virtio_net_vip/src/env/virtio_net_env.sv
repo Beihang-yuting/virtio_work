@@ -6,6 +6,10 @@
 //
 // Top-level UVM environment for the virtio-net driver VIP.
 //
+// 中文说明：这是业务验证环境的装配根节点。DPU 控制面先解析出冻结的
+// device/resource snapshot，本环境只消费 snapshot，不重新分配 BDF、BAR 或 qpair；
+// 因而控制面、PCIe 传输层和 virtio 业务层的职责保持分离。
+//
 // Creates and wires all components:
 //   - PF manager (SR-IOV orchestration)
 //   - VF instances (per-VF driver wrappers, dynamic array)
@@ -21,6 +25,8 @@
 // PCIe subenv connection (pcie_tl_env) is deferred to the test's
 // connect_phase because the PCIe env is created by the test.  Tests bind it
 // once through bind_pcie(), which wires every active function.
+// 中文说明：PCIe 子环境由 test 创建，本 env 在 connect_phase 通过 bind_pcie()
+// 接入 RC sequencer、RC/EP monitor 和 completion adapter。
 //
 // Depends on:
 //   - All Phase 1-7 components
@@ -74,6 +80,7 @@ class virtio_net_env extends uvm_env;
     // Constructor
     // ========================================================================
 
+    // 构造环境并初始化尚未发布的配置状态；不创建子组件，也不会访问 snapshot。
     function new(string name, uvm_component parent);
         super.new(name, parent);
         configuration_valid = 0;
@@ -81,6 +88,9 @@ class virtio_net_env extends uvm_env;
         protocol_event_vif_index = 0;
     endfunction
 
+    // 根据冻结 snapshot 中声明的 VIO service 创建 PF/VF 实例；数组下标只是
+    // 运行时容器索引，真实身份始终来自 service key。成功返回 1；失败返回 0
+    // 并在 why 中说明缺失 service、资源 binding 或实例类型错误。
     protected function bit build_snapshot_topology(output string why);
         dpu_service_key_t service_keys[$];
         dpu_service_key_t grouped_services[$][$];
@@ -176,6 +186,8 @@ class virtio_net_env extends uvm_env;
         return 1;
     endfunction
 
+    // 返回当前生效 DUT capability 的防御性副本，避免调用者修改环境持有的权威对象；
+    // build_phase 尚未成功取得 capability 时返回 null。
     function dpu_dut_caps snapshot_effective_dut_caps();
         dpu_dut_caps snapshot;
 
@@ -192,6 +204,8 @@ class virtio_net_env extends uvm_env;
     //
     // Retrieve behavior plus the mandatory frozen snapshot and create all
     // components from declared VIO services.
+    // 中文说明：从 config_db 取得行为配置和严格匹配的一对冻结 snapshot，绑定
+    // Host memory/IOMMU 后创建 PF/VF 拓扑；任何所有权或版本不一致均 UVM_FATAL。
     // ========================================================================
 
     virtual function void build_phase(uvm_phase phase);
@@ -202,9 +216,14 @@ class virtio_net_env extends uvm_env;
 
         super.build_phase(phase);
 
-        // Get config from config_db
+        // 从 config_db 取得业务行为配置以及全局 DPU 发布的冻结 snapshot。
+        // 这里拒绝缺失或不匹配的 snapshot，避免业务环境私自构造拓扑。
         if (!uvm_config_db #(virtio_net_env_config)::get(this, "", "cfg", cfg)) begin
             `uvm_fatal("VIRTIO_ENV", "No virtio_net_env_config found in config_db")
+            return;
+        end
+        if (!cfg.validate_execution_mode(why)) begin
+            `uvm_fatal("VIRTIO_ENV", {"invalid execution/completion mode: ", why})
             return;
         end
         if (!uvm_config_db#(dpu_device_snapshot)::get(
@@ -253,7 +272,8 @@ class virtio_net_env extends uvm_env;
             $sformatf("build_phase: %s", cfg.convert2string()),
             UVM_LOW)
 
-        // Create shared components
+        // 创建 Host memory、IOMMU、等待策略等共享基础设施。相同 host-id 的
+        // 多个业务环境应从同一个 host_mem_pool 取得 manager。
         selected_pool = cfg.host_mem_pool_binding;
         if (uvm_config_db#(uvm_object)::get(
                 this, "", "dpu_host_mem_pool", dpu_pool_ref)) begin
@@ -366,7 +386,7 @@ class virtio_net_env extends uvm_env;
             return;
         end
 
-        // Virtual sequencer
+        // 虚拟 sequencer 汇聚所有活动 PF/VF 的 driver sequencer，供跨功能场景使用。
         v_seqr = virtio_virtual_sequencer::type_id::create("v_seqr", this);
 
     endfunction
@@ -380,6 +400,8 @@ class virtio_net_env extends uvm_env;
     // Note: wire_shared() for VF instances requires pcie_rc_seqr which
     // comes from the PCIe TL env. That connection is deferred to the
     // test's connect_phase.
+    // 中文说明：按 service key 装载每个 Function 的 driver 行为，连接监控与
+    // scoreboard/coverage，并发布虚拟 sequencer 引用；配置无效时不产生副作用。
     // ========================================================================
 
     virtual function void connect_phase(uvm_phase phase);
@@ -432,7 +454,7 @@ class virtio_net_env extends uvm_env;
             end
         end
 
-        // Wire virtual sequencer
+        // 将各功能的 sequencer 和共享 Host/IOMMU 引用接入虚拟 sequencer。
         v_seqr.vf_seqrs = new[vf_instances.size()];
         foreach (vf_instances[i])
             v_seqr.vf_seqrs[i] = vf_instances[i].driver_agent.sequencer;
@@ -452,6 +474,9 @@ class virtio_net_env extends uvm_env;
 
     endfunction
 
+    // 将一个 RC sequencer 及可选 completion/monitor 绑定到全部 VIO Function。
+    // 先对所有对象做无副作用预检，再一次性提交；任一 Function 失败则返回 0、
+    // 标记环境无效，并取消其余预检状态，避免出现部分绑定。
     // Bind one required RC sequencer and optional TLM completion adapter to
     // all snapshot-declared VIO functions.
     function bit bind_pcie(
@@ -622,6 +647,9 @@ class virtio_net_env extends uvm_env;
         return 1;
     endfunction
 
+    // 按完整 {host, segment, BDF} 为每个 snapshot Function 选择独立 endpoint。
+    // endpoint 数量、身份或预检不匹配时返回 0，且在全部校验通过前不提交连接。
+    // 中文：输入 endpoint 数组，输出全部 Function 的原子化绑定结果，失败不保留部分状态。
     // Bind every snapshot function to one explicitly keyed external path.
     // Validation and function preflight finish before adapter, observer,
     // monitor, FSM, or virtual-sequencer state is committed.
@@ -904,6 +932,8 @@ class virtio_net_env extends uvm_env;
         return 1;
     endfunction
 
+    // 预检单个 Function 所需的 observer、协议接口池和 FSM/ops；成功时返回 1、
+    // 暂存 protocol_vif 并推进索引，失败时通过 UVM_FATAL 报告且不提交连接。
     protected function bit preflight_function_pcie(
         input virtio_function_instance function_instance,
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
@@ -954,6 +984,8 @@ class virtio_net_env extends uvm_env;
         return 1;
     endfunction
 
+    // 提交一个已预检 Function 的共享内存、IOMMU、RC sequencer 和 monitor 连接；
+    // 成功返回 1 并消费一个协议接口槽位，空句柄或提交失败返回 0。
     protected function bit bind_function_pcie(
         input virtio_function_instance function_instance,
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
@@ -1012,6 +1044,8 @@ class virtio_net_env extends uvm_env;
         return 1;
     endfunction
 
+    // 将显式 endpoint 的 sequencer/monitor/completion adapter 提交给指定 Function；
+    // 身份匹配已在上层预检，空对象或任一底层绑定失败时返回 0。
     protected function bit bind_function_pcie_endpoint(
         input virtio_function_instance function_instance,
         input virtio_pcie_function_endpoint endpoint,
@@ -1042,6 +1076,8 @@ class virtio_net_env extends uvm_env;
     // Run leak checks and print barrier statistics.
     // Performance and verification reports are handled by their own
     // report_phase methods (called automatically by UVM).
+    // 中文说明：配置成功时检查 Host memory、IOVA 和各 virtqueue 是否泄漏，
+    // 并打印 barrier 统计；配置阶段已经失败时跳过，避免解引用未构造对象。
     // ========================================================================
 
     virtual function void report_phase(uvm_phase phase);

@@ -127,8 +127,28 @@ endclass : virtio_indirect_desc_test_transport
 class virtio_indirect_desc_test extends uvm_test;
     `uvm_component_utils(virtio_indirect_desc_test)
 
+    // All indirect-descriptor subtests share one Host-0 manager owned by the
+    // external host_mem project.  This makes leaked SG/data buffers visible at
+    // the end of the complete descriptor regression.
+    virtio_shared_mem_fixture mem_fixture;
+    host_mem_manager shared_mem;
+    bit [63:0] owned_sg_buffers[$];
+
     function new(string name, uvm_component parent);
         super.new(name, parent);
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        mem_fixture = virtio_shared_mem_fixture::type_id::create(
+            "indirect_mem_fixture");
+        if (!mem_fixture.create_host(
+                0, 64'h0000_0001_4000_0000,
+                64'h0000_0001_41FF_FFFF, HOST_MEM_RANDOM))
+            `uvm_fatal("INDIRECT_TEST", "failed to create Host-0 memory")
+        shared_mem = mem_fixture.get_host(0);
+        if (shared_mem == null)
+            `uvm_fatal("INDIRECT_TEST", "Host-0 memory handle is null")
     endfunction
 
     virtual task run_phase(uvm_phase phase);
@@ -140,6 +160,8 @@ class virtio_indirect_desc_test extends uvm_test;
         test_dataplane_tx_indirect_feature_gate();
         test_dataplane_tx_queue_full_cleanup();
         test_atomic_tx_queue_full_cleanup();
+
+        shared_mem.leak_check();
 
         `uvm_info("INDIRECT_TEST", "All indirect descriptor tests PASSED", UVM_NONE)
         phase.drop_objection(this);
@@ -161,7 +183,14 @@ class virtio_indirect_desc_test extends uvm_test;
             entry.addr = buf_addr;
             entry.len  = lengths[i];
             sgs[i].entries.push_back(entry);
+            owned_sg_buffers.push_back(buf_addr);
         end
+    endfunction
+
+    function void release_owned_sg_buffers();
+        foreach (owned_sg_buffers[i])
+            shared_mem.free(owned_sg_buffers[i]);
+        owned_sg_buffers.delete();
     endfunction
 
     function void read_desc(host_mem_manager mem,
@@ -294,7 +323,7 @@ class virtio_indirect_desc_test extends uvm_test;
     endfunction
 
     task test_split_indirect_descriptor();
-        host_mem_manager mem = host_mem_manager::type_id::create("split_mem");
+        host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("split_iommu");
         virtio_memory_barrier_model barrier =
             virtio_memory_barrier_model::type_id::create("split_barrier");
@@ -317,7 +346,7 @@ class virtio_indirect_desc_test extends uvm_test;
         bit [31:0] saved_len;
         bit [63:0] extra_iova;
 
-        mem.init_region(64'h6100_0000, 64'h6101_FFFF);
+        mem = shared_mem;
         vq = split_virtqueue::type_id::create("split_vq");
         vq.setup(0, 16, mem, iommu, barrier, err_inj, wait_pol, 16'h0700);
         vq.alloc_rings();
@@ -408,10 +437,11 @@ class virtio_indirect_desc_test extends uvm_test;
         vq.free_rings();
 
         `uvm_info("INDIRECT_TEST", "split indirect descriptor test PASSED", UVM_LOW)
+        release_owned_sg_buffers();
     endtask
 
     task test_packed_indirect_descriptor();
-        host_mem_manager mem = host_mem_manager::type_id::create("packed_mem");
+        host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("packed_iommu");
         virtio_memory_barrier_model barrier =
             virtio_memory_barrier_model::type_id::create("packed_barrier");
@@ -434,7 +464,7 @@ class virtio_indirect_desc_test extends uvm_test;
         bit [31:0] saved_len;
         bit [63:0] extra_iova;
 
-        mem.init_region(64'h6200_0000, 64'h6201_FFFF);
+        mem = shared_mem;
         vq = packed_virtqueue::type_id::create("packed_vq");
         vq.setup(1, 16, mem, iommu, barrier, err_inj, wait_pol, 16'h0701);
         vq.alloc_rings();
@@ -531,10 +561,11 @@ class virtio_indirect_desc_test extends uvm_test;
             else `uvm_fatal("INDIRECT_TEST", "packed reset leaked indirect table resources")
 
         `uvm_info("INDIRECT_TEST", "packed indirect descriptor test PASSED", UVM_LOW)
+        release_owned_sg_buffers();
     endtask
 
     task test_tx_indirect_feature_gate();
-        host_mem_manager mem = host_mem_manager::type_id::create("tx_gate_mem");
+        host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("tx_gate_iommu");
         virtio_memory_barrier_model barrier =
             virtio_memory_barrier_model::type_id::create("tx_gate_barrier");
@@ -554,7 +585,7 @@ class virtio_indirect_desc_test extends uvm_test;
         int unsigned budget;
         virtio_tx_indirect_feature_error_catcher feature_error;
 
-        mem.init_region(64'h6300_0000, 64'h6301_FFFF);
+        mem = shared_mem;
         vq_mgr.mem = mem;
         vq_mgr.iommu = iommu;
         vq_mgr.barrier = barrier;
@@ -605,7 +636,7 @@ class virtio_indirect_desc_test extends uvm_test;
     endtask
 
     task test_dataplane_tx_indirect_feature_gate();
-        host_mem_manager mem = host_mem_manager::type_id::create("dataplane_gate_mem");
+        host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("dataplane_gate_iommu");
         virtio_memory_barrier_model barrier =
             virtio_memory_barrier_model::type_id::create("dataplane_gate_barrier");
@@ -623,7 +654,7 @@ class virtio_indirect_desc_test extends uvm_test;
         int unsigned desc_id;
         virtio_dataplane_indirect_feature_error_catcher feature_error;
 
-        mem.init_region(64'h6400_0000, 64'h6401_FFFF);
+        mem = shared_mem;
         vq_mgr.mem = mem;
         vq_mgr.iommu = iommu;
         vq_mgr.barrier = barrier;
@@ -678,7 +709,7 @@ class virtio_indirect_desc_test extends uvm_test;
     // rejected atomic submission must leave only the first submission's maps,
     // token, add count, and notification visible.
     task test_atomic_tx_queue_full_cleanup();
-        host_mem_manager mem = host_mem_manager::type_id::create("atomic_full_mem");
+        host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("atomic_full_iommu");
         virtio_memory_barrier_model barrier =
             virtio_memory_barrier_model::type_id::create("atomic_full_barrier");
@@ -704,7 +735,7 @@ class virtio_indirect_desc_test extends uvm_test;
         int unsigned kicks_before;
         virtio_tx_queue_full_error_catcher queue_full_error;
 
-        mem.init_region(64'h6500_0000, 64'h6501_FFFF);
+        mem = shared_mem;
         vq_mgr.mem = mem;
         vq_mgr.iommu = iommu;
         vq_mgr.barrier = barrier;
@@ -763,7 +794,7 @@ class virtio_indirect_desc_test extends uvm_test;
     // A second direct submission to a full queue must release those temporary
     // buffers and must not create another tracked packet or success statistic.
     task test_dataplane_tx_queue_full_cleanup();
-        host_mem_manager mem = host_mem_manager::type_id::create("dataplane_full_mem");
+        host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("dataplane_full_iommu");
         virtio_memory_barrier_model barrier =
             virtio_memory_barrier_model::type_id::create("dataplane_full_barrier");
@@ -790,7 +821,7 @@ class virtio_indirect_desc_test extends uvm_test;
         longint unsigned errors_before;
         virtio_tx_queue_full_error_catcher queue_full_error;
 
-        mem.init_region(64'h6600_0000, 64'h6601_FFFF);
+        mem = shared_mem;
         vq_mgr.mem = mem;
         vq_mgr.iommu = iommu;
         vq_mgr.barrier = barrier;

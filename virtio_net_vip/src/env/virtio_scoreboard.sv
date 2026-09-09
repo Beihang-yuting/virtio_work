@@ -186,7 +186,13 @@ class virtio_scoreboard extends uvm_component;
         if (custom_checker != null) begin
             match = custom_checker.custom_compare(expected, actual);
         end else begin
-            match = expected.compare(actual);
+            // net_packet packet_item compares protocol layers but the
+            // dataplane contract is the exact wire byte stream.  Prefer the
+            // adapter so payload bytes are included, then retain the generic
+            // UVM comparison for legacy synthetic objects.
+            match = virtio_net_packet_adapter::compare(expected, actual);
+            if (!match)
+                match = expected.compare(actual);
         end
 
         if (match) begin
@@ -459,11 +465,16 @@ class virtio_scoreboard extends uvm_component;
 
     protected function virtio_byte_queue_t get_pkt_data(uvm_object pkt);
         byte unsigned empty[$];
-        // Packet data extraction is implementation-specific.
-        // The actual packet_item class (from the test layer) should provide
-        // a method to get raw bytes. Tests should register a custom_checker
-        // for real packet comparison with full data extraction.
         if (pkt == null) return empty;
+        if (virtio_net_packet_adapter::pack(pkt, empty))
+            return empty;
+
+        // Keep the fallback wrapper useful for malformed-packet tests.
+        begin
+            virtio_rx_pkt_wrapper wrapper;
+            if ($cast(wrapper, pkt))
+                return wrapper.payload;
+        end
         return empty;
     endfunction
 

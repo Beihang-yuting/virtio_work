@@ -56,6 +56,13 @@ virtual class virtqueue_base extends uvm_object;
     // callers retain ownership of the GPA they supplied.
     protected bit migration_owned_dma_iovas[bit [63:0]];
 
+    // Last descriptor made visible by add_buf().  Keeping this tiny piece of
+    // publication state in the common base lets the notification hook mutate
+    // the exact descriptor the driver just advertised without exposing ring
+    // internals to a fault sequence.
+    protected bit          last_published_valid = 0;
+    protected int unsigned last_published_desc_index = 0;
+
     // Queue restore preflights mappings while the atomic-ops layer still owns
     // their temporary migration records.  Commit only after that layer has
     // atomically transferred every mapping in this queue snapshot.
@@ -173,6 +180,156 @@ virtual class virtqueue_base extends uvm_object;
     pure virtual function void dma_unmap_buf(bit [63:0] iova);
 
     // ----- Error injection -----
+    // Return the serialized descriptor format used by this queue.  Standard
+    // split/packed implementations override it; a custom queue deliberately
+    // defaults to VQ_CUSTOM so the generic corruption helper cannot guess a
+    // field offset for a user-defined layout.
+    virtual function virtqueue_type_e descriptor_format();
+        return VQ_CUSTOM;
+    endfunction
+
+    // Corrupt one descriptor in the already-published ring.  This wrapper is
+    // the normal fixture/REAL_DUT hook: callers identify a queue object and a
+    // descriptor index, while the queue supplies its shared host-memory
+    // object, descriptor-table address, queue size, and wire format.
+    virtual function bit corrupt_published_descriptor(
+        int unsigned desc_index,
+        virtio_desc_corruption_field_e field,
+        bit [63:0] value,
+        output string why
+    );
+        why = "";
+        if (err_inj == null) begin
+            why = $sformatf("queue_id=%0d has no virtqueue_error_injector",
+                           queue_id);
+            `uvm_warning("VQ_DESC_CORRUPT", why)
+            return 0;
+        end
+        return err_inj.corrupt_descriptor(
+            mem, desc_table_addr, descriptor_format(), queue_size,
+            desc_index, field, value, why);
+    endfunction
+
+    // Record the descriptor index published by add_buf().  Split queues use
+    // the head index; packed queues use the ring slot.  Both are serialized
+    // as 16-byte entries, so the generic corruption helper can address them.
+    protected function void mark_published_descriptor(int unsigned desc_index);
+        last_published_desc_index = desc_index;
+        last_published_valid = 1;
+    endfunction
+
+    protected function void clear_published_descriptor();
+        last_published_desc_index = 0;
+        last_published_valid = 0;
+    endfunction
+
+    // Consume one configured semantic fault at a queue/responder boundary.
+    // Only descriptor-local errors are applied automatically; ring-index,
+    // barrier, IOMMU and interrupt faults retain their dedicated APIs.  This
+    // narrow mapping prevents a generic hook from silently corrupting an
+    // unrelated ring field while still making common descriptor faults real
+    // Host-memory mutations.
+    virtual function bit process_error_injection(
+        virtqueue_error_phase_e fault_phase
+    );
+        virtio_desc_corruption_field_e field;
+        bit [63:0] value;
+        string why;
+        bit supported;
+
+        if ((err_inj == null) || !last_published_valid ||
+            (mem == null) || (desc_table_addr == 0))
+            return 0;
+
+        field = VQ_DESC_FIELD_FLAGS;
+        value = 0;
+        supported = 1;
+        case (err_inj.err_type)
+            VQ_ERR_ZERO_LEN_BUF: begin
+                field = VQ_DESC_FIELD_LEN;
+                value = 0;
+            end
+            VQ_ERR_DESC_UNALIGNED: begin
+                field = VQ_DESC_FIELD_ADDR;
+                value = 64'h1;
+            end
+            VQ_ERR_WRONG_FLAGS: begin
+                field = VQ_DESC_FIELD_FLAGS;
+                value = 0;
+            end
+            VQ_ERR_AVAIL_USED_FLAG_CORRUPT: begin
+                // AVAIL/USED are serialized in packed descriptor flags.  In
+                // split rings they live in the avail/used ring headers, so a
+                // generic descriptor hook must not claim to inject this
+                // error there.
+                if (descriptor_format() == VQ_PACKED) begin
+                    field = VQ_DESC_FIELD_FLAGS;
+                    value = 0;
+                end else begin
+                    supported = 0;
+                end
+            end
+            VQ_ERR_OOB_INDEX: begin
+                if (descriptor_format() == VQ_SPLIT) begin
+                    field = VQ_DESC_FIELD_NEXT;
+                    value = queue_size;
+                end else if (descriptor_format() == VQ_PACKED) begin
+                    field = VQ_DESC_FIELD_ID;
+                    value = queue_size;
+                end else begin
+                    supported = 0;
+                end
+            end
+            VQ_ERR_STALE_DESC: begin
+                if (descriptor_format() == VQ_SPLIT) begin
+                    field = VQ_DESC_FIELD_NEXT;
+                    value = 16'hffff;
+                end else if (descriptor_format() == VQ_PACKED) begin
+                    field = VQ_DESC_FIELD_ID;
+                    value = 16'hffff;
+                end else begin
+                    supported = 0;
+                end
+            end
+            VQ_ERR_CIRCULAR_CHAIN: begin
+                if (descriptor_format() == VQ_SPLIT) begin
+                    field = VQ_DESC_FIELD_NEXT;
+                    value = last_published_desc_index;
+                end else if (descriptor_format() == VQ_PACKED) begin
+                    field = VQ_DESC_FIELD_FLAGS;
+                    value = VIRTQ_DESC_F_NEXT;
+                end else begin
+                    supported = 0;
+                end
+            end
+            default: supported = 0;
+        endcase
+
+        if (!supported) begin
+            `uvm_info("VQ_ERR_INJ", $sformatf(
+                "queue_id=%0d phase=%s semantic %s has no generic descriptor mutation",
+                queue_id, fault_phase.name(), err_inj.err_type.name()), UVM_HIGH)
+            return 0;
+        end
+
+        // Do not consume/count a semantic request until this queue knows how
+        // to realize it as an actual Host-memory mutation.  Unsupported enum
+        // values remain available to their dedicated ring/IOMMU/interrupt
+        // hooks instead of being reported as a false descriptor injection.
+        if (!err_inj.should_inject(queue_id, fault_phase))
+            return 0;
+
+        if (!err_inj.corrupt_descriptor(
+                mem, desc_table_addr, descriptor_format(), queue_size,
+                last_published_desc_index, field, value, why)) begin
+            `uvm_warning("VQ_ERR_INJ", $sformatf(
+                "queue_id=%0d phase=%s descriptor fault %s failed: %s",
+                queue_id, fault_phase.name(), err_inj.err_type.name(), why))
+            return 0;
+        end
+        return 1;
+    endfunction
+
     pure virtual function void inject_desc_error(virtqueue_error_e err_type);
 
     // ----- Migration snapshot -----

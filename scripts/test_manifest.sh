@@ -1,5 +1,24 @@
 #!/usr/bin/env bash
 
+# 中文说明：测试清单在被 VCS 或回归脚本 source 时统一解析外部控制面，
+# 让所有调用者共享同一个独立 checkout；这里不拥有 dpu_common 的生命周期。
+# dpu_common is intentionally outside this repository.  Resolve it once when
+# the manifest is sourced so every caller (VCS and strict regression) uses the
+# same independently versioned control-plane checkout.
+if [[ -z "${DPU_COMMON_ROOT:-}" ]]; then
+  echo "DPU_COMMON_ROOT must point to the external dpu_common checkout" >&2
+  return 2 2>/dev/null || exit 2
+fi
+DPU_COMMON_ROOT="$(cd "$DPU_COMMON_ROOT" 2>/dev/null && pwd)" || {
+  echo "DPU_COMMON_ROOT is not a readable directory: ${DPU_COMMON_ROOT}" >&2
+  return 2 2>/dev/null || exit 2
+}
+export DPU_COMMON_ROOT
+if [[ ! -f "$DPU_COMMON_ROOT/src/dpu_resource_pkg.sv" ]]; then
+  echo "DPU_COMMON_ROOT does not contain dpu_common/src/dpu_resource_pkg.sv: $DPU_COMMON_ROOT" >&2
+  return 2 2>/dev/null || exit 2
+fi
+
 VIRTIO_MAINTAINED_TESTS=(
   dpu_resource_manager_test
   dpu_reg_plan_test
@@ -10,11 +29,16 @@ VIRTIO_MAINTAINED_TESTS=(
   dpu_device_bootstrap_plan_test
   dpu_vio_reg_plan_test
   virtio_dut_caps_test
+  virtio_execution_mode_test
+  virtio_real_dut_iova_dma_test
   virtio_fabric_resource_test
   virtio_unit_test
+  virtio_host_mem_reclaim_test
+  virtio_queue_semantics_test
   virtio_stress_unit_test
   virtio_protocol_test
   virtio_indirect_desc_test
+  virtio_desc_corruption_test
   virtio_admin_vq_test
   virtio_migration_dirty_test
   virtio_monitor_test
@@ -26,11 +50,17 @@ VIRTIO_MAINTAINED_TESTS=(
   virtio_dual_test
   virtio_smoke_test
   virtio_traffic_test
+  virtio_net_packet_multi_queue_test
+  virtio_real_driver_flow_test
+  virtio_real_driver_multiqueue_test
+  virtio_real_driver_rx_test
   host_mem_random_test
   virtio_pcie_host_mem_test
   dpu_pcie_tl_executor_integration_test
 )
 
+# 中文说明：统计文档中某个完整字面量的出现次数，供静态契约检查使用；输入
+# 文件和非空 token，文件不可读或 token 为空时返回错误。
 _count_literal_occurrences() {
   local file_path="$1"
   local literal="$2"
@@ -51,8 +81,10 @@ _count_literal_occurrences() {
   ' "$file_path"
 }
 
+# 中文说明：校验维护测试清单无重复项，并确认关键控制面测试在外部 filelist
+# 中恰好出现一次；失败返回非零，不修改源码或构建产物。
 _validate_virtio_test_manifest() {
-  local manifest_root required test_name count
+  local manifest_root required test_name count source_literal
   local -A seen=()
 
   manifest_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -73,16 +105,19 @@ _validate_virtio_test_manifest() {
       echo "required maintained test must appear exactly once: $required" >&2
       return 1
     fi
-    count="$(awk -v source="dpu_common/tests/${required}.sv" \
+    source_literal="$DPU_COMMON_ROOT/tests/${required}.sv"
+    count="$(awk -v source="\$DPU_COMMON_ROOT/tests/${required}.sv" \
       '$0 == source { count++ } END { print count + 0 }' \
       "$manifest_root/filelists/tests.f")"
     if [[ "$count" -ne 1 ]]; then
-      echo "required test source must appear exactly once: dpu_common/tests/${required}.sv" >&2
+      echo "required test source must appear exactly once: \$DPU_COMMON_ROOT/tests/${required}.sv (resolved ${source_literal})" >&2
       return 1
     fi
   done
 }
 
+# 中文说明：检查 DPU 控制面关键静态契约、executor 注入示例及已删除 API；
+# 该检查只读外部 checkout、源码和文档，任何陈旧入口都会阻止回归启动。
 _validate_global_dpu_static_contracts() {
   local manifest_root builder definition_count named_use_count literal_count
   local executor_input_count executor_assignment_count
@@ -130,7 +165,7 @@ _validate_global_dpu_static_contracts() {
     return 1
   fi
 
-  builder="$manifest_root/dpu_common/src/dpu_device_bootstrap_plan_builder.sv"
+  builder="$DPU_COMMON_ROOT/src/dpu_device_bootstrap_plan_builder.sv"
   definition_count="$(awk '
       $0 == "localparam bit [63:0] DPU_AF_DECLARATION_ADDR = 64\047h1010;" {
         count++
@@ -165,8 +200,8 @@ _validate_global_dpu_static_contracts() {
   removed_caps_binder+='dut_caps'
   removed_caps_call_pattern="(^|[^[:alnum:]_])${removed_caps_binder}[[:space:]]*\\("
   if grep -R -n -E --include='*.sv' "$removed_caps_call_pattern" \
-      "$manifest_root/dpu_common/src" \
-      "$manifest_root/dpu_common/tests" \
+      "$DPU_COMMON_ROOT/src" \
+      "$DPU_COMMON_ROOT/tests" \
       "$manifest_root/virtio_net_vip/src" \
       "$manifest_root/virtio_net_vip/tests" ||
      grep -n -E "$removed_caps_call_pattern" \
@@ -177,6 +212,8 @@ _validate_global_dpu_static_contracts() {
   fi
 }
 
+# 中文说明：检查 README/手册中的测试顺序、service-key API 和禁止示例；失败
+# 返回累计错误数，确保文档不会指导用户绕过 snapshot/隔离边界。
 _validate_documentation_contracts() {
   local manifest_root invalid_default_path stale_default_method
   local stale_vf_method positional_vf_phrase doc label failures index
@@ -266,6 +303,7 @@ _validate_documentation_contracts || {
 }
 unset -f _validate_documentation_contracts
 
+# 中文说明：判断请求的 UVM test 是否在维护清单中；仅返回布尔值，不启动测试。
 is_virtio_maintained_test() {
   local requested="$1"
   local maintained
