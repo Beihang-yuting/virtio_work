@@ -121,6 +121,46 @@ class virtio_pf_lifecycle_test_fsm extends virtio_auto_fsm;
     endtask
 endclass : virtio_pf_lifecycle_test_fsm
 
+// 计数型发包桩：parallel_traffic 委托钩子的最小实现。每次 send_one
+// 只递增计数并返回成功，用于验证并发框架把"钩子真实确认的次数"
+// 原样汇总进 actual_sent——而不是把目标包数当结果返回。
+class virtio_pf_lifecycle_counting_worker extends virtio_traffic_worker_base;
+    `uvm_object_utils(virtio_pf_lifecycle_counting_worker)
+
+    int unsigned send_calls;
+
+    function new(string name = "virtio_pf_lifecycle_counting_worker");
+        super.new(name);
+    endfunction
+
+    virtual task send_one(int unsigned vf_id, int unsigned seq_no,
+                          output bit ok);
+        send_calls++;
+        ok = 1'b1;
+    endtask
+endclass : virtio_pf_lifecycle_counting_worker
+
+// 捕获"未绑定 traffic_worker"的预期告警：该告警是诚实语义的一部分
+//（见 virtio_concurrency_controller 类头），捕获计数供断言，同时避免
+// 预期内的 WARNING 触发 strict 日志门禁。
+class virtio_pf_lifecycle_traffic_warning_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "virtio_pf_lifecycle_traffic_warning_catcher");
+        super.new(name);
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_WARNING) && (get_id() == "CONC_CTRL") &&
+            uvm_is_match("*no traffic_worker bound*", get_message())) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_pf_lifecycle_traffic_warning_catcher
+
 class virtio_pf_lifecycle_expected_error_catcher extends uvm_report_catcher;
     int unsigned caught_count;
 
@@ -383,10 +423,32 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         assert(results.size() == 0)
             else `uvm_fatal("PF_LIFECYCLE",
                 "parallel_vf_op did not return an empty result for zero workers")
-        controller.parallel_traffic(vf_ids, 2, actual_sent);
-        assert((actual_sent.size() == 1) && (actual_sent[0] == 2))
-            else `uvm_fatal("PF_LIFECYCLE",
-                "parallel_traffic did not await and return the worker count")
+        // 诚实语义 1：未绑定发包钩子时不发送任何报文，计数必须为 0
+        //（历史实现把目标包数直接当结果返回，此断言防止该缺陷复发）。
+        begin
+            virtio_pf_lifecycle_traffic_warning_catcher traffic_catcher;
+            traffic_catcher = new();
+            uvm_report_cb::add(null, traffic_catcher);
+            controller.parallel_traffic(vf_ids, 2, actual_sent);
+            uvm_report_cb::delete(null, traffic_catcher);
+            assert((actual_sent.size() == 1) && (actual_sent[0] == 0) &&
+                   (traffic_catcher.caught_count == 1))
+                else `uvm_fatal("PF_LIFECYCLE",
+                    "parallel_traffic without a worker must report zero sends and warn")
+        end
+        // 诚实语义 2：绑定计数桩后，汇总值必须等于钩子被真实调用并
+        // 确认成功的次数。
+        begin
+            virtio_pf_lifecycle_counting_worker counting_worker;
+            counting_worker = virtio_pf_lifecycle_counting_worker::type_id::create(
+                "pf_lifecycle_counting_worker");
+            controller.traffic_worker = counting_worker;
+            controller.parallel_traffic(vf_ids, 2, actual_sent);
+            assert((actual_sent.size() == 1) && (actual_sent[0] == 2) &&
+                   (counting_worker.send_calls == 2))
+                else `uvm_fatal("PF_LIFECYCLE",
+                    "parallel_traffic did not report the worker-confirmed send count")
+        end
         controller.parallel_traffic(no_vf_ids, 2, actual_sent);
         assert(actual_sent.size() == 0)
             else `uvm_fatal("PF_LIFECYCLE",

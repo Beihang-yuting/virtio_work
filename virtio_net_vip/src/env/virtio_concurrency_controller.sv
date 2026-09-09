@@ -22,7 +22,40 @@
 //   - virtio_vf_instance (per-VF driver wrapper)
 //   - virtio_wait_policy (timeout/polling)
 //   - virtio_net_types.sv (virtio_txn_type_e, race_point_e)
+//
+// 中文说明（职责与所有权）：本类是 env 级共享组件（uvm_object，由
+// virtio_net_env 创建并注入 vf_instances/wait_pol 引用，不拥有 VF 的
+// 生命周期）。parallel_vf_op 直接驱动 VF 的 init/shutdown/reset；
+// parallel_traffic 本身不产生报文——发包动作经 traffic_worker 钩子
+// 委托给调用方（见 virtio_traffic_worker_base），actual_sent 只统计
+// 钩子真实确认成功的包数，未绑定钩子时诚实返回 0 并告警，绝不以
+// 目标包数冒充实际发送量。
 // ============================================================================
+
+// ----------------------------------------------------------------------------
+// virtio_traffic_worker_base — parallel_traffic 的发包委托钩子。
+//
+// 为什么需要这一层：并发控制器只负责"多 VF 并行 + 超时 + 汇总"这个
+// 框架，具体一包怎么发（走 dataplane、atomic_ops 还是测试桩）属于
+// 调用方的策略。调用方派生本类实现 send_one() 并绑到
+// controller.traffic_worker；send_one 返回 ok=1 才计入 actual_sent。
+// 基类默认 ok=0（不发包），保证未实现的派生类不会虚报计数。
+// ----------------------------------------------------------------------------
+class virtio_traffic_worker_base extends uvm_object;
+    `uvm_object_utils(virtio_traffic_worker_base)
+
+    function new(string name = "virtio_traffic_worker_base");
+        super.new(name);
+    endfunction
+
+    // 发送一个报文。vf_id 为目标 VF 序号，seq_no 为该 VF 内的包序号；
+    // ok=1 表示报文确实提交成功（计入统计），ok=0 表示失败（该 VF
+    // 停止继续发送）。副作用由派生类定义。
+    virtual task send_one(int unsigned vf_id, int unsigned seq_no,
+                          output bit ok);
+        ok = 1'b0;
+    endtask
+endclass
 
 class virtio_concurrency_controller extends uvm_object;
     `uvm_object_utils(virtio_concurrency_controller)
@@ -32,6 +65,9 @@ class virtio_concurrency_controller extends uvm_object;
 
     // ===== Wait policy =====
     virtio_wait_policy wait_pol;
+
+    // ===== 发包委托钩子（可选，由调用方绑定；见类头说明）=====
+    virtio_traffic_worker_base traffic_worker;
 
     // ========================================================================
     // Constructor
@@ -127,13 +163,15 @@ class virtio_concurrency_controller extends uvm_object;
     // ========================================================================
     // parallel_traffic
     //
-    // Generate traffic on multiple VFs concurrently. Each VF sends
-    // pkts_per_vf packets through its TX path.
+    // 并发流量框架：对每个 VF 起一个命名 fork worker，逐包调用
+    // traffic_worker.send_one() 委托发包，带整体超时。
     //
-    // Parameters:
-    //   vf_ids       -- list of VF indices
-    //   pkts_per_vf  -- number of packets each VF should send
-    //   actual_sent  -- output: actual packets sent per VF
+    // 输入：vf_ids（VF 序号列表）、pkts_per_vf（每 VF 目标包数）。
+    // 输出：actual_sent[i] = 该 VF 经钩子确认成功的包数（真实计数，
+    //       不是目标值）。失败/超时/未绑定钩子时对应项可小于目标，
+    //       未绑定钩子恒为 0 并每 VF 告警一次。
+    // 边界：vf_id 越界或实例为空时该 worker 计 0 并告警；整体超时到
+    //       达时未完成的 worker 被 disable，已计入的包数保留。
     // ========================================================================
 
     virtual task parallel_traffic(
@@ -167,15 +205,31 @@ class virtio_concurrency_controller extends uvm_object;
                             worker_actual_sent[idx] = 0;
 
                             if (vf_id < vf_instances.size() && vf_instances[vf_id] != null) begin
-                                // Traffic generation is done via sequences in Phase 9.
-                                // Here we provide the concurrency framework; the actual
-                                // packet submission is delegated to the caller's sequence.
                                 `uvm_info("CONC_CTRL",
                                     $sformatf("parallel_traffic: VF%0d starting %0d pkts",
                                               vf_id, target_pkts),
                                     UVM_HIGH)
-                                // Placeholder: actual traffic driven by sequences
-                                worker_actual_sent[idx] = target_pkts;
+                                if (traffic_worker == null) begin
+                                    // 诚实语义：没有绑定发包钩子就没有报文
+                                    // 被发送，计数保持 0，绝不以目标值冒充。
+                                    `uvm_warning("CONC_CTRL",
+                                        $sformatf({"parallel_traffic: no traffic_worker",
+                                                   " bound, VF%0d sends nothing"}, vf_id))
+                                end
+                                else begin
+                                    for (int unsigned p = 0; p < target_pkts; p++) begin
+                                        bit send_ok;
+                                        traffic_worker.send_one(vf_id, p, send_ok);
+                                        if (!send_ok) begin
+                                            `uvm_warning("CONC_CTRL",
+                                                $sformatf({"parallel_traffic: VF%0d",
+                                                           " send %0d failed, stop"},
+                                                          vf_id, p))
+                                            break;
+                                        end
+                                        worker_actual_sent[idx]++;
+                                    end
+                                end
                             end
                         end
                     join_none
