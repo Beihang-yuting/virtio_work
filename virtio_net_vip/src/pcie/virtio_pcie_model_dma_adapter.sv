@@ -109,9 +109,14 @@ class virtio_pcie_model_dma_adapter extends uvm_object;
     endfunction
 
     // 接口契约：输入设备可见地址和长度，输出精确字节数组。成功发送一条
-    // EP-originated MemRd，等待 bounded Completion 后去除首 DWORD 偏移；未绑定、
-    // 非法跨页、超时、非成功 Completion 或 payload 太短时只报 UVM_ERROR 并返回空数组。
-    // 不直接访问 Host memory，也不返回协议错误码；TLP/driver 由调用方拥有。
+    // EP-originated MemRd 并等待 bounded Completion。pcie_work 的 rb_data
+    // 语义是"只含 Byte Enable 使能的有效字节、按线上顺序排列"（partial-BE
+    // 语义，见 pcie_tl_tlp 的 completion 回填），因此对齐偏移已在上游剥除，
+    // 这里期望 rb_data.size() == size 并原样拷贝，绝不能再按 byte_offset
+    // 二次裁剪（历史写法假设 DWORD 填充 payload，会把非对齐读误判为
+    // "payload too short"）。未绑定、非法跨页、超时、非成功 Completion 或
+    // 有效字节不足时只报 UVM_ERROR 并返回空数组。不直接访问 Host memory，
+    // 也不返回协议错误码；TLP/driver 由调用方拥有。
     virtual task read(
         input bit [63:0] addr,
         input int unsigned size,
@@ -159,15 +164,15 @@ class virtio_pcie_model_dma_adapter extends uvm_object;
                 addr, size, tlp.rb_status.name()))
             return;
         end
-        if (tlp.rb_data.size() < byte_offset + size) begin
+        if (tlp.rb_data.size() < size) begin
             `uvm_error("MODEL_DMA", $sformatf(
-                "MODEL DMA read payload too short addr=0x%016h got=%0d expected=%0d",
-                addr, tlp.rb_data.size(), byte_offset + size))
+                "MODEL DMA read valid bytes too short addr=0x%016h got=%0d expected=%0d",
+                addr, tlp.rb_data.size(), size))
             return;
         end
         data = new[size];
         foreach (data[index])
-            data[index] = tlp.rb_data[index + byte_offset];
+            data[index] = tlp.rb_data[index];
     endtask
 
     // 接口契约：输入设备可见地址和待写字节，异步/posted 发送一条 EP-originated

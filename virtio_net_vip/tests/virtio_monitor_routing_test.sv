@@ -195,9 +195,6 @@ class virtio_monitor_routing_test extends uvm_test;
     localparam bit [63:0] PF_BAR0_BASE = 64'h0000_0002_0000_0000;
     localparam bit [63:0] PF_BAR2_BASE = 64'h0000_0002_0200_0000;
     localparam bit [63:0] PF_BAR4_BASE = 64'h0000_0002_0201_0000;
-    localparam bit [63:0] VF_BAR0_BASE = 64'h0000_0002_0202_0000;
-    localparam bit [63:0] VF_BAR2_BASE = 64'h0000_0002_0202_4000;
-    localparam bit [63:0] VF_BAR4_BASE = 64'h0000_0002_0202_8000;
     localparam bit [31:0] COMMON_OFF   = 32'h0000_0100;
     localparam bit [31:0] COMMON_LEN   = 32'h0000_0040;
     localparam bit [31:0] NOTIFY_OFF   = 32'h0000_0200;
@@ -208,6 +205,34 @@ class virtio_monitor_routing_test extends uvm_test;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
+    endfunction
+
+    // 校验 function 实例导入的 BAR 副本与冻结快照的解析结果逐对一致。
+    // 期望值向 device_env 当前快照按 DEVICE_MEMORY/MAILBOX/MSIX 顺序查询
+    // （与 virtio_function_instance 的导入顺序一致），不依赖任何硬编码
+    // 基址——放置策略变化时本检查仍然有效。快照缺失或任一 BAR 查询失败
+    // 均返回 0，由调用方的断言统一报 fatal。
+    protected function bit function_bars_match_snapshot(
+        input virtio_function_instance fn
+    );
+        dpu_device_snapshot  snapshot;
+        dpu_bar_pair_lease_t expected;
+        dpu_bar_role_e       kinds[3] =
+            '{DPU_BAR_DEVICE_MEMORY, DPU_BAR_MAILBOX, DPU_BAR_MSIX};
+        string why;
+
+        if ((fn == null) || (device_env == null))
+            return 0;
+        snapshot = device_env.get_snapshot();
+        if ((snapshot == null) || (fn.bar_pairs.size() != 3))
+            return 0;
+        foreach (kinds[i]) begin
+            if (!snapshot.get_bar(fn.function_key, kinds[i], expected, why))
+                return 0;
+            if (fn.bar_pairs[i].base != expected.base)
+                return 0;
+        end
+        return 1;
     endfunction
 
     protected function void pin_real_dut_bars(
@@ -838,14 +863,14 @@ class virtio_monitor_routing_test extends uvm_test;
         assert(vf.bdf != (pf.bdf + 1))
             else `uvm_fatal("ROUTING_TEST",
                 "VF BDF unexpectedly used arithmetic PF+VF placement")
-        assert((pf.bar_pairs.size() == 3) &&
-               (pf.bar_pairs[0].base == PF_BAR0_BASE) &&
-               (pf.bar_pairs[1].base == PF_BAR2_BASE) &&
-               (pf.bar_pairs[2].base == PF_BAR4_BASE) &&
-               (vf.bar_pairs.size() == 3) &&
-               (vf.bar_pairs[0].base == VF_BAR0_BASE) &&
-               (vf.bar_pairs[1].base == VF_BAR2_BASE) &&
-               (vf.bar_pairs[2].base == VF_BAR4_BASE))
+        // BAR 期望值不再硬编码：VF 的 BAR 由放置策略自动分配，dpu_common
+        // 策略演进（如"大 BAR 优先"）会合法地改变基址。本断言的意图是
+        // "function 实例的 BAR 副本 == 冻结快照的解析结果"，因此期望值
+        // 直接向同一个 resolved snapshot 查询（顺序与 function_instance
+        // 的导入一致：DEVICE_MEMORY/MAILBOX/MSIX）。PF 为 pinned BAR，
+        // 快照值等于测试常量，一并覆盖。
+        assert(function_bars_match_snapshot(pf) &&
+               function_bars_match_snapshot(vf))
             else `uvm_fatal("ROUTING_TEST",
                 "PF/VF BAR copies differ from resolved snapshot values")
         assert((pf.resource_manager == device_env.get_resource_manager()) &&
