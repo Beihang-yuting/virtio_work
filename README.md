@@ -419,6 +419,29 @@ make test TEST=virtio_unit_test
 
 ---
 
+## 多 Host 顶层环境示例（显式启用）
+
+[`virtio_system_env_example_test.sv`](examples/virtio_system_env/virtio_system_env_example_test.sv)
+把 `virtio_system_env_config`、`virtio_system_env` 和测试类放在同一个示例文件中，
+演示怎样自行装配多 Host 环境。这两个类仅用于示例，不属于默认 VIP API，也不进入
+默认 filelist。需要运行时，使用示例目录下的
+[`run_vcs.sh`](examples/virtio_system_env/run_vcs.sh) 显式编译。
+
+示例只创建一个 `dpu_device_env` 解析全局拓扑和资源；其下按 `host_id` 创建
+`virtio_env_hN`，每个子环境只消费归属于该 Host 的 VIO service 和 qpair。
+一个共享 `host_mem_pool` 按 Host 保存独立的 `host_mem_manager`，所以四个 Host
+对应四个 manager。全局 qpair 容量可设为 2048，队列的 Host/PF/VF 归属由
+冻结的 service/function binding 确定，无须按 VF 或 qpair 创建环境。
+
+在示例的 `system_cfg.dpu_cfg.device_cfg` 中配置 Host、PCIe domain、PF/VF
+及 BAR；在 `system_cfg.dpu_cfg.placement_cfg` 中配置 qpair profile 和 VIO
+placement；在 `system_cfg.vio_cfg_by_host[host_id]` 中配置每个 Host 的
+driver、queue 和 feature。BAR 的基址可以在合法 MMIO window 内随机选择。
+这些 authoring 对象来自 `dpu_common` 和 VIP 的现有配置 API；如需在自己的
+testbench 使用这套层次，可按平台需求改造示例并显式加入专用编译列表。
+
+`virtio_test_device_builder` 是 tests 目录里的辅助工具，不是环境的必需依赖。
+
 ## Global DPU 配置边界
 
 `dpu_device_cfg` 与 `dpu_resource_placement_cfg` 是唯一可变的 authoring
@@ -429,8 +452,9 @@ override。`dpu_device_env` 一次性将这两个输入解析为彼此精确关�
 resource manager。VIO 只按完整 `dpu_service_key_t` 导入自己的 frozen bindings，
 不 author topology、capability、BDF、BAR 或资源分配。
 
-以下是 README 中唯一的端到端 authoring 示例。`virtio_test_device_builder` 只是
-测试用 convenience；它只填充公开配置对象，不转换旧模型。为清晰起见示例写出
+下面保留一个单 Host builder 兼容示例，帮助迁移已有 fixture。多 Host 装配可参考
+上面的可选示例。`virtio_test_device_builder` 只是测试辅助，
+不是解析器或环境依赖；它只填充公开配置对象，不转换旧模型。为清晰起见示例写出
 四个 eligible VF；生产配置也可以在显式 PF 下 author `vf_pools` template，resolver
 只会从该已声明的 inventory 选择候选项。
 
@@ -500,7 +524,7 @@ global_cfg.executor = injected_executor;
 uvm_config_db#(dpu_device_env_config)::set(
     this, "device_env", "cfg", global_cfg);
 uvm_config_db#(virtio_net_env_config)::set(
-    this, "device_env.env", "cfg", vio_cfg);
+    this, "device_env.virtio_env", "cfg", vio_cfg);
 endfunction
 ```
 

@@ -5,6 +5,9 @@
 // virtio_net_env
 //
 // Top-level UVM environment for the virtio-net driver VIP.
+// 所属层次：src/env；主要依赖 virtio_net_env_config、dpu_resource_pkg 的冻结
+// 快照，以及 host_mem_pool/PCIe TL。test 持有配置与 PCIe 环境，当前 env 在
+// UVM 生命周期中借用并装配业务组件，不接管控制面或外部资源的所有权。
 //
 // 中文说明：这是业务验证环境的装配根节点。DPU 控制面先解析出冻结的
 // device/resource snapshot，本环境只消费 snapshot，不重新分配 BDF、BAR 或 qpair；
@@ -106,8 +109,40 @@ class virtio_net_env extends uvm_env;
         dpu_vio_qpair_binding_t service_bindings[$];
 
         why = "";
-        device_snapshot.list_services(DPU_SERVICE_VIO_NET, service_keys);
+        // 空白名单保持原有的全量 service 语义；非空白名单按完整 key 筛选。
+        // 多个 Host 子环境由此消费同一快照的不同部分，不重复解析资源。
+        if (cfg.service_keys.size() == 0)
+            device_snapshot.list_services(DPU_SERVICE_VIO_NET, service_keys);
+        else
+            foreach (cfg.service_keys[index])
+                service_keys.push_back(cfg.service_keys[index]);
+        if (cfg.host_scope_enable) begin
+            dpu_service_key_t scoped_service_keys[$];
+
+            // 仅依据快照确认的 owner 过滤 Host；找不到 owner 必须整体失败。
+            foreach (service_keys[index]) begin
+                dpu_function_key_t scoped_owner;
+                string scope_why;
+
+                if (!device_snapshot.get_service_owner(
+                        service_keys[index], scoped_owner, scope_why)) begin
+                    why = scope_why;
+                    return 0;
+                end
+                if (scoped_owner.host_id == cfg.host_scope_id)
+                    scoped_service_keys.push_back(service_keys[index]);
+            end
+            service_keys = scoped_service_keys;
+        end
         if (service_keys.size() == 0) begin
+            // 作用域内可以合法地没有 VIO 参与者；保持共享基础设施但创建空函数
+            // 数组。未设作用域时全局无 service 仍是配置错误，避免静默漏配置。
+            if ((cfg.service_keys.size() != 0) || cfg.host_scope_enable) begin
+                pf_instances = new[0];
+                function_instances = new[0];
+                vf_instances = new[0];
+                return 1;
+            end
             why = "frozen device snapshot declares no VIO services";
             return 0;
         end

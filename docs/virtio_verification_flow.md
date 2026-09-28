@@ -62,6 +62,40 @@
 | pcie/ | 模式边界 5 文件（MODEL 设备模型 / REAL_DUT DMA 服务） |
 | env/ | 快照消费、组件树组装、原子 PCIe 绑定、并发控制器 |
 
+## 2.1 可选的多 Host 顶层环境示例
+
+[`virtio_system_env_example_test.sv`](../examples/virtio_system_env/virtio_system_env_example_test.sv)
+在一个示例文件中定义 `virtio_system_env_config`、`virtio_system_env` 和测试类，
+演示多 Host 的一种装配方式。这两个类不属于默认 VIP API，也不进入默认 filelist；
+需要运行时使用 [`run_vcs.sh`](../examples/virtio_system_env/run_vcs.sh) 显式编译示例。
+示例中的组件层次如下：
+
+```text
+uvm_test_top.system_env
+├── dpu_env                         // 唯一拓扑/资源解析者
+│   ├── virtio_env_h0               // Host 0 的 VIO service scope
+│   ├── virtio_env_h1               // Host 1 的 VIO service scope
+│   └── ...
+└── pcie_env                        // 可选 sibling，由平台显式绑定
+```
+
+示例测试在 `system_cfg.dpu_cfg.device_cfg` 里直接填写 Host、PCIe domain、PF/VF、
+`dpu_bar_request` 和 `eligible_service_kinds`，在
+`system_cfg.dpu_cfg.placement_cfg` 里填写 qpair profile 与
+`dpu_vio_placement_request`，在 `system_cfg.vio_cfg_by_host[host_id]` 里填写
+驱动 feature、queue、IOMMU 和每个 service 的行为。`functions[].services[]` 不
+预声明 VIO；VIO service 由 placement request 解析后产生。
+
+示例环境为每个 `host_id` 在同一个 `host_mem_pool` 中创建一个独立的
+`host_mem_manager`。四个 Host 就是四个 manager；子环境只按自己的 `host_id`
+取得 manager，PCIe Root 也必须用相同 Host handle 显式绑定。`dpu_device_env` 将
+冻结的 device/resource snapshot 发布到其后代，因此该示例把 `virtio_env_hN` 挂在
+`dpu_env` 下面。单 Root 可以调用示例的 `system_env.bind_pcie_host()`，多 Root 使用
+按完整 `{host_id, segment_id, BDF}` 配置的 `virtio_pcie_function_endpoint`。
+
+`virtio_test_device_builder` 仍可用于旧的单 Host fixture，但只是测试辅助，不是
+默认环境依赖；需要完全控制数量和身份时，可以参考示例直接编辑上述 authoring 对象。
+
 ## 3. 阶段 A：配置下发（设备初始化）
 
 全部配置访问最终经 `virtio_bar_accessor` 变成 TLP 从 `pcie_rc_seqr` 发出。

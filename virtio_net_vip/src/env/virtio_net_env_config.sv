@@ -5,8 +5,12 @@
 // virtio_net_env_config
 //
 // Unified configuration object for the virtio-net UVM environment.
+// 所属层次：src/env，作为 test authoring 与 virtio_net_env 的行为配置边界。
 // 中文说明：本对象只描述 virtio 驱动行为、内存和验证策略；Host/PF/VF/BDF/BAR
 // 拓扑以及 qpair 归属必须由全局 dpu_common snapshot 提供。
+// 主要依赖：virtio_net_types、dpu_resource_pkg 的 service key/snapshot，
+// 以及 host_mem_pool。test 持有配置对象；环境在 build/connect 阶段借用，
+// 不接管其生命周期，也不改写冻结的控制面快照。
 // Provides VIO service behavior, memory regions, IOMMU policy, performance
 // limits, and verification component enables. Device topology and placement
 // belong exclusively to the frozen global device snapshot.
@@ -28,6 +32,15 @@ class virtio_net_env_config extends uvm_object;
     } service_config_entry_t;
 
     protected service_config_entry_t m_service_configs[string];
+
+    // 可选 service 白名单。空队列保持旧环境的全量消费语义；非空时按完整
+    // service key 精确筛选，允许多个子环境共享同一对冻结快照与资源管理器。
+    dpu_service_key_t service_keys[$];
+
+    // 可选 Host 范围在快照发布后按 owner.host_id 过滤；因此 AUTO placement
+    // 的最终归属仍由控制面决定，不按 authoring 顺序预猜 PF/VF 身份。
+    bit          host_scope_enable = 0;
+    int unsigned host_scope_id = 0;
 
     // ===== Default driver config =====
     int unsigned         default_num_pairs = 1;
@@ -95,6 +108,53 @@ class virtio_net_env_config extends uvm_object;
     // 仅初始化 UVM 配置对象；默认字段在声明处设定，构造函数不创建外部资源。
     function new(string name = "virtio_net_env_config");
         super.new(name);
+    endfunction
+
+    // 功能：将一个 VIO-net service key 加入可选白名单。
+    // 输入/输出：输入完整 key，成功返回 1，失败返回 0 并填写 why。
+    // 边界/副作用：拒绝非 VIO 或重复键；声明存在性和 Host 归属留待冻结快照校验。
+    function bit add_service_key(
+        input dpu_service_key_t key,
+        output string why
+    );
+        string service_name;
+
+        service_name = dpu_service_key_name(key);
+        why = "";
+        if (key.service_kind != DPU_SERVICE_VIO_NET) begin
+            why = {"service scope requires VIO-net key ", service_name};
+            return 0;
+        end
+        foreach (service_keys[index]) begin
+            if (dpu_service_key_name(service_keys[index]) == service_name) begin
+                why = {"duplicate service scope key ", service_name};
+                return 0;
+            end
+        end
+        service_keys.push_back(key);
+        return 1;
+    endfunction
+
+    // 功能：查询 key 是否落在当前白名单内；空白名单表示旧版全量消费。
+    // 输入/输出：输入完整 key，返回是否选中；只读，不改变配置或快照。
+    function bit service_key_selected(input dpu_service_key_t key);
+        string service_name;
+
+        if (service_keys.size() == 0)
+            return 1;
+        service_name = dpu_service_key_name(key);
+        foreach (service_keys[index]) begin
+            if (dpu_service_key_name(service_keys[index]) == service_name)
+                return 1;
+        end
+        return 0;
+    endfunction
+
+    // 功能：按最终 function owner 判断是否属于本 Host。
+    // 输入/输出：输入快照 owner，返回是否选中；白名单与 Host 筛选保持独立。
+    // 边界/副作用：关闭 Host scope 时允许任意 owner；不推断或修改资源归属。
+    function bit service_host_selected(input dpu_function_key_t owner);
+        return !host_scope_enable || (owner.host_id == host_scope_id);
     endfunction
 
     // ========================================================================
@@ -328,6 +388,13 @@ class virtio_net_env_config extends uvm_object;
         end
         if (!validate_local(why))
             return 0;
+        // Host 范围必须与该业务环境的内存/IOMMU Host ID 一致，防止跨域消费。
+        if (host_scope_enable && (host_scope_id != host_id)) begin
+            why = $sformatf(
+                "host scope id %0d disagrees with environment host_id %0d",
+                host_scope_id, host_id);
+            return 0;
+        end
         snapshot_caps = snapshot.snapshot_dut_caps();
         if (snapshot_caps == null) begin
             why = "frozen snapshot has no DUT capabilities";
@@ -339,6 +406,42 @@ class virtio_net_env_config extends uvm_object;
             why = "frozen snapshot has an invalid VIO qpair capability";
             return 0;
         end
+        // 先用冻结快照验证显式白名单：完整 service key 必须已声明，owner 必须
+        // 属于当前 Host；按键而非数组下标筛选，避免 PF/VF 创建顺序影响隔离。
+        foreach (service_keys[index]) begin
+            string scope_name;
+
+            scope_name = dpu_service_key_name(service_keys[index]);
+            if (service_keys[index].service_kind != DPU_SERVICE_VIO_NET) begin
+                why = {"service scope requires VIO-net key ", scope_name};
+                return 0;
+            end
+            for (int prior = 0; prior < index; prior++) begin
+                if (dpu_service_key_name(service_keys[prior]) == scope_name) begin
+                    why = {"duplicate service scope key ", scope_name};
+                    return 0;
+                end
+            end
+            if (!snapshot.get_service_owner(
+                    service_keys[index], owner, service_why)) begin
+                why = {"service scope key is not declared by snapshot ",
+                       scope_name, ": ", service_why};
+                return 0;
+            end
+            if ((service_keys.size() != 0 || host_scope_enable) &&
+                (owner.host_id != host_id)) begin
+                why = $sformatf(
+                    "service scope key %s belongs to Host %0d, but this environment is bound to Host %0d",
+                    scope_name, owner.host_id, host_id);
+                return 0;
+            end
+            if (host_scope_enable && !service_host_selected(owner)) begin
+                why = $sformatf(
+                    "service scope key %s belongs to Host %0d, expected Host %0d",
+                    scope_name, owner.host_id, host_scope_id);
+                return 0;
+            end
+        end
         foreach (m_service_configs[service_name]) begin
             if (m_service_configs[service_name].key.service_kind !=
                 DPU_SERVICE_VIO_NET) begin
@@ -346,10 +449,22 @@ class virtio_net_env_config extends uvm_object;
                        service_name};
                 return 0;
             end
+            if (!service_key_selected(m_service_configs[service_name].key)) begin
+                why = {"VIO service configuration is outside the selected ",
+                       "service scope ", service_name};
+                return 0;
+            end
             if (!snapshot.get_service_owner(
                     m_service_configs[service_name].key, owner, service_why)) begin
                 why = {"VIO service configuration is not declared by snapshot ",
                        service_name, ": ", service_why};
+                return 0;
+            end
+            if ((service_keys.size() != 0 || host_scope_enable) &&
+                !service_host_selected(owner)) begin
+                why = $sformatf(
+                    "VIO service configuration %s belongs to Host %0d, expected Host %0d",
+                    service_name, owner.host_id, host_scope_id);
                 return 0;
             end
             if (m_service_configs[service_name].cfg.num_queue_pairs >
@@ -374,6 +489,9 @@ class virtio_net_env_config extends uvm_object;
     virtual function string convert2string();
         string s;
         s = $sformatf("virtio_net_env_config:\n");
+        s = {s, $sformatf("  service_scope=%0d (%s)\n", service_keys.size(),
+                          (service_keys.size() == 0) ? "all VIO services" :
+                          "explicit service keys")};
         s = {s, $sformatf("  mem_base=0x%016h, mem_end=0x%016h\n", mem_base, mem_end)};
         s = {s, $sformatf("  host_id=%0d, host_mem_policy=%s, host_mem_binding=%s, host_mem_pool=%s\n",
                           host_id, host_mem_policy.name(),

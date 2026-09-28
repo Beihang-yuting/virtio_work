@@ -1,6 +1,9 @@
 `ifndef VIRTIO_DUT_CAPS_TEST_SV
 `define VIRTIO_DUT_CAPS_TEST_SV
 
+// 所属层次：tests；职责是验证 DUT capability、冻结快照和 VIO 行为配置
+// 之间的边界。依赖 dpu_resource_pkg 与 virtio_net_pkg；测试只构造临时配置
+// 和快照，UVM 运行结束后销毁，不持有生产环境资源。
 import uvm_pkg::*;
 `include "uvm_macros.svh"
 import dpu_resource_pkg::*;
@@ -1662,12 +1665,16 @@ class virtio_dut_caps_test extends uvm_test;
         end
     endtask
 
+    // 功能：验证完整 service key 的行为覆盖、能力上限和 Host 作用域隔离。
+    // 输入/输出：无参数，失败用 UVM_FATAL 报告；仅创建测试内配置与快照。
+    // 边界：重点拒绝重复、未声明及跨 Host 的 service，不启动硬件事务。
     task assert_service_keyed_vio_behavior();
         virtio_net_env_config cfg;
         virtio_net_env_config undeclared_cfg;
         virtio_net_env_config over_cap_cfg;
         virtio_net_env_config invalid_local_cfg;
         virtio_net_env_config same_function_cfg;
+        virtio_net_env_config scoped_cfg;
         dpu_device_snapshot snapshot;
         dpu_dut_caps observed_caps;
         dpu_service_key_t first_key;
@@ -1802,6 +1809,26 @@ class virtio_dut_caps_test extends uvm_test;
         invalid_local_cfg.bw_limit_mbps = 0;
         if (invalid_local_cfg.validate_local(why))
             `uvm_fatal("DUT_CAPS", "local VIO validation accepted zero enabled bandwidth limit")
+
+        // 用双 Host 冻结快照验证显式白名单的键唯一性与 Host 内存域隔离；
+        // 同时确认不存在的 service 不会因白名单操作被隐式创建。
+        scoped_cfg = virtio_net_env_config::type_id::create(
+            "scoped_service_cfg");
+        scoped_cfg.host_id = 0;
+        if (!scoped_cfg.add_service_key(first_key, why) ||
+            !scoped_cfg.validate_against_snapshot(snapshot, why)) begin
+            `uvm_fatal("DUT_CAPS", {"valid explicit service scope rejected: ", why})
+        end
+        if (scoped_cfg.add_service_key(first_key, why))
+            `uvm_fatal("DUT_CAPS", "duplicate explicit service scope accepted")
+        if (!scoped_cfg.add_service_key(second_key, why))
+            `uvm_fatal("DUT_CAPS", {"could not add cross-Host scope probe: ", why})
+        if (scoped_cfg.validate_against_snapshot(snapshot, why))
+            `uvm_fatal("DUT_CAPS", "service scope accepted a different Host")
+        scoped_cfg.service_keys.delete();
+        if (!scoped_cfg.add_service_key(undeclared_key, why) ||
+            scoped_cfg.validate_against_snapshot(snapshot, why))
+            `uvm_fatal("DUT_CAPS", "service scope accepted an undeclared service")
     endtask
 
     task assert_env_propagates_caps_to_fabric();
