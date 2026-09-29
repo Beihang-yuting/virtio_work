@@ -120,7 +120,7 @@ disable fork;  // 杀死调用线程中的所有子进程!
 | `dpu_common` | `$DPU_COMMON_ROOT`（项目外 checkout） | DPU 全局拓扑、资源快照和寄存器计划 | 固定 SHA 的独立仓库 |
 
 本版本固定使用 `dpu_common@4d739965eb47d90b47cc048fc71fd8d7d76a77ca`、
-`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28`；PCIe TL VIP 使用项目外
+`host_mem@35ec087014744ec85cf6c0fe17e1f7118ee7a7b7`；PCIe TL VIP 使用项目外
 `pcie_work/main`（其 `pcie_tl_vip` 位于 `pcie_work/pcie_tl_vip`），并要求跟踪
 `origin/main`。`make check-deps` 会在编译前验证固定依赖以及 PCIe 的远程/分支契约。
 `dpu_common`、`host_mem` 和 `pcie_work` 不允许复制到本项目根目录，编译前必须分别设置
@@ -1767,7 +1767,7 @@ snapshot pair 保持不变。notify、MSI-X、port/route 和 scheduler builders 
 # 外部 host_mem
 export HOST_MEM_ROOT=/path/to/host_mem
 git -C "$HOST_MEM_ROOT" checkout --detach \
-  365b7553fc7dac6b4ad55886a8e4869153607c28
+  35ec087014744ec85cf6c0fe17e1f7118ee7a7b7
 
 # 外部 net_packet master
 export NET_PACKET_ROOT=/path/to/net_packet

@@ -1,12 +1,7 @@
-// All paths are relative to the repository root.
-// Compile host_mem_pkg before the PCIe package that imports it. The
-// virtio-net package includes host_mem_manager.sv and host_mem_pool.sv in its
-// own package scope; the pool must be visible before env configuration.
-// net_packet is sourced only from the external NET_PACKET_ROOT checkout.
-
-// net_packet is an external, independently versioned checkout.  Its UVM
-// wrappers are included inside virtio_net_pkg so packet_item is visible to
-// package-scoped dataplane classes without creating a second global copy.
+// 目录层次：filelists。外部 package 各编译一次，顺序为 net_packet、Host memory、
+// PCIe，最后编译本地 virtio_net_pkg；相同源码不可再以旧 filelist 或文本 include
+// 重复加入，否则 packet_item/host_mem_manager 会出现不同的类型身份。
+// NET_PACKET_ROOT 与 HOST_MEM_ROOT 由依赖检查解析，调用者管理其 checkout。
 +define+UVM
 +incdir+$NET_PACKET_ROOT/src
 +incdir+$NET_PACKET_ROOT/src/common
@@ -23,6 +18,7 @@
 +incdir+$NET_PACKET_ROOT/src/sequence
 +incdir+$NET_PACKET_ROOT/src/stream
 +incdir+$NET_PACKET_ROOT/src/uvm_wrapper
+$NET_PACKET_ROOT/src/net_packet_pkg.sv
 
 +incdir+$HOST_MEM_ROOT/src
 $HOST_MEM_ROOT/src/host_mem_pkg.sv

@@ -1,7 +1,11 @@
+// tests/：经真实 driver 流程验证多队列 TX；依赖 net_packet_pkg 的报文模板
+// 和 virtio_net_pkg 的共享 fixture。测试创建 packet_item，fixture 管理队列与
+// Host memory 句柄；仿真结束由 UVM 释放组件，不在本文件重复定义外部类。
 `ifndef VIRTIO_REAL_DRIVER_MULTI_QUEUE_TEST_SV
 `define VIRTIO_REAL_DRIVER_MULTI_QUEUE_TEST_SV
 
 import uvm_pkg::*;
+import net_packet_pkg::*;
 import virtio_net_pkg::*;
 `include "uvm_macros.svh"
 

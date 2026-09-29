@@ -32,6 +32,10 @@ if ! grep -Fq '+incdir+$NET_PACKET_ROOT/src' "$repo_root/filelists/virtio_net.f"
   echo "virtio filelist does not consume NET_PACKET_ROOT" >&2
   exit 1
 fi
+if ! grep -Fq '$NET_PACKET_ROOT/src/net_packet_pkg.sv' "$repo_root/filelists/virtio_net.f"; then
+  echo "virtio filelist does not compile the external net_packet package" >&2
+  exit 1
+fi
 if grep -Fq "$local_net_packet_path" "$repo_root/filelists/virtio_net.f"; then
   echo "virtio filelist still references the local net_packet extension" >&2
   exit 1
@@ -52,6 +56,7 @@ for script in "$repo_root/scripts/check_deps.sh" "$repo_root/scripts/bootstrap.s
     exit 1
   fi
   for source_file in \
+      src/net_packet_pkg.sv \
       src/core/packet.sv \
       src/uvm_wrapper/packet_item.sv \
       src/uvm_wrapper/packet_sequence.sv \

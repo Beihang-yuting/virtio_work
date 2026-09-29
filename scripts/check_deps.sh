@@ -12,7 +12,7 @@ dpu_common_revision="4d739965eb47d90b47cc048fc71fd8d7d76a77ca"
 dpu_common_url="https://github.com/Beihang-yuting/dpu_common.git"
 net_packet_url="https://github.com/Beihang-yuting/net_packet.git"
 pcie_work_url="https://github.com/Beihang-yuting/pcie_work.git"
-host_mem_revision="365b7553fc7dac6b4ad55886a8e4869153607c28"
+host_mem_revision="35ec087014744ec85cf6c0fe17e1f7118ee7a7b7"
 host_mem_url="https://github.com/Beihang-yuting/host_mem.git"
 
 # queue_work remains a separately versioned queue library.  It is required by
@@ -54,6 +54,7 @@ if [[ "$host_mem_root" == "$root_dir"/* ]]; then
 fi
 for source_file in \
     src/host_mem_pkg.sv \
+    src/host_mem_macros.svh \
     src/host_mem_manager.sv \
     src/host_mem_pool.sv \
     tb/host_mem_random_tb.sv; do
@@ -163,6 +164,8 @@ if [[ "$net_packet_root" == "$root_dir"/* ]]; then
 fi
 for source_file in \
     filelist.f \
+    filelist_pkg.f \
+    src/net_packet_pkg.sv \
     src/core/packet.sv \
     src/uvm_wrapper/packet_item.sv \
     src/uvm_wrapper/packet_sequence.sv \

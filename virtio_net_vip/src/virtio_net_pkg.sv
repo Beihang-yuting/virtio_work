@@ -1,10 +1,11 @@
 // =============================================================================
 // virtio_net_pkg.sv
-// Top-level package for the virtio-net UVM VIP.
-//
-// Import order: uvm_pkg, then external packages, then local sources in
-// dependency order (types -> shared -> iommu -> virtqueue -> transport ->
-// callbacks/transactions/agent -> dataplane -> sriov -> env -> sequences).
+// 目录层次：virtio_net_vip/src，virtio-net UVM VIP 的唯一 package 入口。
+// 先导入 net_packet_pkg、host_mem_pkg、PCIe 和资源包，再按类型、共享模型、
+// 队列、传输、agent、数据面、SR-IOV、环境和序列的依赖顺序纳入本地源码。
+// 外部 packet 与 Host memory 类只在各自 package 定义一次；本包复导出这些
+// 类型以兼容已使用 virtio_net_pkg::* 的调用端。对象仍由环境或调用者创建，
+// 本 package 不接管 packet、Host memory 或 PCIe 资源的生命周期。
 // =============================================================================
 
 `ifndef VIRTIO_NET_PKG_SV
@@ -15,19 +16,16 @@ package virtio_net_pkg;
   import uvm_pkg::*;
   `include "uvm_macros.svh"
 
+  import net_packet_pkg::*;
   import host_mem_pkg::*;
   import pcie_tl_pkg::*;
   import dpu_resource_pkg::*;
 
-  // External net_packet master is intentionally included in this package.
-  // This keeps packet_item/packet in the same visibility domain as the TX/RX
-  // adapter and avoids a duplicate compilation-unit definition.
-  `include "uvm_wrapper/packet_item.sv"
-  `include "uvm_wrapper/packet_sequence.sv"
-  `include "uvm_wrapper/protocol_seq_wrapper.sv"
+  // 既有外部测试只导入本包；复导出保持其类型名可见，类型身份仍由原包所有。
+  // 新接入项目也可直接 import net_packet_pkg::* 和 host_mem_pkg::*。
+  export net_packet_pkg::*;
+  export host_mem_pkg::*;
 
-  `include "host_mem_manager.sv"
-  `include "host_mem_pool.sv"
   `include "shared/host_mem_bar_reservation_importer.sv"
   `include "pcie/pcie_tl_dpu_reg_backend.sv"
 

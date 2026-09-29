@@ -1,7 +1,11 @@
+// tests/：经 DUT responder 边界验证真实 driver RX；依赖 net_packet_pkg 的
+// packet_item 和报文模板，以及 virtio_net_pkg 的共享 fixture。测试持有期望
+// 报文句柄，fixture 持有内存与队列资源；UVM 在仿真结束回收测试组件。
 `ifndef VIRTIO_REAL_DRIVER_RX_TEST_SV
 `define VIRTIO_REAL_DRIVER_RX_TEST_SV
 
 import uvm_pkg::*;
+import net_packet_pkg::*;
 import virtio_net_pkg::*;
 `include "uvm_macros.svh"
 

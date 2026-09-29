@@ -1,8 +1,12 @@
+// tests/：多队列报文端到端回归；依赖 net_packet_pkg 的报文类型与模板枚举，
+// 以及 virtio_net_pkg 的队列、TX/RX 引擎。测试拥有创建的 packet_item 和队列
+// 句柄，运行阶段由 UVM 管理；外部 package 各只编译一次以保持类型身份一致。
 `ifndef VIRTIO_NET_PACKET_MULTI_QUEUE_TEST_SV
 `define VIRTIO_NET_PACKET_MULTI_QUEUE_TEST_SV
 
 import uvm_pkg::*;
 `include "uvm_macros.svh"
+import net_packet_pkg::*;
 import virtio_net_pkg::*;
 
 // 中文说明：真实 net_packet 多队列数据面测试。

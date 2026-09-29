@@ -323,7 +323,7 @@ memory 在本工程中增加了随机布局与 reservation/pool 适配层：
 - Synopsys VCS（通过 `$VCS_HOME` 提供）和 UVM 1.2
 - 可访问外部依赖 checkout 的 Git 远端
 - 项目外 `host_mem` checkout（`HOST_MEM_ROOT`，固定提交
-  `365b7553fc7dac6b4ad55886a8e4869153607c28`）
+  `35ec087014744ec85cf6c0fe17e1f7118ee7a7b7`）
 - 项目外 `net_packet` master checkout（`NET_PACKET_ROOT`，工作树跟踪
   `origin/master`）
 - 独立的 `dpu_common` checkout（固定提交 `4d739965eb47d90b47cc048fc71fd8d7d76a77ca`）
@@ -348,7 +348,7 @@ $VCS_HOME/bin/vcs -ID
 export DPU_COMMON_ROOT=/home/ryan/workspace/ryan/dpu_common
 git -C "$DPU_COMMON_ROOT" checkout --detach 4d739965eb47d90b47cc048fc71fd8d7d76a77ca
 export HOST_MEM_ROOT=/home/ryan/workspace/ryan/host_mem
-git -C "$HOST_MEM_ROOT" checkout --detach 365b7553fc7dac6b4ad55886a8e4869153607c28
+git -C "$HOST_MEM_ROOT" checkout --detach 35ec087014744ec85cf6c0fe17e1f7118ee7a7b7
 export NET_PACKET_ROOT=/home/ryan/workspace/ryan/net_packet
 git -C "$NET_PACKET_ROOT" fetch origin master
 git -C "$NET_PACKET_ROOT" switch master 2>/dev/null || \
@@ -411,11 +411,14 @@ make test TEST=virtio_unit_test
 没有泄漏。`virtio_traffic_test` 和 `virtio_net_packet_multi_queue_test` 也从
 同一个 Host manager 分配 ring 和 packet buffer。
 
-`pcie_work/main` 和 `net_packet/master` 是项目外的滚动分支依赖，
-`host_mem@365b7553fc7dac6b4ad55886a8e4869153607c28` 仍固定以保证 Host-memory
-分配器接口稳定；其中 `host_mem` 提供 `host_mem_pkg.sv`、`host_mem_manager.sv` 和
-`host_mem_pool.sv`，PCIe package 由 `$PCIE_WORK_ROOT/pcie_tl_vip` 提供。构建前的
-分支/远程检查保证来源明确；实际的 VCS 编译和动态 UVM 回归结果仍取决于运行环境。
+`pcie_work/main` 和 `net_packet/master` 是项目外的滚动分支依赖，`host_mem`
+固定到受支持的提交。`filelists/virtio_net.f` 先编译
+`$NET_PACKET_ROOT/src/net_packet_pkg.sv` 和 `$HOST_MEM_ROOT/src/host_mem_pkg.sv`，
+再编译 PCIe 与本地 virtio package。外部单独的 SV 文件应在使用类型的作用域中
+`import net_packet_pkg::*;` 或 `import host_mem_pkg::*;`；宏需显式 include 对应
+`.svh`，package import 不会导入宏。不能在同一构建中再编译旧
+`net_packet/filelist.f`，也不能重复 include `host_mem_manager.sv` 或
+`host_mem_pool.sv`，否则类可能形成不同的类型身份。
 
 ---
 
