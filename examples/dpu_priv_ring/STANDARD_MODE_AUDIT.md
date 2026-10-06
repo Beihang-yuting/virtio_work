@@ -65,6 +65,11 @@ RTL 完成写回约定核实。这里复现的是 C 谓词，不是宣称已经�
 触发条件：VERSION_1=1、MRG_RXBUF=0、HASH_REPORT=0。影响 TX header 描述符长度
 以及 RX payload 起点。这是 VIP 标准路径问题，与 DPU 直接使用原始帧的差异分开处理。
 
+**状态（2026-10-06）：已修复。** `get_hdr_size()` 在 VERSION_1 或 MRG_RXBUF 时返回 12；
+`num_buffers` 仅在协商 MRG_RXBUF 时用于合包（atomic ops 与 RX engine 两条路径）。
+回归：`virtio_protocol_test` 覆盖 10/12/20B 尺寸，`virtio_indirect_desc_test` 覆盖
+VERSION_1 TX header 描述符 12B 及无 MRG_RXBUF 时 RX 不合包。
+
 ### 3. VIP 的 packed 通知传入包数和固定 wrap
 
 [virtio_atomic_ops.sv](../../virtio_net_vip/src/agent/virtio_atomic_ops.sv) 的
@@ -75,6 +80,11 @@ wrap 也不能固定为 0。
 首圈一次普通 TX 使用 header+payload 两条描述符时，下一槽应为 2、wrap 应为 1，
 当前生产调用传入 1/0。协商 NOTIFICATION_DATA 后会形成错误的 32bit 通知内容；
 未协商该特性时只写 qid，此问题不会体现在通知数据中。
+
+**状态（2026-10-06）：已修复。** virtqueue 新增 `get_notify_next_idx()/get_notify_wrap()`：
+split 返回 `avail_idx`，packed 返回下一描述符槽及驱动 wrap counter，自定义队列保持原值。
+atomic ops 的 TX、RX refill、Admin VQ、control VQ 通知均改用该游标。
+回归：`virtio_indirect_desc_test` 校验 split 1/0、packed 首包 2/1、回绕后 0/0。
 
 ## 验证边界与后续接入
 

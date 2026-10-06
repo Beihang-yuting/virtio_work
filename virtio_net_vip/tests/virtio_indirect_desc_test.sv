@@ -113,6 +113,10 @@ class virtio_indirect_desc_test_transport extends virtio_pci_transport;
     `uvm_object_utils(virtio_indirect_desc_test_transport)
 
     int unsigned kick_count;
+    // Last notify arguments, so production callers' cursor can be checked.
+    int unsigned last_kick_queue_id;
+    int unsigned last_kick_next_avail_idx;
+    bit          last_kick_wrap_counter;
 
     function new(string name = "virtio_indirect_desc_test_transport");
         super.new(name);
@@ -121,6 +125,9 @@ class virtio_indirect_desc_test_transport extends virtio_pci_transport;
 
     virtual task kick(int unsigned queue_id, int unsigned next_avail_idx, bit wrap_counter);
         kick_count++;
+        last_kick_queue_id       = queue_id;
+        last_kick_next_avail_idx = next_avail_idx;
+        last_kick_wrap_counter   = wrap_counter;
     endtask
 endclass : virtio_indirect_desc_test_transport
 
@@ -160,6 +167,8 @@ class virtio_indirect_desc_test extends uvm_test;
         test_dataplane_tx_indirect_feature_gate();
         test_dataplane_tx_queue_full_cleanup();
         test_atomic_tx_queue_full_cleanup();
+        test_atomic_notify_cursor();
+        test_atomic_rx_num_buffers_without_mrg();
 
         shared_mem.leak_check();
 
@@ -877,6 +886,214 @@ class virtio_indirect_desc_test extends uvm_test;
         vq.free_rings();
 
         `uvm_info("INDIRECT_TEST", "dataplane TX queue-full cleanup test PASSED", UVM_LOW)
+    endtask
+
+    // Production atomic TX must notify with the ring cursor, not the number
+    // of submitted chains: split passes avail_idx, packed passes the next
+    // descriptor slot plus the driver wrap counter.  It also checks that the
+    // modern (VERSION_1) header descriptor is 12 bytes.
+    task test_atomic_notify_cursor();
+        host_mem_manager mem;
+        virtio_iommu_model iommu = virtio_iommu_model::type_id::create("cursor_iommu");
+        virtio_memory_barrier_model barrier =
+            virtio_memory_barrier_model::type_id::create("cursor_barrier");
+        virtqueue_error_injector err_inj =
+            virtqueue_error_injector::type_id::create("cursor_err_inj");
+        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("cursor_wait_pol");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("cursor_vq_mgr");
+        virtio_indirect_desc_test_transport transport =
+            virtio_indirect_desc_test_transport::type_id::create("cursor_transport");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("cursor_ops");
+        virtqueue_base base_vq;
+        split_virtqueue split_vq;
+        packed_virtqueue packed_vq;
+        virtio_net_hdr_t net_hdr;
+        uvm_event token0, token1, token2;
+        uvm_object completed[$];
+        int unsigned desc_id0, desc_id1, split_desc;
+        int unsigned budget;
+        bit [63:0] addr;
+        bit [31:0] len;
+        bit [15:0] id;
+        bit [15:0] flags;
+
+        mem = shared_mem;
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.barrier = barrier;
+        vq_mgr.err_inj = err_inj;
+        vq_mgr.wait_pol = wait_pol;
+        vq_mgr.bdf = 16'h0704;
+        base_vq = vq_mgr.create_queue(0, 16, VQ_SPLIT);
+        assert($cast(split_vq, base_vq))
+            else `uvm_fatal("INDIRECT_TEST", "failed to create cursor split queue")
+        split_vq.alloc_rings();
+        base_vq = vq_mgr.create_queue(1, 4, VQ_PACKED);
+        assert($cast(packed_vq, base_vq))
+            else `uvm_fatal("INDIRECT_TEST", "failed to create cursor packed queue")
+        packed_vq.alloc_rings();
+
+        transport.bdf = 16'h0704;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = wait_pol;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        token0 = new("cursor_token0");
+        token1 = new("cursor_token1");
+        token2 = new("cursor_token2");
+        net_hdr = '{default: 0};
+
+        // Split: one header+payload chain publishes avail_idx 1.
+        ops.tx_submit(0, net_hdr, token0, 1'b0, split_desc);
+        assert(split_desc != '1 && transport.last_kick_queue_id == 0 &&
+               transport.last_kick_next_avail_idx == 1 &&
+               transport.last_kick_wrap_counter == 1'b0)
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "split notify cursor next=%0d wrap=%0b, expected 1/0",
+                transport.last_kick_next_avail_idx, transport.last_kick_wrap_counter))
+        read_desc(mem, split_vq.desc_table_addr, split_desc, addr, len, flags, id);
+        assert(len == 12)
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "VERSION_1 TX header descriptor len=%0d, expected 12", len))
+
+        // Packed size 4: first two-descriptor chain stops at slot 2 in the
+        // initial wrap (1); the second fills the ring and wraps to 0/0.
+        ops.tx_submit(1, net_hdr, token1, 1'b0, desc_id0);
+        assert(desc_id0 != '1 && transport.last_kick_queue_id == 1 &&
+               transport.last_kick_next_avail_idx == 2 &&
+               transport.last_kick_wrap_counter == 1'b1)
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "packed notify cursor next=%0d wrap=%0b, expected 2/1",
+                transport.last_kick_next_avail_idx, transport.last_kick_wrap_counter))
+        read_packed_desc(mem, packed_vq.desc_table_addr, 0, addr, len, id, flags);
+        assert(len == 12)
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "VERSION_1 packed TX header descriptor len=%0d, expected 12", len))
+        ops.tx_submit(1, net_hdr, token2, 1'b0, desc_id1);
+        assert(desc_id1 != '1 &&
+               transport.last_kick_next_avail_idx == 0 &&
+               transport.last_kick_wrap_counter == 1'b0)
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "packed wrapped notify cursor next=%0d wrap=%0b, expected 0/0",
+                transport.last_kick_next_avail_idx, transport.last_kick_wrap_counter))
+
+        complete_split(mem, split_vq, split_desc, 0);
+        budget = 1;
+        ops.tx_complete(0, completed, budget);
+        complete_packed(mem, packed_vq, 0);
+        complete_packed(mem, packed_vq, 2);
+        budget = 2;
+        ops.tx_complete(1, completed, budget);
+        assert(completed.size() == 3 && iommu.total_maps == iommu.total_unmaps)
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "notify cursor TX completion left %0d packets, maps=%0d unmaps=%0d",
+                completed.size(), iommu.total_maps, iommu.total_unmaps))
+        split_vq.free_rings();
+        packed_vq.free_rings();
+
+        `uvm_info("INDIRECT_TEST", "atomic notify cursor test PASSED", UVM_LOW)
+    endtask
+
+    // VERSION_1 without MRG_RXBUF carries num_buffers in the 12-byte header,
+    // but only MRG_RXBUF gives it meaning.  A non-1 value must not make the
+    // driver consume extra used entries as continuation buffers.
+    task test_atomic_rx_num_buffers_without_mrg();
+        host_mem_manager mem;
+        virtio_iommu_model iommu = virtio_iommu_model::type_id::create("rx_nomrg_iommu");
+        virtio_memory_barrier_model barrier =
+            virtio_memory_barrier_model::type_id::create("rx_nomrg_barrier");
+        virtqueue_error_injector err_inj =
+            virtqueue_error_injector::type_id::create("rx_nomrg_err_inj");
+        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("rx_nomrg_wait_pol");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("rx_nomrg_vq_mgr");
+        virtio_indirect_desc_test_transport transport =
+            virtio_indirect_desc_test_transport::type_id::create("rx_nomrg_transport");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("rx_nomrg_ops");
+        virtqueue_base base_vq;
+        split_virtqueue vq;
+        uvm_object received[$];
+        byte frame[];
+        iommu_fault_e fault;
+        bit [63:0] addr;
+        bit [31:0] len;
+        bit [15:0] flags;
+        bit [15:0] next;
+        int unsigned budget;
+
+        mem = shared_mem;
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.barrier = barrier;
+        vq_mgr.err_inj = err_inj;
+        vq_mgr.wait_pol = wait_pol;
+        vq_mgr.bdf = 16'h0705;
+        base_vq = vq_mgr.create_queue(0, 16, VQ_SPLIT);
+        assert($cast(vq, base_vq))
+            else `uvm_fatal("INDIRECT_TEST", "failed to create RX split queue")
+        vq.alloc_rings();
+
+        transport.bdf = 16'h0705;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = wait_pol;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+
+        ops.rx_refill(0, 2);
+        assert(vq.get_pending_count() == 2)
+            else `uvm_fatal("INDIRECT_TEST", "RX refill did not post two buffers")
+
+        // Device writes a 12-byte header with num_buffers=2 and a 64-byte
+        // frame into buffer 0, then completes only that buffer.
+        read_desc(mem, vq.desc_table_addr, 0, addr, len, flags, next);
+        frame = new[12 + 64];
+        foreach (frame[i]) frame[i] = 8'h00;
+        frame[10] = 8'h02;
+        for (int unsigned i = 12; i < frame.size(); i++) frame[i] = i[7:0];
+        assert(iommu.write_from_device_for_host(0, mem, 16'h0705, addr, frame, fault))
+            else `uvm_fatal("INDIRECT_TEST", "device RX write failed")
+        complete_split(mem, vq, 0, frame.size());
+
+        budget = 4;
+        ops.rx_receive(0, received, budget);
+        assert(received.size() == 1 && vq.get_pending_count() == 1)
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "RX without MRG_RXBUF received=%0d pending=%0d, expected 1/1",
+                received.size(), vq.get_pending_count()))
+
+        // Complete the second buffer as used entry 1 so its DMA retires
+        // through the normal receive path.
+        begin
+            byte used_entry[];
+            byte used_idx[];
+
+            read_desc(mem, vq.desc_table_addr, 1, addr, len, flags, next);
+            frame[10] = 8'h01;
+            assert(iommu.write_from_device_for_host(0, mem, 16'h0705, addr, frame, fault))
+                else `uvm_fatal("INDIRECT_TEST", "device RX write failed")
+            used_entry = new[8];
+            used_entry[0] = 8'h01;
+            for (int unsigned i = 1; i < 4; i++) used_entry[i] = 8'h00;
+            for (int unsigned i = 0; i < 4; i++)
+                used_entry[i+4] = frame.size() >> (i * 8);
+            used_idx = new[2];
+            used_idx[0] = 8'h02;
+            used_idx[1] = 8'h00;
+            mem.write_mem(vq.device_ring_addr + 4 + 8, used_entry);
+            mem.write_mem(vq.device_ring_addr + 2, used_idx);
+        end
+        budget = 4;
+        ops.rx_receive(0, received, budget);
+        assert(received.size() == 2 && vq.get_pending_count() == 0)
+            else `uvm_fatal("INDIRECT_TEST", "second RX buffer was not received")
+        vq.free_rings();
+        assert(iommu.total_maps == iommu.total_unmaps)
+            else `uvm_fatal("INDIRECT_TEST", "RX num_buffers test leaked mappings")
+
+        `uvm_info("INDIRECT_TEST", "atomic RX num_buffers without MRG_RXBUF test PASSED", UVM_LOW)
     endtask
 
 endclass : virtio_indirect_desc_test

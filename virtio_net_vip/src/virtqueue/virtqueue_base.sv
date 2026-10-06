@@ -188,6 +188,16 @@ virtual class virtqueue_base extends uvm_object;
     pure virtual function int unsigned get_pending_count();
     pure virtual function bit          needs_notification();
 
+    // 通知数据游标（NOTIFICATION_DATA）：next_idx 为驱动下一个发布位置，
+    // wrap 为 packed 驱动侧 wrap counter。split/packed 各自覆盖；自定义队列
+    // 无标准游标，默认沿用已投递 chain 数且 wrap=0。
+    virtual function int unsigned get_notify_next_idx();
+        return total_add_buf_ops;
+    endfunction
+    virtual function bit get_notify_wrap();
+        return 1'b0;
+    endfunction
+
     // 队列托管 DMA 映射：dma_map_buf 用本队列的 {host_id, bdf} 域把调用方的
     // GPA 映射为 IOVA 并登记到 dma_mappings（GPA 所有权仍归调用方），返回
     // IOVA；dma_unmap_buf 按 IOVA 解除映射并注销登记。经此登记的映射才会被

@@ -800,6 +800,10 @@ class virtio_real_driver_flow_fixture extends uvm_component;
                 "transport did not reach DRIVER_OK (status=0x%02h)", status))
             return;
         end
+        // The transport negotiated directly, so give the atomic ops the same
+        // feature view; it sizes the virtio-net header from these bits.
+        function_instance.driver_agent.ops.negotiated_features =
+            function_instance.transport.driver_features;
         // Keep the shared FSM's lifecycle view consistent for callers that
         // inspect it, without invoking virtio_auto_fsm.full_init(), whose
         // queue-setup stage would allocate rings a second time.

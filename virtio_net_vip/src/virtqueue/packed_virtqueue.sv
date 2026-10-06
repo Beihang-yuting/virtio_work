@@ -601,6 +601,15 @@ class packed_virtqueue extends virtqueue_base;
         return queue_size - free_id_list.size();
     endfunction
 
+    // Packed notification data carries the next descriptor slot and the
+    // driver wrap counter, not the number of published chains.
+    virtual function int unsigned get_notify_next_idx();
+        return next_avail_idx;
+    endfunction
+    virtual function bit get_notify_wrap();
+        return avail_wrap_counter;
+    endfunction
+
     // ------------------------------------------------------------------
     // needs_notification -- Check device event suppression flags
     //

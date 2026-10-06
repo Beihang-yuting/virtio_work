@@ -553,6 +553,11 @@ class split_virtqueue extends virtqueue_base;
         return queue_size - num_free;
     endfunction
 
+    // Split notification data carries the free-running avail->idx.
+    virtual function int unsigned get_notify_next_idx();
+        return avail_idx;
+    endfunction
+
     // ------------------------------------------------------------------
     // needs_notification -- Check if device needs a kick
     //

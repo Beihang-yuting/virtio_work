@@ -1078,7 +1078,8 @@ class virtio_atomic_ops extends uvm_object;
             // descriptor corruption is consumed only by legacy callers that
             // invoke kick() directly and never reaches normal TX flows.
             void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
-            transport.kick(queue_id, vq.total_add_buf_ops, 0);
+            transport.kick(queue_id, vq.get_notify_next_idx(),
+                           vq.get_notify_wrap());
             void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
         end
 
@@ -1218,7 +1219,8 @@ class virtio_atomic_ops extends uvm_object;
             // Mirror tx_submit(): rx_refill also bypasses virtqueue::kick()
             // and emits the notify through the PCI transport directly.
             void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
-            transport.kick(queue_id, vq.total_add_buf_ops, 0);
+            transport.kick(queue_id, vq.get_notify_next_idx(),
+                           vq.get_notify_wrap());
             void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
         end
 
@@ -1277,7 +1279,10 @@ class virtio_atomic_ops extends uvm_object;
                                                 negotiated_features, net_hdr);
                 for (int unsigned i = hdr_size; i < buf_data.size(); i++)
                     payload.push_back(buf_data[i]);
-                num_buffers = (net_hdr.num_buffers == 0) ? 1 :
+                // Only MRG_RXBUF gives num_buffers meaning; a VERSION_1
+                // header carries the field for a single-buffer packet.
+                num_buffers = ((net_hdr.num_buffers == 0) ||
+                               !negotiated_features[VIRTIO_NET_F_MRG_RXBUF]) ? 1 :
                               net_hdr.num_buffers;
                 retire_normal_dma_record(record);
 
@@ -1493,7 +1498,8 @@ class virtio_atomic_ops extends uvm_object;
                     void'(admin_context.vq.process_error_injection(
                         VQ_FAULT_PRE_NOTIFY));
                     admin_context.transport.kick(admin_context.queue_id,
-                                                 admin_context.vq.total_add_buf_ops, 0);
+                                                 admin_context.vq.get_notify_next_idx(),
+                                                 admin_context.vq.get_notify_wrap());
                     void'(admin_context.vq.process_error_injection(
                         VQ_FAULT_POST_NOTIFY));
 
@@ -1718,7 +1724,8 @@ class virtio_atomic_ops extends uvm_object;
         // 6. Kick control queue
         if (ctrl_vq.needs_notification()) begin
             void'(ctrl_vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
-            transport.kick(ctrl_qid, ctrl_vq.total_add_buf_ops, 0);
+            transport.kick(ctrl_qid, ctrl_vq.get_notify_next_idx(),
+                           ctrl_vq.get_notify_wrap());
             void'(ctrl_vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
         end
 

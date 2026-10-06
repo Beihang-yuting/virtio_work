@@ -84,9 +84,8 @@ class virtio_protocol_test extends uvm_test;
         byte unsigned packed_data[$];
         bit [63:0] features;
 
-        // Basic header (10 bytes)
+        // Legacy basic header (10 bytes): no VERSION_1, MRG_RXBUF or HASH_REPORT
         features = 0;
-        features[VIRTIO_F_VERSION_1] = 1;
 
         hdr_in.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
         hdr_in.gso_type = VIRTIO_NET_HDR_GSO_TCPV4;
@@ -112,6 +111,24 @@ class virtio_protocol_test extends uvm_test;
         assert(hdr_out.gso_size == hdr_in.gso_size) else `uvm_error("TEST", "gso_size mismatch")
         assert(hdr_out.csum_start == hdr_in.csum_start) else `uvm_error("TEST", "csum_start mismatch")
         assert(hdr_out.csum_offset == hdr_in.csum_offset) else `uvm_error("TEST", "csum_offset mismatch")
+
+        // Modern header (12 bytes): VERSION_1 alone uses struct virtio_net_hdr_v1,
+        // which always carries num_buffers even without MRG_RXBUF.
+        packed_data = {};  // clear queue
+        features[VIRTIO_F_VERSION_1] = 1;
+        hdr_in.num_buffers = 16'd1;
+
+        assert(virtio_net_hdr_util::get_hdr_size(features) == 12)
+            else `uvm_error("TEST", "VERSION_1 hdr size should be 12")
+
+        virtio_net_hdr_util::pack_hdr(hdr_in, features, packed_data);
+        assert(packed_data.size() == 12)
+            else `uvm_error("TEST", $sformatf("VERSION_1 packed size %0d != 12", packed_data.size()))
+
+        virtio_net_hdr_util::unpack_hdr(packed_data, features, hdr_out);
+        assert(hdr_out.csum_offset == hdr_in.csum_offset &&
+               hdr_out.num_buffers == 16'd1)
+            else `uvm_error("TEST", "VERSION_1 header field mismatch")
 
         // MRG_RXBUF header (12 bytes)
         packed_data = {};  // clear queue

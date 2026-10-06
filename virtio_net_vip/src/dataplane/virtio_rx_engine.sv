@@ -325,7 +325,9 @@ class virtio_rx_engine extends uvm_object;
 
             // 7. Merge additional buffers if num_buffers > 1
             num_bufs = net_hdr.num_buffers;
-            if (num_bufs == 0)
+            // num_buffers is only meaningful with MRG_RXBUF; a VERSION_1
+            // header carries the field but the packet is always one buffer.
+            if (num_bufs == 0 || !negotiated_features[VIRTIO_NET_F_MRG_RXBUF])
                 num_bufs = 1;  // Spec says 0 means 1 for legacy
 
             if (num_bufs > 1) begin

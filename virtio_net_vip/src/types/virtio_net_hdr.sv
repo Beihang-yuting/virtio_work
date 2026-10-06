@@ -7,9 +7,9 @@
 // Utility class providing static methods for serializing and deserializing
 // virtio_net_hdr_t to/from little-endian byte arrays. Header size depends
 // on negotiated features:
-//   - 10 bytes  : basic header (flags, gso_type, hdr_len, gso_size,
-//                               csum_start, csum_offset)
-//   - 12 bytes  : + num_buffers  (VIRTIO_NET_F_MRG_RXBUF)
+//   - 10 bytes  : legacy basic header (flags, gso_type, hdr_len, gso_size,
+//                                      csum_start, csum_offset)
+//   - 12 bytes  : + num_buffers  (VIRTIO_NET_F_MRG_RXBUF or VIRTIO_F_VERSION_1)
 //   - 20 bytes  : + hash_value, hash_report (VIRTIO_NET_F_HASH_REPORT)
 // ============================================================================
 
@@ -24,7 +24,7 @@ class virtio_net_hdr_util;
     static function int unsigned get_hdr_size(bit [63:0] features);
         if (features[VIRTIO_NET_F_HASH_REPORT])
             return 20;
-        else if (features[VIRTIO_NET_F_MRG_RXBUF])
+        else if (features[VIRTIO_NET_F_MRG_RXBUF] || features[VIRTIO_F_VERSION_1])
             return 12;
         else
             return 10;
@@ -41,7 +41,7 @@ class virtio_net_hdr_util;
     //   [5:4]    gso_size      (16-bit LE)
     //   [7:6]    csum_start    (16-bit LE)
     //   [9:8]    csum_offset   (16-bit LE)
-    //  (if MRG_RXBUF or HASH_REPORT)
+    //  (if VERSION_1, MRG_RXBUF or HASH_REPORT)
     //   [11:10]  num_buffers   (16-bit LE)
     //  (if HASH_REPORT)
     //   [15:12]  hash_value    (32-bit LE)

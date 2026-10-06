@@ -166,6 +166,10 @@ class virtio_resource_topology_probe extends virtio_net_env;
         device_snapshot = exact_device_snapshot;
         resource_snapshot = exact_resource_snapshot;
         device_resource_manager = exact_manager;
+        // build_phase is skipped, so supply the default env config the
+        // topology builder reads: no service whitelist, no Host scope.
+        if (cfg == null)
+            cfg = virtio_net_env_config::type_id::create("topology_probe_cfg");
         return build_snapshot_topology(why);
     endfunction
 endclass : virtio_resource_topology_probe
