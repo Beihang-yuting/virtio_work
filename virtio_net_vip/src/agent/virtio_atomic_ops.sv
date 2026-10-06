@@ -120,6 +120,25 @@ class virtio_atomic_ops extends uvm_object;
         void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
     endtask
 
+    // 把 buffer set 中的全部缓冲按添加顺序转成普通 DMA 所有权记录，追加到
+    // records，然后让 set 放弃所有权。之后只由完成路径或已确认的设备复位退休。
+    // 调用方保证每一项都已映射（只在 add_buf 成功后调用）。
+    protected function void adopt_dma_set(
+        virtio_dma_buffer_set   dma_set,
+        ref normal_dma_record_t records[$]
+    );
+        normal_dma_record_t record;
+
+        for (int unsigned i = 0; i < dma_set.count(); i++) begin
+            record.host_id = dma_set.get_host_id();
+            record.bdf     = dma_set.get_bdf();
+            record.gpa     = dma_set.get_gpa(i);
+            record.iova    = dma_set.get_iova(i);
+            records.push_back(record);
+        end
+        dma_set.disown();
+    endfunction
+
     // Device-side writers must use this completed-write boundary instead of
     // calling IOMMU translate() followed by host_mem.write_mem().  It commits
     // bytes first and lets the IOMMU preserve a migration generation payload
@@ -926,18 +945,15 @@ class virtio_atomic_ops extends uvm_object;
         int unsigned     hdr_dma_size;
         int unsigned     pkt_size;
         int unsigned     pkt_dma_size;
-        bit [63:0]       hdr_gpa;
-        bit [63:0]       pkt_gpa;
-        bit [63:0]       hdr_iova;
-        bit [63:0]       pkt_iova;
+        int              hdr_idx;
+        int              pkt_idx;
         virtio_sg_list   sgs[2];
         virtio_sg_entry  hdr_entry;
         virtio_sg_entry  pkt_entry;
-        int unsigned     result;
         byte             hdr_data[];
         byte             pkt_data[];
-        normal_dma_record_t dma_record;
         byte unsigned    wire_bytes[$];
+        virtio_dma_buffer_set dma_set;
 
         desc_id = '1;
         if (use_indirect &&
@@ -989,18 +1005,14 @@ class virtio_atomic_ops extends uvm_object;
         // the 64-byte minimum frame.
         pkt_dma_size = (pkt_size + 3) & ~3;
 
-        // 3. Allocate host_mem for hdr + data buffers
-        hdr_gpa = mem.alloc(hdr_dma_size, .align(1));
-        if (hdr_gpa == '1) begin
-            `uvm_error("ATOMIC_OPS",
-                $sformatf("tx_submit: host_mem alloc failed for queue %0d", queue_id))
-            return;
-        end
-        pkt_gpa = mem.alloc(pkt_dma_size, .align(1));
-        if (pkt_gpa == '1) begin
-            // No DMA mapping or descriptor owns the header yet, so rollback
-            // the sole successful allocation exactly once.
-            mem.free(hdr_gpa);
+        // 3. Allocate host_mem for hdr + data buffers.  A failed second
+        //    allocation rolls back the first; nothing is mapped yet.
+        dma_set = new("tx_dma");
+        dma_set.bind_domain(mem, iommu, get_iommu_host_id(transport), transport.bdf);
+        hdr_idx = dma_set.alloc(hdr_dma_size);
+        pkt_idx = (hdr_idx < 0) ? -1 : dma_set.alloc(pkt_dma_size);
+        if (pkt_idx < 0) begin
+            dma_set.release_all();
             `uvm_error("ATOMIC_OPS",
                 $sformatf("tx_submit: host_mem alloc failed for queue %0d", queue_id))
             return;
@@ -1009,79 +1021,51 @@ class virtio_atomic_ops extends uvm_object;
         // 4. Write hdr and data to host_mem
         hdr_data = new[hdr_size];
         foreach (hdr_bytes[i]) hdr_data[i] = hdr_bytes[i];
-        mem.write_mem(hdr_gpa, hdr_data);
+        dma_set.write(hdr_idx, hdr_data);
 
         if (pkt_bytes.size() > 0) begin
             pkt_data = new[pkt_size];
             foreach (pkt_bytes[i]) pkt_data[i] = pkt_bytes[i];
-            mem.write_mem(pkt_gpa, pkt_data);
+            dma_set.write(pkt_idx, pkt_data);
         end
 
         // 5. Map through IOMMU (DMA_TO_DEVICE -- device reads these buffers)
-        hdr_iova = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, hdr_gpa, hdr_dma_size, DMA_TO_DEVICE);
-        if ((hdr_iova == '1) || (hdr_iova == 0)) begin
-            mem.free(hdr_gpa);
-            mem.free(pkt_gpa);
+        if (!dma_set.map(hdr_idx, DMA_TO_DEVICE)) begin
+            dma_set.release_all();
             `uvm_error("ATOMIC_OPS", $sformatf(
                 "tx_submit: failed to map header for queue %0d", queue_id))
             return;
         end
-        pkt_iova = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, pkt_gpa, pkt_dma_size, DMA_TO_DEVICE);
-        if ((pkt_iova == '1) || (pkt_iova == 0)) begin
-            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
-                                 hdr_iova);
-            mem.free(hdr_gpa);
-            mem.free(pkt_gpa);
+        if (!dma_set.map(pkt_idx, DMA_TO_DEVICE)) begin
+            dma_set.release_all();
             `uvm_error("ATOMIC_OPS", $sformatf(
                 "tx_submit: failed to map payload for queue %0d", queue_id))
             return;
         end
 
-        // Track the complete DMA ownership pairs for completion/reset.
-        if (!tx_dma_map.exists(queue_id))
-            tx_dma_map[queue_id] = {};
-        dma_record.host_id = get_iommu_host_id(transport);
-        dma_record.bdf = transport.bdf;
-        dma_record.gpa = hdr_gpa;
-        dma_record.iova = hdr_iova;
-        tx_dma_map[queue_id].push_back(dma_record);
-        dma_record.host_id = get_iommu_host_id(transport);
-        dma_record.bdf = transport.bdf;
-        dma_record.gpa = pkt_gpa;
-        dma_record.iova = pkt_iova;
-        tx_dma_map[queue_id].push_back(dma_record);
-
         // 6. Build scatter-gather lists: [hdr_sg(out)] [data_sg(out)]
-        hdr_entry.addr = hdr_iova;
+        hdr_entry.addr = dma_set.get_iova(hdr_idx);
         hdr_entry.len  = hdr_size;
         sgs[0].entries.push_back(hdr_entry);
 
-        pkt_entry.addr = pkt_iova;
+        pkt_entry.addr = dma_set.get_iova(pkt_idx);
         pkt_entry.len  = pkt_size;
         sgs[1].entries.push_back(pkt_entry);
 
-        // 7. Add buffers to virtqueue (n_out=2, n_in=0)
-        result = vq.add_buf(sgs, 2, 0, pkt, use_indirect);
-        desc_id = result;
-
-        // The data buffers belong to this operation, not to add_buf().  A
-        // rejected chain must not remain in the completion map or reach the
-        // notification path.
-        if (result == '1) begin
-            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
-                                 hdr_iova);
-            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
-                                 pkt_iova);
-            mem.free(hdr_gpa);
-            mem.free(pkt_gpa);
-            tx_dma_map[queue_id].pop_back();
-            tx_dma_map[queue_id].pop_back();
-            if (tx_dma_map[queue_id].size() == 0)
-                tx_dma_map.delete(queue_id);
+        // 7. Add buffers to virtqueue (n_out=2, n_in=0).  The data buffers
+        //    belong to this operation, not to add_buf(); a rejected chain
+        //    rolls back and never reaches the completion map or notify path.
+        desc_id = vq.add_buf(sgs, 2, 0, pkt, use_indirect);
+        if (desc_id == '1) begin
+            dma_set.release_all();
             return;
         end
+
+        // Hand both ownership records (hdr first, matching tx_complete's
+        // two-per-packet retirement) to completion/reset before notifying.
+        if (!tx_dma_map.exists(queue_id))
+            tx_dma_map[queue_id] = {};
+        adopt_dma_set(dma_set, tx_dma_map[queue_id]);
 
         // 8. Kick if device needs notification
         if (vq.needs_notification())
@@ -1089,7 +1073,7 @@ class virtio_atomic_ops extends uvm_object;
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("tx_submit: queue_id=%0d desc_id=%0d hdr_iova=0x%016h pkt_iova=0x%016h",
-                      queue_id, desc_id, hdr_iova, pkt_iova), UVM_HIGH)
+                      queue_id, desc_id, hdr_entry.addr, pkt_entry.addr), UVM_HIGH)
     endtask
 
     // ------------------------------------------------------------------------
@@ -1152,6 +1136,7 @@ class virtio_atomic_ops extends uvm_object;
         int unsigned     buf_dma_size;
         int unsigned     hdr_size;
         int unsigned     filled = 0;
+        virtio_dma_buffer_set dma_set;
 
         vq = vq_mgr.get_queue(queue_id);
         if (vq == null) return;
@@ -1164,60 +1149,51 @@ class virtio_atomic_ops extends uvm_object;
             buf_size = hdr_size + 1514;
         buf_dma_size = (buf_size + 3) & ~3;
 
+        // 每个 buffer 是一次独立提交：成功后所有权转入 rx_dma_map，集合清空复用。
+        dma_set = new("rx_dma");
+        dma_set.bind_domain(mem, iommu, get_iommu_host_id(transport), transport.bdf);
+
         while (filled < num_bufs && vq.get_free_count() > 0) begin
-            bit [63:0]       buf_gpa;
-            bit [63:0]       buf_iova;
+            int              buf_idx;
             virtio_sg_list   sgs[1];
             virtio_sg_entry  buf_entry;
             int unsigned     result;
-            normal_dma_record_t dma_record;
 
             // Allocate RX buffer from host memory
-            buf_gpa = mem.alloc(buf_dma_size, .align(1));
-            if (buf_gpa == '1) begin
+            buf_idx = dma_set.alloc(buf_dma_size);
+            if (buf_idx < 0) begin
                 `uvm_warning("ATOMIC_OPS",
                     $sformatf("rx_refill: host_mem alloc failed at buffer %0d", filled))
                 break;
             end
 
             // Zero-fill the buffer
-            mem.mem_set(buf_gpa, 0, buf_dma_size);
+            dma_set.fill(buf_idx, 8'h00);
 
             // Map through IOMMU (DMA_FROM_DEVICE -- device writes to this buffer)
-            buf_iova = iommu.map_for_host(get_iommu_host_id(transport),
-                transport.bdf, buf_gpa, buf_dma_size, DMA_FROM_DEVICE);
-            if ((buf_iova == '1) || (buf_iova == 0)) begin
-                mem.free(buf_gpa);
+            if (!dma_set.map(buf_idx, DMA_FROM_DEVICE)) begin
+                dma_set.release_all();
                 `uvm_error("ATOMIC_OPS", $sformatf(
                     "rx_refill: failed to map buffer %0d for queue %0d",
                     filled, queue_id))
                 break;
             end
 
-            // Track the complete DMA ownership pair for completion/reset.
-            if (!rx_dma_map.exists(queue_id))
-                rx_dma_map[queue_id] = {};
-            dma_record.host_id = get_iommu_host_id(transport);
-            dma_record.bdf = transport.bdf;
-            dma_record.gpa = buf_gpa;
-            dma_record.iova = buf_iova;
-            rx_dma_map[queue_id].push_back(dma_record);
-
             // Build sg: single device-writable buffer (n_out=0, n_in=1)
-            buf_entry.addr = buf_iova;
+            buf_entry.addr = dma_set.get_iova(buf_idx);
             buf_entry.len  = buf_size;
             sgs[0].entries.push_back(buf_entry);
 
             result = vq.add_buf(sgs, 0, 1, null, 0);
             if (result == '1) begin
-                iommu.unmap_for_host(get_iommu_host_id(transport),
-                                     transport.bdf, buf_iova);
-                mem.free(buf_gpa);
-                rx_dma_map[queue_id].pop_back();
-                if (rx_dma_map[queue_id].size() == 0)
-                    rx_dma_map.delete(queue_id);
+                dma_set.release_all();
                 break;
             end
+
+            // Track the complete DMA ownership pair for completion/reset.
+            if (!rx_dma_map.exists(queue_id))
+                rx_dma_map[queue_id] = {};
+            adopt_dma_set(dma_set, rx_dma_map[queue_id]);
             filled++;
         end
 
