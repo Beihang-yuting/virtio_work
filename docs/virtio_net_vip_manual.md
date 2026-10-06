@@ -341,6 +341,7 @@ virtio_net_vip/
 |   |   +-- virtio_pci_cap_manager.sv       -- PCI Capability 链表遍历与解析
 |   |   +-- virtio_notification_manager.sv  -- MSI-X/INTx/polling 中断管理
 |   |   +-- virtio_discovery_strategy.sv    -- BAR/capability 发现策略
+|   |   +-- virtio_config_backend.sv        -- 设备配置后端接口 + common-config 实现
 |   |   +-- virtio_pci_transport.sv         -- PCI 传输封装 (完整初始化序列)
 |   +-- agent/
 |   |   +-- virtio_atomic_ops.sv            -- 原子操作库 (~30 个方法)

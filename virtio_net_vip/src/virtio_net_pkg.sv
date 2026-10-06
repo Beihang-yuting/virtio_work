@@ -72,6 +72,8 @@ package virtio_net_pkg;
   `include "transport/virtio_discovery_strategy.sv"
   `include "transport/virtio_pci_transport.sv"
   `include "dpu_priv/dpu_priv_driver_config.sv"
+  `include "transport/virtio_config_backend.sv"
+  `include "dpu_priv/dpu_priv_config_backend.sv"
 
   // ---------------------------------------------------------------------------
   // 第 5 层 – 事务与驱动 agent（types/、agent/）

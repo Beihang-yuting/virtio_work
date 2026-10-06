@@ -159,6 +159,76 @@ class virtio_unit_recording_discovery extends virtio_discovery_strategy;
     endtask
 endclass : virtio_unit_recording_discovery
 
+// 记录型配置后端：验证 atomic ops 的全部设备配置副作用都经由注入的后端，
+// 这是后续 AF 直配后端替换 common-config 的接入点。
+class virtio_unit_recording_backend extends virtio_config_backend;
+    `uvm_object_utils(virtio_unit_recording_backend)
+
+    string calls[$];
+    bit [7:0] status_reg;
+    virtio_queue_program_t configured_program;
+    virtio_queue_program_t disabled_program;
+
+    function new(string name = "virtio_unit_recording_backend");
+        super.new(name);
+        status_reg = 0;
+    endfunction
+
+    virtual task reset(output bit ok);
+        calls.push_back("reset");
+        ok = 1;
+    endtask
+    virtual task read_status(output bit [7:0] status);
+        calls.push_back("read_status");
+        status = status_reg;
+    endtask
+    virtual task write_status(bit [7:0] status);
+        calls.push_back("write_status");
+        status_reg = status;
+    endtask
+    virtual task read_device_features(output bit [63:0] features);
+        calls.push_back("read_device_features");
+        features = 64'h3;
+    endtask
+    virtual task write_driver_features(bit [63:0] features);
+        calls.push_back("write_driver_features");
+    endtask
+    virtual task set_features(bit [63:0] driver_caps, output bit [63:0] accepted);
+        calls.push_back("set_features");
+        accepted = driver_caps & 64'h3;
+    endtask
+    virtual task query_queue_max(int unsigned queue_id, output int unsigned max_size);
+        calls.push_back("query_queue_max");
+        max_size = 8;
+    endtask
+    virtual task configure_queue(virtio_queue_program_t q, output bit ok);
+        calls.push_back("configure_queue");
+        configured_program = q;
+        ok = 1;
+    endtask
+    virtual task enable_queue(virtio_queue_program_t q, output bit ok);
+        calls.push_back("enable_queue");
+        ok = 1;
+    endtask
+    virtual task disable_queue(virtio_queue_program_t q, output bit ok);
+        calls.push_back("disable_queue");
+        disabled_program = q;
+        ok = 1;
+    endtask
+    virtual task reset_queue(int unsigned queue_id, output bit ok);
+        calls.push_back("reset_queue");
+        ok = 1;
+    endtask
+    virtual task set_msix(int unsigned queue_ids[$], output bit ok);
+        calls.push_back("set_msix");
+        ok = 1;
+    endtask
+    virtual task clear_msix(output bit ok);
+        calls.push_back("clear_msix");
+        ok = 1;
+    endtask
+endclass : virtio_unit_recording_backend
+
 // ============================================================================
 // virtio_unit_test
 //
@@ -225,6 +295,7 @@ class virtio_unit_test extends uvm_test;
         test_tlm_completion_factory_owner();
         test_late_driver_agent_binding();
         test_discovery_strategy_selection();
+        test_config_backend_injection();
         test_dma_buffer_set();
 
         `uvm_info("UNIT_TEST", "All unit tests PASSED", UVM_NONE)
@@ -1077,6 +1148,72 @@ class virtio_unit_test extends uvm_test;
                 "discover_and_init_bars did not delegate exactly once (count=%0d)",
                 recorder.discover_count))
         `uvm_info("UNIT_TEST", "test_discovery_strategy_selection PASSED", UVM_LOW)
+    endtask
+
+    // atomic ops 的 status/feature/queue/MSI-X/复位副作用全部经注入后端，且队列
+    // 编程参数（host/BDF/IOVA/大小/环类型）完整交给后端并在拆除时原样交回。
+    task test_config_backend_injection();
+        virtio_atomic_ops ops;
+        virtio_unit_recording_backend backend;
+        virtio_pci_transport transport;
+        virtqueue_manager vq_mgr;
+        virtio_iommu_model iommu;
+        host_mem_manager mem;
+        bit [63:0] result;
+        bit [63:0] negotiated;
+        bit ok;
+        string expected[$];
+
+        ops = virtio_atomic_ops::type_id::create("backend_ops");
+        backend = virtio_unit_recording_backend::type_id::create("recording_backend");
+        transport = virtio_pci_transport::type_id::create("backend_transport");
+        vq_mgr = virtqueue_manager::type_id::create("backend_vq_mgr");
+        iommu = virtio_iommu_model::type_id::create("backend_iommu");
+        mem = host_mem_manager::type_id::create("backend_mem");
+        mem.init_region(64'h7600_0000, 64'h7600_FFFF);
+        transport.bdf = 16'h0131;
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.bdf = transport.bdf;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.iommu = iommu;
+        ops.mem = mem;
+        ops.config_backend = backend;
+
+        ops.set_acknowledge();
+        ops.negotiate_features(64'h5, result);
+        // device_reset_verified 会清零 negotiated_features，先保存协商结果。
+        negotiated = ops.negotiated_features;
+        ops.setup_queue(0, 4, VQ_SPLIT, ok);
+        if (!ok)
+            `uvm_error("TEST", "setup_queue failed with recording backend")
+        ops.teardown_queue(0);
+        ops.reset_queue(0);
+        ops.setup_msix(1);
+        ops.device_reset_verified(ok);
+
+        expected = '{"write_status", "set_features", "query_queue_max",
+                     "configure_queue", "enable_queue", "disable_queue",
+                     "reset_queue", "set_msix", "reset"};
+        if (backend.calls != expected)
+            `uvm_error("TEST", $sformatf("unexpected backend call sequence %p", backend.calls))
+        if ((result != 64'h1) || (negotiated != 64'h1) ||
+            (backend.status_reg != DEV_STATUS_ACKNOWLEDGE) || !ok ||
+            (backend.bound_transport() != transport))
+            `uvm_error("TEST", "backend results were not propagated to ops")
+        if ((backend.configured_program.queue_id != 0) ||
+            (backend.configured_program.queue_size != 4) ||
+            (backend.configured_program.vq_type != VQ_SPLIT) ||
+            (backend.configured_program.bdf != 16'h0131) ||
+            (backend.configured_program.desc_iova == 0) ||
+            (backend.configured_program.driver_iova == 0) ||
+            (backend.configured_program.device_iova == 0) ||
+            (backend.disabled_program.desc_iova !=
+             backend.configured_program.desc_iova) ||
+            (vq_mgr.get_queue_count() != 0))
+            `uvm_error("TEST", "queue program was not passed through the backend")
+        `uvm_info("UNIT_TEST", "test_config_backend_injection PASSED", UVM_LOW)
     endtask
 
 endclass

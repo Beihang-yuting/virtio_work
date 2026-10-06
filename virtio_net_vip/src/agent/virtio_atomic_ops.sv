@@ -34,6 +34,11 @@ class virtio_atomic_ops extends uvm_object;
     // ===== Negotiated state =====
     bit [63:0]                 negotiated_features;
 
+    // ===== Device configuration backend =====
+    // 设备配置副作用的唯一出口；为空时使用绑定当前 transport 的 common-config
+    // 后端。私有 ops 与后续 AF 直配在此注入其他实现。
+    virtio_config_backend      config_backend;
+
     // ===== Internal tracking =====
     // Normal data DMA owns both sides of a mapping.  Retaining only the IOVA
     // made reset/teardown able to unmap (at best) while leaking the host
@@ -52,6 +57,8 @@ class virtio_atomic_ops extends uvm_object;
     // retired by every later ordinary device reset.
     protected normal_dma_record_t migration_restore_dma[$];
     protected bit [63:0]         ring_iovas[int unsigned][$];  // queue_id -> ring IOVAs (desc, avail, used)
+    // 每个已编程队列的设备视角参数；拆除时原样交回后端，复位后清空。
+    protected virtio_queue_program_t queue_programs[int unsigned];
 
     // ========================================================================
     // Constructor
@@ -104,6 +111,16 @@ class virtio_atomic_ops extends uvm_object;
                 return 1;
         end
         return (migration_restore_dma.size() != 0);
+    endfunction
+
+    // 返回本 ops 的配置后端：未注入时创建 common-config 后端；每次调用都重新绑定
+    // 当前 transport，测试或 Function 替换 transport 后不会访问旧对象。
+    protected function virtio_config_backend cfg_backend();
+        if (config_backend == null)
+            config_backend = virtio_common_cfg_backend::type_id::create(
+                {get_name(), "_cfg_backend"});
+        config_backend.bind_transport(transport);
+        return config_backend;
     endfunction
 
     // 生产路径的通知边界：PRE_NOTIFY 故障钩子 → transport 通知（携带 ring 游标
@@ -478,6 +495,7 @@ class virtio_atomic_ops extends uvm_object;
     virtual task device_reset_verified(ref bit reset_complete);
         int unsigned tx_qids[$];
         int unsigned rx_qids[$];
+        virtio_config_backend backend;
 
         `uvm_info("ATOMIC_OPS", "device_reset: starting", UVM_MEDIUM)
 
@@ -487,7 +505,8 @@ class virtio_atomic_ops extends uvm_object;
             `uvm_error("ATOMIC_OPS", "device_reset: incomplete PF lifecycle context")
             return;
         end
-        transport.reset_device_verified(reset_complete);
+        backend = cfg_backend();
+        backend.reset(reset_complete);
         if (!reset_complete) begin
             `uvm_error("ATOMIC_OPS", "device_reset: transport reset did not complete; retaining PF DMA")
             return;
@@ -506,6 +525,7 @@ class virtio_atomic_ops extends uvm_object;
             end
         end
         ring_iovas.delete();
+        queue_programs.delete();
         foreach (tx_dma_map[qid]) begin
             tx_qids.push_back(qid);
         end
@@ -544,7 +564,10 @@ class virtio_atomic_ops extends uvm_object;
     // set_acknowledge -- Set ACKNOWLEDGE bit in device status
     // ------------------------------------------------------------------------
     virtual task set_acknowledge();
-        transport.write_device_status(DEV_STATUS_ACKNOWLEDGE);
+        virtio_config_backend backend;
+
+        backend = cfg_backend();
+        backend.write_status(DEV_STATUS_ACKNOWLEDGE);
         `uvm_info("ATOMIC_OPS", "set_acknowledge: done", UVM_HIGH)
     endtask
 
@@ -552,10 +575,13 @@ class virtio_atomic_ops extends uvm_object;
     // set_driver -- OR current status with DRIVER bit and write back
     // ------------------------------------------------------------------------
     virtual task set_driver();
+        virtio_config_backend backend;
         bit [7:0] status;
-        transport.read_device_status(status);
+
+        backend = cfg_backend();
+        backend.read_status(status);
         status = status | DEV_STATUS_DRIVER;
-        transport.write_device_status(status);
+        backend.write_status(status);
         `uvm_info("ATOMIC_OPS",
             $sformatf("set_driver: status=0x%02h", status), UVM_HIGH)
     endtask
@@ -564,15 +590,17 @@ class virtio_atomic_ops extends uvm_object;
     // set_features_ok -- Set FEATURES_OK and verify device accepted it
     // ------------------------------------------------------------------------
     virtual task set_features_ok(ref bit ok);
+        virtio_config_backend backend;
         bit [7:0] status;
         bit [7:0] readback;
 
-        transport.read_device_status(status);
+        backend = cfg_backend();
+        backend.read_status(status);
         status = status | DEV_STATUS_FEATURES_OK;
-        transport.write_device_status(status);
+        backend.write_status(status);
 
         // Poll to confirm FEATURES_OK is still set
-        transport.read_device_status(readback);
+        backend.read_status(readback);
         ok = (readback & DEV_STATUS_FEATURES_OK) ? 1 : 0;
 
         if (!ok) begin
@@ -588,8 +616,11 @@ class virtio_atomic_ops extends uvm_object;
     // verify_features_ok -- Re-read status and check FEATURES_OK bit
     // ------------------------------------------------------------------------
     virtual task verify_features_ok(ref bit ok);
+        virtio_config_backend backend;
         bit [7:0] status;
-        transport.read_device_status(status);
+
+        backend = cfg_backend();
+        backend.read_status(status);
         ok = (status & DEV_STATUS_FEATURES_OK) ? 1 : 0;
         `uvm_info("ATOMIC_OPS",
             $sformatf("verify_features_ok: status=0x%02h ok=%0b", status, ok), UVM_HIGH)
@@ -599,10 +630,13 @@ class virtio_atomic_ops extends uvm_object;
     // set_driver_ok -- OR current status with DRIVER_OK bit
     // ------------------------------------------------------------------------
     virtual task set_driver_ok();
+        virtio_config_backend backend;
         bit [7:0] status;
-        transport.read_device_status(status);
+
+        backend = cfg_backend();
+        backend.read_status(status);
         status = status | DEV_STATUS_DRIVER_OK;
-        transport.write_device_status(status);
+        backend.write_status(status);
         `uvm_info("ATOMIC_OPS",
             $sformatf("set_driver_ok: status=0x%02h", status), UVM_HIGH)
     endtask
@@ -611,10 +645,13 @@ class virtio_atomic_ops extends uvm_object;
     // set_failed -- OR current status with FAILED bit
     // ------------------------------------------------------------------------
     virtual task set_failed();
+        virtio_config_backend backend;
         bit [7:0] status;
-        transport.read_device_status(status);
+
+        backend = cfg_backend();
+        backend.read_status(status);
         status = status | DEV_STATUS_FAILED;
-        transport.write_device_status(status);
+        backend.write_status(status);
         `uvm_info("ATOMIC_OPS",
             $sformatf("set_failed: status=0x%02h", status), UVM_HIGH)
     endtask
@@ -627,21 +664,30 @@ class virtio_atomic_ops extends uvm_object;
     // read_device_features -- Read device-offered feature bits
     // ------------------------------------------------------------------------
     virtual task read_device_features(ref bit [63:0] features);
-        transport.read_device_features(features);
+        virtio_config_backend backend;
+
+        backend = cfg_backend();
+        backend.read_device_features(features);
     endtask
 
     // ------------------------------------------------------------------------
     // write_driver_features -- Write driver-selected feature bits
     // ------------------------------------------------------------------------
     virtual task write_driver_features(bit [63:0] features);
-        transport.write_driver_features(features);
+        virtio_config_backend backend;
+
+        backend = cfg_backend();
+        backend.write_driver_features(features);
     endtask
 
     // ------------------------------------------------------------------------
     // negotiate_features -- AND device features with driver caps, write result
     // ------------------------------------------------------------------------
     virtual task negotiate_features(bit [63:0] driver_caps, ref bit [63:0] result);
-        transport.negotiate_features(driver_caps, result);
+        virtio_config_backend backend;
+
+        backend = cfg_backend();
+        backend.set_features(driver_caps, result);
         negotiated_features = result;
         `uvm_info("ATOMIC_OPS",
             $sformatf("negotiate_features: result=0x%016h", result), UVM_MEDIUM)
@@ -661,6 +707,8 @@ class virtio_atomic_ops extends uvm_object;
         output bit          ok
     );
         virtqueue_base     vq;
+        virtio_config_backend backend;
+        virtio_queue_program_t qprog;
         int unsigned       max_size;
         int unsigned       eff_size;
         int unsigned       desc_size;
@@ -670,6 +718,7 @@ class virtio_atomic_ops extends uvm_object;
         bit [63:0]         avail_iova;
         bit [63:0]         used_iova;
         int unsigned       msix_vector;
+        bit                configured;
 
         ok = 0;
         if ((transport == null) || (vq_mgr == null) || (iommu == null) ||
@@ -682,11 +731,9 @@ class virtio_atomic_ops extends uvm_object;
             $sformatf("setup_queue: queue_id=%0d size=%0d type=%s",
                       queue_id, queue_size, vq_type.name()), UVM_MEDIUM)
 
-        // 1. Select queue on transport
-        transport.select_queue(queue_id);
-
-        // 2. Read device-advertised max queue size
-        transport.read_queue_num_max(max_size);
+        // 1-2. Select queue and read device-advertised max queue size
+        backend = cfg_backend();
+        backend.query_queue_max(queue_id, max_size);
 
         // 3. Determine effective size
         if (queue_size == 0)
@@ -773,10 +820,34 @@ class virtio_atomic_ops extends uvm_object;
         else
             msix_vector = 0;
 
-        // 9. Setup queue on transport (writes addresses, size, enables)
-        transport.setup_single_queue(queue_id, eff_size,
-                                     desc_iova, avail_iova, used_iova,
-                                     msix_vector);
+        // 9. 经配置后端编程并启用队列（common-config：写大小/地址/向量并置
+        // Q_ENABLE）。后端拒绝时设备不得访问该队列，因此可以立即回收 ring 映射。
+        qprog = virtio_empty_queue_program();
+        qprog.host_id     = get_iommu_host_id(transport);
+        qprog.bdf         = transport.bdf;
+        qprog.queue_id    = queue_id;
+        qprog.queue_size  = eff_size;
+        qprog.vq_type     = vq_type;
+        qprog.desc_iova   = desc_iova;
+        qprog.driver_iova = avail_iova;
+        qprog.device_iova = used_iova;
+        qprog.msix_vector = msix_vector;
+        qprog.local_qid   = queue_id;
+        qprog.tx_mode     = queue_id[0];
+        backend.configure_queue(qprog, configured);
+        if (configured)
+            backend.enable_queue(qprog, configured);
+        if (!configured) begin
+            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf, desc_iova);
+            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf, avail_iova);
+            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf, used_iova);
+            ring_iovas.delete(queue_id);
+            vq_mgr.destroy_queue(queue_id);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: config backend rejected queue_id=%0d", queue_id))
+            return;
+        end
+        queue_programs[queue_id] = qprog;
 
         // 10. Mark queue as enabled
         vq.state = VQ_ENABLED;
@@ -794,13 +865,30 @@ class virtio_atomic_ops extends uvm_object;
     virtual task teardown_queue(int unsigned queue_id);
         virtqueue_base vq;
         uvm_object tokens[$];
+        virtio_config_backend backend;
+        virtio_queue_program_t qprog;
+        bit stopped;
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("teardown_queue: queue_id=%0d", queue_id), UVM_MEDIUM)
 
-        // 1. Disable queue on transport
-        transport.select_queue(queue_id);
-        transport.write_queue_enable(0);
+        // 1. 经配置后端停用队列；后端未确认停止时保留全部 ring/DMA 所有权。
+        if (queue_programs.exists(queue_id))
+            qprog = queue_programs[queue_id];
+        else begin
+            qprog = virtio_empty_queue_program();
+            qprog.host_id  = get_iommu_host_id(transport);
+            qprog.bdf      = transport.bdf;
+            qprog.queue_id = queue_id;
+        end
+        backend = cfg_backend();
+        backend.disable_queue(qprog, stopped);
+        if (!stopped) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "teardown_queue: config backend did not confirm queue_id=%0d stopped; retaining queue DMA",
+                queue_id))
+            return;
+        end
 
         // 2. Detach all unused buffers
         vq = vq_mgr.get_queue(queue_id);
@@ -830,6 +918,7 @@ class virtio_atomic_ops extends uvm_object;
 
         // 5. Destroy queue
         vq_mgr.destroy_queue(queue_id);
+        queue_programs.delete(queue_id);
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("teardown_queue: queue_id=%0d complete, detached %0d tokens",
@@ -840,11 +929,20 @@ class virtio_atomic_ops extends uvm_object;
     // reset_queue -- Per-queue reset using virtio 1.2 queue reset mechanism
     // ------------------------------------------------------------------------
     virtual task reset_queue(int unsigned queue_id);
+        virtio_config_backend backend;
+        bit reset_ok;
+
         `uvm_info("ATOMIC_OPS",
             $sformatf("reset_queue: queue_id=%0d", queue_id), UVM_MEDIUM)
 
         // Write Q_RESET and poll until complete
-        transport.write_queue_reset(queue_id);
+        backend = cfg_backend();
+        backend.reset_queue(queue_id, reset_ok);
+        if (!reset_ok) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "reset_queue: config backend did not confirm queue_id=%0d reset", queue_id))
+            return;
+        end
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("reset_queue: queue_id=%0d reset complete", queue_id), UVM_MEDIUM)
@@ -2013,30 +2111,18 @@ class virtio_atomic_ops extends uvm_object;
     // setup_msix -- Configure MSI-X vectors for all queues
     // ------------------------------------------------------------------------
     virtual task setup_msix(int unsigned num_queues);
-        interrupt_mode_e actual_mode;
+        virtio_config_backend backend;
+        int unsigned queue_ids[$];
+        bit msix_ok;
 
-        if (transport.cap_mgr.has_msix()) begin
-            transport.notify_mgr.setup_msix(
-                transport.cap_mgr.get_msix_table_size(),
-                transport.cap_mgr.msix_table_bir,
-                transport.cap_mgr.msix_table_offset
-            );
-            transport.notify_mgr.allocate_irq_vectors(num_queues, actual_mode);
-
-            // Bind config change vector
-            transport.write_config_msix_vector(transport.notify_mgr.config_vector);
-
-            // Bind per-queue vectors
-            for (int unsigned q = 0; q < num_queues; q++) begin
-                transport.write_queue_msix_vector(q, transport.notify_mgr.queue_vectors[q]);
-            end
-
-            // Unmask all vectors
-            transport.notify_mgr.unmask_all();
-        end else begin
-            transport.notify_mgr.irq_mode = IRQ_INTX;
-            transport.notify_mgr.intx_enabled = 1;
-        end
+        // 队列号 0..num_queues-1（与 HEAD 相同）；P3-9 改为 vq_mgr 中的实际队列号。
+        for (int unsigned q = 0; q < num_queues; q++)
+            queue_ids.push_back(q);
+        backend = cfg_backend();
+        backend.set_msix(queue_ids, msix_ok);
+        if (!msix_ok)
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_msix: config backend rejected %0d queue vectors", num_queues))
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("setup_msix: num_queues=%0d mode=%s",
@@ -2047,7 +2133,11 @@ class virtio_atomic_ops extends uvm_object;
     // teardown_msix -- Mask and release all MSI-X vectors
     // ------------------------------------------------------------------------
     virtual task teardown_msix();
-        transport.notify_mgr.mask_all();
+        virtio_config_backend backend;
+        bit cleared;
+
+        backend = cfg_backend();
+        backend.clear_msix(cleared);
         `uvm_info("ATOMIC_OPS", "teardown_msix: all vectors masked", UVM_MEDIUM)
     endtask
 

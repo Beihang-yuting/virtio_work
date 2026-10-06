@@ -9,7 +9,9 @@
 // common-config 或 control VQ 带入驱动的私有数据路径。继承的统一 API 仍可被序列调用。
 class dpu_priv_atomic_ops extends virtio_atomic_ops;
     `uvm_object_utils(dpu_priv_atomic_ops)
-    protected dpu_priv_device_control device_control;
+    // 私有控制面后端：包装 env_cfg 注入的 dpu_priv_device_control，同时作为本 ops
+    // 的 config_backend；doorbell 也经它发出。
+    protected dpu_priv_config_backend private_backend;
     protected dpu_priv_queue_config queue_cfg[int unsigned];
     protected dpu_priv_queue_context_t contexts[int unsigned];
     protected int unsigned configured_pairs, default_size, rx_size;
@@ -28,7 +30,10 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
             return 0;
         end
         if (!cfg.validate(pairs, why)) return 0;
-        device_control = cfg.control;
+        private_backend = dpu_priv_config_backend::type_id::create(
+            {get_name(), "_private_backend"});
+        private_backend.control = cfg.control;
+        config_backend = private_backend;
         configured_pairs = pairs;
         default_size = cfg.default_queue_size;
         rx_size = cfg.rx_buf_size;
@@ -50,7 +55,7 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
 
     // 统一检查配置和 Host/BDF 所有权；不允许一个 Function 的 ops 错接另一 Host 内存。
     protected function bit context_ready();
-        if ((device_control == null) || (transport == null) || (mem == null) ||
+        if ((private_backend == null) || (private_backend.control == null) || (transport == null) || (mem == null) ||
             (iommu == null) || (vq_mgr == null) || (vq_mgr.barrier == null) ||
             (vq_mgr.mem != mem) || (vq_mgr.iommu != iommu) ||
             (vq_mgr.host_id != get_iommu_host_id(transport)) ||
@@ -72,6 +77,7 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
         dpu_priv_queue_context_t ctx;
         int unsigned size;
         bit configured;
+        virtio_config_backend backend;
 
         ok = 0;
         if (!context_ready()) return;
@@ -122,7 +128,8 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
             return;
         end
         ctx.cq_iova = ctx.ring_iova + size*16;
-        device_control.configure_queue(ctx, configured);
+        backend = cfg_backend();
+        backend.configure_queue(dpu_priv_config_backend::from_context(ctx), configured);
         if (!configured) begin
             iommu.unmap_for_host(ctx.host_id, ctx.bdf, ctx.ring_iova);
             vq_mgr.destroy_queue(queue_id);
@@ -174,9 +181,12 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
 
     // 停队成功才回收；后端超时/失败保留队列和全部 DMA，允许诊断或稍后重试。
     virtual task teardown_queue(int unsigned queue_id);
+        virtio_config_backend backend;
         bit stopped;
         if (!contexts.exists(queue_id)) return;
-        device_control.disable_queue(contexts[queue_id], stopped);
+        backend = cfg_backend();
+        backend.disable_queue(dpu_priv_config_backend::from_context(contexts[queue_id]),
+                              stopped);
         if (!stopped) begin
             `uvm_error("DPU_PRIV_OPS", "teardown: 未确认 DMA 停止，保留队列资源")
             return;
@@ -191,11 +201,12 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
 
     // Function 级复位由真实控制后端确认；失败保持资源，成功逐队列回收。
     virtual task device_reset_verified(ref bit reset_complete);
+        virtio_config_backend backend;
         int unsigned qids[$];
         reset_complete = 0;
         if (!context_ready()) return;
-        device_control.reset_device(get_iommu_host_id(transport), transport.bdf,
-                                     reset_complete);
+        backend = cfg_backend();
+        backend.reset(reset_complete);
         if (!reset_complete) begin
             `uvm_error("DPU_PRIV_OPS", "reset: 未确认 Function 停止 DMA，保留资源")
             return;
@@ -216,7 +227,8 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
             return;
         end
         vq.kick();
-        device_control.notify_queue(transport, contexts[queue_id], cb.last_notify_word);
+        private_backend.bind_transport(transport);
+        private_backend.notify_queue(contexts[queue_id], cb.last_notify_word);
     endtask
 
     // 将 packet_item 的原始 Ethernet 字节映射成一个 SG；回调负责 64KiB 分片。
