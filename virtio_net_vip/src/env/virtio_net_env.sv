@@ -747,7 +747,7 @@ class virtio_net_env extends uvm_env;
     protected function bit abort_bind(input pcie_bind_plan_t plan[$]);
         foreach (plan[plan_index]) begin
             if (plan[plan_index].function_instance != null)
-                plan[plan_index].function_instance.cancel_preflight_bind_pcie();
+                plan[plan_index].function_instance.cancel_bind_pcie();
         end
         configuration_valid = 0;
         return 0;
@@ -970,7 +970,7 @@ class virtio_net_env extends uvm_env;
                 next_protocol_event_vif_index, staged_protocol_vif,
                 protocol_vif))
             return 0;
-        if (!function_instance.commit_preflight_bind_pcie(
+        if (!function_instance.commit_bind_pcie(
             host_mem, iommu, barrier, err_inj, wait_pol, pcie_rc_seqr)) begin
             return 0;
         end

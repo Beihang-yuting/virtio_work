@@ -28,7 +28,6 @@ class virtio_full_integration_test extends uvm_test;
     virtio_memory_barrier_model barrier;
     virtqueue_error_injector err_inj;
     virtio_atomic_ops ops;
-    virtio_auto_fsm fsm;
     virtio_perf_monitor perf_mon;
     virtio_function_instance binding_function;
 
@@ -98,10 +97,13 @@ class virtio_full_integration_test extends uvm_test;
         super.connect_phase(phase);
 
         transport.bdf = 16'h0100;  // Bus=1, Dev=0, Func=0
-        if (!binding_function.bind_pcie_components(
-            "full_function", transport, vq_mgr, null, host_mem, iommu,
-            barrier, err_inj, wait_pol, binding_function.drv_cfg,
-            pcie_env.rc_agent.sequencer, ops, fsm)) begin
+        // 测试自建的 transport/vq_mgr/ops 交给 Function 的统一绑定入口接线。
+        binding_function.transport = transport;
+        binding_function.vq_mgr = vq_mgr;
+        binding_function.driver_agent.ops = ops;
+        if (!binding_function.wire_shared(
+            host_mem, iommu, barrier, err_inj, wait_pol,
+            pcie_env.rc_agent.sequencer)) begin
             `uvm_fatal("FULL_TEST", "failed to bind function to PCIe")
             return;
         end

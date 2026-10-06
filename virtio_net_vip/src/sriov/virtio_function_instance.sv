@@ -61,8 +61,9 @@ class virtio_function_instance extends uvm_component;
         pcie_bind_prepared = 0;
     endfunction
 
-    // 根据本 Function 的配置创建匹配的 ops/FSM 候选，预检不访问设备。
-    // 已提供对象类型冲突时拒绝，防止标准 FSM 驱动私有 ring；配置仅在提交时冻结。
+    // 根据本 Function 的配置选择并创建匹配的 ops/FSM 候选；这是 driver 工厂
+    // 选择的唯一位置，不访问设备。已提供对象与私有配置类型冲突时拒绝，防止标准
+    // FSM 驱动私有 ring；factory 返回空对象时 UVM_FATAL。配置仅在提交时冻结。
     protected function bit prepare_driver_candidates(
         string label, virtio_driver_config_t behavior,
         ref virtio_atomic_ops candidate_ops, ref virtio_auto_fsm candidate_fsm
@@ -84,13 +85,23 @@ class virtio_function_instance extends uvm_component;
                 `uvm_error("FUNCTION_BIND", "私有配置与已绑定 ops/FSM 类型冲突")
                 return 0;
             end
-        end else begin
-            if (candidate_ops == null)
-                candidate_ops = virtio_atomic_ops::type_id::create({label, "_ops"}, this);
-            if (candidate_fsm == null)
-                candidate_fsm = virtio_auto_fsm::type_id::create({label, "_fsm"}, this);
+            return 1;
         end
-        return (candidate_ops != null) && (candidate_fsm != null);
+        if (candidate_fsm == null)
+            candidate_fsm = virtio_auto_fsm::type_id::create({label, "_fsm"}, this);
+        if (candidate_fsm == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s factory returned a null PCIe FSM", label))
+            return 0;
+        end
+        if (candidate_ops == null)
+            candidate_ops = virtio_atomic_ops::type_id::create({label, "_ops"}, this);
+        if (candidate_ops == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s factory returned null PCIe atomic ops", label))
+            return 0;
+        end
+        return 1;
     endfunction
 
     // 创建该 Function 独占的 driver/queue/dataplane/transport 对象，并应用当前
@@ -209,13 +220,10 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
-    // 预检 RC sequencer、transport、FSM/ops 和本 Function 的 qpair 上限；成功只
-    // 暂存候选对象，不修改已经提交的共享连接，失败返回 0 并保留 why/fatal 诊断。
-    // 中文：输入 RC sequencer，输出可提交的 FSM/ops 候选；任何依赖缺失只返回失败，
-    // 不修改已提交共享对象。
-    // Side-effect-free half of PCIe binding.  The environment preflights all
-    // active functions before any one-shot FSM, observer, or monitor state is
-    // committed, so a later function cannot leave earlier functions bound.
+    // 两阶段绑定的预检半段：检查 RC sequencer、driver agent、transport 子对象和
+    // 本 Function 的 qpair 上限，只暂存 FSM/ops 候选，不修改任何已提交的连接；
+    // 失败返回 0 并保留 UVM_FATAL 诊断。环境对全部 Function 预检后才逐个提交，
+    // 后面的 Function 失败不会留下前面 Function 的部分绑定。
     function bit preflight_bind_pcie(
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
     );
@@ -224,7 +232,7 @@ class virtio_function_instance extends uvm_component;
         virtio_auto_fsm candidate_fsm;
         virtio_atomic_ops candidate_ops;
 
-        cancel_preflight_bind_pcie();
+        cancel_bind_pcie();
         function_name = $sformatf("function_%0d", vf_index);
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("FUNCTION_BIND", $sformatf(
@@ -250,25 +258,8 @@ class virtio_function_instance extends uvm_component;
         end
         candidate_fsm = driver_agent.fsm;
         candidate_ops = driver_agent.ops;
-        if ((private_cfg != null) &&
-            !prepare_driver_candidates(function_name, drv_cfg, candidate_ops, candidate_fsm))
+        if (!prepare_driver_candidates(function_name, drv_cfg, candidate_ops, candidate_fsm))
             return 0;
-        if (candidate_fsm == null)
-            candidate_fsm = virtio_auto_fsm::type_id::create(
-                {function_name, "_fsm"}, this);
-        if (candidate_fsm == null) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "%s factory returned a null PCIe FSM", function_name))
-            return 0;
-        end
-        if (candidate_ops == null)
-            candidate_ops = virtio_atomic_ops::type_id::create(
-                {function_name, "_ops"}, this);
-        if (candidate_ops == null) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "%s factory returned null PCIe atomic ops", function_name))
-            return 0;
-        end
         if (!candidate_fsm.mq_pair_limit_binding_supported(
             drv_cfg.max_vio_net_qpairs_per_device, why
         )) begin
@@ -292,16 +283,17 @@ class virtio_function_instance extends uvm_component;
         return pending_pcie_ops;
     endfunction
 
-    // 丢弃尚未提交的 FSM/ops 候选，供批量绑定失败回滚；不触碰已经提交的连接。
-    function void cancel_preflight_bind_pcie();
+    // 两阶段绑定的取消入口：丢弃尚未提交的 FSM/ops 候选，供批量绑定回滚；
+    // 不触碰已经提交的连接。
+    function void cancel_bind_pcie();
         pending_pcie_fsm = null;
         pending_pcie_ops = null;
         pcie_bind_prepared = 0;
     endfunction
 
-    // 将成功预检的候选一次性接入共享 Host/IOMMU/PCIe 资源；缺少预检状态时
-    // 拒绝提交并返回 0，成功后清除暂存句柄。
-    function bit commit_preflight_bind_pcie(
+    // 两阶段绑定的提交半段：把预检成功的候选一次性接入共享 Host/IOMMU/PCIe
+    // 资源；缺少预检状态时 UVM_FATAL 并返回 0，成功后清除暂存句柄。
+    function bit commit_bind_pcie(
         input host_mem_manager hmem,
         input virtio_iommu_model iommu_mdl,
         input virtio_memory_barrier_model bar_mdl,
@@ -332,17 +324,12 @@ class virtio_function_instance extends uvm_component;
         barrier = bar_mdl;
         err_inj = einj;
         wait_pol = wpol;
-        cancel_preflight_bind_pcie();
+        cancel_bind_pcie();
         return 1;
     endfunction
 
-    // 统一提交已经通过空句柄、factory 和 qpair 上限检查的组件；失败只返回 0，
-    // 不接受半初始化的 driver/transport。
-    // 中文：输入已验证的 transport、queue、driver 和共享资源，执行最终接线；边界
-    // 检查未通过时返回 0，不创建半初始化的数据面。
-    // Commit only handles that have passed all null/factory/MQ checks.  The
-    // environment reaches this helper through preflight; the standalone API
-    // below performs the same checks before calling it.
+    // 只由 commit_bind_pcie 调用：接线已通过 preflight_bind_pcie 空句柄、factory
+    // 与 qpair 上限检查的组件；失败只返回 0，不接受半初始化的 driver/transport。
     local function bit commit_validated_pcie_components(
         input string function_name,
         input virtio_pci_transport transport_ref,
@@ -434,89 +421,8 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
-    // 对单个 Function 提供可复用的公开绑定原语；内部先完成候选检查，再接线
-    // transport、virtqueue、driver 和可选 dataplane，任一输入为空即失败。
-    // Public binding primitive.  The environment uses it for each active
-    // PF/VF; standalone TLM tests use a compatible function instance too.
-    function bit bind_pcie_components(
-        input string function_name,
-        input virtio_pci_transport transport_ref,
-        input virtqueue_manager vq_mgr_ref,
-        input virtio_driver_agent driver_agent_ref,
-        input host_mem_manager hmem,
-        input virtio_iommu_model iommu_mdl,
-        input virtio_memory_barrier_model bar_mdl,
-        input virtqueue_error_injector einj,
-        input virtio_wait_policy wpol,
-        input virtio_driver_config_t driver_cfg,
-        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
-        ref virtio_atomic_ops ops,
-        ref virtio_auto_fsm fsm
-    );
-        string why;
-        virtio_auto_fsm candidate_fsm;
-        virtio_atomic_ops candidate_ops;
-
-        if (pcie_rc_seqr == null) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "%s received a null PCIe RC sequencer", function_name))
-            return 0;
-        end
-        if ((transport_ref == null) || (vq_mgr_ref == null)) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "%s is missing transport or virtqueue manager", function_name))
-            return 0;
-        end
-        if ((transport_ref.bar == null) ||
-            (transport_ref.notify_mgr == null) ||
-            (transport_ref.cap_mgr == null)) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                {"%s is missing transport BAR, notify manager, or ",
-                 "capability manager"}, function_name))
-            return 0;
-        end
-
-        candidate_fsm = fsm;
-        candidate_ops = ops;
-        if ((private_cfg != null) &&
-            !prepare_driver_candidates(function_name, driver_cfg, candidate_ops, candidate_fsm))
-            return 0;
-        if (candidate_fsm == null)
-            candidate_fsm = virtio_auto_fsm::type_id::create(
-                {function_name, "_fsm"});
-        if (candidate_fsm == null) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "%s factory returned a null PCIe FSM", function_name))
-            return 0;
-        end
-        if (candidate_ops == null)
-            candidate_ops = virtio_atomic_ops::type_id::create(
-                {function_name, "_ops"});
-        if (candidate_ops == null) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "%s factory returned null PCIe atomic ops", function_name))
-            return 0;
-        end
-        if (!candidate_fsm.mq_pair_limit_binding_supported(
-            driver_cfg.max_vio_net_qpairs_per_device, why
-        )) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "%s could not bind its MQ pair limit: %s", function_name, why))
-            return 0;
-        end
-        if (!commit_validated_pcie_components(
-            function_name, transport_ref, vq_mgr_ref, driver_agent_ref,
-            hmem, iommu_mdl, bar_mdl, einj, wpol, driver_cfg, pcie_rc_seqr,
-            candidate_ops, candidate_fsm)) begin
-            return 0;
-        end
-        ops = candidate_ops;
-        fsm = candidate_fsm;
-        return 1;
-    endfunction
-
-    // 兼容旧 standalone 调用方，将共享基础设施注入本实例并委托统一 PCIe
-    // 绑定原语；环境路径通常使用 preflight/commit 两阶段接口。
+    // 单 Function 便捷入口：preflight + commit 的组合；任一半段失败都丢弃候选，
+    // 不保留部分接线。环境批量绑定直接使用两阶段接口以保证多 Function 原子性。
     function bit wire_shared(
         host_mem_manager hmem,
         virtio_iommu_model iommu_mdl,
@@ -525,28 +431,11 @@ class virtio_function_instance extends uvm_component;
         virtio_wait_policy wpol,
         uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
     );
-        virtio_atomic_ops ops;
-        virtio_auto_fsm fsm;
-
-        if (driver_agent == null) begin
-            `uvm_fatal("FUNCTION_BIND", $sformatf(
-                "function_%0d is missing driver agent", vf_index))
-            return 0;
-        end
-        ops = driver_agent.ops;
-        fsm = driver_agent.fsm;
-        if (!bind_pcie_components(
-            $sformatf("function_%0d", vf_index), transport, vq_mgr,
-            driver_agent, hmem, iommu_mdl, bar_mdl, einj, wpol, drv_cfg,
-            pcie_rc_seqr, ops, fsm)) begin
-            return 0;
-        end
-        mem = hmem;
-        iommu = iommu_mdl;
-        barrier = bar_mdl;
-        err_inj = einj;
-        wait_pol = wpol;
-        return 1;
+        if (preflight_bind_pcie(pcie_rc_seqr) &&
+            commit_bind_pcie(hmem, iommu_mdl, bar_mdl, einj, wpol, pcie_rc_seqr))
+            return 1;
+        cancel_bind_pcie();
+        return 0;
     endfunction
 
     // standalone 便捷入口：使用实例当前保存的共享对象绑定一个 RC sequencer。

@@ -120,7 +120,6 @@ class virtio_dual_test extends uvm_test;
     virtio_memory_barrier_model barrier_a;
     virtqueue_error_injector    err_inj_a;
     virtio_atomic_ops     ops_a;
-    virtio_auto_fsm       fsm_a;
     virtio_function_instance binding_function_a;
 
     // ---- VIP B components ----
@@ -132,7 +131,6 @@ class virtio_dual_test extends uvm_test;
     virtio_memory_barrier_model barrier_b;
     virtqueue_error_injector    err_inj_b;
     virtio_atomic_ops     ops_b;
-    virtio_auto_fsm       fsm_b;
     virtio_function_instance binding_function_b;
 
     // Perf monitors
@@ -273,10 +271,12 @@ class virtio_dual_test extends uvm_test;
 
         // ---- Wire VIP A ----
         transport_a.bdf = 16'h0100;
-        if (!binding_function_a.bind_pcie_components(
-            "dual_function_a", transport_a, vq_mgr_a, null, mem_a, iommu_a,
-            barrier_a, err_inj_a, wait_pol_a, binding_function_a.drv_cfg,
-            pcie_env.rc_agent.sequencer, ops_a, fsm_a)) begin
+        binding_function_a.transport = transport_a;
+        binding_function_a.vq_mgr = vq_mgr_a;
+        binding_function_a.driver_agent.ops = ops_a;
+        if (!binding_function_a.wire_shared(
+            mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a,
+            pcie_env.rc_agent.sequencer)) begin
             `uvm_fatal("DUAL_TEST", "failed to bind function A to PCIe")
             return;
         end
@@ -288,10 +288,12 @@ class virtio_dual_test extends uvm_test;
 
         // ---- Wire VIP B ----
         transport_b.bdf = 16'h0200;
-        if (!binding_function_b.bind_pcie_components(
-            "dual_function_b", transport_b, vq_mgr_b, null, mem_b, iommu_b,
-            barrier_b, err_inj_b, wait_pol_b, binding_function_b.drv_cfg,
-            pcie_env.rc_agent.sequencer, ops_b, fsm_b)) begin
+        binding_function_b.transport = transport_b;
+        binding_function_b.vq_mgr = vq_mgr_b;
+        binding_function_b.driver_agent.ops = ops_b;
+        if (!binding_function_b.wire_shared(
+            mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b,
+            pcie_env.rc_agent.sequencer)) begin
             `uvm_fatal("DUAL_TEST", "failed to bind function B to PCIe")
             return;
         end
