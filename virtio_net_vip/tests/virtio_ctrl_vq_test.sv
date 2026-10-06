@@ -9,56 +9,6 @@ import virtio_net_pkg::*;
 // 寄存器桩 transport 只记录建队与通知；建队、DMA 映射与回滚全部走生产 atomic ops。
 // 测试拥有全部 Host memory/IOMMU/队列对象，每个子测试结束时拆除并检查泄漏。
 
-// 寄存器桩：common-config 访问只记录、不发 TLP；read_net_config 返回可编程的
-// max_virtqueue_pairs，用于验证 controlq 按 2*max_virtqueue_pairs 编号。
-class virtio_ctrl_vq_test_transport extends virtio_pci_transport;
-    `uvm_object_utils(virtio_ctrl_vq_test_transport)
-
-    int unsigned max_virtqueue_pairs;
-    int unsigned net_config_reads;
-    int unsigned kick_count;
-    int unsigned programmed_qids[$];
-
-    function new(string name = "virtio_ctrl_vq_test_transport");
-        super.new(name);
-        max_virtqueue_pairs = 1;
-        net_config_reads = 0;
-        kick_count = 0;
-    endfunction
-
-    virtual task read_net_config(ref virtio_net_device_config_t cfg);
-        net_config_reads++;
-        cfg = '{default: 0};
-        cfg.max_virtqueue_pairs = max_virtqueue_pairs;
-    endtask
-
-    virtual task select_queue(int unsigned queue_id);
-    endtask
-
-    virtual task read_queue_num_max(ref int unsigned max_size);
-        max_size = 8;
-    endtask
-
-    virtual task setup_single_queue(
-        int unsigned queue_id,
-        int unsigned queue_size,
-        bit [63:0]   desc_addr,
-        bit [63:0]   driver_addr,
-        bit [63:0]   device_addr,
-        int unsigned msix_vector
-    );
-        programmed_qids.push_back(queue_id);
-    endtask
-
-    virtual task write_queue_enable(bit enable);
-    endtask
-
-    virtual task kick(int unsigned queue_id, int unsigned next_avail_idx,
-                      bit wrap_counter);
-        kick_count++;
-    endtask
-endclass : virtio_ctrl_vq_test_transport
-
 // 设备接受 MQ 变更：只替换 control 命令往返，建队/拆队仍走生产实现。
 class virtio_ctrl_vq_test_mq_ops extends virtio_atomic_ops;
     `uvm_object_utils(virtio_ctrl_vq_test_mq_ops)
@@ -168,7 +118,7 @@ class virtio_ctrl_vq_test extends uvm_test;
     // 一个 Function 的最小装配：ring 内存给 vq_mgr，ops_mem 给 ops 的数据/控制缓冲。
     protected function void wire_ops(
         virtio_atomic_ops             ops,
-        virtio_ctrl_vq_test_transport transport,
+        virtio_mock_transport transport,
         virtqueue_manager             vq_mgr,
         host_mem_manager              ring_mem,
         host_mem_manager              ops_mem,
@@ -199,8 +149,8 @@ class virtio_ctrl_vq_test extends uvm_test;
     // 设备 max_virtqueue_pairs=2、当前 1 对：control VQ 必须是 4，扩到 2 对时
     // 新建的 RX1/TX1（2/3）不得与 control VQ 冲突。
     task test_ctrl_vq_at_twice_max_pairs();
-        virtio_ctrl_vq_test_transport transport =
-            virtio_ctrl_vq_test_transport::type_id::create("mq_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("mq_transport");
         virtio_ctrl_vq_test_mq_ops ops =
             virtio_ctrl_vq_test_mq_ops::type_id::create("mq_ops");
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("mq_vq_mgr");
@@ -215,7 +165,7 @@ class virtio_ctrl_vq_test extends uvm_test;
 
         mem.init_region(64'h7000_0000, 64'h7000_FFFF);
         wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h0901);
-        transport.max_virtqueue_pairs = 2;
+        transport.mock_net_config.max_virtqueue_pairs = 2;
         ops.negotiated_features = '0;
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
         ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
@@ -258,8 +208,8 @@ class virtio_ctrl_vq_test extends uvm_test;
     // ops 内存只有一个 16B 最小块：header 占用后 ack 申请失败。ctrl_send 必须释放
     // header，不映射、不入队、不通知，并以 ACK_ERR 返回。
     task test_ctrl_send_alloc_failure_rolls_back();
-        virtio_ctrl_vq_test_transport transport =
-            virtio_ctrl_vq_test_transport::type_id::create("alloc_fail_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("alloc_fail_transport");
         virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("alloc_fail_ops");
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("alloc_fail_vq_mgr");
         virtio_ctrl_vq_test_mem ring_mem =
@@ -316,8 +266,8 @@ class virtio_ctrl_vq_test extends uvm_test;
 
     // header 映射成功、data 映射失败：ctrl_send 必须撤销 header 映射并释放三块缓冲。
     task test_ctrl_send_map_failure_rolls_back();
-        virtio_ctrl_vq_test_transport transport =
-            virtio_ctrl_vq_test_transport::type_id::create("map_fail_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("map_fail_transport");
         virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("map_fail_ops");
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("map_fail_vq_mgr");
         virtio_ctrl_vq_test_mem mem =

@@ -55,29 +55,6 @@ class virtio_queue_semantics_test extends uvm_test;
         phase.drop_objection(this);
     endtask
 
-    task write_split_used(
-        split_virtqueue vq,
-        int unsigned slot,
-        int unsigned desc_id,
-        int unsigned used_idx
-    );
-        byte entry[8];
-        byte idx_data[2];
-
-        entry[0] = desc_id[7:0];
-        entry[1] = desc_id[15:8];
-        entry[2] = desc_id[23:16];
-        entry[3] = desc_id[31:24];
-        entry[4] = 0;
-        entry[5] = 1;
-        entry[6] = 0;
-        entry[7] = 0;
-        idx_data[0] = used_idx[7:0];
-        idx_data[1] = used_idx[15:8];
-        mem.write_mem(vq.device_ring_addr + 4 + slot * 8, entry);
-        mem.write_mem(vq.device_ring_addr + 2, idx_data);
-    endtask
-
     task test_split_fill_drain_wrap();
         split_virtqueue vq;
         int unsigned device_used_idx = 0;
@@ -116,7 +93,7 @@ class virtio_queue_semantics_test extends uvm_test;
                 `uvm_fatal("QUEUE_SEMANTICS", "split queue did not reach full")
 
             for (int unsigned i = 0; i < desc_ids.size(); i++) begin
-                write_split_used(vq, i, desc_ids[i], device_used_idx + 1);
+                virtio_vq_test_kit::complete_split_at(mem, vq, i, desc_ids[i], 256, device_used_idx + 1);
                 device_used_idx++;
             end
 

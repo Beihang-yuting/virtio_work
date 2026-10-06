@@ -1145,25 +1145,9 @@ class virtio_traffic_test extends uvm_test;
 
             // Simulate device processing all 256 entries
             for (int unsigned i = 0; i < desc_ids.size(); i++) begin
-                byte used_entry[8];
-                int unsigned ring_offset;
-                byte used_idx_data[2];
-
-                ring_offset = 4 + (used_idx % queue_size) * 8;
-                used_entry[0] = desc_ids[i][7:0];
-                used_entry[1] = desc_ids[i][15:8];
-                used_entry[2] = desc_ids[i][23:16];
-                used_entry[3] = desc_ids[i][31:24];
-                used_entry[4] = 128;  // len
-                used_entry[5] = 0;
-                used_entry[6] = 0;
-                used_entry[7] = 0;
-                mem.write_mem(vq.device_ring_addr + ring_offset, used_entry);
-
+                virtio_vq_test_kit::complete_split_at(
+                    mem, vq, used_idx % queue_size, desc_ids[i], 128, used_idx + 1);
                 used_idx++;
-                used_idx_data[0] = used_idx[7:0];
-                used_idx_data[1] = used_idx[15:8];
-                mem.write_mem(vq.device_ring_addr + 2, used_idx_data);
             end
 
             // Poll all 256 used entries
@@ -1318,25 +1302,10 @@ class virtio_traffic_test extends uvm_test;
             begin
                 int unsigned used_idx = 0;
                 for (int unsigned i = 0; i < split_desc_ids.size(); i++) begin
-                    byte used_entry[8];
-                    int unsigned ring_offset;
-                    byte used_idx_data[2];
-
-                    ring_offset = 4 + (used_idx % split_queue_size) * 8;
-                    used_entry[0] = split_desc_ids[i][7:0];
-                    used_entry[1] = split_desc_ids[i][15:8];
-                    used_entry[2] = split_desc_ids[i][23:16];
-                    used_entry[3] = split_desc_ids[i][31:24];
-                    used_entry[4] = 8'd0;
-                    used_entry[5] = 8'd0;
-                    used_entry[6] = 8'd0;
-                    used_entry[7] = 8'd0;
-                    mem.write_mem(split_vq.device_ring_addr + ring_offset, used_entry);
-
+                    virtio_vq_test_kit::complete_split_at(
+                        mem, split_vq, used_idx % split_queue_size,
+                        split_desc_ids[i], 0, used_idx + 1);
                     used_idx++;
-                    used_idx_data[0] = used_idx[7:0];
-                    used_idx_data[1] = used_idx[15:8];
-                    mem.write_mem(split_vq.device_ring_addr + 2, used_idx_data);
                 end
             end
 

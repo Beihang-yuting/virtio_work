@@ -109,33 +109,6 @@ class virtio_host_mem_reclaim_test extends uvm_test;
             operations, freed), UVM_LOW)
     endtask
 
-    task write_used_entry(
-        split_virtqueue vq,
-        int unsigned slot,
-        int unsigned desc_id,
-        int unsigned used_len,
-        int unsigned used_idx,
-        host_mem_manager mem
-    );
-        byte entry[8];
-        byte idx_bytes[2];
-        bit [63:0] entry_addr;
-
-        entry[0] = desc_id[7:0];
-        entry[1] = desc_id[15:8];
-        entry[2] = desc_id[23:16];
-        entry[3] = desc_id[31:24];
-        entry[4] = used_len[7:0];
-        entry[5] = used_len[15:8];
-        entry[6] = used_len[23:16];
-        entry[7] = used_len[31:24];
-        idx_bytes[0] = used_idx[7:0];
-        idx_bytes[1] = used_idx[15:8];
-        entry_addr = vq.device_ring_addr + 4 + slot * 8;
-        mem.write_mem(entry_addr, entry);
-        mem.write_mem(vq.device_ring_addr + 2, idx_bytes);
-    endtask
-
     task test_split_queue_reclaim();
         virtio_iommu_model iommu;
         virtio_memory_barrier_model barrier;
@@ -192,8 +165,7 @@ class virtio_host_mem_reclaim_test extends uvm_test;
             end
 
             for (int unsigned i = 0; i < desc_ids.size(); i++) begin
-                write_used_entry(vq, i, desc_ids[i], 64,
-                                 used_idx + 1, host0_mem);
+                virtio_vq_test_kit::complete_split_at(host0_mem, vq, i, desc_ids[i], 64, used_idx + 1);
                 used_idx++;
             end
 

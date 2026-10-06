@@ -5,94 +5,19 @@ import uvm_pkg::*;
 `include "uvm_macros.svh"
 import virtio_net_pkg::*;
 
-// Migration state capture does not need PCIe TLP traffic in this focused
-// regression.  Keep the transport behaviour visible while exercising the
-// production FSM freeze/restore entry points.
-class virtio_migration_dirty_test_transport extends virtio_pci_transport;
+// 迁移恢复路径要求“已验证复位”后设备状态读回 0；其余寄存器模型（状态读写、
+// net config、队列编程记录、num_max）沿用公共 mock transport。
+class virtio_migration_dirty_test_transport extends virtio_mock_transport;
     `uvm_object_utils(virtio_migration_dirty_test_transport)
-
-    bit [7:0] device_status;
-    bit       device_reset_complete;
-    int unsigned queue_num_max;
-    bit          programmed_queue_valid[int unsigned];
-    bit [63:0]   programmed_queue_desc[int unsigned];
-    bit [63:0]   programmed_queue_driver[int unsigned];
-    bit [63:0]   programmed_queue_device[int unsigned];
-    int unsigned programmed_queue_size[int unsigned];
 
     function new(string name = "virtio_migration_dirty_test_transport");
         super.new(name);
-        device_status = DEV_STATUS_DRIVER_OK;
-        device_reset_complete = 1;
-        queue_num_max = 8;
     endfunction
-
-    virtual task read_device_status(ref bit [7:0] status);
-        status = device_status;
-    endtask
-
-    virtual task write_device_status(bit [7:0] status);
-        device_status = status;
-    endtask
 
     virtual task reset_device_verified(ref bit reset_complete);
-        device_status = '0;
-        reset_complete = device_reset_complete;
+        super.reset_device_verified(reset_complete);
+        mock_status = '0;
     endtask
-
-    virtual task read_net_config(ref virtio_net_device_config_t cfg);
-        cfg = '{default: 0};
-    endtask
-
-    // Queue setup remains production code.  This focused transport replaces
-    // only PCIe register traffic with an observable register model so the
-    // test can prove that the programmed IOVAs resolve to the live rings.
-    virtual task select_queue(int unsigned queue_id);
-    endtask
-
-    virtual task read_queue_num_max(ref int unsigned max_size);
-        max_size = queue_num_max;
-    endtask
-
-    virtual task setup_single_queue(
-        int unsigned queue_id,
-        int unsigned queue_size,
-        bit [63:0]   desc_addr,
-        bit [63:0]   driver_addr,
-        bit [63:0]   device_addr,
-        int unsigned msix_vector
-    );
-        programmed_queue_valid[queue_id]  = 1;
-        programmed_queue_desc[queue_id]   = desc_addr;
-        programmed_queue_driver[queue_id] = driver_addr;
-        programmed_queue_device[queue_id] = device_addr;
-        programmed_queue_size[queue_id]   = queue_size;
-    endtask
-
-    virtual task kick(int unsigned queue_id, int unsigned next_avail_idx,
-                      bit wrap_counter);
-    endtask
-
-    function bit get_programmed_queue(
-        int unsigned queue_id,
-        ref bit [63:0] desc_addr,
-        ref bit [63:0] driver_addr,
-        ref bit [63:0] device_addr,
-        ref int unsigned queue_size
-    );
-        desc_addr = '0;
-        driver_addr = '0;
-        device_addr = '0;
-        queue_size = 0;
-        if (!programmed_queue_valid.exists(queue_id) ||
-            !programmed_queue_valid[queue_id])
-            return 0;
-        desc_addr = programmed_queue_desc[queue_id];
-        driver_addr = programmed_queue_driver[queue_id];
-        device_addr = programmed_queue_device[queue_id];
-        queue_size = programmed_queue_size[queue_id];
-        return 1;
-    endfunction
 endclass : virtio_migration_dirty_test_transport
 
 // The FSM contract, rather than PCIe transport sequencing, is the subject of
@@ -1590,40 +1515,6 @@ class virtio_migration_dirty_test extends uvm_test;
         fsm.state = FSM_RUNNING;
     endtask
 
-    task publish_split_tx_completion(
-        host_mem_manager mem,
-        virtqueue_base   vq,
-        int unsigned     used_idx,
-        int unsigned     head_id
-    );
-        byte entry[];
-        byte idx_bytes[];
-
-        entry = new[8];
-        foreach (entry[i])
-            entry[i] = 0;
-        for (int unsigned byte_index = 0; byte_index < 4; byte_index++)
-            entry[byte_index] = head_id[byte_index * 8 +: 8];
-        mem.write_mem(vq.device_ring_addr + 4 + (used_idx - 1) * 8, entry);
-        idx_bytes = new[2];
-        idx_bytes[0] = used_idx[7:0];
-        idx_bytes[1] = used_idx[15:8];
-        mem.write_mem(vq.device_ring_addr + 2, idx_bytes);
-    endtask
-
-    task publish_packed_tx_completion(
-        host_mem_manager mem,
-        virtqueue_base   vq,
-        int unsigned     descriptor_index
-    );
-        byte descriptor[];
-
-        mem.read_mem(vq.desc_table_addr + descriptor_index * 16, 16,
-                     descriptor);
-        descriptor[15] = descriptor[15] | 8'h80;
-        mem.write_mem(vq.desc_table_addr + descriptor_index * 16, descriptor);
-    endtask
-
     task publish_tx_completion(
         virtqueue_type_e vq_type,
         host_mem_manager mem,
@@ -1632,10 +1523,11 @@ class virtio_migration_dirty_test extends uvm_test;
         int unsigned     descriptor_or_head
     );
         if (vq_type == VQ_SPLIT)
-            publish_split_tx_completion(mem, vq, completion_index,
-                                        descriptor_or_head);
+            virtio_vq_test_kit::complete_split_at(
+                mem, vq, completion_index - 1, descriptor_or_head, 0,
+                completion_index);
         else
-            publish_packed_tx_completion(mem, vq, descriptor_or_head);
+            virtio_vq_test_kit::complete_packed(mem, vq, descriptor_or_head);
     endtask
 
     // A direct TX owns two normal DMA mappings and an indirect TX additionally

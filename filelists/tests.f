@@ -6,6 +6,9 @@ virtio_net_vip/tests/virtio_test_device_builder.sv
 // queue_work 只消费中立 gq_host_mem_provider；该适配器把项目共享 pool
 // 注入 binder，不在 queue_work 或 $unit 重复编译 host_mem_pool。
 virtio_net_vip/tests/virtio_queue_host_mem_provider_adapter.sv
+// 测试公共件：无 PCIe 的 transport 替身与 virtqueue 测试 kit，须先于使用者编译。
+virtio_net_vip/tests/virtio_mock_transport.sv
+virtio_net_vip/tests/virtio_vq_test_kit.sv
 $DPU_COMMON_ROOT/tests/dpu_resource_manager_test.sv
 $DPU_COMMON_ROOT/tests/dpu_reg_plan_test.sv
 $DPU_COMMON_ROOT/tests/dpu_pcie_reg_executor_test.sv

@@ -6,64 +6,6 @@ import uvm_pkg::*;
 import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
 
-// This transport keeps the Admin VQ test in-process: it records the notify
-// while exposing a controlled device status through the public transport API.
-class virtio_admin_vq_test_transport extends virtio_pci_transport;
-    `uvm_object_utils(virtio_admin_vq_test_transport)
-
-    int unsigned kick_count;
-    int unsigned reset_count;
-    int unsigned device_reset_count;
-    int unsigned last_reset_queue_id;
-    bit [7:0]    mock_status;
-    bit          queue_reset_complete;
-    bit          device_reset_complete;
-    uvm_event    kick_event;
-
-    function new(string name = "virtio_admin_vq_test_transport");
-        super.new(name);
-        kick_count = 0;
-        reset_count = 0;
-        device_reset_count = 0;
-        last_reset_queue_id = '1;
-        mock_status = DEV_STATUS_DRIVER_OK;
-        queue_reset_complete = 1;
-        device_reset_complete = 1;
-        kick_event = new("admin_vq_kick_event");
-    endfunction
-
-    virtual task kick(int unsigned queue_id, int unsigned next_avail_idx,
-                      bit wrap_counter);
-        kick_count++;
-        kick_event.trigger();
-    endtask
-
-    virtual task read_device_status(ref bit [7:0] status);
-        status = mock_status;
-    endtask
-
-    virtual task write_queue_reset(int unsigned queue_id);
-        reset_count++;
-        last_reset_queue_id = queue_id;
-    endtask
-
-    virtual task write_queue_reset_verified(int unsigned queue_id,
-                                            ref bit reset_complete);
-        reset_count++;
-        last_reset_queue_id = queue_id;
-        reset_complete = queue_reset_complete;
-    endtask
-
-    virtual task reset_device();
-        device_reset_count++;
-    endtask
-
-    virtual task reset_device_verified(ref bit reset_complete);
-        device_reset_count++;
-        reset_complete = device_reset_complete;
-    endtask
-endclass : virtio_admin_vq_test_transport
-
 // The production IOMMU normally always allocates an IOVA. This test double
 // makes a selected allocation fail so Admin-VQ cleanup is exercised at the
 // same map-return boundary as the virtqueue indirect-table path.
@@ -72,7 +14,7 @@ class virtio_admin_vq_test_iommu extends virtio_iommu_model;
 
     int unsigned map_attempts;
     int unsigned fail_on_map_attempt;
-    virtio_admin_vq_test_transport transport_for_unmap;
+    virtio_mock_transport transport_for_unmap;
     bit observe_unmap_order;
     bit saw_unmap;
     bit queue_reset_requested_before_first_unmap;
@@ -107,7 +49,7 @@ class virtio_admin_vq_test_iommu extends virtio_iommu_model;
         if (observe_unmap_order && !saw_unmap) begin
             saw_unmap = 1;
             queue_reset_requested_before_first_unmap =
-                (transport_for_unmap != null && transport_for_unmap.reset_count != 0);
+                (transport_for_unmap != null && transport_for_unmap.queue_reset_count != 0);
             device_reset_requested_before_first_unmap =
                 (transport_for_unmap != null && transport_for_unmap.device_reset_count != 0);
         end
@@ -121,7 +63,7 @@ endclass : virtio_admin_vq_test_iommu
 class virtio_admin_vq_test_reset_owner extends virtio_admin_full_reset_owner;
     `uvm_object_utils(virtio_admin_vq_test_reset_owner)
 
-    virtio_admin_vq_test_transport transport;
+    virtio_mock_transport transport;
     int unsigned reset_count;
     bit reset_succeeds;
     bit normal_pf_state_invalidated;
@@ -296,35 +238,6 @@ class virtio_admin_vq_test extends uvm_test;
         next  = {data[15], data[14]};
     endfunction
 
-    function void complete_split(host_mem_manager mem,
-                                 split_virtqueue vq,
-                                 int unsigned head,
-                                 int unsigned used_len);
-        complete_split_at(mem, vq, 0, head, used_len);
-    endfunction
-
-    function void complete_split_at(host_mem_manager mem,
-                                    split_virtqueue vq,
-                                    int unsigned used_slot,
-                                    int unsigned head,
-                                    int unsigned used_len);
-        byte used_entry[];
-        byte used_idx[];
-        int unsigned next_used_idx;
-
-        used_entry = new[8];
-        for (int unsigned i = 0; i < 4; i++) begin
-            used_entry[i] = head[i * 8 +: 8];
-            used_entry[i + 4] = used_len[i * 8 +: 8];
-        end
-        used_idx = new[2];
-        next_used_idx = used_slot + 1;
-        used_idx[0] = next_used_idx[7:0];
-        used_idx[1] = 8'h00;
-        mem.write_mem(vq.device_ring_addr + 4 + used_slot * 8, used_entry);
-        mem.write_mem(vq.device_ring_addr + 2, used_idx);
-    endfunction
-
     task complete_admin_response(
         host_mem_manager       mem,
         virtio_iommu_model     iommu,
@@ -375,7 +288,7 @@ class virtio_admin_vq_test extends uvm_test;
         assert(iommu.write_from_device(mem, vq.bdf, in_addr,
                                        device_response, fault))
             else `uvm_fatal("ADMIN_VQ", "concurrent Admin response DMA write failed")
-        complete_split_at(mem, vq, used_slot, head, device_response.size());
+        virtio_vq_test_kit::complete_split_at(mem, vq, used_slot, head, device_response.size(), used_slot + 1);
     endtask
 
     // This is the only test setup path.  It creates a queue independent of
@@ -385,7 +298,7 @@ class virtio_admin_vq_test extends uvm_test;
         ref virtio_admin_vq_context      ctx,
         ref host_mem_manager              mem,
         ref virtio_iommu_model            iommu,
-        ref virtio_admin_vq_test_transport transport,
+        ref virtio_mock_transport transport,
         ref split_virtqueue               vq
     );
         virtio_memory_barrier_model barrier;
@@ -397,7 +310,7 @@ class virtio_admin_vq_test extends uvm_test;
         barrier = virtio_memory_barrier_model::type_id::create("admin_barrier");
         err_inj = virtqueue_error_injector::type_id::create("admin_err_inj");
         wait_pol = virtio_wait_policy::type_id::create("admin_wait_pol");
-        transport = virtio_admin_vq_test_transport::type_id::create("admin_transport");
+        transport = virtio_mock_transport::type_id::create("admin_transport");
         vq = split_virtqueue::type_id::create("admin_split_vq");
 
         mem.init_region(64'h7100_0000, 64'h7103_FFFF);
@@ -456,7 +369,7 @@ class virtio_admin_vq_test extends uvm_test;
     endtask
 
     task assert_no_submission(string scenario,
-                              virtio_admin_vq_test_transport transport,
+                              virtio_mock_transport transport,
                               split_virtqueue vq,
                               virtio_iommu_model iommu,
                               int unsigned add_before);
@@ -472,7 +385,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -519,7 +432,7 @@ class virtio_admin_vq_test extends uvm_test;
                 assert(iommu.write_from_device(mem, vq.bdf, in_addr,
                                                device_response, fault))
                     else `uvm_fatal("ADMIN_VQ", "Admin response DMA write failed")
-                complete_split(mem, vq, 0, device_response.size());
+                virtio_vq_test_kit::complete_split_at(mem, vq, 0, 0, device_response.size(), 1);
             end
         join_none
 
@@ -541,8 +454,8 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
-        virtio_admin_vq_test_transport wrong_transport;
+        virtio_mock_transport transport;
+        virtio_mock_transport wrong_transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -550,7 +463,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_expected_error_catcher catcher;
 
         configure_admin_context(ctx, mem, iommu, transport, vq);
-        wrong_transport = virtio_admin_vq_test_transport::type_id::create(
+        wrong_transport = virtio_mock_transport::type_id::create(
             "wrong_admin_pf_transport"
         );
         wrong_transport.bdf = 16'h0808;
@@ -573,7 +486,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         virtio_admin_vq_expected_error_catcher catcher;
 
@@ -602,7 +515,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         virtio_admin_vq_expected_error_catcher catcher;
 
@@ -635,7 +548,7 @@ class virtio_admin_vq_test extends uvm_test;
         host_mem_manager               foreign_mem;
         virtio_iommu_model             iommu;
         virtio_iommu_model             foreign_iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         virtio_atomic_ops              ops;
         byte unsigned                  request[];
@@ -701,7 +614,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         virtio_atomic_ops              ops;
         byte unsigned                  request[];
@@ -735,7 +648,7 @@ class virtio_admin_vq_test extends uvm_test;
         host_mem_manager               foreign_mem;
         virtio_iommu_model             iommu;
         virtio_iommu_model             foreign_iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -794,7 +707,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         bit                            recovery_complete;
         virtio_admin_vq_expected_error_catcher catcher;
@@ -815,7 +728,7 @@ class virtio_admin_vq_test extends uvm_test;
 
         assert(!recovery_complete && catcher.caught_count == 1 &&
                last_reset_owner.reset_count == 0 && transport.device_reset_count == 0 &&
-               transport.reset_count == 0 && iommu.total_maps == 0 &&
+               transport.queue_reset_count == 0 && iommu.total_maps == 0 &&
                iommu.total_unmaps == 0 && ctx.dma_quarantined &&
                ctx.quarantined_iovas.size() == 1 && ctx.quarantined_gpas.size() == 1)
             else `uvm_fatal("ADMIN_VQ",
@@ -836,7 +749,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request_one[];
         byte unsigned                  request_two[];
@@ -886,7 +799,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request_one[];
         byte unsigned                  request_two[];
@@ -940,7 +853,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -965,7 +878,7 @@ class virtio_admin_vq_test extends uvm_test;
         disable saturated_timeout_completion;
 
         assert(ok && response.size() == 1 && response[0] == 8'hC3 &&
-               transport.kick_count == 1 && transport.reset_count == 0 &&
+               transport.kick_count == 1 && transport.queue_reset_count == 0 &&
                last_reset_owner.reset_count == 0 &&
                iommu.total_maps == iommu.total_unmaps && vq.get_free_count() == 8)
             else `uvm_fatal("ADMIN_VQ", "saturated Admin timeout did not poll through delayed completion")
@@ -976,7 +889,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1001,7 +914,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1026,7 +939,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1051,7 +964,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1076,7 +989,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1101,7 +1014,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1126,7 +1039,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1151,7 +1064,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1176,7 +1089,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1209,7 +1122,7 @@ class virtio_admin_vq_test extends uvm_test;
                 assert(iommu.write_from_device(mem, vq.bdf, in_addr,
                                                device_response, fault))
                     else `uvm_fatal("ADMIN_VQ", "error response DMA write failed")
-                complete_split(mem, vq, 0, device_response.size());
+                virtio_vq_test_kit::complete_split_at(mem, vq, 0, 0, device_response.size(), 1);
             end
         join_none
         pf_mgr.admin_cmd(0, request, response, ok);
@@ -1227,7 +1140,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1269,7 +1182,7 @@ class virtio_admin_vq_test extends uvm_test;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
         virtio_admin_vq_test_iommu    test_iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1299,7 +1212,7 @@ class virtio_admin_vq_test extends uvm_test;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
         virtio_admin_vq_test_iommu    test_iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1321,7 +1234,7 @@ class virtio_admin_vq_test extends uvm_test;
         uvm_report_cb::delete(null, catcher);
 
         assert(!ok && catcher.caught_count >= 1 && transport.kick_count == 1 &&
-               transport.reset_count == 0 && transport.device_reset_count == 1 &&
+               transport.queue_reset_count == 0 && transport.device_reset_count == 1 &&
                last_reset_owner.reset_count == 1 &&
                last_reset_owner.normal_pf_state_invalidated &&
                !ctx.configured && test_iommu.saw_unmap &&
@@ -1336,7 +1249,7 @@ class virtio_admin_vq_test extends uvm_test;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
         virtio_admin_vq_test_iommu    test_iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1357,7 +1270,7 @@ class virtio_admin_vq_test extends uvm_test;
         fork : admin_malformed_completion
             begin
                 wait (transport.kick_count != 0);
-                complete_split(mem, vq, 0, 0);
+                virtio_vq_test_kit::complete_split_at(mem, vq, 0, 0, 0, 1);
             end
         join_none
         pf_mgr.admin_cmd(0, request, response, ok);
@@ -1365,7 +1278,7 @@ class virtio_admin_vq_test extends uvm_test;
         uvm_report_cb::delete(null, catcher);
 
         assert(!ok && catcher.caught_count >= 1 && transport.kick_count == 1 &&
-               transport.reset_count == 0 && transport.device_reset_count == 1 &&
+               transport.queue_reset_count == 0 && transport.device_reset_count == 1 &&
                last_reset_owner.reset_count == 1 &&
                last_reset_owner.normal_pf_state_invalidated &&
                !ctx.configured && test_iommu.saw_unmap &&
@@ -1380,7 +1293,7 @@ class virtio_admin_vq_test extends uvm_test;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
         virtio_admin_vq_test_iommu    test_iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1401,7 +1314,7 @@ class virtio_admin_vq_test extends uvm_test;
         uvm_report_cb::delete(null, catcher);
 
         assert(!ok && catcher.caught_count >= 1 && transport.kick_count == 1 &&
-               transport.reset_count == 1 && transport.device_reset_count == 0 &&
+               transport.queue_reset_count == 1 && transport.device_reset_count == 0 &&
                transport.last_reset_queue_id == ctx.queue_id && !ctx.configured &&
                test_iommu.saw_unmap &&
                test_iommu.queue_reset_requested_before_first_unmap &&
@@ -1417,7 +1330,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1437,7 +1350,7 @@ class virtio_admin_vq_test extends uvm_test;
         uvm_report_cb::delete(null, catcher);
 
         assert(!ok && catcher.caught_count >= 1 && transport.kick_count == 1 &&
-               transport.reset_count == 1 && !ctx.configured &&
+               transport.queue_reset_count == 1 && !ctx.configured &&
                iommu.total_maps == 2 && iommu.total_unmaps == 0 &&
                vq.desc_table_addr != 0 && ctx.recovery_required &&
                ctx.dma_quarantined && ctx.quarantined_iovas.size() == 2 &&
@@ -1463,7 +1376,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];
@@ -1507,7 +1420,7 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_admin_vq_context       ctx;
         host_mem_manager               mem;
         virtio_iommu_model             iommu;
-        virtio_admin_vq_test_transport transport;
+        virtio_mock_transport transport;
         split_virtqueue                vq;
         byte unsigned                  request[];
         byte unsigned                  response[];

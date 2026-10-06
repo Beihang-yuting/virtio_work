@@ -9,29 +9,6 @@ import uvm_pkg::*;
 import net_packet_pkg::*;
 import virtio_net_pkg::*;
 
-// 中文说明：数据面委托 atomic ops 后会经 transport 发 notify；本测试不建 PCIe
-// 通路，用最小 transport 只记录每个队列的 notify 次数，不产生寄存器访问。
-class virtio_net_packet_mq_test_transport extends virtio_pci_transport;
-    `uvm_object_utils(virtio_net_packet_mq_test_transport)
-
-    int unsigned kicks_per_queue[int unsigned];
-
-    function new(string name = "virtio_net_packet_mq_test_transport");
-        super.new(name);
-    endfunction
-
-    virtual task kick(int unsigned queue_id, int unsigned next_avail_idx,
-                      bit wrap_counter);
-        if (!kicks_per_queue.exists(queue_id))
-            kicks_per_queue[queue_id] = 0;
-        kicks_per_queue[queue_id]++;
-    endtask
-
-    function int unsigned kicks(int unsigned queue_id);
-        return kicks_per_queue.exists(queue_id) ? kicks_per_queue[queue_id] : 0;
-    endfunction
-endclass : virtio_net_packet_mq_test_transport
-
 // 中文说明：真实 net_packet 多队列数据面测试。
 //
 // 队列布局固定为：
@@ -57,7 +34,7 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
     virtio_wait_policy       wait_pol;
     virtqueue_manager        vq_mgr;
     virtio_net_dataplane     dataplane;
-    virtio_net_packet_mq_test_transport transport;
+    virtio_mock_transport transport;
     virtio_atomic_ops        ops;
     split_virtqueue          queues[int unsigned];
 
@@ -109,34 +86,6 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
         len   = read_u32(vq.desc_table_addr + desc_id * 16 + 8);
         flags = read_u16(vq.desc_table_addr + desc_id * 16 + 12);
         next  = read_u16(vq.desc_table_addr + desc_id * 16 + 14);
-    endfunction
-
-    function void write_used_entry(
-        split_virtqueue vq,
-        int unsigned used_slot,
-        int unsigned desc_id,
-        int unsigned used_len,
-        int unsigned used_count
-    );
-        byte id_bytes[4];
-        byte len_bytes[4];
-        byte idx_bytes[2];
-        bit [63:0] entry_addr;
-
-        entry_addr = vq.device_ring_addr + 4 + used_slot * 8;
-        id_bytes[0] = desc_id[7:0];
-        id_bytes[1] = desc_id[15:8];
-        id_bytes[2] = desc_id[23:16];
-        id_bytes[3] = desc_id[31:24];
-        len_bytes[0] = used_len[7:0];
-        len_bytes[1] = used_len[15:8];
-        len_bytes[2] = used_len[23:16];
-        len_bytes[3] = used_len[31:24];
-        idx_bytes[0] = used_count[7:0];
-        idx_bytes[1] = used_count[15:8];
-        mem.write_mem(entry_addr, id_bytes);
-        mem.write_mem(entry_addr + 4, len_bytes);
-        mem.write_mem(vq.device_ring_addr + 2, idx_bytes);
     endfunction
 
     function packet_item make_packet(string name, int unsigned length);
@@ -276,7 +225,7 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
 
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE,
                             2048, 0, DEVICE_BDF, 0);
-        transport = virtio_net_packet_mq_test_transport::type_id::create(
+        transport = virtio_mock_transport::type_id::create(
             "multi_queue_transport");
         transport.bdf = DEVICE_BDF;
         ops = virtio_atomic_ops::type_id::create("multi_queue_ops");
@@ -319,8 +268,7 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
                     transport.kicks(qid), PACKETS_PER_QUEUE))
 
             for (int unsigned i = 0; i < PACKETS_PER_QUEUE; i++)
-                write_used_entry(queues[qid], i, tx_descs[qid][i],
-                                 10 + tx_packets[qid][i].pkt.raw_data.size(), i + 1);
+                virtio_vq_test_kit::complete_split_at(mem, queues[qid], i, tx_descs[qid][i], 10 + tx_packets[qid][i].pkt.raw_data.size(), i + 1);
 
             begin
                 uvm_object completed[$];
@@ -370,7 +318,7 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
                            0, mem, DEVICE_BDF, buf_iova, rx_data, fault))
                     else `uvm_fatal("NET_PACKET_TEST", $sformatf(
                         "RX q%0d device DMA write failed (%s)", qid, fault.name()))
-                write_used_entry(queues[qid], i, desc_id, rx_data.size(), i + 1);
+                virtio_vq_test_kit::complete_split_at(mem, queues[qid], i, desc_id, rx_data.size(), i + 1);
             end
 
             begin

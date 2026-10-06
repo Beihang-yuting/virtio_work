@@ -106,31 +106,6 @@ class virtio_dataplane_indirect_test_packet extends uvm_object;
     endfunction
 endclass : virtio_dataplane_indirect_test_packet
 
-// TX feature-gate testing needs the atomic submission path but no PCIe side
-// effects.  Keep the transport real enough for tx_submit while suppressing
-// its final notification write.
-class virtio_indirect_desc_test_transport extends virtio_pci_transport;
-    `uvm_object_utils(virtio_indirect_desc_test_transport)
-
-    int unsigned kick_count;
-    // Last notify arguments, so production callers' cursor can be checked.
-    int unsigned last_kick_queue_id;
-    int unsigned last_kick_next_avail_idx;
-    bit          last_kick_wrap_counter;
-
-    function new(string name = "virtio_indirect_desc_test_transport");
-        super.new(name);
-        kick_count = 0;
-    endfunction
-
-    virtual task kick(int unsigned queue_id, int unsigned next_avail_idx, bit wrap_counter);
-        kick_count++;
-        last_kick_queue_id       = queue_id;
-        last_kick_next_avail_idx = next_avail_idx;
-        last_kick_wrap_counter   = wrap_counter;
-    endtask
-endclass : virtio_indirect_desc_test_transport
-
 class virtio_indirect_desc_test extends uvm_test;
     `uvm_component_utils(virtio_indirect_desc_test)
 
@@ -300,38 +275,6 @@ class virtio_indirect_desc_test extends uvm_test;
         end
     endfunction
 
-    function void complete_split(host_mem_manager mem,
-                                 split_virtqueue vq,
-                                 int unsigned head,
-                                 int unsigned used_len);
-        byte used_entry[];
-        byte used_idx[];
-
-        used_entry = new[8];
-        for (int unsigned i = 0; i < 4; i++) begin
-            used_entry[i]   = head[i * 8 +: 8];
-            used_entry[i+4] = used_len[i * 8 +: 8];
-        end
-        used_idx = new[2];
-        used_idx[0] = 8'h01;
-        used_idx[1] = 8'h00;
-        mem.write_mem(vq.device_ring_addr + 4, used_entry);
-        mem.write_mem(vq.device_ring_addr + 2, used_idx);
-    endfunction
-
-    function void complete_packed(host_mem_manager mem,
-                                  packed_virtqueue vq,
-                                  int unsigned head);
-        byte flags[];
-        bit [15:0] value;
-
-        mem.read_mem(vq.desc_table_addr + head * 16 + 14, 2, flags);
-        value = {flags[1], flags[0]} | VIRTQ_DESC_F_USED;
-        flags[0] = value[7:0];
-        flags[1] = value[15:8];
-        mem.write_mem(vq.desc_table_addr + head * 16 + 14, flags);
-    endfunction
-
     task test_split_indirect_descriptor();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("split_iommu");
@@ -372,7 +315,7 @@ class virtio_indirect_desc_test extends uvm_test;
             else `uvm_fatal("INDIRECT_TEST", "split table record missing")
         check_indirect_table(vq, mem, iommu, head, sgs, 1'b0);
 
-        complete_split(mem, vq, head, 144);
+        virtio_vq_test_kit::complete_split_at(mem, vq, 0, head, 144, 1);
         used = vq.poll_used(completed_token, completed_len);
         assert(used) else `uvm_fatal("INDIRECT_TEST", "split indirect completion not consumed")
         assert(completed_token == token && completed_len == 144)
@@ -490,7 +433,7 @@ class virtio_indirect_desc_test extends uvm_test;
             else `uvm_fatal("INDIRECT_TEST", "packed table record missing")
         check_indirect_table(vq, mem, iommu, head, sgs, 1'b1);
 
-        complete_packed(mem, vq, head);
+        virtio_vq_test_kit::complete_packed(mem, vq, head);
         used = vq.poll_used(completed_token, completed_len);
         assert(used) else `uvm_fatal("INDIRECT_TEST", "packed indirect completion not consumed")
         assert(completed_token == token && completed_len == 3 * 16)
@@ -583,8 +526,8 @@ class virtio_indirect_desc_test extends uvm_test;
             virtqueue_error_injector::type_id::create("tx_gate_err_inj");
         virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("tx_gate_wait_pol");
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("tx_gate_vq_mgr");
-        virtio_indirect_desc_test_transport transport =
-            virtio_indirect_desc_test_transport::type_id::create("tx_gate_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("tx_gate_transport");
         virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("tx_gate_ops");
         virtqueue_base base_vq;
         split_virtqueue vq;
@@ -633,7 +576,7 @@ class virtio_indirect_desc_test extends uvm_test;
                vq.get_indirect_table_count() == 1)
             else `uvm_fatal("INDIRECT_TEST", "tx_submit rejected negotiated indirect descriptors")
 
-        complete_split(mem, vq, desc_id, 0);
+        virtio_vq_test_kit::complete_split_at(mem, vq, 0, desc_id, 0, 1);
         budget = 1;
         ops.tx_complete(0, completed, budget);
         assert(completed.size() == 1 && completed[0] == token &&
@@ -656,8 +599,8 @@ class virtio_indirect_desc_test extends uvm_test;
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("dataplane_gate_vq_mgr");
         virtio_net_dataplane dataplane =
             virtio_net_dataplane::type_id::create("dataplane_gate");
-        virtio_indirect_desc_test_transport transport =
-            virtio_indirect_desc_test_transport::type_id::create("dataplane_gate_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("dataplane_gate_transport");
         virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("dataplane_gate_ops");
         virtqueue_base base_vq;
         split_virtqueue vq;
@@ -715,7 +658,7 @@ class virtio_indirect_desc_test extends uvm_test;
             else `uvm_fatal("INDIRECT_TEST",
                 "dataplane TX rejected negotiated indirect descriptors")
 
-        complete_split(mem, vq, desc_id, 0);
+        virtio_vq_test_kit::complete_split_at(mem, vq, 0, desc_id, 0, 1);
         dataplane.tx_engine.complete_tx(0, 1, completed);
         assert(completed.size() == 1 && completed[0] == token &&
                vq.get_indirect_table_count() == 0 &&
@@ -739,8 +682,8 @@ class virtio_indirect_desc_test extends uvm_test;
             virtqueue_error_injector::type_id::create("atomic_full_err_inj");
         virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("atomic_full_wait_pol");
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("atomic_full_vq_mgr");
-        virtio_indirect_desc_test_transport transport =
-            virtio_indirect_desc_test_transport::type_id::create("atomic_full_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("atomic_full_transport");
         virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("atomic_full_ops");
         virtqueue_base base_vq;
         split_virtqueue vq;
@@ -801,7 +744,7 @@ class virtio_indirect_desc_test extends uvm_test;
             else `uvm_fatal("INDIRECT_TEST",
                 "atomic TX queue-full failure retained maps, submission state, or kick")
 
-        complete_split(mem, vq, filler_desc, 0);
+        virtio_vq_test_kit::complete_split_at(mem, vq, 0, filler_desc, 0, 1);
         budget = 1;
         ops.tx_complete(0, completed, budget);
         assert(completed.size() == 1 && completed[0] == filler_token &&
@@ -826,8 +769,8 @@ class virtio_indirect_desc_test extends uvm_test;
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("dataplane_full_vq_mgr");
         virtio_net_dataplane dataplane =
             virtio_net_dataplane::type_id::create("dataplane_full");
-        virtio_indirect_desc_test_transport transport =
-            virtio_indirect_desc_test_transport::type_id::create("dataplane_full_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("dataplane_full_transport");
         virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("dataplane_full_ops");
         virtqueue_base base_vq;
         split_virtqueue vq;
@@ -902,7 +845,7 @@ class virtio_indirect_desc_test extends uvm_test;
             else `uvm_fatal("INDIRECT_TEST",
                 "dataplane TX queue-full failure retained maps, token, or statistics")
 
-        complete_split(mem, vq, filler_desc, 0);
+        virtio_vq_test_kit::complete_split_at(mem, vq, 0, filler_desc, 0, 1);
         dataplane.tx_engine.complete_tx(0, 1, completed);
         assert(completed.size() == 1 && completed[0] == filler_token &&
                iommu.total_maps == iommu.total_unmaps)
@@ -925,8 +868,8 @@ class virtio_indirect_desc_test extends uvm_test;
             virtqueue_error_injector::type_id::create("cursor_err_inj");
         virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("cursor_wait_pol");
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("cursor_vq_mgr");
-        virtio_indirect_desc_test_transport transport =
-            virtio_indirect_desc_test_transport::type_id::create("cursor_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("cursor_transport");
         virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("cursor_ops");
         virtqueue_base base_vq;
         split_virtqueue split_vq;
@@ -1003,11 +946,11 @@ class virtio_indirect_desc_test extends uvm_test;
                 "packed wrapped notify cursor next=%0d wrap=%0b, expected 0/0",
                 transport.last_kick_next_avail_idx, transport.last_kick_wrap_counter))
 
-        complete_split(mem, split_vq, split_desc, 0);
+        virtio_vq_test_kit::complete_split_at(mem, split_vq, 0, split_desc, 0, 1);
         budget = 1;
         ops.tx_complete(0, completed, budget);
-        complete_packed(mem, packed_vq, 0);
-        complete_packed(mem, packed_vq, 2);
+        virtio_vq_test_kit::complete_packed(mem, packed_vq, 0);
+        virtio_vq_test_kit::complete_packed(mem, packed_vq, 2);
         budget = 2;
         ops.tx_complete(1, completed, budget);
         assert(completed.size() == 3 && iommu.total_maps == iommu.total_unmaps)
@@ -1032,8 +975,8 @@ class virtio_indirect_desc_test extends uvm_test;
             virtqueue_error_injector::type_id::create("rx_nomrg_err_inj");
         virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("rx_nomrg_wait_pol");
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("rx_nomrg_vq_mgr");
-        virtio_indirect_desc_test_transport transport =
-            virtio_indirect_desc_test_transport::type_id::create("rx_nomrg_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("rx_nomrg_transport");
         virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("rx_nomrg_ops");
         virtqueue_base base_vq;
         split_virtqueue vq;
@@ -1079,7 +1022,7 @@ class virtio_indirect_desc_test extends uvm_test;
         for (int unsigned i = 12; i < frame.size(); i++) frame[i] = i[7:0];
         assert(iommu.write_from_device_for_host(0, mem, 16'h0705, addr, frame, fault))
             else `uvm_fatal("INDIRECT_TEST", "device RX write failed")
-        complete_split(mem, vq, 0, frame.size());
+        virtio_vq_test_kit::complete_split_at(mem, vq, 0, 0, frame.size(), 1);
 
         budget = 4;
         ops.rx_receive(0, received, budget);
@@ -1091,23 +1034,11 @@ class virtio_indirect_desc_test extends uvm_test;
         // Complete the second buffer as used entry 1 so its DMA retires
         // through the normal receive path.
         begin
-            byte used_entry[];
-            byte used_idx[];
-
             read_desc(mem, vq.desc_table_addr, 1, addr, len, flags, next);
             frame[10] = 8'h01;
             assert(iommu.write_from_device_for_host(0, mem, 16'h0705, addr, frame, fault))
                 else `uvm_fatal("INDIRECT_TEST", "device RX write failed")
-            used_entry = new[8];
-            used_entry[0] = 8'h01;
-            for (int unsigned i = 1; i < 4; i++) used_entry[i] = 8'h00;
-            for (int unsigned i = 0; i < 4; i++)
-                used_entry[i+4] = frame.size() >> (i * 8);
-            used_idx = new[2];
-            used_idx[0] = 8'h02;
-            used_idx[1] = 8'h00;
-            mem.write_mem(vq.device_ring_addr + 4 + 8, used_entry);
-            mem.write_mem(vq.device_ring_addr + 2, used_idx);
+            virtio_vq_test_kit::complete_split_at(mem, vq, 1, 1, frame.size(), 2);
         end
         budget = 4;
         ops.rx_receive(0, received, budget);
@@ -1134,8 +1065,8 @@ class virtio_indirect_desc_test extends uvm_test;
             virtio_wait_policy::type_id::create("dataplane_notify_wait_pol");
         virtqueue_manager vq_mgr =
             virtqueue_manager::type_id::create("dataplane_notify_vq_mgr");
-        virtio_indirect_desc_test_transport transport =
-            virtio_indirect_desc_test_transport::type_id::create("dataplane_notify_transport");
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("dataplane_notify_transport");
         virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("dataplane_notify_ops");
         virtio_net_dataplane dataplane =
             virtio_net_dataplane::type_id::create("dataplane_notify");
@@ -1193,7 +1124,7 @@ class virtio_indirect_desc_test extends uvm_test;
                 "dataplane TX did not notify the device (desc=%0d kicks=%0d)",
                 desc_id, transport.kick_count))
 
-        complete_split(mem, tx_vq, desc_id, 0);
+        virtio_vq_test_kit::complete_split_at(mem, tx_vq, 0, desc_id, 0, 1);
         dataplane.tx_engine.complete_tx(1, 1, completed);
         assert((completed.size() == 1) && (completed[0] == token))
             else `uvm_fatal("INDIRECT_TEST", "dataplane TX completion did not return the token")
@@ -1215,7 +1146,7 @@ class virtio_indirect_desc_test extends uvm_test;
         for (int unsigned i = 10; i < frame.size(); i++) frame[i] = i[7:0];
         assert(iommu.write_from_device_for_host(0, mem, 16'h0706, addr, frame, fault))
             else `uvm_fatal("INDIRECT_TEST", "device RX write failed")
-        complete_split(mem, rx_vq, 0, frame.size());
+        virtio_vq_test_kit::complete_split_at(mem, rx_vq, 0, 0, frame.size(), 1);
         dataplane.rx_engine.receive_packets(0, 1, received);
         assert((received.size() == 1) && (rx_vq.get_pending_count() == 0) &&
                (dataplane.rx_engine.total_rx_packets == 1))

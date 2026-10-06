@@ -6,37 +6,6 @@ import uvm_pkg::*;
 import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
 
-// This transport reports a chosen device-reset completion without requiring
-// PCIe traffic.  The PF lifecycle API remains responsible for what completion
-// permits it to invalidate.
-class virtio_pf_lifecycle_test_transport extends virtio_pci_transport;
-    `uvm_object_utils(virtio_pf_lifecycle_test_transport)
-
-    bit          device_reset_complete;
-    int unsigned device_reset_count;
-    int unsigned kick_count;
-
-    function new(string name = "virtio_pf_lifecycle_test_transport");
-        super.new(name);
-        device_reset_complete = 1;
-        device_reset_count = 0;
-        kick_count = 0;
-    endfunction
-
-    virtual task reset_device_verified(ref bit reset_complete);
-        device_reset_count++;
-        reset_complete = device_reset_complete;
-    endtask
-
-    // Pending-DMA lifecycle tests exercise real split virtqueues but do not
-    // need a PCIe notification path.  Keep the transport side effect
-    // observable without requiring a TLM sequencer.
-    virtual task kick(int unsigned queue_id, int unsigned next_avail_idx,
-                      bit wrap_counter);
-        kick_count++;
-    endtask
-endclass : virtio_pf_lifecycle_test_transport
-
 // The production classes keep their allocation/mapping tables protected.
 // These test-only views make reset ownership observable without widening the
 // public dataplane API solely for a regression assertion.
@@ -462,7 +431,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
     // allowing PF reset to detach queues and DMA concurrently.
     task test_pf_reset_waits_for_real_dataplane_worker();
         virtio_pf_lifecycle_reset_owner   reset_owner;
-        virtio_pf_lifecycle_test_transport transport;
+        virtio_mock_transport transport;
         virtio_auto_fsm                    fsm;
         virtio_pf_lifecycle_blocking_ops   ops;
         virtio_iommu_model                  iommu;
@@ -474,7 +443,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         bit                                 reset_complete;
         bit                                 reset_returned;
 
-        transport = virtio_pf_lifecycle_test_transport::type_id::create(
+        transport = virtio_mock_transport::type_id::create(
             "real_worker_reset_transport");
         fsm = virtio_auto_fsm::type_id::create("real_worker_reset_fsm");
         ops = virtio_pf_lifecycle_blocking_ops::type_id::create(
@@ -569,13 +538,13 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
 
     task test_verified_reset_quiesces_and_requires_reinitialization();
         virtio_pf_lifecycle_reset_owner  reset_owner;
-        virtio_pf_lifecycle_test_transport transport;
+        virtio_mock_transport transport;
         virtio_pf_lifecycle_test_fsm    fsm;
         virtio_atomic_ops                ops;
         virtio_iommu_model               iommu;
         bit                              reset_complete;
 
-        transport = virtio_pf_lifecycle_test_transport::type_id::create(
+        transport = virtio_mock_transport::type_id::create(
             "verified_reset_transport");
         fsm = virtio_pf_lifecycle_test_fsm::type_id::create("verified_reset_fsm");
         ops = virtio_atomic_ops::type_id::create("verified_reset_ops");
@@ -613,7 +582,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
     // rather than inspecting internal bookkeeping alone.
     task test_verified_reset_retires_pending_normal_dma();
         virtio_pf_lifecycle_reset_owner   reset_owner;
-        virtio_pf_lifecycle_test_transport transport;
+        virtio_mock_transport transport;
         virtio_pf_lifecycle_test_fsm       fsm;
         virtio_atomic_ops                   ops;
         virtio_pf_lifecycle_tracking_mem    mem;
@@ -630,7 +599,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         int unsigned                        ring_allocation_count;
         bit                                 reset_complete;
 
-        transport = virtio_pf_lifecycle_test_transport::type_id::create(
+        transport = virtio_mock_transport::type_id::create(
             "pending_dma_reset_transport");
         fsm = virtio_pf_lifecycle_test_fsm::type_id::create(
             "pending_dma_reset_fsm");
@@ -713,7 +682,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
     // allocation to fail.  The TX submission must roll back that header
     // allocation without attempting any DMA map or queue notification.
     task test_tx_second_allocation_failure_releases_header();
-        virtio_pf_lifecycle_test_transport  transport;
+        virtio_mock_transport  transport;
         virtio_atomic_ops                    ops;
         virtqueue_manager                    vq_mgr;
         virtio_pf_lifecycle_tracking_mem     mem;
@@ -727,7 +696,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         int unsigned                         desc_id;
         int unsigned                         allocation_baseline;
 
-        transport = virtio_pf_lifecycle_test_transport::type_id::create(
+        transport = virtio_mock_transport::type_id::create(
             "tx_second_alloc_fail_transport");
         ops = virtio_atomic_ops::type_id::create("tx_second_alloc_fail_ops");
         vq_mgr = virtqueue_manager::type_id::create("tx_second_alloc_fail_vq_mgr");
@@ -778,7 +747,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
 
     task test_failed_reset_retains_pf_runtime();
         virtio_pf_lifecycle_reset_owner          reset_owner;
-        virtio_pf_lifecycle_test_transport       transport;
+        virtio_mock_transport       transport;
         virtio_pf_lifecycle_test_fsm             fsm;
         virtio_atomic_ops                        ops;
         virtio_iommu_model                       iommu;
@@ -786,7 +755,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         bit                                      reset_complete;
         bit [63:0]                               features_before;
 
-        transport = virtio_pf_lifecycle_test_transport::type_id::create(
+        transport = virtio_mock_transport::type_id::create(
             "failed_reset_transport");
         transport.device_reset_complete = 0;
         fsm = virtio_pf_lifecycle_test_fsm::type_id::create("failed_reset_fsm");
