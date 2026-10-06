@@ -23,8 +23,8 @@ class virtio_function_instance extends uvm_component;
     dpu_bar_pair_lease_t    bar_pairs[$];
     dpu_resource_manager    resource_manager;
     virtio_resource_client  resource_client;
-    protected dpu_device_snapshot configuration_snapshot;
-    protected dpu_resource_snapshot configuration_resource_snapshot;
+    // 已校验的 snapshot 上下文；非空表示本实例已被某个 service 配置。
+    protected vio_snapshot_ctx snapshot_ctx;
 
     // PCIe context is owned by the PCIe function manager, not this function.
     uvm_object              pcie_ctx_ref;
@@ -116,13 +116,9 @@ class virtio_function_instance extends uvm_component;
         apply_function_configuration();
     endfunction
 
-    // 从同一份冻结、按 service-key 索引的 snapshot 解析身份和资源。
-    // 调用方不能直接传入 raw BDF/BAR，也不能把已绑定实例迁移到另一份 snapshot。
-    // 中文：输入冻结 device/resource snapshot 和 service key，输出本实例的身份、BAR
-    // 与资源句柄；快照不匹配、服务未声明或 manager 不属于同一 pair 时失败。
-    // Resolve all identity and placement from one frozen, service-keyed device
-    // snapshot. Callers cannot provide raw BDF/BAR values, and an established
-    // function binding cannot move to a different snapshot.
+    // 独立调用入口（测试与兼容路径）：先拒绝非冻结 device snapshot 和改绑到另一份
+    // device snapshot，再由 vio_snapshot_ctx 一次性校验 resource snapshot/manager，
+    // 最后委托 configure_from_ctx。调用方不能传入 raw BDF/BAR。
     virtual function bit configure_from_service(
         input dpu_device_snapshot device_snapshot,
         input dpu_resource_snapshot resource_snapshot,
@@ -130,10 +126,7 @@ class virtio_function_instance extends uvm_component;
         input dpu_resource_manager manager,
         input uvm_object pcie_ctx = null
     );
-        dpu_function_key_t key;
-        dpu_pcie_function_id_t pcie_id;
-        dpu_bar_pair_lease_t bars[$];
-        dpu_bar_pair_lease_t bar;
+        vio_snapshot_ctx ctx;
         string why;
 
         if ((device_snapshot == null) || !device_snapshot.is_frozen()) begin
@@ -141,6 +134,40 @@ class virtio_function_instance extends uvm_component;
                 "function configuration requires a frozen device snapshot")
             return 0;
         end
+        if (!device_snapshot_assignable(device_snapshot))
+            return 0;
+        ctx = vio_snapshot_ctx::create_checked(
+            device_snapshot, resource_snapshot, manager, why);
+        if (ctx == null) begin
+            `uvm_fatal("FUNCTION_INSTANCE",
+                {"function configuration requires its exact frozen resource ",
+                 "snapshot and pair-seeded manager"})
+            return 0;
+        end
+        return configure_from_ctx(ctx, service_key, pcie_ctx);
+    endfunction
+
+    // 生产入口：ctx 已由 env 校验。解析本 service 的 owner、PCIe 身份和三个 BAR，
+    // 拒绝改绑（device snapshot / resource snapshot / service / manager / PCIe
+    // context），在提交前导入资源视图；任何失败 UVM_FATAL 并保持原有绑定。
+    virtual function bit configure_from_ctx(
+        input vio_snapshot_ctx ctx,
+        input dpu_service_key_t service_key,
+        input uvm_object pcie_ctx = null
+    );
+        dpu_device_snapshot device_snapshot;
+        dpu_function_key_t key;
+        dpu_pcie_function_id_t pcie_id;
+        dpu_bar_pair_lease_t bars[$];
+        dpu_bar_pair_lease_t bar;
+        string why;
+
+        if (ctx == null) begin
+            `uvm_fatal("FUNCTION_INSTANCE",
+                "function configuration requires a validated snapshot context")
+            return 0;
+        end
+        device_snapshot = ctx.device_snapshot();
         if (service_key.service_kind != DPU_SERVICE_VIO_NET) begin
             `uvm_fatal("FUNCTION_INSTANCE",
                 "function configuration requires a VIO-net service key")
@@ -166,46 +193,33 @@ class virtio_function_instance extends uvm_component;
             return 0;
         end
         bars.push_back(bar);
-        if ((configuration_snapshot != null) &&
-            (configuration_snapshot != device_snapshot)) begin
-            `uvm_fatal("FUNCTION_INSTANCE",
-                {"function configuration ownership cannot be reassigned to a ",
-                 "different device snapshot"})
+        if (!device_snapshot_assignable(device_snapshot))
             return 0;
-        end
-        if ((resource_snapshot == null) || !resource_snapshot.is_frozen() ||
-            !resource_snapshot.references_device_snapshot(device_snapshot) ||
-            (manager == null) ||
-            !manager.is_seeded_from_snapshots(
-                device_snapshot, resource_snapshot) ||
-            !manager.contains_function(key)) begin
+        if (!ctx.manager().contains_function(key)) begin
             `uvm_fatal("FUNCTION_INSTANCE",
                 {"function configuration requires its exact frozen resource ",
                  "snapshot and pair-seeded manager"})
             return 0;
         end
-        if ((configuration_resource_snapshot != null) &&
-            ((configuration_resource_snapshot != resource_snapshot) ||
+        if ((snapshot_ctx != null) &&
+            ((snapshot_ctx.resource_snapshot() != ctx.resource_snapshot()) ||
              (dpu_service_key_name(this.service_key) !=
               dpu_service_key_name(service_key)) ||
-             ((resource_manager != null) && (resource_manager != manager)) ||
+             ((resource_manager != null) && (resource_manager != ctx.manager())) ||
              (pcie_ctx_ref != pcie_ctx))) begin
             `uvm_fatal("FUNCTION_INSTANCE",
                 {"function configuration ownership cannot be reassigned to a ",
                  "different resource snapshot, service, manager, or PCIe context"})
             return 0;
         end
-        if (resource_client != null) begin
-            if (!resource_client.bind_to_service(
-                    device_snapshot, resource_snapshot, service_key, why)) begin
-                `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
-                    "could not import service resources for %s: %s",
-                    dpu_service_key_name(service_key), why))
-                return 0;
-            end
+        if ((resource_client != null) &&
+            !resource_client.bind_to_ctx(ctx, service_key, why)) begin
+            `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
+                "could not import service resources for %s: %s",
+                dpu_service_key_name(service_key), why))
+            return 0;
         end
-        configuration_snapshot = device_snapshot;
-        configuration_resource_snapshot = resource_snapshot;
+        snapshot_ctx = ctx;
         function_kind = key.kind;
         function_key = key;
         this.service_key = service_key;
@@ -214,9 +228,23 @@ class virtio_function_instance extends uvm_component;
         pcie_id_valid = 1;
         vf_index = key.vf_id;
         bar_pairs = bars;
-        resource_manager = manager;
+        resource_manager = ctx.manager();
         pcie_ctx_ref = pcie_ctx;
         apply_function_configuration();
+        return 1;
+    endfunction
+
+    // 已配置的 Function 不得迁移到另一份 device snapshot；违反时 UVM_FATAL 并返回 0。
+    local function bit device_snapshot_assignable(
+        input dpu_device_snapshot device_snapshot
+    );
+        if ((snapshot_ctx != null) &&
+            (snapshot_ctx.device_snapshot() != device_snapshot)) begin
+            `uvm_fatal("FUNCTION_INSTANCE",
+                {"function configuration ownership cannot be reassigned to a ",
+                 "different device snapshot"})
+            return 0;
+        end
         return 1;
     endfunction
 
@@ -594,11 +622,12 @@ class virtio_function_instance extends uvm_component;
         if (bar_pairs.size() != 0)
             transport.bar.configure_fabric_bar_pairs(bar_pairs);
 
-        if (configuration_resource_snapshot == null)
+        if (snapshot_ctx == null)
             return;
-        if (!resource_client.bind_to_service(
-                configuration_snapshot, configuration_resource_snapshot,
-                service_key, why)) begin
+        // configure_from_ctx 在子对象已构建时已于提交前导入资源；只有子对象尚未
+        // 构建（resource_client 在 build_phase 才创建）时由这里完成唯一一次导入。
+        if (!resource_client.is_bound_to_service() &&
+            !resource_client.bind_to_ctx(snapshot_ctx, service_key, why)) begin
             `uvm_fatal("FUNCTION_INSTANCE", $sformatf(
                 "could not import service resources for %s: %s",
                 dpu_service_key_name(service_key), why))

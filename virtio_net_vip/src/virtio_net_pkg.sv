@@ -54,7 +54,9 @@ package virtio_net_pkg;
   `include "virtqueue/virtqueue_manager.sv"
 
   // Resource clients are transport discovery callbacks and need to be
-  // complete before the PCI transport class is compiled.
+  // complete before the PCI transport class is compiled.  The snapshot
+  // context they consume is compiled first.
+  `include "sriov/vio_snapshot_ctx.sv"
   `include "sriov/virtio_resource_client.sv"
 
   // ---------------------------------------------------------------------------

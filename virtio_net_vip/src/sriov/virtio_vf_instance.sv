@@ -18,21 +18,19 @@ class virtio_vf_instance extends virtio_function_instance;
         function_kind = DPU_FUNCTION_VF;
     endfunction
 
-    // 在基类解析之前加一道 VF 守卫：service 必须由冻结 snapshot 声明，
+    // 在基类解析之前加一道 VF 守卫：service 必须由 ctx 中的冻结 snapshot 声明，
     // 且其 owner 的 kind 必须是 VF——防止把 PF 服务错绑到 VF 实例上。
-    // 校验通过后完全委托基类 configure_from_service。
-    virtual function bit configure_from_service(
-        input dpu_device_snapshot device_snapshot,
-        input dpu_resource_snapshot resource_snapshot,
+    // configure_from_service 经基类包装后也会走到这里。
+    virtual function bit configure_from_ctx(
+        input vio_snapshot_ctx ctx,
         input dpu_service_key_t service_key,
-        input dpu_resource_manager manager,
         input uvm_object pcie_ctx = null
     );
         dpu_function_key_t owner;
         string why;
 
-        if ((device_snapshot == null) || !device_snapshot.is_frozen() ||
-            !device_snapshot.get_service_owner(service_key, owner, why)) begin
+        if ((ctx == null) ||
+            !ctx.device_snapshot().get_service_owner(service_key, owner, why)) begin
             `uvm_fatal("VF_INSTANCE",
                 "VF instance requires a frozen snapshot-declared service")
             return 0;
@@ -42,8 +40,7 @@ class virtio_vf_instance extends virtio_function_instance;
                 "virtio_vf_instance requires a VF-owned service")
             return 0;
         end
-        return super.configure_from_service(
-            device_snapshot, resource_snapshot, service_key, manager, pcie_ctx);
+        return super.configure_from_ctx(ctx, service_key, pcie_ctx);
     endfunction
 
 endclass : virtio_vf_instance

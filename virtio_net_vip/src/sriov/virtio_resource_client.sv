@@ -30,13 +30,44 @@ class virtio_resource_client extends uvm_object;
         runtime_ready = 0;
     endfunction
 
-    // 把本 client 绑定到一个 service 的 qpair 资源视图。
-    // 校验链：snapshot 对必须冻结且互相引用 → service 必须是 VIO_NET 且
-    // 所有权自洽 → 至少存在一条 qpair 绑定 → 已绑定时只允许幂等重绑。
-    // 成功后按 local_pair 升序保存映射（冒泡排序，规模小无性能问题），
-    // 并把 runtime_ready 清零（需重新 mark）。失败通过 why 给出原因。
-    // 注意：RX/TX 共享同一 global qpair id，方向仅由 local virtqueue id 区分。
+    // 独立调用入口（测试直接使用）：先确认 snapshot 对冻结且互相引用，再执行
+    // 与 ctx 路径相同的绑定。失败通过 why 给出原因且不改变已有绑定。
     function bit bind_to_service(
+        input dpu_device_snapshot device_snapshot,
+        input dpu_resource_snapshot resource_snapshot,
+        input dpu_service_key_t service_key,
+        output string why
+    );
+        why = "";
+        if ((device_snapshot == null) || !device_snapshot.is_frozen() ||
+            (resource_snapshot == null) || !resource_snapshot.is_frozen() ||
+            !resource_snapshot.references_device_snapshot(device_snapshot)) begin
+            why = "virtio resource client requires an exact frozen snapshot pair";
+            return 0;
+        end
+        return bind_validated(device_snapshot, resource_snapshot, service_key, why);
+    endfunction
+
+    // 生产入口：ctx 已由 env 校验，不再重复检查 snapshot 对。
+    function bit bind_to_ctx(
+        input vio_snapshot_ctx ctx,
+        input dpu_service_key_t service_key,
+        output string why
+    );
+        why = "";
+        if (ctx == null) begin
+            why = "virtio resource client requires a validated snapshot context";
+            return 0;
+        end
+        return bind_validated(ctx.device_snapshot(), ctx.resource_snapshot(),
+                              service_key, why);
+    endfunction
+
+    // 绑定主体（snapshot 对已校验）：service 必须是 VIO_NET 且所有权自洽 →
+    // 至少存在一条 qpair 绑定 → 已绑定时只允许幂等重绑。成功后按 local_pair
+    // 升序保存映射并清 runtime_ready。RX/TX 共享同一 global qpair id，方向仅由
+    // local virtqueue id 区分。
+    local function bit bind_validated(
         input dpu_device_snapshot device_snapshot,
         input dpu_resource_snapshot resource_snapshot,
         input dpu_service_key_t service_key,
@@ -49,12 +80,6 @@ class virtio_resource_client extends uvm_object;
         virtio_qpair_mapping_t swap;
 
         why = "";
-        if ((device_snapshot == null) || !device_snapshot.is_frozen() ||
-            (resource_snapshot == null) || !resource_snapshot.is_frozen() ||
-            !resource_snapshot.references_device_snapshot(device_snapshot)) begin
-            why = "virtio resource client requires an exact frozen snapshot pair";
-            return 0;
-        end
         if ((service_key.service_kind != DPU_SERVICE_VIO_NET) ||
             !device_snapshot.get_service_owner(service_key, owner, why) ||
             !dpu_same_function_key(owner, service_key.function_key)) begin

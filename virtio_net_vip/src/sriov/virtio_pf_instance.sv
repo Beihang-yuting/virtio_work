@@ -55,7 +55,7 @@ class virtio_pf_instance extends uvm_component;
     protected bit               configuration_valid;
     protected bit               services_configured;
 
-    // 构造函数：初始化为"未配置"状态；实际拓扑必须经 configure_services
+    // 构造函数：初始化为"未配置"状态；实际拓扑必须经 configure_services/configure_services_ctx
     // 从冻结 snapshot 注入，build_phase 会对未配置实例直接 fatal。
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -63,19 +63,8 @@ class virtio_pf_instance extends uvm_component;
         services_configured = 0;
     endfunction
 
-    // 从冻结 snapshot 一次性解析并创建整个 PF 服务组（PF + 全部 VF）。
-    // 前置校验（全部通过前不改动任何成员，保证失败无副作用）：
-    //   - 只允许配置一次；parent 必须是 PF key（vf_id==0）；
-    //   - device/resource snapshot 均冻结、互相引用，且 manager 由同一对
-    //     snapshot 播种；能查到 virtio.qpair 资源类；
-    //   - manager 与 snapshot 的 DUT 能力（host/PF/VF/队列/MSI-X/BAR profile）
-    //     逐项一致；
-    //   - 每个 service：必须是 VIO_NET、有 qpair 绑定、owner 属于本 PF 组、
-    //     owner 不重复、PCIe id 可解析、三个 BAR 角色齐全且顺序正确、
-    //     manager 包含该 function。
-    // 通过后：记录 pf_key/host_id/pf_id，按 owner 类型创建 pf_function 或
-    // vf_functions[]（各自 configure_from_service），并把每个 service 的
-    // qpair 绑定导入 pf_manager.resource_pool；成功返回 1，失败 why 说明。
+    // 独立调用入口（测试直接使用）：用 vio_snapshot_ctx 一次性校验 snapshot 对与
+    // manager，失败时在 why 中说明且不创建任何子对象；成功后委托 configure_services_ctx。
     function bit configure_services(
         input dpu_function_key_t parent_pf_key,
         input dpu_device_snapshot snapshot,
@@ -84,6 +73,37 @@ class virtio_pf_instance extends uvm_component;
         input dpu_resource_manager manager,
         output string why
     );
+        vio_snapshot_ctx ctx;
+
+        ctx = vio_snapshot_ctx::create_checked(
+            snapshot, resource_snapshot, manager, why);
+        if (ctx == null) begin
+            why = {"VIO service group: ", why};
+            return 0;
+        end
+        return configure_services_ctx(parent_pf_key, ctx, service_keys, why);
+    endfunction
+
+    // 从已校验的 ctx 一次性解析并创建整个 PF 服务组（PF + 全部 VF）。
+    // 前置校验（全部通过前不改动任何成员，保证失败无副作用）：
+    //   - 只允许配置一次；parent 必须是 PF key（vf_id==0）；
+    //   - manager 能查到 virtio.qpair 资源类，DUT 能力（host/PF/VF/队列/MSI-X/
+    //     BAR profile）与 snapshot 逐项一致；
+    //   - 每个 service：必须是 VIO_NET、有 qpair 绑定、owner 属于本 PF 组、
+    //     owner 不重复、PCIe id 可解析、三个 BAR 角色齐全且顺序正确、
+    //     manager 包含该 function。
+    // 通过后：记录 pf_key/host_id/pf_id，按 owner 类型创建 pf_function 或
+    // vf_functions[]（各自 configure_from_ctx），并把每个 service 的 qpair 绑定
+    // 导入 pf_manager.resource_pool；成功返回 1，失败 why 说明。
+    function bit configure_services_ctx(
+        input dpu_function_key_t parent_pf_key,
+        input vio_snapshot_ctx ctx,
+        input dpu_service_key_t service_keys[$],
+        output string why
+    );
+        dpu_device_snapshot snapshot;
+        dpu_resource_snapshot resource_snapshot;
+        dpu_resource_manager manager;
         dpu_function_key_t owner;
         dpu_pcie_function_id_t pcie_id;
         dpu_bar_pair_lease_t bars[$];
@@ -107,24 +127,13 @@ class virtio_pf_instance extends uvm_component;
             why = "VIO service group requires a PF parent key";
             return 0;
         end
-        if ((snapshot == null) || !snapshot.is_frozen()) begin
-            why = "VIO service group requires a frozen device snapshot";
+        if (ctx == null) begin
+            why = "VIO service group requires a validated snapshot context";
             return 0;
         end
-        if (manager == null) begin
-            why = "VIO service group requires a device resource manager";
-            return 0;
-        end
-        if (!manager.is_snapshot_seeded()) begin
-            why = "VIO service group requires a snapshot-seeded device manager";
-            return 0;
-        end
-        if ((resource_snapshot == null) || !resource_snapshot.is_frozen() ||
-            !resource_snapshot.references_device_snapshot(snapshot) ||
-            !manager.is_seeded_from_snapshots(snapshot, resource_snapshot)) begin
-            why = "VIO service group requires its exact frozen resource snapshot";
-            return 0;
-        end
+        snapshot = ctx.device_snapshot();
+        resource_snapshot = ctx.resource_snapshot();
+        manager = ctx.manager();
         if (!manager.lookup_resource_class(
                 "virtio.qpair", qpair_class_id, why)) begin
             why = {"VIO service group requires virtio.qpair: ", why};
@@ -257,9 +266,8 @@ class virtio_pf_instance extends uvm_component;
                 end
                 pf_function = virtio_function_instance::type_id::create(
                     "pf_function", this);
-                if (!pf_function.configure_from_service(
-                        snapshot, resource_snapshot,
-                        service_keys[index], manager)) begin
+                if (!pf_function.configure_from_ctx(
+                        ctx, service_keys[index])) begin
                     why = "could not configure resolved PF VIO function";
                     return 0;
                 end
@@ -274,9 +282,8 @@ class virtio_pf_instance extends uvm_component;
                 vf_keys[vf_index] = owner;
                 vf_functions[vf_index] = virtio_vf_instance::type_id::create(
                     $sformatf("vf_function_%0d", owner.vf_id), this);
-                if (!vf_functions[vf_index].configure_from_service(
-                        snapshot, resource_snapshot,
-                        service_keys[index], manager)) begin
+                if (!vf_functions[vf_index].configure_from_ctx(
+                        ctx, service_keys[index])) begin
                     why = "could not configure resolved VF VIO function";
                     return 0;
                 end
@@ -306,7 +313,7 @@ class virtio_pf_instance extends uvm_component;
         end
     endfunction
 
-    // build 阶段守卫：未经 configure_services 的实例直接 fatal——PF 组
+    // build 阶段守卫：未经 configure_services(_ctx) 的实例直接 fatal——PF 组
     // 不允许脱离 snapshot 声明凭空构建；补建缺失的 pf_manager 并赋 pf_index。
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);

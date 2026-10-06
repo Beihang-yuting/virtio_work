@@ -52,6 +52,8 @@ class virtio_net_env extends uvm_env;
     protected dpu_device_snapshot device_snapshot;
     protected dpu_resource_snapshot resource_snapshot;
     protected dpu_resource_manager device_resource_manager;
+    // 一次校验后的只读 snapshot 上下文；下游 PF/Function/resource client 只消费它。
+    protected vio_snapshot_ctx snapshot_ctx;
     protected bit              configuration_valid;
     local dpu_dut_caps         effective_dut_caps;
 
@@ -86,6 +88,7 @@ class virtio_net_env extends uvm_env;
         super.new(name, parent);
         configuration_valid = 0;
         effective_dut_caps = null;
+        snapshot_ctx = null;
         protocol_event_vif_index = 0;
     endfunction
 
@@ -105,6 +108,14 @@ class virtio_net_env extends uvm_env;
         dpu_vio_qpair_binding_t service_bindings[$];
 
         why = "";
+        // build_phase 已建立 snapshot_ctx；测试探针跳过 build_phase、直接写入三个
+        // snapshot 字段时在这里补建，校验规则仍只有 vio_snapshot_ctx 一处。
+        if (snapshot_ctx == null) begin
+            snapshot_ctx = vio_snapshot_ctx::create_checked(
+                device_snapshot, resource_snapshot, device_resource_manager, why);
+            if (snapshot_ctx == null)
+                return 0;
+        end
         // 空白名单保持原有的全量 service 语义；非空白名单按完整 key 筛选。
         // 多个 Host 子环境由此消费同一快照的不同部分，不重复解析资源。
         if (cfg.service_keys.size() == 0)
@@ -176,9 +187,9 @@ class virtio_net_env extends uvm_env;
             pf_instances[index] = virtio_pf_instance::type_id::create(
                 $sformatf("pf_%0d_%0d", group_keys[index].host_id,
                           group_keys[index].pf_id), this);
-            if (!pf_instances[index].configure_services(
-                    group_keys[index], device_snapshot, resource_snapshot,
-                    grouped_services[index], device_resource_manager, why))
+            if (!pf_instances[index].configure_services_ctx(
+                    group_keys[index], snapshot_ctx,
+                    grouped_services[index], why))
                 return 0;
         end
         function_count = 0;
@@ -259,33 +270,18 @@ class virtio_net_env extends uvm_env;
             `uvm_fatal("VIRTIO_ENV", {"invalid execution/completion mode: ", why})
             return;
         end
-        if (!uvm_config_db#(dpu_device_snapshot)::get(
-                this, "", "dpu_device_snapshot", device_snapshot) ||
-            (device_snapshot == null) || !device_snapshot.is_frozen()) begin
-            `uvm_fatal("VIRTIO_ENV",
-                "a published frozen device snapshot is required")
-            return;
-        end
-        if (!uvm_config_db#(dpu_resource_snapshot)::get(
-                this, "", "dpu_resource_snapshot", resource_snapshot) ||
-            (resource_snapshot == null) || !resource_snapshot.is_frozen() ||
-            !resource_snapshot.references_device_snapshot(device_snapshot)) begin
-            `uvm_fatal("VIRTIO_ENV",
-                "an exact published frozen resource snapshot is required")
-            return;
-        end
-        if (!uvm_config_db#(dpu_resource_manager)::get(
-                this, "", "dpu_resource_manager", device_resource_manager) ||
-            (device_resource_manager == null) ||
-            !device_resource_manager.is_snapshot_seeded()) begin
-            `uvm_fatal("VIRTIO_ENV",
-                "a published snapshot-seeded device resource manager is required")
-            return;
-        end
-        if (!device_resource_manager.is_seeded_from_snapshots(
-                device_snapshot, resource_snapshot)) begin
-            `uvm_fatal("VIRTIO_ENV",
-                "published resource manager does not belong to the snapshot pair")
+        // 三者由全局 DPU 发布；这里一次性校验 frozen/引用/seeded 关系并封装为只读
+        // 上下文，下游 PF/Function/resource client 不再重复校验。
+        void'(uvm_config_db#(dpu_device_snapshot)::get(
+            this, "", "dpu_device_snapshot", device_snapshot));
+        void'(uvm_config_db#(dpu_resource_snapshot)::get(
+            this, "", "dpu_resource_snapshot", resource_snapshot));
+        void'(uvm_config_db#(dpu_resource_manager)::get(
+            this, "", "dpu_resource_manager", device_resource_manager));
+        snapshot_ctx = vio_snapshot_ctx::create_checked(
+            device_snapshot, resource_snapshot, device_resource_manager, why);
+        if (snapshot_ctx == null) begin
+            `uvm_fatal("VIRTIO_ENV", {"published snapshot context is invalid: ", why})
             return;
         end
         if (!cfg.validate_against_snapshot(device_snapshot, why)) begin
