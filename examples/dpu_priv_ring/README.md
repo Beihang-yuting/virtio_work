@@ -118,10 +118,12 @@ if (function_instance.get_state() != VF_DISABLED)
 `DPU_COMMON_ROOT`、`NET_PACKET_ROOT`、`HOST_MEM_ROOT`、`PCIE_WORK_ROOT`、
 `QUEUE_WORK_ROOT`。`scripts/check_deps.sh` 会核对这些外部依赖。
 
+两个测试已列入 `scripts/test_manifest.sh`，与其他维护测试共用 `filelists/tests.f`
+和 `virtio_tb_top` 编译，`make regression` 会运行它们。单独运行：
+
 ```bash
-./examples/dpu_priv_ring/run_vcs.sh
-# 默认运行 dpu_priv_driver_flow_test；换成字节合同测试：
-TEST=dpu_priv_ring_contract_test ./examples/dpu_priv_ring/run_vcs.sh
+TEST=dpu_priv_driver_flow_test ./scripts/vcs.sh
+TEST=dpu_priv_ring_contract_test ./scripts/vcs.sh
 ```
 
 流程测试复用 `examples/virtio_system_env` 顶层：两个 Host 各有一个私有 VF 和

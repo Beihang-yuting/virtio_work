@@ -47,4 +47,9 @@ virtio_net_vip/tests/virtio_real_driver_flow_test.sv
 virtio_net_vip/tests/virtio_real_driver_multiqueue_test.sv
 virtio_net_vip/tests/virtio_real_driver_rx_test.sv
 virtio_net_vip/tests/dpu_pcie_tl_executor_integration_test.sv
+// 私有环流程测试继承多 Host 示例环境，示例文件须先于两个私有环测试编译；
+// 示例测试类本身不在维护清单中，仍由 examples/virtio_system_env/run_vcs.sh 运行。
+examples/virtio_system_env/virtio_system_env_example_test.sv
+examples/dpu_priv_ring/dpu_priv_ring_contract_test.sv
+examples/dpu_priv_ring/dpu_priv_driver_flow_test.sv
 virtio_net_vip/tests/virtio_tb_top.sv

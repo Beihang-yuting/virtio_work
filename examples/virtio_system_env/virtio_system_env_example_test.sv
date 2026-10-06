@@ -1,4 +1,4 @@
-// 目录层次：examples/virtio_system_env，仅由示例 filelist 显式编译，不进入默认 VIP 包。
+// 目录层次：examples/virtio_system_env，经 filelists/tests.f 编译（私有环流程测试继承它），不进入默认 VIP 包。
 // 职责：在同一示例文件中演示系统配置、DPU/virtio/可选 PCIe 层次组装及双 Host 资源检查。
 // 依赖：预先编译的 UVM、host_mem、pcie_tl、dpu_resource 与 virtio_net 包。
 // 所有权与生命周期：测试持有配置，UVM 管理组件至仿真结束；DPU 独占拓扑解析与快照发布，
@@ -9,8 +9,8 @@
 `define VIRTIO_SYSTEM_ENV_EXAMPLE_TEST_SV
 
 // Example-local top-level configuration, environment, and executable test.
-// Compile this file explicitly after virtio_net_pkg; it is not part of the
-// default VIP package or maintained regression filelist.
+// filelists/tests.f compiles it after virtio_net_pkg because the private-ring
+// flow test extends it; the example test itself is not a maintained test.
 import uvm_pkg::*;
 `include "uvm_macros.svh"
 import host_mem_pkg::*;

@@ -2064,8 +2064,9 @@ make regression
 `virtio_net_packet_multi_queue_test`、`virtio_real_driver_flow_test`、
 `virtio_real_driver_multiqueue_test`、`virtio_real_driver_rx_test`、
 `host_mem_random_test`、
-`virtio_pcie_host_mem_test` 和 `dpu_pcie_tl_executor_integration_test`，
-共 37 项。该入口
+`virtio_pcie_host_mem_test`、`dpu_pcie_tl_executor_integration_test`、
+`dpu_priv_driver_flow_test` 和 `dpu_priv_ring_contract_test`，
+共 39 项。该入口
 要求 `make check-deps` 先通过；无 VCS 环境时它应在编译前报告 VCS 依赖错误。
 
 其中 `virtio_host_mem_reclaim_test`、`virtio_queue_semantics_test`、

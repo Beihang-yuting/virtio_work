@@ -1,4 +1,4 @@
-// 目录层次：examples/dpu_priv_ring；显式 filelist 编译的 DPU 私有环合同测试。
+// 目录层次：examples/dpu_priv_ring；由 filelists/tests.f 编入维护回归的 DPU 私有环合同测试。
 // 依赖预编译 host_mem_pkg、virtio_net_pkg 中的生产私有回调；字节黄金值来自 53 主机
 // icpu-kernel-driver/txrx.h 在同平台 GCC 9.4 编译的 C 位字段探针。
 // 测试拥有 Host memory、queue manager、回调与模拟设备 CQ 写入；所有环在结束时
@@ -404,12 +404,5 @@ class dpu_priv_ring_contract_test extends uvm_test;
         phase.drop_objection(this);
     endtask
 endclass
-
-// 最小仿真顶层只启动本示例测试；不依赖默认 tests.f 或 virtio_tb_top。
-module dpu_priv_ring_tb_top;
-    import uvm_pkg::*;
-
-    initial run_test("dpu_priv_ring_contract_test");
-endmodule
 
 `endif

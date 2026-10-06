@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 目录层次：examples/virtio_system_env。仅在显式调用时追加示例 filelist，
-# 不修改默认 VCS 入口和维护回归清单。依赖仓库脚本完成依赖校验，编译产物
-# 保存在 build/examples/virtio_system_env；脚本不持有外部依赖的生命周期。
+# 目录层次：examples/virtio_system_env。示例源文件已随 filelists/tests.f 编译
+# （私有环流程测试继承它），本脚本只负责运行不在维护清单中的示例测试。依赖仓库
+# 脚本完成依赖校验，编译产物保存在 build/examples/virtio_system_env。
 set -euo pipefail
 
 example_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,7 +41,6 @@ simv="$root_dir/build/examples/virtio_system_env/simv"
   -f "$root_dir/filelists/virtio_net.f" \
   -f "$root_dir/filelists/queue_work_integration.f" \
   -f "$root_dir/filelists/tests.f" \
-  -f "$example_dir/example.f" \
   -top virtio_tb_top -o "$simv"
 
 if (( !compile_only )); then

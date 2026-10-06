@@ -397,8 +397,9 @@ make test TEST=virtio_unit_test
 `virtio_traffic_test`、`virtio_net_packet_multi_queue_test`、
 `virtio_real_driver_flow_test`、`virtio_real_driver_multiqueue_test`、
 `virtio_real_driver_rx_test`、
-`host_mem_random_test`、`virtio_pcie_host_mem_test` 和
-`dpu_pcie_tl_executor_integration_test`，共 37 项。
+`host_mem_random_test`、`virtio_pcie_host_mem_test`、
+`dpu_pcie_tl_executor_integration_test`、`dpu_priv_driver_flow_test` 和
+`dpu_priv_ring_contract_test`，共 39 项。
 `make check-deps` 会验证 `host_mem` 外部 checkout 固定 SHA、VCS 环境以及
 `dpu_common` 的固定版本；同时要求 `net_packet` 处于 `master`/`origin/master`、
 `pcie_work` 处于 `main`/`origin/main`，并且二者都来自指定远程。
@@ -426,9 +427,10 @@ make test TEST=virtio_unit_test
 
 [`virtio_system_env_example_test.sv`](examples/virtio_system_env/virtio_system_env_example_test.sv)
 把 `virtio_system_env_config`、`virtio_system_env` 和测试类放在同一个示例文件中，
-演示怎样自行装配多 Host 环境。这两个类仅用于示例，不属于默认 VIP API，也不进入
-默认 filelist。需要运行时，使用示例目录下的
-[`run_vcs.sh`](examples/virtio_system_env/run_vcs.sh) 显式编译。
+演示怎样自行装配多 Host 环境。这两个类仅用于示例，不属于默认 VIP API；因为
+`dpu_priv_driver_flow_test` 继承它，示例文件随 `filelists/tests.f` 编译，但示例测试
+不在维护清单中。需要运行时，使用示例目录下的
+[`run_vcs.sh`](examples/virtio_system_env/run_vcs.sh)。
 
 示例只创建一个 `dpu_device_env` 解析全局拓扑和资源；其下按 `host_id` 创建
 `virtio_env_hN`，每个子环境只消费归属于该 Host 的 VIO service 和 qpair。

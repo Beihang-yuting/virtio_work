@@ -57,6 +57,8 @@ VIRTIO_MAINTAINED_TESTS=(
   host_mem_random_test
   virtio_pcie_host_mem_test
   dpu_pcie_tl_executor_integration_test
+  dpu_priv_driver_flow_test
+  dpu_priv_ring_contract_test
 )
 
 # 中文说明：统计文档中某个完整字面量的出现次数，供静态契约检查使用；输入

@@ -66,8 +66,9 @@
 
 [`virtio_system_env_example_test.sv`](../examples/virtio_system_env/virtio_system_env_example_test.sv)
 在一个示例文件中定义 `virtio_system_env_config`、`virtio_system_env` 和测试类，
-演示多 Host 的一种装配方式。这两个类不属于默认 VIP API，也不进入默认 filelist；
-需要运行时使用 [`run_vcs.sh`](../examples/virtio_system_env/run_vcs.sh) 显式编译示例。
+演示多 Host 的一种装配方式。这两个类不属于默认 VIP API；私有环流程测试继承它，
+因此示例文件随 `filelists/tests.f` 编译，但示例测试不在维护清单中，需要运行时使用
+[`run_vcs.sh`](../examples/virtio_system_env/run_vcs.sh)。
 示例中的组件层次如下：
 
 ```text
