@@ -278,11 +278,7 @@ class virtio_indirect_desc_test extends uvm_test;
     task test_split_indirect_descriptor();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("split_iommu");
-        virtio_memory_barrier_model barrier =
-            virtio_memory_barrier_model::type_id::create("split_barrier");
-        virtqueue_error_injector err_inj =
-            virtqueue_error_injector::type_id::create("split_err_inj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("split_wait_pol");
+        virtio_vq_test_kit kit;
         split_virtqueue vq;
         virtio_sg_list sgs[];
         uvm_event token;
@@ -300,9 +296,8 @@ class virtio_indirect_desc_test extends uvm_test;
         bit [63:0] extra_iova;
 
         mem = shared_mem;
-        vq = split_virtqueue::type_id::create("split_vq");
-        vq.setup(0, 16, mem, iommu, barrier, err_inj, wait_pol, 16'h0700);
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("split", mem, iommu, 16'h0700);
+        vq = kit.make_split("split_vq", 0, 16, 16'h0700);
         build_three_sg(mem, sgs);
         token = new("split_token");
 
@@ -396,11 +391,7 @@ class virtio_indirect_desc_test extends uvm_test;
     task test_packed_indirect_descriptor();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("packed_iommu");
-        virtio_memory_barrier_model barrier =
-            virtio_memory_barrier_model::type_id::create("packed_barrier");
-        virtqueue_error_injector err_inj =
-            virtqueue_error_injector::type_id::create("packed_err_inj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("packed_wait_pol");
+        virtio_vq_test_kit kit;
         packed_virtqueue vq;
         virtio_sg_list sgs[];
         uvm_event token;
@@ -418,9 +409,8 @@ class virtio_indirect_desc_test extends uvm_test;
         bit [63:0] extra_iova;
 
         mem = shared_mem;
-        vq = packed_virtqueue::type_id::create("packed_vq");
-        vq.setup(1, 16, mem, iommu, barrier, err_inj, wait_pol, 16'h0701);
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("packed", mem, iommu, 16'h0701);
+        vq = kit.make_packed("packed_vq", 1, 16, 16'h0701);
         build_three_sg(mem, sgs);
         token = new("packed_token");
 
@@ -520,16 +510,10 @@ class virtio_indirect_desc_test extends uvm_test;
     task test_tx_indirect_feature_gate();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("tx_gate_iommu");
-        virtio_memory_barrier_model barrier =
-            virtio_memory_barrier_model::type_id::create("tx_gate_barrier");
-        virtqueue_error_injector err_inj =
-            virtqueue_error_injector::type_id::create("tx_gate_err_inj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("tx_gate_wait_pol");
-        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("tx_gate_vq_mgr");
+        virtio_vq_test_kit kit;
         virtio_mock_transport transport =
             virtio_mock_transport::type_id::create("tx_gate_transport");
-        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("tx_gate_ops");
-        virtqueue_base base_vq;
+        virtio_atomic_ops ops;
         split_virtqueue vq;
         virtio_net_hdr_t net_hdr;
         uvm_event token;
@@ -539,23 +523,11 @@ class virtio_indirect_desc_test extends uvm_test;
         virtio_tx_indirect_feature_error_catcher feature_error;
 
         mem = shared_mem;
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.bdf = 16'h0702;
-        base_vq = vq_mgr.create_queue(0, 16, VQ_SPLIT);
-        assert($cast(vq, base_vq))
-            else `uvm_fatal("INDIRECT_TEST", "failed to create TX split queue")
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("tx_gate", mem, iommu, 16'h0702);
+        vq = kit.add_split(0, 16);
 
         transport.bdf = 16'h0702;
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        ops = kit.make_ops(transport, "tx_gate_ops");
         token = new("tx_gate_token");
         net_hdr = '{default: 0};
 
@@ -591,18 +563,12 @@ class virtio_indirect_desc_test extends uvm_test;
     task test_dataplane_tx_indirect_feature_gate();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("dataplane_gate_iommu");
-        virtio_memory_barrier_model barrier =
-            virtio_memory_barrier_model::type_id::create("dataplane_gate_barrier");
-        virtqueue_error_injector err_inj =
-            virtqueue_error_injector::type_id::create("dataplane_gate_err_inj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("dataplane_gate_wait_pol");
-        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("dataplane_gate_vq_mgr");
+        virtio_vq_test_kit kit;
         virtio_net_dataplane dataplane =
             virtio_net_dataplane::type_id::create("dataplane_gate");
         virtio_mock_transport transport =
             virtio_mock_transport::type_id::create("dataplane_gate_transport");
-        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("dataplane_gate_ops");
-        virtqueue_base base_vq;
+        virtio_atomic_ops ops;
         split_virtqueue vq;
         virtio_dataplane_indirect_test_packet token;
         uvm_object completed[$];
@@ -611,26 +577,14 @@ class virtio_indirect_desc_test extends uvm_test;
         virtio_dataplane_indirect_feature_error_catcher feature_error;
 
         mem = shared_mem;
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.bdf = 16'h0703;
-        base_vq = vq_mgr.create_queue(0, 16, VQ_SPLIT);
-        assert($cast(vq, base_vq))
-            else `uvm_fatal("INDIRECT_TEST", "failed to create dataplane TX split queue")
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("dataplane_gate", mem, iommu, 16'h0703);
+        vq = kit.add_split(0, 16);
 
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
                             16'h0703);
         transport.bdf = 16'h0703;
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        ops = kit.make_ops(transport, "dataplane_gate_ops");
         ops.negotiated_features = features;
         dataplane.bind_ops(ops);
         token = virtio_dataplane_indirect_test_packet::type_id::create("dataplane_gate_token");
@@ -676,16 +630,10 @@ class virtio_indirect_desc_test extends uvm_test;
     task test_atomic_tx_queue_full_cleanup();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("atomic_full_iommu");
-        virtio_memory_barrier_model barrier =
-            virtio_memory_barrier_model::type_id::create("atomic_full_barrier");
-        virtqueue_error_injector err_inj =
-            virtqueue_error_injector::type_id::create("atomic_full_err_inj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("atomic_full_wait_pol");
-        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("atomic_full_vq_mgr");
+        virtio_vq_test_kit kit;
         virtio_mock_transport transport =
             virtio_mock_transport::type_id::create("atomic_full_transport");
-        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("atomic_full_ops");
-        virtqueue_base base_vq;
+        virtio_atomic_ops ops;
         split_virtqueue vq;
         virtio_net_hdr_t net_hdr;
         uvm_event filler_token;
@@ -701,23 +649,11 @@ class virtio_indirect_desc_test extends uvm_test;
         virtio_tx_queue_full_error_catcher queue_full_error;
 
         mem = shared_mem;
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.bdf = 16'h0704;
-        base_vq = vq_mgr.create_queue(0, 2, VQ_SPLIT);
-        assert($cast(vq, base_vq))
-            else `uvm_fatal("INDIRECT_TEST", "failed to create atomic queue-full split queue")
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("atomic_full", mem, iommu, 16'h0704);
+        vq = kit.add_split(0, 2);
 
         transport.bdf = 16'h0704;
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        ops = kit.make_ops(transport, "atomic_full_ops");
         net_hdr = '{default: 0};
         filler_token = new("atomic_full_filler");
         rejected_token = new("atomic_full_rejected");
@@ -761,18 +697,12 @@ class virtio_indirect_desc_test extends uvm_test;
     task test_dataplane_tx_queue_full_cleanup();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("dataplane_full_iommu");
-        virtio_memory_barrier_model barrier =
-            virtio_memory_barrier_model::type_id::create("dataplane_full_barrier");
-        virtqueue_error_injector err_inj =
-            virtqueue_error_injector::type_id::create("dataplane_full_err_inj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("dataplane_full_wait_pol");
-        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("dataplane_full_vq_mgr");
+        virtio_vq_test_kit kit;
         virtio_net_dataplane dataplane =
             virtio_net_dataplane::type_id::create("dataplane_full");
         virtio_mock_transport transport =
             virtio_mock_transport::type_id::create("dataplane_full_transport");
-        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("dataplane_full_ops");
-        virtqueue_base base_vq;
+        virtio_atomic_ops ops;
         split_virtqueue vq;
         virtio_dataplane_indirect_test_packet filler_token;
         virtio_dataplane_indirect_test_packet rejected_token;
@@ -790,26 +720,14 @@ class virtio_indirect_desc_test extends uvm_test;
         virtio_tx_queue_full_error_catcher queue_full_error;
 
         mem = shared_mem;
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.bdf = 16'h0705;
-        base_vq = vq_mgr.create_queue(0, 2, VQ_SPLIT);
-        assert($cast(vq, base_vq))
-            else `uvm_fatal("INDIRECT_TEST", "failed to create dataplane queue-full split queue")
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("dataplane_full", mem, iommu, 16'h0705);
+        vq = kit.add_split(0, 2);
 
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
                             16'h0705);
         transport.bdf = 16'h0705;
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        ops = kit.make_ops(transport, "dataplane_full_ops");
         ops.negotiated_features = features;
         dataplane.bind_ops(ops);
         filler_token = virtio_dataplane_indirect_test_packet::type_id::create(
@@ -862,16 +780,10 @@ class virtio_indirect_desc_test extends uvm_test;
     task test_atomic_notify_cursor();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("cursor_iommu");
-        virtio_memory_barrier_model barrier =
-            virtio_memory_barrier_model::type_id::create("cursor_barrier");
-        virtqueue_error_injector err_inj =
-            virtqueue_error_injector::type_id::create("cursor_err_inj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("cursor_wait_pol");
-        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("cursor_vq_mgr");
+        virtio_vq_test_kit kit;
         virtio_mock_transport transport =
             virtio_mock_transport::type_id::create("cursor_transport");
-        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("cursor_ops");
-        virtqueue_base base_vq;
+        virtio_atomic_ops ops;
         split_virtqueue split_vq;
         packed_virtqueue packed_vq;
         virtio_net_hdr_t net_hdr;
@@ -885,27 +797,12 @@ class virtio_indirect_desc_test extends uvm_test;
         bit [15:0] flags;
 
         mem = shared_mem;
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.bdf = 16'h0704;
-        base_vq = vq_mgr.create_queue(0, 16, VQ_SPLIT);
-        assert($cast(split_vq, base_vq))
-            else `uvm_fatal("INDIRECT_TEST", "failed to create cursor split queue")
-        split_vq.alloc_rings();
-        base_vq = vq_mgr.create_queue(1, 4, VQ_PACKED);
-        assert($cast(packed_vq, base_vq))
-            else `uvm_fatal("INDIRECT_TEST", "failed to create cursor packed queue")
-        packed_vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("cursor", mem, iommu, 16'h0704);
+        split_vq = kit.add_split(0, 16);
+        packed_vq = kit.add_packed(1, 4);
 
         transport.bdf = 16'h0704;
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        ops = kit.make_ops(transport, "cursor_ops");
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
         token0 = new("cursor_token0");
         token1 = new("cursor_token1");
@@ -969,16 +866,10 @@ class virtio_indirect_desc_test extends uvm_test;
     task test_atomic_rx_num_buffers_without_mrg();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("rx_nomrg_iommu");
-        virtio_memory_barrier_model barrier =
-            virtio_memory_barrier_model::type_id::create("rx_nomrg_barrier");
-        virtqueue_error_injector err_inj =
-            virtqueue_error_injector::type_id::create("rx_nomrg_err_inj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("rx_nomrg_wait_pol");
-        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("rx_nomrg_vq_mgr");
+        virtio_vq_test_kit kit;
         virtio_mock_transport transport =
             virtio_mock_transport::type_id::create("rx_nomrg_transport");
-        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("rx_nomrg_ops");
-        virtqueue_base base_vq;
+        virtio_atomic_ops ops;
         split_virtqueue vq;
         uvm_object received[$];
         byte frame[];
@@ -990,23 +881,11 @@ class virtio_indirect_desc_test extends uvm_test;
         int unsigned budget;
 
         mem = shared_mem;
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.bdf = 16'h0705;
-        base_vq = vq_mgr.create_queue(0, 16, VQ_SPLIT);
-        assert($cast(vq, base_vq))
-            else `uvm_fatal("INDIRECT_TEST", "failed to create RX split queue")
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("rx_nomrg", mem, iommu, 16'h0705);
+        vq = kit.add_split(0, 16);
 
         transport.bdf = 16'h0705;
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        ops = kit.make_ops(transport, "rx_nomrg_ops");
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
 
         ops.rx_refill(0, 2);
@@ -1057,20 +936,12 @@ class virtio_indirect_desc_test extends uvm_test;
         host_mem_manager mem;
         virtio_iommu_model iommu =
             virtio_iommu_model::type_id::create("dataplane_notify_iommu");
-        virtio_memory_barrier_model barrier =
-            virtio_memory_barrier_model::type_id::create("dataplane_notify_barrier");
-        virtqueue_error_injector err_inj =
-            virtqueue_error_injector::type_id::create("dataplane_notify_err_inj");
-        virtio_wait_policy wait_pol =
-            virtio_wait_policy::type_id::create("dataplane_notify_wait_pol");
-        virtqueue_manager vq_mgr =
-            virtqueue_manager::type_id::create("dataplane_notify_vq_mgr");
+        virtio_vq_test_kit kit;
         virtio_mock_transport transport =
             virtio_mock_transport::type_id::create("dataplane_notify_transport");
-        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("dataplane_notify_ops");
+        virtio_atomic_ops ops;
         virtio_net_dataplane dataplane =
             virtio_net_dataplane::type_id::create("dataplane_notify");
-        virtqueue_base base_vq;
         split_virtqueue tx_vq;
         split_virtqueue rx_vq;
         virtio_dataplane_indirect_test_packet token;
@@ -1086,27 +957,12 @@ class virtio_indirect_desc_test extends uvm_test;
         int unsigned desc_id;
 
         mem = shared_mem;
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.bdf = 16'h0706;
-        base_vq = vq_mgr.create_queue(1, 8, VQ_SPLIT);
-        assert($cast(tx_vq, base_vq))
-            else `uvm_fatal("INDIRECT_TEST", "failed to create dataplane notify TX queue")
-        tx_vq.alloc_rings();
-        base_vq = vq_mgr.create_queue(0, 8, VQ_SPLIT);
-        assert($cast(rx_vq, base_vq))
-            else `uvm_fatal("INDIRECT_TEST", "failed to create dataplane notify RX queue")
-        rx_vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("dataplane_notify", mem, iommu, 16'h0706);
+        tx_vq = kit.add_split(1, 8);
+        rx_vq = kit.add_split(0, 8);
 
         transport.bdf = 16'h0706;
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        ops = kit.make_ops(transport, "dataplane_notify_ops");
         features = '0;
         ops.negotiated_features = features;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 0,

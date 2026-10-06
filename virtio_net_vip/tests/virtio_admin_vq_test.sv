@@ -288,7 +288,8 @@ class virtio_admin_vq_test extends uvm_test;
         assert(iommu.write_from_device(mem, vq.bdf, in_addr,
                                        device_response, fault))
             else `uvm_fatal("ADMIN_VQ", "concurrent Admin response DMA write failed")
-        virtio_vq_test_kit::complete_split_at(mem, vq, used_slot, head, device_response.size(), used_slot + 1);
+        virtio_vq_test_kit::complete_split_at(
+            mem, vq, used_slot, head, device_response.size(), used_slot + 1);
     endtask
 
     // This is the only test setup path.  It creates a queue independent of
@@ -301,32 +302,26 @@ class virtio_admin_vq_test extends uvm_test;
         ref virtio_mock_transport transport,
         ref split_virtqueue               vq
     );
-        virtio_memory_barrier_model barrier;
-        virtqueue_error_injector    err_inj;
-        virtio_wait_policy          wait_pol;
+        virtio_vq_test_kit          kit;
 
         mem = host_mem_manager::type_id::create("admin_mem");
         iommu = virtio_admin_vq_test_iommu::type_id::create("admin_iommu");
-        barrier = virtio_memory_barrier_model::type_id::create("admin_barrier");
-        err_inj = virtqueue_error_injector::type_id::create("admin_err_inj");
-        wait_pol = virtio_wait_policy::type_id::create("admin_wait_pol");
         transport = virtio_mock_transport::type_id::create("admin_transport");
-        vq = split_virtqueue::type_id::create("admin_split_vq");
 
+        kit = virtio_vq_test_kit::create_kit("admin", mem, iommu, 16'h0708);
         mem.init_region(64'h7100_0000, 64'h7103_FFFF);
-        wait_pol.default_poll_interval_ns = 1;
-        wait_pol.default_timeout_ns = 8;
-        wait_pol.max_poll_attempts = 16;
+        kit.wait_pol.default_poll_interval_ns = 1;
+        kit.wait_pol.default_timeout_ns = 8;
+        kit.wait_pol.max_poll_attempts = 16;
         transport.bdf = 16'h0708;
-        vq.setup(7, 8, mem, iommu, barrier, err_inj, wait_pol, 16'h0708);
-        vq.alloc_rings();
+        vq = kit.make_split("admin_split_vq", 7, 8, 16'h0708);
 
         ctx = virtio_admin_vq_context::type_id::create("admin_vq_context");
         ctx.transport = transport;
         ctx.vq = vq;
         ctx.mem = mem;
         ctx.iommu = iommu;
-        ctx.wait_pol = wait_pol;
+        ctx.wait_pol = kit.wait_pol;
         ctx.queue_id = 7;
         ctx.response_capacity = 16;
         ctx.negotiated_features = '0;
