@@ -51,18 +51,15 @@ class virtio_stress_unit_test extends uvm_test;
     task test_large_descriptor_count();
         host_mem_manager mem = host_mem_manager::type_id::create("ld_mem");
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("ld_iommu");
-        virtio_memory_barrier_model barrier = virtio_memory_barrier_model::type_id::create("ld_bar");
-        virtqueue_error_injector err_inj = virtqueue_error_injector::type_id::create("ld_einj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("ld_wp");
+        virtio_vq_test_kit kit;
         split_virtqueue vq;
         int unsigned queue_size = 256;
 
         mem.init_region(64'h3000_0000, 64'h3003_FFFF);  // 256KB
         iommu.strict_permission_check = 0;
 
-        vq = split_virtqueue::type_id::create("ld_vq");
-        vq.setup(0, queue_size, mem, iommu, barrier, err_inj, wait_pol, 16'h0100);
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("ld", mem, iommu, 16'h0100);
+        vq = kit.make_split("ld_vq", 0, queue_size, 16'h0100);
 
         // Fill all descriptors
         for (int i = 0; i < queue_size; i++) begin
@@ -166,17 +163,14 @@ class virtio_stress_unit_test extends uvm_test;
     task test_packed_virtqueue();
         host_mem_manager mem = host_mem_manager::type_id::create("pq_mem");
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("pq_iommu");
-        virtio_memory_barrier_model barrier = virtio_memory_barrier_model::type_id::create("pq_bar");
-        virtqueue_error_injector err_inj = virtqueue_error_injector::type_id::create("pq_einj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("pq_wp");
+        virtio_vq_test_kit kit;
         packed_virtqueue vq;
 
         mem.init_region(64'h4000_0000, 64'h4000_FFFF);
         iommu.strict_permission_check = 0;
 
-        vq = packed_virtqueue::type_id::create("pq");
-        vq.setup(0, 32, mem, iommu, barrier, err_inj, wait_pol, 16'h0300);
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("pq", mem, iommu, 16'h0300);
+        vq = kit.make_packed("pq", 0, 32, 16'h0300);
 
         assert(vq.get_free_count() == 32)
             else `uvm_error("TEST", $sformatf("packed: expected 32 free, got %0d", vq.get_free_count()))
@@ -210,22 +204,15 @@ class virtio_stress_unit_test extends uvm_test;
     task test_virtqueue_manager();
         host_mem_manager mem = host_mem_manager::type_id::create("vm_mem");
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("vm_iommu");
-        virtio_memory_barrier_model barrier = virtio_memory_barrier_model::type_id::create("vm_bar");
-        virtqueue_error_injector err_inj = virtqueue_error_injector::type_id::create("vm_einj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("vm_wp");
+        virtio_vq_test_kit kit;
         virtqueue_manager mgr;
         virtqueue_base vq;
 
         mem.init_region(64'h5000_0000, 64'h5003_FFFF);
         iommu.strict_permission_check = 0;
 
-        mgr = virtqueue_manager::type_id::create("mgr");
-        mgr.mem = mem;
-        mgr.iommu = iommu;
-        mgr.barrier = barrier;
-        mgr.err_inj = err_inj;
-        mgr.wait_pol = wait_pol;
-        mgr.bdf = 16'h0400;
+        kit = virtio_vq_test_kit::create_kit("vm", mem, iommu, 16'h0400);
+        mgr = kit.vq_mgr;
 
         // Create split queue
         vq = mgr.create_queue(0, 64, VQ_SPLIT);

@@ -17,9 +17,7 @@ class virtio_queue_semantics_test extends uvm_test;
     virtio_shared_mem_fixture mem_fixture;
     host_mem_manager mem;
     virtio_iommu_model iommu;
-    virtio_memory_barrier_model barrier;
-    virtqueue_error_injector err_inj;
-    virtio_wait_policy wait_pol;
+    virtio_vq_test_kit kit;
 
     function new(string name = "virtio_queue_semantics_test",
                  uvm_component parent = null);
@@ -38,9 +36,7 @@ class virtio_queue_semantics_test extends uvm_test;
         if (mem == null)
             `uvm_fatal("QUEUE_SEMANTICS", "Host-0 memory handle is null")
         iommu = virtio_iommu_model::type_id::create("queue_iommu");
-        barrier = virtio_memory_barrier_model::type_id::create("queue_barrier");
-        err_inj = virtqueue_error_injector::type_id::create("queue_err_inj");
-        wait_pol = virtio_wait_policy::type_id::create("queue_wait_pol");
+        kit = virtio_vq_test_kit::create_kit("queue", mem, iommu, 16'h0100);
         iommu.strict_permission_check = 0;
     endfunction
 
@@ -59,10 +55,7 @@ class virtio_queue_semantics_test extends uvm_test;
         split_virtqueue vq;
         int unsigned device_used_idx = 0;
 
-        vq = split_virtqueue::type_id::create("semantic_split_vq");
-        vq.setup(0, QUEUE_SIZE, mem, iommu, barrier, err_inj,
-                 wait_pol, 16'h0100, 0);
-        vq.alloc_rings();
+        vq = kit.make_split("semantic_split_vq", 0, QUEUE_SIZE, 16'h0100);
 
         for (int unsigned cycle = 0; cycle < CYCLES; cycle++) begin
             int unsigned desc_ids[$];
@@ -93,7 +86,8 @@ class virtio_queue_semantics_test extends uvm_test;
                 `uvm_fatal("QUEUE_SEMANTICS", "split queue did not reach full")
 
             for (int unsigned i = 0; i < desc_ids.size(); i++) begin
-                virtio_vq_test_kit::complete_split_at(mem, vq, i, desc_ids[i], 256, device_used_idx + 1);
+                virtio_vq_test_kit::complete_split_at(
+                    mem, vq, i, desc_ids[i], 256, device_used_idx + 1);
                 device_used_idx++;
             end
 
@@ -146,10 +140,7 @@ class virtio_queue_semantics_test extends uvm_test;
         int unsigned device_idx = 0;
         bit device_wrap = 1;
 
-        vq = packed_virtqueue::type_id::create("semantic_packed_vq");
-        vq.setup(1, QUEUE_SIZE, mem, iommu, barrier, err_inj,
-                 wait_pol, 16'h0100, 0);
-        vq.alloc_rings();
+        vq = kit.make_packed("semantic_packed_vq", 1, QUEUE_SIZE, 16'h0100);
 
         for (int unsigned cycle = 0; cycle < CYCLES; cycle++) begin
             bit [63:0] buffers[$];

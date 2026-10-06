@@ -601,17 +601,14 @@ class virtio_unit_test extends uvm_test;
     task test_split_virtqueue();
         host_mem_manager mem = host_mem_manager::type_id::create("sq_mem");
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("sq_iommu");
-        virtio_memory_barrier_model barrier = virtio_memory_barrier_model::type_id::create("barrier");
-        virtqueue_error_injector err_inj = virtqueue_error_injector::type_id::create("err_inj");
-        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("wait_pol");
+        virtio_vq_test_kit kit;
         split_virtqueue vq;
 
         mem.init_region(64'h2000_0000, 64'h2000_FFFF);
         iommu.strict_permission_check = 0;  // relax for unit test
 
-        vq = split_virtqueue::type_id::create("vq");
-        vq.setup(0, 16, mem, iommu, barrier, err_inj, wait_pol, 16'h0100);
-        vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit("sq", mem, iommu, 16'h0100);
+        vq = kit.make_split("vq", 0, 16, 16'h0100);
 
         assert(vq.get_free_count() == 16)
             else `uvm_error("TEST", $sformatf("expected 16 free, got %0d", vq.get_free_count()))

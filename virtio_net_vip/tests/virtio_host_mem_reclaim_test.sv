@@ -111,20 +111,16 @@ class virtio_host_mem_reclaim_test extends uvm_test;
 
     task test_split_queue_reclaim();
         virtio_iommu_model iommu;
-        virtio_memory_barrier_model barrier;
-        virtqueue_error_injector err_inj;
-        virtio_wait_policy wait_pol;
+        virtio_vq_test_kit kit;
         split_virtqueue vq;
 
         iommu = virtio_iommu_model::type_id::create("reclaim_iommu");
-        barrier = virtio_memory_barrier_model::type_id::create("reclaim_barrier");
-        err_inj = virtqueue_error_injector::type_id::create("reclaim_err_inj");
-        wait_pol = virtio_wait_policy::type_id::create("reclaim_wait_pol");
+        kit = virtio_vq_test_kit::create_kit("reclaim", host0_mem, iommu, 16'h0100);
         iommu.strict_permission_check = 0;
 
         vq = split_virtqueue::type_id::create("reclaim_vq");
-        vq.setup(0, QUEUE_SIZE, host0_mem, iommu, barrier, err_inj,
-                 wait_pol, 16'h0100, 0);
+        vq.setup(0, QUEUE_SIZE, host0_mem, iommu, kit.barrier, kit.err_inj,
+                 kit.wait_pol, 16'h0100, 0);
 
         for (int unsigned cycle = 0; cycle < RECLAIM_CYCLES; cycle++) begin
             int unsigned desc_ids[$];
@@ -133,8 +129,8 @@ class virtio_host_mem_reclaim_test extends uvm_test;
 
             if (cycle != 0) begin
                 vq.reset_queue();
-                vq.setup(0, QUEUE_SIZE, host0_mem, iommu, barrier, err_inj,
-                         wait_pol, 16'h0100, 0);
+                vq.setup(0, QUEUE_SIZE, host0_mem, iommu, kit.barrier, kit.err_inj,
+                         kit.wait_pol, 16'h0100, 0);
             end
             vq.alloc_rings();
 
@@ -165,7 +161,8 @@ class virtio_host_mem_reclaim_test extends uvm_test;
             end
 
             for (int unsigned i = 0; i < desc_ids.size(); i++) begin
-                virtio_vq_test_kit::complete_split_at(host0_mem, vq, i, desc_ids[i], 64, used_idx + 1);
+                virtio_vq_test_kit::complete_split_at(
+                    host0_mem, vq, i, desc_ids[i], 64, used_idx + 1);
                 used_idx++;
             end
 

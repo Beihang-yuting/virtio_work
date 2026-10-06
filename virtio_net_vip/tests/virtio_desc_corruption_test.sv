@@ -14,9 +14,7 @@ class virtio_desc_corruption_test extends uvm_test;
 
     host_mem_manager              mem;
     virtio_iommu_model            iommu;
-    virtio_memory_barrier_model   barrier;
-    virtqueue_error_injector     err_inj;
-    virtio_wait_policy             wait_pol;
+    virtio_vq_test_kit            kit;
 
     function new(string name = "virtio_desc_corruption_test",
                  uvm_component parent = null);
@@ -29,11 +27,7 @@ class virtio_desc_corruption_test extends uvm_test;
         mem.init_region(64'h0000_0001_5000_0000,
                         64'h0000_0001_500F_FFFF);
         iommu = virtio_iommu_model::type_id::create("corruption_iommu");
-        barrier = virtio_memory_barrier_model::type_id::create(
-            "corruption_barrier");
-        err_inj = virtqueue_error_injector::type_id::create(
-            "corruption_err_inj");
-        wait_pol = virtio_wait_policy::type_id::create("corruption_wait_pol");
+        kit = virtio_vq_test_kit::create_kit("corruption", mem, iommu, 16'h1500);
         iommu.strict_permission_check = 0;
     endfunction
 
@@ -71,9 +65,7 @@ class virtio_desc_corruption_test extends uvm_test;
         int unsigned corruption_before;
         string why;
 
-        vq = split_virtqueue::type_id::create("any_phase_split_vq");
-        vq.setup(3, 4, mem, iommu, barrier, err_inj, wait_pol, 16'h1503, 0);
-        vq.alloc_rings();
+        vq = kit.make_split("any_phase_split_vq", 3, 4, 16'h1503);
         addr = mem.alloc(64, .align(16));
         if (addr == '1)
             `uvm_fatal("DESC_CORRUPTION", "ANY-phase data allocation failed")
@@ -86,15 +78,15 @@ class virtio_desc_corruption_test extends uvm_test;
         if (head == '1)
             `uvm_fatal("DESC_CORRUPTION", "ANY-phase descriptor publication failed")
 
-        err_inj.configure(VQ_ERR_ZERO_LEN_BUF, 0, 3, 100, VQ_FAULT_ANY);
-        semantic_before = err_inj.injection_count();
-        corruption_before = err_inj.descriptor_corruption_count();
+        kit.err_inj.configure(VQ_ERR_ZERO_LEN_BUF, 0, 3, 100, VQ_FAULT_ANY);
+        semantic_before = kit.err_inj.injection_count();
+        corruption_before = kit.err_inj.descriptor_corruption_count();
         if (!vq.process_error_injection(VQ_FAULT_PRE_NOTIFY) ||
             vq.process_error_injection(VQ_FAULT_POST_NOTIFY))
             `uvm_fatal("DESC_CORRUPTION",
                        "VQ_FAULT_ANY did not stop after the first phase")
-        if (err_inj.injection_count() != semantic_before + 1 ||
-            err_inj.descriptor_corruption_count() != corruption_before + 1)
+        if (kit.err_inj.injection_count() != semantic_before + 1 ||
+            kit.err_inj.descriptor_corruption_count() != corruption_before + 1)
             `uvm_fatal("DESC_CORRUPTION",
                        "VQ_FAULT_ANY recorded more than one mutation per operation")
 
@@ -103,8 +95,8 @@ class virtio_desc_corruption_test extends uvm_test;
         if (!vq.process_error_injection(VQ_FAULT_PRE_NOTIFY))
             `uvm_fatal("DESC_CORRUPTION",
                        "VQ_FAULT_ANY did not re-arm for a new operation")
-        if (err_inj.injection_count() != semantic_before + 2 ||
-            err_inj.descriptor_corruption_count() != corruption_before + 2)
+        if (kit.err_inj.injection_count() != semantic_before + 2 ||
+            kit.err_inj.descriptor_corruption_count() != corruption_before + 2)
             `uvm_fatal("DESC_CORRUPTION",
                        "VQ_FAULT_ANY new-operation accounting is incorrect")
 
@@ -153,9 +145,7 @@ class virtio_desc_corruption_test extends uvm_test;
         string why;
         int unsigned head;
 
-        vq = split_virtqueue::type_id::create("corruption_split_vq");
-        vq.setup(0, 8, mem, iommu, barrier, err_inj, wait_pol, 16'h1500, 0);
-        vq.alloc_rings();
+        vq = kit.make_split("corruption_split_vq", 0, 8, 16'h1500);
         make_one_sg(sgs, 64);
         original_addr = sgs[0].entries[0].addr;
         head = vq.add_buf(sgs, 1, 0, null, 1'b0);
@@ -173,7 +163,7 @@ class virtio_desc_corruption_test extends uvm_test;
         if (len != 0)
             `uvm_fatal("DESC_CORRUPTION", "split LEN mutation was not visible")
 
-        if (!err_inj.corrupt_descriptor(
+        if (!kit.err_inj.corrupt_descriptor(
                 mem, vq.desc_table_addr, VQ_SPLIT, vq.queue_size, head,
                 VQ_DESC_FIELD_ADDR, 64'h0000_0000_DEAD_0000, why))
             `uvm_fatal("DESC_CORRUPTION", {"ADDR mutation failed: ", why})
@@ -181,7 +171,7 @@ class virtio_desc_corruption_test extends uvm_test;
         if (addr != 64'h0000_0000_DEAD_0000)
             `uvm_fatal("DESC_CORRUPTION", "split ADDR mutation was not visible")
 
-        if (!err_inj.corrupt_descriptor(
+        if (!kit.err_inj.corrupt_descriptor(
                 mem, vq.desc_table_addr, VQ_SPLIT, vq.queue_size, head,
                 VQ_DESC_FIELD_FLAGS, VIRTQ_DESC_F_NEXT, why))
             `uvm_fatal("DESC_CORRUPTION", {"FLAGS mutation failed: ", why})
@@ -189,7 +179,7 @@ class virtio_desc_corruption_test extends uvm_test;
         if (flags != VIRTQ_DESC_F_NEXT)
             `uvm_fatal("DESC_CORRUPTION", "split FLAGS mutation was not visible")
 
-        if (!err_inj.corrupt_descriptor(
+        if (!kit.err_inj.corrupt_descriptor(
                 mem, vq.desc_table_addr, VQ_SPLIT, vq.queue_size, head,
                 VQ_DESC_FIELD_NEXT, vq.queue_size, why))
             `uvm_fatal("DESC_CORRUPTION", {"NEXT mutation failed: ", why})
@@ -198,7 +188,7 @@ class virtio_desc_corruption_test extends uvm_test;
             `uvm_fatal("DESC_CORRUPTION", "split NEXT mutation was not visible")
 
         // ID is not encoded in a split descriptor; the helper must reject it.
-        if (err_inj.corrupt_descriptor(
+        if (kit.err_inj.corrupt_descriptor(
                 mem, vq.desc_table_addr, VQ_SPLIT, vq.queue_size, head,
                 VQ_DESC_FIELD_ID, 7, why))
             `uvm_fatal("DESC_CORRUPTION", "split ID corruption was accepted")
@@ -217,9 +207,7 @@ class virtio_desc_corruption_test extends uvm_test;
         string why;
         int unsigned head;
 
-        vq = packed_virtqueue::type_id::create("corruption_packed_vq");
-        vq.setup(1, 8, mem, iommu, barrier, err_inj, wait_pol, 16'h1501, 0);
-        vq.alloc_rings();
+        vq = kit.make_packed("corruption_packed_vq", 1, 8, 16'h1501);
         make_one_sg(sgs, 64);
         head = vq.add_buf(sgs, 1, 0, null, 1'b0);
         if (head == '1)
@@ -240,7 +228,7 @@ class virtio_desc_corruption_test extends uvm_test;
         if (id != 16'd7)
             `uvm_fatal("DESC_CORRUPTION", "packed ID mutation was not visible")
 
-        if (!err_inj.corrupt_descriptor(
+        if (!kit.err_inj.corrupt_descriptor(
                 mem, vq.desc_table_addr, VQ_PACKED, vq.queue_size, head,
                 VQ_DESC_FIELD_FLAGS, 16'h0080, why))
             `uvm_fatal("DESC_CORRUPTION", {"packed FLAGS mutation failed: ", why})
@@ -253,7 +241,7 @@ class virtio_desc_corruption_test extends uvm_test;
             `uvm_fatal("DESC_CORRUPTION", "packed FLAGS mutation was not visible")
 
         // Packed rings have no serialized NEXT field; reject it explicitly.
-        if (err_inj.corrupt_descriptor(
+        if (kit.err_inj.corrupt_descriptor(
                 mem, vq.desc_table_addr, VQ_PACKED, vq.queue_size, head,
                 VQ_DESC_FIELD_NEXT, 1, why))
             `uvm_fatal("DESC_CORRUPTION", "packed NEXT corruption was accepted")
@@ -265,17 +253,17 @@ class virtio_desc_corruption_test extends uvm_test;
     task test_rejects_invalid_target();
         string why;
         bit ok;
-        ok = err_inj.corrupt_descriptor(
+        ok = kit.err_inj.corrupt_descriptor(
             mem, 64'h0000_0001_5000_0000, VQ_SPLIT, 4, 4,
             VQ_DESC_FIELD_LEN, 1, why);
         if (ok)
             `uvm_fatal("DESC_CORRUPTION", "out-of-range descriptor index accepted")
-        ok = err_inj.corrupt_descriptor(
+        ok = kit.err_inj.corrupt_descriptor(
             mem, 64'h0000_0001_5000_0000, VQ_CUSTOM, 4, 0,
             VQ_DESC_FIELD_LEN, 1, why);
         if (ok)
             `uvm_fatal("DESC_CORRUPTION", "custom ring corruption was accepted")
-        ok = err_inj.corrupt_descriptor(
+        ok = kit.err_inj.corrupt_descriptor(
             mem, 64'hffff_ffff_ffff_fff0, VQ_SPLIT, 2, 1,
             VQ_DESC_FIELD_LEN, 1, why);
         if (ok)
@@ -297,9 +285,7 @@ class virtio_desc_corruption_test extends uvm_test;
         int unsigned corruption_before;
         int unsigned semantic_before;
 
-        vq = split_virtqueue::type_id::create("timed_split_vq");
-        vq.setup(2, 4, mem, iommu, barrier, err_inj, wait_pol, 16'h1502, 0);
-        vq.alloc_rings();
+        vq = kit.make_split("timed_split_vq", 2, 4, 16'h1502);
         addr = mem.alloc(64, .align(16));
         if (addr == '1)
             `uvm_fatal("DESC_CORRUPTION", "timed data allocation failed")
@@ -313,36 +299,36 @@ class virtio_desc_corruption_test extends uvm_test;
             `uvm_fatal("DESC_CORRUPTION", "timed descriptor publication failed")
 
         // A phase mismatch must not consume the operation countdown.
-        err_inj.configure(VQ_ERR_ZERO_LEN_BUF, 0, 2, 100,
-                          VQ_FAULT_POST_NOTIFY);
+        kit.err_inj.configure(VQ_ERR_ZERO_LEN_BUF, 0, 2, 100,
+                              VQ_FAULT_POST_NOTIFY);
         // The phase filter itself must not consume the operation.
-        corruption_before = err_inj.descriptor_corruption_count();
-        if (err_inj.should_inject(2, VQ_FAULT_PRE_NOTIFY))
+        corruption_before = kit.err_inj.descriptor_corruption_count();
+        if (kit.err_inj.should_inject(2, VQ_FAULT_PRE_NOTIFY))
             `uvm_fatal("DESC_CORRUPTION", "POST_NOTIFY fault fired at PRE_NOTIFY")
-        if (err_inj.descriptor_corruption_count() != corruption_before)
+        if (kit.err_inj.descriptor_corruption_count() != corruption_before)
             `uvm_fatal("DESC_CORRUPTION", "phase mismatch consumed an injection")
         vq.kick();
         mem.read_mem(vq.desc_table_addr + head * 16 + 8, 4, data);
         if ({data[3], data[2], data[1], data[0]} != 0)
             `uvm_fatal("DESC_CORRUPTION", "POST_NOTIFY descriptor mutation missing")
-        if (err_inj.last_injection_phase() != VQ_FAULT_POST_NOTIFY)
+        if (kit.err_inj.last_injection_phase() != VQ_FAULT_POST_NOTIFY)
             `uvm_fatal("DESC_CORRUPTION", "wrong timing phase recorded")
         // The same configured fault is consumed exactly once by the kick.
-        if (err_inj.descriptor_corruption_count() != corruption_before + 1)
+        if (kit.err_inj.descriptor_corruption_count() != corruption_before + 1)
             `uvm_fatal("DESC_CORRUPTION",
                        $sformatf("expected one timed corruption, got %0d",
-                                 err_inj.descriptor_corruption_count()))
+                                 kit.err_inj.descriptor_corruption_count()))
 
         // Semantic faults owned by a dedicated ring/interrupt hook must not
         // be falsely counted as descriptor corruption just because a queue
         // kick occurred.
-        err_inj.configure(VQ_ERR_SPURIOUS_INTERRUPT, 0, 2, 100,
-                          VQ_FAULT_POST_NOTIFY);
-        corruption_before = err_inj.descriptor_corruption_count();
-        semantic_before = err_inj.injection_count();
+        kit.err_inj.configure(VQ_ERR_SPURIOUS_INTERRUPT, 0, 2, 100,
+                              VQ_FAULT_POST_NOTIFY);
+        corruption_before = kit.err_inj.descriptor_corruption_count();
+        semantic_before = kit.err_inj.injection_count();
         vq.kick();
-        if (err_inj.injection_count() != semantic_before ||
-            err_inj.descriptor_corruption_count() != corruption_before)
+        if (kit.err_inj.injection_count() != semantic_before ||
+            kit.err_inj.descriptor_corruption_count() != corruption_before)
             `uvm_fatal("DESC_CORRUPTION",
                        "unsupported semantic fault was falsely consumed")
 
