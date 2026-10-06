@@ -371,7 +371,6 @@ class virtio_net_env_config extends uvm_object;
             driver_cfg.vq_type = VQ_CUSTOM;
             driver_cfg.irq_mode = IRQ_POLLING;
             driver_cfg.driver_features = 0;
-            driver_cfg.rx_buf_mode = RX_MODE_SMALL;
             driver_cfg.rx_buf_size = private_cfg.rx_buf_size;
         end
         why = "";

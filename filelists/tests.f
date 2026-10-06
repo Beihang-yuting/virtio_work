@@ -34,7 +34,6 @@ virtio_net_vip/tests/virtio_migration_dirty_test.sv
 virtio_net_vip/tests/virtio_e2e_test.sv
 virtio_net_vip/tests/virtio_full_test.sv
 virtio_net_vip/tests/virtio_dual_test.sv
-virtio_net_vip/tests/virtio_base_test.sv
 virtio_net_vip/tests/virtio_smoke_test.sv
 virtio_net_vip/tests/virtio_traffic_test.sv
 virtio_net_vip/tests/virtio_dut_caps_test.sv

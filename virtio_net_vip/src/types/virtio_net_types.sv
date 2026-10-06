@@ -137,7 +137,7 @@ typedef enum bit [7:0] {
 } device_status_e;
 
 typedef enum { DRV_MODE_AUTO, DRV_MODE_MANUAL, DRV_MODE_HYBRID } driver_mode_e;
-typedef enum { RX_MODE_MERGEABLE, RX_MODE_BIG, RX_MODE_SMALL } rx_buf_mode_e;
+typedef enum { RX_MODE_MERGEABLE } rx_buf_mode_e;
 typedef enum { IRQ_MSIX_PER_QUEUE, IRQ_MSIX_SHARED, IRQ_INTX, IRQ_POLLING } interrupt_mode_e;
 typedef enum { DMA_TO_DEVICE, DMA_FROM_DEVICE, DMA_BIDIRECTIONAL } dma_dir_e;
 // 设备执行主体和完成通知机制分开建模，避免两种设备行为同时驱动队列。

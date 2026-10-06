@@ -17,11 +17,8 @@
 //   5. Verifies RX checksums when GUEST_CSUM is negotiated.
 //   6. Auto-refills buffers when free count drops below threshold.
 //
-// Three buffer modes are supported:
-//   RX_MODE_MERGEABLE -- Multiple small buffers can be merged for one packet.
-//                        Header includes num_buffers field.
-//   RX_MODE_BIG       -- Single large buffer (64K+) per packet.
-//   RX_MODE_SMALL     -- Single buffer sized for MTU + header.
+// Buffer mode: RX_MODE_MERGEABLE only -- several buffers can be merged for
+// one packet; the header carries the num_buffers field.
 //
 // Depends on:
 //   - virtqueue_manager, virtqueue_base (add_buf, poll_used, kick)
@@ -118,20 +115,11 @@ class virtio_rx_engine extends uvm_object;
     // ==================================================================
     // get_rx_buf_size
     //
-    // Returns the appropriate buffer allocation size based on the
-    // current buffer mode.
+    // Returns the mergeable RX buffer allocation size.
     // ==================================================================
-    // 查询模式对应的 buffer 容量；设为虚接口供私有协议返回不含 Virtio header 的容量。
+    // 查询 mergeable buffer 容量；设为虚接口供私有协议返回不含 Virtio header 的容量。
     virtual function int unsigned get_rx_buf_size();
-        int unsigned hdr_size;
-        hdr_size = virtio_net_hdr_util::get_hdr_size(negotiated_features);
-
-        case (buf_mode)
-            RX_MODE_MERGEABLE: return buf_size;
-            RX_MODE_BIG:       return 65550;
-            RX_MODE_SMALL:     return 1514 + hdr_size;
-            default:           return buf_size;
-        endcase
+        return buf_size;
     endfunction : get_rx_buf_size
 
     // ==================================================================
@@ -167,8 +155,8 @@ class virtio_rx_engine extends uvm_object;
     // ==================================================================
     // receive_packets
     //
-    // Top-level RX entry point. Dispatches to the appropriate receive
-    // method based on buffer mode, then auto-refills if needed.
+    // Top-level RX entry point. Receives frames through the bound
+    // atomic ops, then auto-refills if needed.
     //
     // Parameters:
     //   queue_id -- RX virtqueue ID to poll
@@ -362,131 +350,6 @@ class virtio_rx_engine extends uvm_object;
             UVM_HIGH)
 
     endtask : receive_mergeable
-
-    // ==================================================================
-    // receive_big (protected)
-    //
-    // Big-buffer mode receive: single large buffer per packet, no merge.
-    // ==================================================================
-    // 大 buffer 模式委托单 buffer 接收；容量由投递时确定，本入口不再合包。
-    protected virtual task receive_big(
-        int unsigned      queue_id,
-        int unsigned      budget,
-        ref uvm_object    received[$]
-    );
-        receive_single_buf(queue_id, budget, received);
-    endtask : receive_big
-
-    // ==================================================================
-    // receive_small (protected)
-    //
-    // Small-buffer mode receive: single MTU-sized buffer per packet.
-    // ==================================================================
-    // MTU 大小模式委托单 buffer 接收；输出追加到 received，不改变其已有元素。
-    protected virtual task receive_small(
-        int unsigned      queue_id,
-        int unsigned      budget,
-        ref uvm_object    received[$]
-    );
-        receive_single_buf(queue_id, budget, received);
-    endtask : receive_small
-
-    // ==================================================================
-    // receive_single_buf (protected)
-    //
-    // Shared implementation for big and small modes. Each packet is
-    // contained in exactly one buffer (no merging).
-    // ==================================================================
-    // 每个完成项解析一份标准 header 和 payload，校验可选 checksum 后返回 packet；
-    // 非法 token 或过短 header 报错，合法 tracker 的 buffer 在复制后立即回收。
-    protected virtual task receive_single_buf(
-        int unsigned      queue_id,
-        int unsigned      budget,
-        ref uvm_object    received[$]
-    );
-        virtqueue_base     vq;
-        uvm_object         token;
-        int unsigned       len;
-        int unsigned       count;
-        int unsigned       hdr_size;
-
-        vq = vq_mgr.get_queue(queue_id);
-        if (vq == null) begin
-            `uvm_error("RX_ENG",
-                $sformatf("receive_single_buf: queue %0d not found", queue_id))
-            return;
-        end
-
-        hdr_size = virtio_net_hdr_util::get_hdr_size(negotiated_features);
-        count = 0;
-
-        while (count < budget) begin
-            virtio_buf_tracker tracker;
-            byte              buf_data[];
-            byte unsigned      payload[$];
-            virtio_net_hdr_t   net_hdr;
-            bit [63:0]         buf_gpa;
-
-            if (!vq.poll_used(token, len))
-                break;
-
-            if (!$cast(tracker, token) || tracker.count() == 0) begin
-                `uvm_error("RX_ENG", "receive_single_buf: invalid tracker token")
-                total_rx_errors++;
-                continue;
-            end
-
-            buf_gpa = tracker.gpa_list[0];
-
-            // Read used data
-            mem.read_mem(buf_gpa, len, buf_data);
-
-            if (buf_data.size() < hdr_size) begin
-                `uvm_error("RX_ENG",
-                    $sformatf("receive_single_buf: buffer too small (%0d < hdr %0d)",
-                              buf_data.size(), hdr_size))
-                cleanup_rx_buffer(buf_gpa);
-                total_rx_errors++;
-                continue;
-            end
-
-            // Parse header
-            begin
-                byte unsigned buf_data_u[$];
-                foreach (buf_data[i]) buf_data_u.push_back(buf_data[i]);
-                virtio_net_hdr_util::unpack_hdr(buf_data_u, negotiated_features, net_hdr);
-
-                // Extract payload
-                for (int i = hdr_size; i < len; i++)
-                    payload.push_back(buf_data_u[i]);
-            end
-
-            // Cleanup buffer
-            cleanup_rx_buffer(buf_gpa);
-
-            // RX checksum verification
-            if (negotiated_features[VIRTIO_NET_F_GUEST_CSUM]) begin
-                if (!offload.verify_rx_csum(net_hdr, payload)) begin
-                    `uvm_warning("RX_ENG",
-                        $sformatf("receive_single_buf: RX checksum failed, pkt_size=%0d",
-                                  payload.size()))
-                end
-            end
-
-            // Build a real net_packet item, preserving a wrapper for malformed
-            // payloads that the protocol parser cannot decode.
-            received.push_back(build_received_packet(payload, net_hdr));
-
-            total_rx_packets++;
-            total_rx_bytes += payload.size();
-            count++;
-        end
-
-        `uvm_info("RX_ENG",
-            $sformatf("receive_single_buf: queue=%0d received=%0d", queue_id, count),
-            UVM_HIGH)
-
-    endtask : receive_single_buf
 
     // ==================================================================
     // cleanup_rx_buffer (protected)
