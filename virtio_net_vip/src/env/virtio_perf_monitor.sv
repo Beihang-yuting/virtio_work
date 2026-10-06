@@ -126,6 +126,71 @@ class virtio_perf_monitor extends uvm_component;
     endfunction
 
     // ========================================================================
+    // 运行时重配 -- build_phase 只在构建时初始化令牌桶；运行中改带宽需调用这里
+    // ========================================================================
+
+    localparam int unsigned BW_BURST_WINDOW_NS = 100_000;
+
+    // 按 mbps 重配限速：令牌桶容量为 BW_BURST_WINDOW_NS 时间窗内的字节数并
+    // 立即装满；mbps=0 关闭限速并清空令牌桶。
+    function void configure_bw(int unsigned mbps);
+        longint unsigned scaled_bucket_bytes;
+
+        bw_limit_mbps = mbps;
+        if (mbps > 0) begin
+            bw_limit_enable = 1;
+            scaled_bucket_bytes = mbps;
+            scaled_bucket_bytes *= BW_BURST_WINDOW_NS;
+            scaled_bucket_bytes /= 8000;
+            bucket_size  = scaled_bucket_bytes;
+            token_bucket = bucket_size;  // start full
+            last_refill_time = $realtime;
+        end else begin
+            bw_limit_enable = 0;
+            bucket_size  = 0;
+            token_bucket = 0;
+        end
+    endfunction
+
+    // 不推进仿真时间地为一个 bytes 大小的包补足令牌：返回所需的逻辑等待 ns，
+    // 并按该等待时间补充令牌（不超过桶容量）。要求限速已开启且速率非零。
+    function int unsigned advance_logical_refill(int unsigned bytes);
+        longint unsigned wait_numerator;
+        longint unsigned wait_ns;
+        longint unsigned refill_tokens;
+        longint unsigned refill_total;
+
+        if (!bw_limit_enable || (bw_limit_mbps == 0)) begin
+            `uvm_fatal("PERF_MON",
+                "logical bandwidth refill requires a nonzero enabled rate")
+            return 0;
+        end
+
+        wait_numerator = bytes;
+        wait_numerator *= 8000;
+        wait_ns = (wait_numerator / bw_limit_mbps) + 1;
+        refill_tokens = wait_ns;
+        refill_tokens *= bw_limit_mbps;
+        refill_tokens /= 8000;
+        refill_total = token_bucket;
+        refill_total += refill_tokens;
+        token_bucket = (refill_total > bucket_size) ?
+            bucket_size : refill_total;
+        last_refill_time = $realtime;
+        return wait_ns;
+    endfunction
+
+    // 清空全部统计，开始新的测量阶段；限速开启时把令牌桶重新装满。
+    function void reset_stats();
+        global_stats = '{default: 0, start_time: 0, end_time: 0};
+        vf_stats.delete();
+        latency_samples.delete();
+        last_refill_time = $realtime;
+        if (bw_limit_enable)
+            token_bucket = bucket_size;
+    endfunction
+
+    // ========================================================================
     // record_latency -- Record a per-packet latency sample
     // ========================================================================
 

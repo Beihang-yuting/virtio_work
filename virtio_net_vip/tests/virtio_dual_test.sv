@@ -28,77 +28,6 @@ import host_mem_pkg::*;
 import virtio_net_pkg::*;
 
 // ============================================================================
-// Extended perf monitor: exposes configure_bw() to reinitialize token bucket
-// at runtime (the base class only initializes in build_phase).
-// ============================================================================
-class virtio_perf_monitor_ext extends virtio_perf_monitor;
-    `uvm_component_utils(virtio_perf_monitor_ext)
-
-    localparam int unsigned BW_BURST_WINDOW_NS = 100_000;
-
-    function new(string name, uvm_component parent);
-        super.new(name, parent);
-    endfunction
-
-    // Reconfigure bandwidth limit at runtime, reinitializing the token bucket.
-    function void configure_bw(int unsigned mbps);
-        longint unsigned scaled_bucket_bytes;
-
-        bw_limit_mbps = mbps;
-        if (mbps > 0) begin
-            bw_limit_enable = 1;
-            scaled_bucket_bytes = mbps;
-            scaled_bucket_bytes *= BW_BURST_WINDOW_NS;
-            scaled_bucket_bytes /= 8000;
-            bucket_size  = scaled_bucket_bytes;
-            token_bucket = bucket_size;  // start full
-            last_refill_time = $realtime;
-        end else begin
-            bw_limit_enable = 0;
-            bucket_size  = 0;
-            token_bucket = 0;
-        end
-    endfunction
-
-    // Refill for one packet's logical wait without advancing simulation time.
-    function int unsigned advance_logical_refill(int unsigned bytes);
-        longint unsigned wait_numerator;
-        longint unsigned wait_ns;
-        longint unsigned refill_tokens;
-        longint unsigned refill_total;
-
-        if (!bw_limit_enable || (bw_limit_mbps == 0)) begin
-            `uvm_fatal("DUAL_TEST",
-                "logical bandwidth refill requires a nonzero enabled rate")
-            return 0;
-        end
-
-        wait_numerator = bytes;
-        wait_numerator *= 8000;
-        wait_ns = (wait_numerator / bw_limit_mbps) + 1;
-        refill_tokens = wait_ns;
-        refill_tokens *= bw_limit_mbps;
-        refill_tokens /= 8000;
-        refill_total = token_bucket;
-        refill_total += refill_tokens;
-        token_bucket = (refill_total > bucket_size) ?
-            bucket_size : refill_total;
-        last_refill_time = $realtime;
-        return wait_ns;
-    endfunction
-
-    // Reset all stats for a fresh measurement phase
-    function void reset_stats();
-        global_stats = '{default: 0, start_time: 0, end_time: 0};
-        vf_stats.delete();
-        latency_samples.delete();
-        last_refill_time = $realtime;
-        if (bw_limit_enable)
-            token_bucket = bucket_size;
-    endfunction
-endclass : virtio_perf_monitor_ext
-
-// ============================================================================
 // Dual VIP Test
 // ============================================================================
 class virtio_dual_test extends uvm_test;
@@ -132,8 +61,8 @@ class virtio_dual_test extends uvm_test;
     // Perf monitors
     virtio_perf_monitor   perf_a, perf_b;
 
-    // Extended perf monitor for bandwidth control test (Test 5)
-    virtio_perf_monitor_ext bw_mon;
+    // Perf monitor for bandwidth control test (Test 5)
+    virtio_perf_monitor   bw_mon;
 
     // Test counters
     int unsigned tests_passed;
@@ -250,8 +179,8 @@ class virtio_dual_test extends uvm_test;
         perf_a = virtio_perf_monitor::type_id::create("perf_a", this);
         perf_b = virtio_perf_monitor::type_id::create("perf_b", this);
 
-        // 7b. Extended perf monitor for bandwidth control test
-        bw_mon = virtio_perf_monitor_ext::type_id::create("bw_mon", this);
+        // 7b. Perf monitor for bandwidth control test (runtime reconfigured)
+        bw_mon = virtio_perf_monitor::type_id::create("bw_mon", this);
 
     endfunction
 

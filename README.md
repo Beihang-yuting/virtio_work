@@ -872,7 +872,7 @@ disable fork;             // 会杀死调用线程下的所有子进程！
 
 **现象**：`perf_monitor` 的 `bucket_size` / `token_bucket` 在 `build_phase` 初始化，运行时修改 `bw_limit_mbps` 后内部状态不更新。
 
-**解决方案**：使用 `virtio_perf_monitor_ext` 子类的 `configure_bw()` 方法进行运行时重配。
+**解决方案**：调用 `virtio_perf_monitor::configure_bw()` 进行运行时重配（`reset_stats()` 开始新的测量阶段）。
 
 ---
 
