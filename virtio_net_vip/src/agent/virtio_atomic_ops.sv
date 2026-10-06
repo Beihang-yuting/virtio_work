@@ -435,21 +435,6 @@ class virtio_atomic_ops extends uvm_object;
         return 1;
     endfunction
 
-    // Compatibility name for callers that restore only indirect tables.
-    virtual function bit validate_restored_indirect_ownership(
-        virtio_device_snapshot_t snap
-    );
-        return validate_restored_queue_ownership(snap);
-    endfunction
-
-    // 兼容旧名：仅恢复 indirect 表的调用方入口，委托统一的
-    // claim_restored_queue_ownership。
-    virtual function bit claim_restored_indirect_ownership(
-        virtqueue_snapshot_t queue_snapshot
-    );
-        return claim_restored_queue_ownership(queue_snapshot);
-    endfunction
-
     // ========================================================================
     // Device Lifecycle
     // ========================================================================

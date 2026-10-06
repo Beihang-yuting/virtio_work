@@ -17,21 +17,17 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
     // offsets into PCIe memory addresses at execution time.
     dpu_device_snapshot device_snapshot;
     int unsigned default_root_index;
-    int unsigned root_by_host[int unsigned];
-    // A Host can expose more than one independent PCIe segment/root.  Keep
-    // the legacy host-only map as a fallback, but prefer an exact domain map
-    // whenever a caller has bound one.
+    // A Host can expose more than one independent PCIe segment/root, so
+    // root selection is keyed by the exact {host, segment} domain.
     int unsigned root_by_domain[longint unsigned];
-    int unsigned completion_poll_limit;
 
-    // 初始化 backend 的 root 选择和 Completion 轮询上限；此时不绑定 snapshot
+    // 初始化 backend 的 root 选择；此时不绑定 snapshot
     // 或 PCIe sequencer，后续由 test 显式注入。
     function new(string name = "pcie_tl_dpu_reg_backend");
         super.new(name);
         virtual_sequencer = null;
         device_snapshot = null;
         default_root_index = 0;
-        completion_poll_limit = 50000;
     endfunction
 
     // 注入实际 PCIe virtual sequencer；null 句柄会在后续寄存器执行时被拒绝。
@@ -125,12 +121,6 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         return 1;
     endfunction
 
-    // 设置 Host 级 RC root 后备映射；同 Host 多 segment 时应优先使用 domain 映射。
-    function void bind_host_root(input int unsigned host_id,
-                                 input int unsigned root_index);
-        root_by_host[host_id] = root_index;
-    endfunction
-
     // 将 host_id/segment_id 压缩为关联数组键，保证不同 Host 的相同 segment 不碰撞。
     protected function longint unsigned domain_map_key(
         input int unsigned host_id,
@@ -139,14 +129,14 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         return (longint'(host_id) << 32) | longint'(segment_id);
     endfunction
 
-    // 设置精确 PCIe domain 到 RC root 的映射，优先级高于 Host 级后备映射。
+    // 设置精确 PCIe domain 到 RC root 的映射。
     function void bind_domain_root(input int unsigned host_id,
                                    input int unsigned segment_id,
                                    input int unsigned root_index);
         root_by_domain[domain_map_key(host_id, segment_id)] = root_index;
     endfunction
 
-    // 按 domain→host→default 的优先级选取 RC sequencer；不存在或越界时返回 0。
+    // 按 domain→default 的优先级选取 RC sequencer；不存在或越界时返回 0。
     protected function bit get_root_sequencer(
         input int unsigned host_id,
         input int unsigned segment_id,
@@ -164,8 +154,6 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         root_index = default_root_index;
         if (root_by_domain.exists(domain_map_key(host_id, segment_id)))
             root_index = root_by_domain[domain_map_key(host_id, segment_id)];
-        else if (root_by_host.exists(host_id))
-            root_index = root_by_host[host_id];
         if (virtual_sequencer.rc_seqr_arr.size() != 0) begin
             if (root_index >= virtual_sequencer.rc_seqr_arr.size()) begin
                 why = $sformatf(
@@ -201,44 +189,6 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         return enable;
     endfunction
 
-    // 中文：输入绝对地址和字节宽度，输出 DWORD 地址、长度及首尾 BE；不发送 TLP，
-    // 仅供 read/write 计算请求形状。
-    // 从字节粒度 operation 计算 DWORD 对齐地址、长度和首尾 byte-enable；遇到
-    // 非页对齐 BAR 也保持真实绝对地址的 lane 语义。
-    // 中文接口说明：输入 absolute_address/width_bytes，输出 aligned_address、
-    // length_dw、first_be、last_be，仅计算不发包。
-    // Derive the DWORD-aligned PCIe request shape from a byte-granular
-    // operation.  BAR-relative offsets are validated by dpu_reg_op, while
-    // the actual TLP must use the absolute BAR address (important when a
-    // randomized BAR is not page-aligned).
-    protected function void calc_mem_transfer(
-        input bit [63:0] absolute_address,
-        input int unsigned width_bytes,
-        output bit [63:0] aligned_address,
-        output int unsigned length_dw,
-        output bit [3:0] first_be,
-        output bit [3:0] last_be
-    );
-        int unsigned lane;
-        int unsigned total_bytes;
-
-        lane = absolute_address[1:0];
-        total_bytes = lane + width_bytes;
-        length_dw = (total_bytes + 3) / 4;
-        aligned_address = {absolute_address[63:2], 2'b00};
-        first_be = byte_enable_at_address(absolute_address, width_bytes);
-        last_be = '0;
-        if (length_dw > 1) begin
-            for (int unsigned index = 0; index < 4; index++) begin
-                int signed source_index;
-                source_index = ((length_dw - 1) * 4) + index - lane;
-                if ((source_index >= 0) &&
-                    (source_index < int'(width_bytes)))
-                    last_be[index] = 1'b1;
-            end
-        end
-    endfunction
-
     // 将配置空间写数据按地址低 lane 左移到 PCIe CFG TLP payload 位置。
     protected function bit [31:0] config_payload(input dpu_reg_op operation);
         bit [31:0] value;
@@ -246,52 +196,6 @@ class pcie_tl_dpu_reg_backend extends dpu_pcie_reg_backend;
         value = value << (8 * operation.address[1:0]);
         return value;
     endfunction
-
-    // 从 Completion 返回字节数组中按 lane 提取最多 64-bit 的寄存器值。
-    protected function bit [63:0] payload_value(
-        input bit [7:0] bytes[],
-        input int unsigned width,
-        input int unsigned start_lane
-    );
-        bit [63:0] value;
-        value = '0;
-        for (int unsigned index = 0;
-             index < width && (start_lane + index) < bytes.size() && index < 8;
-             index++)
-            value[index * 8 +: 8] = bytes[start_lane + index];
-        return value;
-    endfunction
-
-    // 轮询已发 TLP 的 Completion 状态；成功置 ok，非 SC 状态、空 TLP 或超时
-    // 均通过 why 返回，并受 completion_poll_limit 限制仿真时间。
-    protected task wait_for_completion(
-        input pcie_tl_tlp issued_tlp,
-        output bit ok,
-        output string why
-    );
-        ok = 0;
-        why = "";
-        if (issued_tlp == null) begin
-            why = "PCIe sequence did not publish its issued TLP";
-            return;
-        end
-        for (int unsigned poll = 0; poll < completion_poll_limit; poll++) begin
-            if (issued_tlp.rb_done) begin
-                if (issued_tlp.rb_status != CPL_STATUS_SC) begin
-                    why = $sformatf(
-                        "PCIe Completion returned status %s",
-                        issued_tlp.rb_status.name());
-                    return;
-                end
-                ok = 1;
-                return;
-            end
-            #1ns;
-        end
-        why = $sformatf(
-            "PCIe Completion timeout after %0d polls",
-            completion_poll_limit);
-    endtask
 
     // 把配置空间或 BAR-relative MMIO 写计划序列化为 PCIe CFG/MEM TLP；配置读写
     // 等待 Completion，posted MMIO write 只确认 TLP 已被 sequencer 接收。

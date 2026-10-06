@@ -97,13 +97,6 @@ class packed_virtqueue extends virtqueue_base;
         flags = {data[15], data[14]};
     endfunction
 
-    // Read only the flags field of a packed descriptor
-    protected function bit [15:0] read_packed_desc_flags(int unsigned idx);
-        byte data[];
-        mem.read_mem(desc_table_addr + idx * 16 + 14, 2, data);
-        return {data[1], data[0]};
-    endfunction
-
     // Write 16-bit value to event suppression area at given address + byte offset
     protected function void write_event_16(bit [63:0] base_addr, int unsigned byte_offset,
                                            bit [15:0] val);

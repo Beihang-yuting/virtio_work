@@ -758,19 +758,6 @@ class virtio_iommu_model extends uvm_object;
         set_dirty_tracking_enable(host_id, 0);
     endfunction
 
-    // Snapshot every live mapping belonging to one requester.  Dirty-page
-    // tracking intentionally records only completed device writes; migration
-    // also needs the complete bytes of clean live mappings still reachable
-    // from raw queue state, such as outstanding TX or indirect descriptors.
-    // Copy them while the source allocation is known to be live.
-    function bit snapshot_live_mappings(
-        host_mem_manager mem,
-        bit [15:0] bdf,
-        ref virtio_mapping_snapshot_t records[$]
-    );
-        return snapshot_live_mappings_for_host(0, mem, bdf, records);
-    endfunction
-
     // 快照指定 {host, BDF} 的全部 live mapping（身份 + 完整 payload）。脏页
     // 跟踪只记录已完成的设备写，而迁移还需要仍被队列裸状态引用的"干净"映射
     // （未完成的 TX 缓冲、indirect 描述符表等），必须趁源端分配还活着时把字节
@@ -785,7 +772,7 @@ class virtio_iommu_model extends uvm_object;
         records.delete();
         if (mem == null) begin
             `uvm_error("IOMMU_MIGRATION",
-                "snapshot_live_mappings: missing host memory")
+                "snapshot_live_mappings_for_host: missing host memory")
             return 0;
         end
         foreach (mapping_table[key]) begin
@@ -799,7 +786,7 @@ class virtio_iommu_model extends uvm_object;
             if (entry.size == 0) begin
                 records.delete();
                 `uvm_error("IOMMU_MIGRATION", $sformatf(
-                    "snapshot_live_mappings: zero-size mapping BDF=0x%04x IOVA=0x%016h",
+                    "snapshot_live_mappings_for_host: zero-size mapping BDF=0x%04x IOVA=0x%016h",
                     bdf, entry.iova))
                 return 0;
             end
@@ -815,7 +802,7 @@ class virtio_iommu_model extends uvm_object;
             if (record.payload.size() != entry.size) begin
                 records.delete();
                 `uvm_error("IOMMU_MIGRATION", $sformatf(
-                    "snapshot_live_mappings: unable to capture %0d bytes at GPA=0x%016h",
+                    "snapshot_live_mappings_for_host: unable to capture %0d bytes at GPA=0x%016h",
                     entry.size, entry.gpa))
                 return 0;
             end
@@ -946,68 +933,8 @@ class virtio_iommu_model extends uvm_object;
         end
     endfunction
 
-    // Backwards-compatible legacy helper.  New migration code must use the
-    // explicit begin/capture generation pair above.
-    function void get_and_clear_dirty(ref bit [63:0] dirty_pages[$]);
-        dirty_pages.delete();
-        foreach (dirty_bitmap[0][page]) begin
-            dirty_pages.push_back(page);
-        end
-        if (dirty_bitmap.exists(0))
-            dirty_bitmap[0].delete();
-    endfunction
-
-    // Return the mapping identity that covered a captured page.  A dirty page
-    // may be produced by a sub-page mapping, so overlap (not full-page
-    // coverage) identifies the mapping that observed the write.
-    function bit get_dirty_page_mapping(
-        bit [63:0] page_id, ref iommu_mapping_t mapping
-    );
-        return get_dirty_page_mapping_for_host(0, page_id, mapping);
-    endfunction
-
-    // 返回覆盖指定脏页的某个 live mapping 身份。按 GPA 区间与页相交判断而非
-    // 整页覆盖——子页映射同样能产生脏页。多个映射相交时返回遍历命中的第一个；
-    // 找不到返回 0 且 mapping 清零。只查 live 表，不看写后快照。
-    function bit get_dirty_page_mapping_for_host(
-        int unsigned host_id,
-        bit [63:0] page_id, ref iommu_mapping_t mapping
-    );
-        bit [63:0] page_base;
-        bit [63:0] page_end;
-
-        mapping = '{default: 0};
-        page_base = page_id << PAGE_SHIFT;
-        page_end = page_base + PAGE_SIZE;
-        foreach (mapping_table[key]) begin
-            iommu_mapping_entry_t entry;
-            entry = mapping_table[key];
-            if (entry.valid && (entry.host_id == host_id) &&
-                (entry.gpa < page_end) &&
-                ((entry.gpa + entry.size) > page_base)) begin
-                mapping.host_id = entry.host_id;
-                mapping.bdf = entry.bdf;
-                mapping.gpa = entry.gpa;
-                mapping.iova = entry.iova;
-                mapping.size = entry.size;
-                mapping.dir = entry.dir;
-                mapping.desc_id = 0;
-                return 1;
-            end
-        end
-        return 0;
-    endfunction
-
-    // Return completed dirty records, including the exact post-write payload
-    // captured while the mapping/allocation was still live.
-    function void get_dirty_page_records(
-        bit [63:0] page_id, ref virtio_dirty_page_snapshot_t records[$]
-    );
-        get_dirty_page_records_for_host(0, page_id, records);
-    endfunction
-
     // 返回某脏页上全部已完成设备写的快照记录（含写后 payload 的精确字节）。
-    // 与 get_dirty_page_mapping_for_host 不同，这里读的是 write_from_device
+    // 数据来自 write_from_device
     // 落盘瞬间抓取的快照，即使映射随后被 unmap/free 依然可用。无记录输出空集。
     function void get_dirty_page_records_for_host(
         int unsigned host_id,
@@ -1019,29 +946,6 @@ class virtio_iommu_model extends uvm_object;
             return;
         foreach (dirty_page_snapshot[host_id][page_id][key]) begin
             records.push_back(dirty_page_snapshot[host_id][page_id][key]);
-        end
-    endfunction
-
-    // Compatibility projection for callers that need only identities.
-    function void get_dirty_page_mappings(
-        bit [63:0] page_id, ref iommu_mapping_t mappings[$]
-    );
-        get_dirty_page_mappings_for_host(0, page_id, mappings);
-    endfunction
-
-    // 兼容投影：数据源同 get_dirty_page_records_for_host，但只取每条快照的
-    // 映射身份、丢弃 payload，供只关心"谁写了这页"的旧调用方使用。
-    function void get_dirty_page_mappings_for_host(
-        int unsigned host_id,
-        bit [63:0] page_id, ref iommu_mapping_t mappings[$]
-    );
-        mappings.delete();
-        if (!dirty_page_snapshot.exists(host_id) ||
-            !dirty_page_snapshot[host_id].exists(page_id))
-            return;
-        foreach (dirty_page_snapshot[host_id][page_id][key]) begin
-            mappings.push_back(
-                dirty_page_snapshot[host_id][page_id][key].mapping);
         end
     endfunction
 
@@ -1080,14 +984,6 @@ class virtio_iommu_model extends uvm_object;
             end
         end
         return 0;
-    endfunction
-
-    // Return one exact live mapping after migration has recreated a stable
-    // source IOVA. Queue ownership restoration uses the destination GPA while
-    // retaining the descriptor-visible IOVA from the snapshot.
-    function bit get_live_mapping(bit [15:0] bdf, bit [63:0] iova,
-                                  ref iommu_mapping_t mapping);
-        return get_live_mapping_for_host(0, bdf, iova, mapping);
     endfunction
 
     // 按 {host, BDF, IOVA} 精确键查询单条 live mapping（iova 必须是映射起始

@@ -84,34 +84,12 @@ class split_virtqueue extends virtqueue_base;
         return {data[1], data[0]};
     endfunction
 
-    // Read the flags field of a descriptor
-    protected function bit [15:0] read_desc_flags(int unsigned idx);
-        byte data[];
-        mem.read_mem(desc_table_addr + idx * 16 + 12, 2, data);
-        return {data[1], data[0]};
-    endfunction
-
     // Write 16-bit value to avail ring at given byte offset
     protected function void write_avail_16(int unsigned byte_offset, bit [15:0] val);
         byte data[2];
         data[0] = val[7:0];
         data[1] = val[15:8];
         mem.write_mem(driver_ring_addr + byte_offset, data);
-    endfunction
-
-    // Read 16-bit value from avail ring at given byte offset
-    protected function bit [15:0] read_avail_16(int unsigned byte_offset);
-        byte data[];
-        mem.read_mem(driver_ring_addr + byte_offset, 2, data);
-        return {data[1], data[0]};
-    endfunction
-
-    // Write 16-bit value to used ring at given byte offset
-    protected function void write_used_16(int unsigned byte_offset, bit [15:0] val);
-        byte data[2];
-        data[0] = val[7:0];
-        data[1] = val[15:8];
-        mem.write_mem(device_ring_addr + byte_offset, data);
     endfunction
 
     // Read 16-bit value from used ring at given byte offset

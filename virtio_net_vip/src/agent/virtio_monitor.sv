@@ -10,7 +10,6 @@ class virtio_monitor extends uvm_monitor;
 
     uvm_analysis_port #(virtio_transaction) txn_ap;
     uvm_analysis_port #(virtio_transaction) err_ap;
-    uvm_analysis_port #(uvm_object)         pkt_ap;
 
     uvm_tlm_analysis_fifo #(virtio_transaction) bar_event_fifo;
     uvm_tlm_analysis_fifo #(virtio_transaction) dma_event_fifo;
@@ -27,14 +26,12 @@ class virtio_monitor extends uvm_monitor;
     virtual virtio_protocol_event_if protocol_vif;
 
     bit chk_status_transition = 1;
-    bit chk_feature_usage = 1;
     bit chk_queue_protocol = 1;
     bit chk_notification = 1;
     bit chk_descriptor_chain = 1;
     bit chk_dma_boundary = 1;
 
     protected bit [7:0] last_status = DEV_STATUS_RESET;
-    protected bit [63:0] used_features = '0;
     protected bit [63:0] dma_addr_lo;
     protected bit [63:0] dma_addr_hi;
     protected bit dma_range_configured;
@@ -51,13 +48,12 @@ class virtio_monitor extends uvm_monitor;
         super.new(name, parent);
     endfunction
 
-    // 创建三个分析端口（txn/err/pkt）、四类事件 FIFO 及对应 uvm_event。
+    // 创建两个分析端口（txn/err）、四类事件 FIFO 及对应 uvm_event。
     // 副作用：FIFO 作为子组件挂在本 monitor 下，事件对象为本地 new。
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
         txn_ap = new("txn_ap", this);
         err_ap = new("err_ap", this);
-        pkt_ap = new("pkt_ap", this);
         bar_event_fifo = new("bar_event_fifo", this);
         dma_event_fifo = new("dma_event_fifo", this);
         interrupt_event_fifo = new("interrupt_event_fifo", this);
@@ -79,12 +75,11 @@ class virtio_monitor extends uvm_monitor;
         dma_range_configured = (lo <= hi);
     endfunction
 
-    // 复位全部协议语义状态：设备状态回 RESET、清 feature 使用记录、
+    // 复位全部协议语义状态：设备状态回 RESET、
     // 丢弃已验证的 notify 队列并清空所有队列配置/使能标记。
     // 用于设备级复位（FLR、status=0），不触碰 DMA 窗口配置。
     virtual function void reset_protocol_state();
         last_status = DEV_STATUS_RESET;
-        used_features = '0;
         verified_submission_queues.delete();
         reset_all_queue_state();
     endfunction
@@ -327,60 +322,6 @@ class virtio_monitor extends uvm_monitor;
             protocol_vif.stage_notify(queue_id, configured, enabled, valid);
         end
         publish_event(txn);
-    endfunction
-
-    // 兼容旧接口：直接委托 observe_status_write 做状态转换检查。
-    virtual function void check_status_transition(
-        input bit [7:0] old_status,
-        input bit [7:0] new_status
-    );
-        observe_status_write(old_status, new_status);
-    endfunction
-
-    // 检查 feature 使用是否越权：attempted_use 中未在 negotiated 出现的位
-    // 即为 unauthorized，非零则报违例（错误 txn 的 features 字段只留越权位）。
-    // 副作用：把 attempted_use 累加进 used_features 供覆盖率/后续分析。
-    virtual function void check_feature_dependency(
-        input bit [63:0] negotiated,
-        input bit [63:0] attempted_use
-    );
-        virtio_transaction txn;
-        bit [63:0] unauthorized;
-
-        txn = new_monitor_txn(VIRTIO_MON_BAR_ACCESS, '0, 0, 1);
-        txn.txn_type = VIO_TXN_INIT;
-        txn.features = attempted_use;
-        unauthorized = attempted_use & ~negotiated;
-        if (chk_feature_usage && (unauthorized != 0)) begin
-            txn.features = unauthorized;
-            mark_error(txn, $sformatf(
-                "Feature dependency violation: used=0x%016h negotiated=0x%016h unauthorized=0x%016h",
-                attempted_use, negotiated, unauthorized));
-        end
-        used_features |= attempted_use;
-        publish_event(txn);
-    endfunction
-
-    // 兼容旧接口：按"无地址信息的 kick"语义委托 observe_queue_notify。
-    virtual function void check_queue_access_valid(input int unsigned queue_id);
-        observe_queue_notify(queue_id);
-    endfunction
-
-    // 外部组件（如 driver 回调）直接广播一笔事务到 txn_ap，不走事件 FIFO。
-    virtual function void broadcast_txn(virtio_transaction txn);
-        txn_ap.write(txn);
-    endfunction
-
-    // 把事务标记为错误后同时广播到 txn_ap 和 err_ap（副作用：置 monitor_error）。
-    virtual function void broadcast_error(virtio_transaction txn);
-        txn.monitor_error = 1;
-        txn_ap.write(txn);
-        err_ap.write(txn);
-    endfunction
-
-    // 广播一个数据面报文对象（收发包路径）到 pkt_ap，供 scoreboard 比对。
-    virtual function void broadcast_pkt(uvm_object pkt);
-        pkt_ap.write(pkt);
     endfunction
 
     // 构造一笔 monitor 事件事务：填入事件类型、地址/长度/读写方向，

@@ -414,16 +414,6 @@ class virtio_pci_cap_manager extends uvm_object;
         return notify_cap.bar;
     endfunction
 
-    // ISR 状态区在其 BAR 内的字节偏移。
-    function bit [63:0] get_isr_bar_offset();
-        return {32'h0, isr_cap.offset};
-    endfunction
-
-    // ISR 状态区所在 BAR 编号。
-    function int unsigned get_isr_bar();
-        return isr_cap.bar;
-    endfunction
-
     // device 专属 config 区在其 BAR 内的字节偏移。
     function bit [63:0] get_device_cfg_bar_offset();
         return {32'h0, device_cfg_cap.offset};
@@ -437,11 +427,6 @@ class virtio_pci_cap_manager extends uvm_object;
     // ========================================================================
     // Validation helpers
     // ========================================================================
-
-    // Check that all mandatory capabilities were discovered
-    function bit all_mandatory_caps_found();
-        return common_cfg_found && notify_found && isr_found;
-    endfunction
 
     // Check that MSI-X is available
     function bit has_msix();

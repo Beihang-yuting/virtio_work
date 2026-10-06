@@ -9,7 +9,7 @@
 // 主要依赖：host_mem_api/host_mem_manager、virtio_iommu_model 及其 DMA 方向检查。
 // 所有权：只借用调用方传入的 manager 和 IOMMU，不拥有、不释放，也不负责 map/unmap。
 // 生命周期：new 后先 configure 一次；随后可作为 host_mem_api 使用，teardown 时仅
-//           由调用方回收底层 manager 的分配。direct GPA 只用于显式 legacy 场景。
+//           由调用方回收底层 manager 的分配。
 class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
     `uvm_object_utils(virtio_pcie_iova_host_mem_proxy)
 
@@ -18,7 +18,6 @@ class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
     protected int unsigned       m_host_id;
     protected bit [15:0]         m_bdf;
     protected bit                 m_configured;
-    protected bit                 m_direct_gpa_mode;
     protected int unsigned       m_read_count;
     protected int unsigned       m_write_count;
     protected int unsigned       m_translation_fault_count;
@@ -31,7 +30,6 @@ class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
         m_host_id = 0;
         m_bdf = '0;
         m_configured = 0;
-        m_direct_gpa_mode = 0;
         m_read_count = 0;
         m_write_count = 0;
         m_translation_fault_count = 0;
@@ -71,14 +69,6 @@ class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
         return 1;
     endfunction
 
-    // 接口契约：切换 legacy 直通模式；打开后 addr 按 GPA 解释并跳过 IOMMU 翻译、
-    // 权限检查和 dirty-page 记录。REAL_DUT 默认关闭，调用方必须显式承担无 IOMMU
-    // 前提；本函数无失败返回，也不会修改底层 manager。
-    function void set_direct_gpa_mode(input bit enable);
-        m_direct_gpa_mode = enable;
-    endfunction
-    // 返回当前是否将传入地址按 GPA 直通；只读，不改变代理状态。
-    function bit direct_gpa_mode(); return m_direct_gpa_mode; endfunction
     // 以下统计只记录本代理成功完成的读写/翻译失败次数，不代表 DUT 硬件计数器。
     function int unsigned read_count(); return m_read_count; endfunction
     function int unsigned write_count(); return m_write_count; endfunction
@@ -87,8 +77,7 @@ class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
     endfunction
 
     // 内部契约：把设备读请求的 IOVA 解析为 GPA。DMA_TO_DEVICE 表示设备读取
-    // Host；未配置、范围不足或 IOMMU 翻译失败返回 0，后者递增 fault 计数；
-    // 直通模式只检查 manager aperture，不经过 IOMMU。
+    // Host；未配置、范围不足或 IOMMU 翻译失败返回 0，后者递增 fault 计数。
     protected function bit resolve_read(
         input bit [63:0] iova,
         input int unsigned size,
@@ -97,10 +86,6 @@ class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
         iommu_fault_e fault;
         gpa = '0;
         if (!m_configured || (m_mem == null)) return 0;
-        if (m_direct_gpa_mode) begin
-            gpa = iova;
-            return m_mem.contains_range(gpa, size);
-        end
         if ((m_iommu == null) || !m_iommu.translate_for_host(
                 m_host_id, m_bdf, iova, size, DMA_TO_DEVICE, gpa, fault)) begin
             m_translation_fault_count++;
@@ -167,21 +152,15 @@ class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
         m_read_count++;
     endfunction
 
-    // 接口契约：addr 是设备可见 IOVA，data 是设备写入字节。正常模式通过
+    // 接口契约：addr 是设备可见 IOVA，data 是设备写入字节。写入通过
     // write_from_device_for_host 保留权限/dirty tracking；空数据、未配置、范围或
-    // 权限失败时不写入且不递增 write_count。直通模式直接写 GPA。
+    // 权限失败时不写入且不递增 write_count。
     virtual function void write_mem(bit [63:0] addr, byte data[],
                                     string file = "", int line = 0);
-        bit [63:0] gpa;
         iommu_fault_e fault;
         if ((data.size() == 0) || !m_configured || (m_mem == null)) return;
-        if (m_direct_gpa_mode) begin
-            if (!m_mem.contains_range(addr, data.size())) return;
-            m_mem.write_mem(addr, data, file, line);
-        end else if ((m_iommu != null) && m_iommu.write_from_device_for_host(
-                         m_host_id, m_mem, m_bdf, addr, data, fault)) begin
-            gpa = addr; // only used for diagnostics/debug; translation is internal
-        end else begin
+        if ((m_iommu == null) || !m_iommu.write_from_device_for_host(
+                m_host_id, m_mem, m_bdf, addr, data, fault)) begin
             m_translation_fault_count++;
             return;
         end
