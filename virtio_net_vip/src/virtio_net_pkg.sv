@@ -103,7 +103,6 @@ package virtio_net_pkg;
   `include "dataplane/virtio_offload_engine.sv"
   `include "dataplane/virtio_tx_engine.sv"
   `include "dataplane/virtio_rx_engine.sv"
-  `include "dataplane/virtio_failover_manager.sv"
   `include "dataplane/virtio_net_dataplane.sv"
   `include "dpu_priv/dpu_priv_dataplane.sv"
 

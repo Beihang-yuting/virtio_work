@@ -9,7 +9,6 @@
 // pcie_tl_func_manager. This class manages only virtio-specific concerns:
 //   - Queue resource mapping (via virtio_vf_resource_pool)
 //   - VF instance lifecycle (via virtio_vf_instance references)
-//   - Failover coordination (via virtio_failover_manager)
 //   - Admin VQ (virtio 1.2+)：完整实现——configure/clear/recover 生命
 //     周期、admin_vq_config_lock 信号量做并发命令串行化、
 //     admin_vq_bindings_are_consistent() 绑定一致性校验、
@@ -28,7 +27,6 @@
 // Depends on:
 //   - virtio_vf_resource_pool (queue mapping)
 //   - virtio_vf_instance (per-VF driver wrapper)
-//   - virtio_failover_manager (STANDBY failover)
 //   - virtio_pci_transport (PF transport for config access)
 //   - virtio_wait_policy (timeout/polling)
 // ============================================================================
@@ -42,7 +40,6 @@ class virtio_pf_manager extends uvm_object;
 
     // ===== Virtio-specific =====
     virtio_vf_resource_pool   resource_pool;
-    virtio_failover_manager   failover_mgr;
 
     // ===== VF instances (references, owned by env) =====
     virtio_vf_instance        vf_instances[];
@@ -715,10 +712,6 @@ class virtio_pf_manager extends uvm_object;
             UVM_LOW)
 
         resource_pool.print_map();
-
-        if (failover_mgr != null) begin
-            `uvm_info("PF_MGR", failover_mgr.get_status_string(), UVM_LOW)
-        end
     endfunction
 
 endclass : virtio_pf_manager

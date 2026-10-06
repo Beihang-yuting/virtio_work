@@ -4,8 +4,8 @@
 // ============================================================================
 // virtio_net_dataplane
 //
-// Top-level dataplane wrapper that aggregates TX engine, RX engine, offload
-// engine, and failover manager into a single manageable unit.
+// Top-level dataplane wrapper that aggregates TX engine, RX engine and
+// offload engine into a single manageable unit.
 //
 // Provides a unified configure() entry point that wires sub-component
 // references (virtqueue_manager, host_mem_manager, IOMMU, etc.) and
@@ -15,7 +15,6 @@
 //   - virtio_tx_engine (packet transmission)
 //   - virtio_rx_engine (packet reception)
 //   - virtio_offload_engine (checksum, GSO, RSS offloads)
-//   - virtio_failover_manager (VIRTIO_NET_F_STANDBY failover)
 //   - virtqueue_manager, host_mem_manager, virtio_iommu_model
 // ============================================================================
 
@@ -26,7 +25,6 @@ class virtio_net_dataplane extends uvm_object;
     virtio_tx_engine          tx_engine;
     virtio_rx_engine          rx_engine;
     virtio_offload_engine     offload;
-    virtio_failover_manager   failover_mgr;
 
     // ===== Configuration =====
     bit [63:0]       negotiated_features;
@@ -36,14 +34,13 @@ class virtio_net_dataplane extends uvm_object;
     int unsigned     rx_buf_size = 1526;
     int unsigned     rx_refill_threshold = 16;
 
-    // 构造函数：创建下属 TX/RX/offload/failover 四个子引擎；
+    // 构造函数：创建下属 TX/RX/offload 三个子引擎；
     // 特性与队列引用由外部在初始化阶段注入。
     function new(string name = "virtio_net_dataplane");
         super.new(name);
         tx_engine    = virtio_tx_engine::type_id::create("tx_engine");
         rx_engine    = virtio_rx_engine::type_id::create("rx_engine");
         offload      = virtio_offload_engine::type_id::create("offload");
-        failover_mgr = virtio_failover_manager::type_id::create("failover_mgr");
     endfunction
 
     // ========================================================================
@@ -132,9 +129,6 @@ class virtio_net_dataplane extends uvm_object;
             "Config: features=0x%016h mtu=%0d mss=%0d rx_mode=%s rx_buf=%0d refill_thresh=%0d",
             negotiated_features, mtu, mss, rx_buf_mode.name(),
             rx_buf_size, rx_refill_threshold), UVM_LOW)
-
-        if (failover_mgr != null)
-            `uvm_info("DATAPLANE", failover_mgr.get_status_string(), UVM_LOW)
     endfunction
 
 endclass : virtio_net_dataplane

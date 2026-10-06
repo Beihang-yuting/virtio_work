@@ -104,11 +104,6 @@ class virtio_net_env_config extends uvm_object;
     bit                  scb_enable = 1;
     bit                  cov_enable = 0;
 
-    // ===== Failover =====
-    bit                  failover_enable = 0;
-    int unsigned         primary_vf_id = 0;
-    int unsigned         standby_vf_id = 1;
-
     // ========================================================================
     // Constructor
     // ========================================================================
@@ -571,9 +566,7 @@ class virtio_net_env_config extends uvm_object;
         s = {s, $sformatf("  default: rx_mode=%s, irq_mode=%s, mtu=%0d\n",
                           default_rx_mode.name(), default_irq_mode.name(), default_mtu)};
         s = {s, $sformatf("  bw_limit: enable=%0b, mbps=%0d\n", bw_limit_enable, bw_limit_mbps)};
-        s = {s, $sformatf("  scb_enable=%0b, cov_enable=%0b\n", scb_enable, cov_enable)};
-        s = {s, $sformatf("  failover: enable=%0b, primary=%0d, standby=%0d",
-                          failover_enable, primary_vf_id, standby_vf_id)};
+        s = {s, $sformatf("  scb_enable=%0b, cov_enable=%0b", scb_enable, cov_enable)};
         return s;
     endfunction
 
