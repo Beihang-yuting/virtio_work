@@ -2,7 +2,7 @@
 // virtio_net_pkg.sv
 // 目录层次：virtio_net_vip/src，virtio-net UVM VIP 的唯一 package 入口。
 // 先导入 net_packet_pkg、host_mem_pkg、PCIe 和资源包，再按类型、共享模型、
-// 队列、传输、agent、数据面、SR-IOV、环境和序列的依赖顺序纳入本地源码。
+// 队列、传输、agent、数据面、SR-IOV 和环境的依赖顺序纳入本地源码。
 // 外部 packet 与 Host memory 类只在各自 package 定义一次；本包复导出这些
 // 类型以兼容已使用 virtio_net_pkg::* 的调用端。对象仍由环境或调用者创建，
 // 本 package 不接管 packet、Host memory 或 PCIe 资源的生命周期。
@@ -123,72 +123,12 @@ package virtio_net_pkg;
   // 第 8 层 – 顶层环境（env/）
   // ---------------------------------------------------------------------------
   `include "env/virtio_net_env_config.sv"
-  `include "env/virtio_virtual_sequencer.sv"
   `include "env/virtio_scoreboard.sv"
   `include "env/virtio_coverage.sv"
   `include "env/virtio_perf_monitor.sv"
   `include "env/virtio_concurrency_controller.sv"
   `include "env/virtio_dynamic_reconfig.sv"
   `include "env/virtio_net_env.sv"
-
-  // ---------------------------------------------------------------------------
-  // 第 9 层 – 序列库（seq/）
-  // ---------------------------------------------------------------------------
-
-  // Base sequences
-  `include "seq/base/virtio_base_seq.sv"
-  `include "seq/base/virtio_init_seq.sv"
-  `include "seq/base/virtio_tx_seq.sv"
-  `include "seq/base/virtio_rx_seq.sv"
-  `include "seq/base/virtio_ctrl_seq.sv"
-  `include "seq/base/virtio_queue_setup_seq.sv"
-  `include "seq/base/virtio_kick_seq.sv"
-
-  // Lifecycle scenario sequences
-  `include "seq/scenario/lifecycle/virtio_lifecycle_full_seq.sv"
-  `include "seq/scenario/lifecycle/virtio_status_error_seq.sv"
-  `include "seq/scenario/lifecycle/virtio_feature_error_seq.sv"
-
-  // Dataplane scenario sequences
-  `include "seq/scenario/dataplane/virtio_tso_seq.sv"
-  `include "seq/scenario/dataplane/virtio_mrg_rxbuf_seq.sv"
-  `include "seq/scenario/dataplane/virtio_rss_distribution_seq.sv"
-  `include "seq/scenario/dataplane/virtio_csum_offload_seq.sv"
-  `include "seq/scenario/dataplane/virtio_tunnel_pkt_seq.sv"
-
-  // Interrupt scenario sequences
-  `include "seq/scenario/interrupt/virtio_adaptive_irq_seq.sv"
-  `include "seq/scenario/interrupt/virtio_event_idx_boundary_seq.sv"
-
-  // Migration scenario sequences
-  `include "seq/scenario/migration/virtio_live_migration_seq.sv"
-  `include "seq/scenario/migration/virtio_failover_seq.sv"
-
-  // SR-IOV scenario sequences
-  `include "seq/scenario/sriov/virtio_multi_vf_init_seq.sv"
-  `include "seq/scenario/sriov/virtio_vf_flr_isolation_seq.sv"
-  `include "seq/scenario/sriov/virtio_mixed_vq_type_seq.sv"
-
-  // Error scenario sequences
-  `include "seq/scenario/error/virtio_desc_error_seq.sv"
-  `include "seq/scenario/error/virtio_iommu_fault_seq.sv"
-  `include "seq/scenario/error/virtio_pcie_cross_error_seq.sv"
-  `include "seq/scenario/error/virtio_bad_packet_seq.sv"
-
-  // Concurrency scenario sequences
-  `include "seq/scenario/concurrency/virtio_concurrent_vf_traffic_seq.sv"
-
-  // Dynamic scenario sequences
-  `include "seq/scenario/dynamic/virtio_live_mq_resize_seq.sv"
-
-  // Boundary scenario sequences
-  `include "seq/scenario/boundary/virtio_boundary_seq.sv"
-
-  // Virtual sequences
-  `include "seq/virtual/virtio_smoke_vseq.sv"
-  `include "seq/virtual/virtio_full_init_traffic_vseq.sv"
-  `include "seq/virtual/virtio_multi_vf_vseq.sv"
-  `include "seq/virtual/virtio_stress_vseq.sv"
 
 endpackage : virtio_net_pkg
 

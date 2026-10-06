@@ -670,9 +670,6 @@ class virtio_dut_caps_test extends uvm_test;
     virtio_dut_caps_bind_probe_env endpoint_bind_env;
     virtio_net_env_config endpoint_bind_cfg;
     dpu_device_env endpoint_bind_device_env;
-    virtio_dut_caps_bind_probe_env null_vseqr_bind_env;
-    virtio_net_env_config null_vseqr_bind_cfg;
-    dpu_device_env null_vseqr_bind_device_env;
     virtio_dut_caps_bind_probe_env adapter_bind_env;
     virtio_net_env_config adapter_bind_cfg;
     dpu_device_env adapter_bind_device_env;
@@ -1048,23 +1045,6 @@ class virtio_dut_caps_test extends uvm_test;
         endpoint_bind_env = virtio_dut_caps_bind_probe_env::type_id::create(
             "endpoint_bind_env", endpoint_bind_device_env);
 
-        null_vseqr_bind_cfg = make_fatal_probe_cfg(
-            "null_vseqr_bind_cfg", 0);
-        null_vseqr_bind_cfg.default_num_pairs = 1;
-        null_vseqr_bind_device_env = make_device_env_fixture(
-            "null_vseqr_bind_device_env", 1, 0, 1, 1);
-        uvm_config_db#(virtio_net_env_config)::set(
-            this, "null_vseqr_bind_device_env.null_vseqr_bind_env", "cfg",
-            null_vseqr_bind_cfg);
-        uvm_config_db#(uvm_active_passive_enum)::set(
-            this,
-            "null_vseqr_bind_device_env.null_vseqr_bind_env.*.driver_agent",
-            "is_active",
-            UVM_PASSIVE);
-        null_vseqr_bind_env =
-            virtio_dut_caps_bind_probe_env::type_id::create(
-                "null_vseqr_bind_env", null_vseqr_bind_device_env);
-
         adapter_bind_cfg = make_fatal_probe_cfg("adapter_bind_cfg", 0);
         adapter_bind_cfg.default_num_pairs = 1;
         adapter_bind_device_env = make_device_env_fixture(
@@ -1218,14 +1198,12 @@ class virtio_dut_caps_test extends uvm_test;
         end
 
         bind_catcher = new("invalid_legacy_bind_catcher", invalid_legacy_env);
-        invalid_legacy_env.v_seqr = propagated_caps_env.v_seqr;
         uvm_report_cb::add(null, bind_catcher);
         if (invalid_legacy_env.bind_pcie(null)) begin
             `uvm_fatal("DUT_CAPS",
                 "invalid legacy environment reported a successful PCIe bind")
         end
         uvm_report_cb::delete(null, bind_catcher);
-        invalid_legacy_env.v_seqr = null;
         if (bind_catcher.caught_count != 0) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
                 "invalid legacy bind reported %0d null-sequencer fatal(s); expected silent return",
@@ -2616,7 +2594,7 @@ class virtio_dut_caps_test extends uvm_test;
 
         if (!bind_succeeded ||
             !observer_override_env.binding_configuration_valid() ||
-            (observer_override_env.v_seqr.pcie_rc_seqr != mq_pcie_seqr) ||
+            (function_instance.transport.bar.pcie_rc_seqr != mq_pcie_seqr) ||
             (observer_override_env.bound_protocol_vif_count() != 1) ||
             (malicious_observer.configure_function_count != 0) ||
             !malicious_observer.function_bound ||
@@ -2659,7 +2637,6 @@ class virtio_dut_caps_test extends uvm_test;
 
         if ((catcher.caught_count != 1) || bind_succeeded ||
             observer_export_env.binding_configuration_valid() ||
-            (observer_export_env.v_seqr.pcie_rc_seqr != null) ||
             (observer_export_env.bound_protocol_vif_count() != 0) ||
             (function_instance.pending_pcie_fsm_candidate() != null) ||
             (function_instance.pending_pcie_ops_candidate() != null) ||
@@ -2685,7 +2662,7 @@ class virtio_dut_caps_test extends uvm_test;
                  "vif=%0d"},
                 catcher.caught_count, bind_succeeded,
                 observer_export_env.binding_configuration_valid(),
-                observer_export_env.v_seqr.pcie_rc_seqr != null,
+                function_instance.transport.bar.pcie_rc_seqr != null,
                 observer_export_env.bound_protocol_vif_count(),
                 function_instance.driver_agent.ops != null,
                 function_instance.driver_agent.fsm != null,
@@ -2714,7 +2691,6 @@ class virtio_dut_caps_test extends uvm_test;
 
         if ((catcher.caught_count != 1) || bind_succeeded ||
             external_monitor_env.binding_configuration_valid() ||
-            (external_monitor_env.v_seqr.pcie_rc_seqr != null) ||
             (external_monitor_env.bound_protocol_vif_count() != 0) ||
             (function_instance.pending_pcie_fsm_candidate() != null) ||
             (function_instance.pending_pcie_ops_candidate() != null) ||
@@ -2740,7 +2716,7 @@ class virtio_dut_caps_test extends uvm_test;
                  "vif=%0d"},
                 catcher.caught_count, bind_succeeded,
                 external_monitor_env.binding_configuration_valid(),
-                external_monitor_env.v_seqr.pcie_rc_seqr != null,
+                function_instance.transport.bar.pcie_rc_seqr != null,
                 external_monitor_env.bound_protocol_vif_count(),
                 function_instance.driver_agent.ops != null,
                 function_instance.driver_agent.fsm != null,
@@ -2774,7 +2750,6 @@ class virtio_dut_caps_test extends uvm_test;
 
         if ((catcher.caught_count != 1) || bind_succeeded ||
             propagated_caps_env.binding_configuration_valid() ||
-            (propagated_caps_env.v_seqr.pcie_rc_seqr != null) ||
             (propagated_caps_env.bound_protocol_vif_count() != 0) ||
             (failing_function.driver_agent.ops != null) ||
             (failing_function.driver_agent.fsm != incompatible_fsm) ||
@@ -2785,7 +2760,7 @@ class virtio_dut_caps_test extends uvm_test;
                  "ops=%0d fsm_changed=%0d observer=%0d"},
                 catcher.caught_count,
                 propagated_caps_env.binding_configuration_valid(),
-                propagated_caps_env.v_seqr.pcie_rc_seqr != null,
+                failing_function.transport.bar.pcie_rc_seqr != null,
                 propagated_caps_env.bound_protocol_vif_count(),
                 failing_function.driver_agent.ops != null,
                 failing_function.driver_agent.fsm != incompatible_fsm,
@@ -2820,7 +2795,6 @@ class virtio_dut_caps_test extends uvm_test;
 
         if ((catcher.caught_count != 1) || bind_succeeded ||
             multi_bind_env.binding_configuration_valid() ||
-            (multi_bind_env.v_seqr.pcie_rc_seqr != null) ||
             (multi_bind_env.bound_protocol_vif_count() != 0) ||
             (first_function.driver_agent.ops != null) ||
             (first_function.driver_agent.fsm != null) ||
@@ -2902,7 +2876,6 @@ class virtio_dut_caps_test extends uvm_test;
         if ((catcher.caught_count != 1) || bind_succeeded ||
             !restore_succeeded ||
             protocol_vif_alias_bind_env.binding_configuration_valid() ||
-            (protocol_vif_alias_bind_env.v_seqr.pcie_rc_seqr != null) ||
             (protocol_vif_alias_bind_env.bound_protocol_vif_count() != 0) ||
             (first_function.pending_pcie_fsm_candidate() != null) ||
             (first_function.pending_pcie_ops_candidate() != null) ||
@@ -2955,7 +2928,7 @@ class virtio_dut_caps_test extends uvm_test;
                  "second_observer=%0d"},
                 catcher.caught_count, bind_succeeded, restore_succeeded,
                 protocol_vif_alias_bind_env.binding_configuration_valid(),
-                protocol_vif_alias_bind_env.v_seqr.pcie_rc_seqr != null,
+                first_function.transport.bar.pcie_rc_seqr != null,
                 protocol_vif_alias_bind_env.bound_protocol_vif_count(),
                 first_function.driver_agent.monitor.protocol_vif ==
                     second_function.driver_agent.monitor.protocol_vif,
@@ -2992,7 +2965,6 @@ class virtio_dut_caps_test extends uvm_test;
 
         if ((catcher.caught_count != 1) || bind_succeeded ||
             alias_bind_env.binding_configuration_valid() ||
-            (alias_bind_env.v_seqr.pcie_rc_seqr != null) ||
             (alias_bind_env.bound_protocol_vif_count() != 0) ||
             (first_function.driver_agent.ops != null) ||
             (first_function.driver_agent.fsm != shared_fsm) ||
@@ -3016,7 +2988,7 @@ class virtio_dut_caps_test extends uvm_test;
                  "first_ops=%0d second_ops=%0d shared_ops=%0d"},
                 catcher.caught_count, bind_succeeded,
                 alias_bind_env.binding_configuration_valid(),
-                alias_bind_env.v_seqr.pcie_rc_seqr != null,
+                first_function.transport.bar.pcie_rc_seqr != null,
                 alias_bind_env.bound_protocol_vif_count(),
                 first_function.driver_agent.ops != null,
                 second_function.driver_agent.ops != null,
@@ -3056,7 +3028,6 @@ class virtio_dut_caps_test extends uvm_test;
 
         if ((catcher.caught_count != 1) || bind_succeeded ||
             ops_alias_bind_env.binding_configuration_valid() ||
-            (ops_alias_bind_env.v_seqr.pcie_rc_seqr != null) ||
             (ops_alias_bind_env.bound_protocol_vif_count() != 0) ||
             (first_function.pending_pcie_fsm_candidate() != null) ||
             (first_function.pending_pcie_ops_candidate() != null) ||
@@ -3101,7 +3072,7 @@ class virtio_dut_caps_test extends uvm_test;
                  "first_fsm_ops=%0d second_fsm_ops=%0d shared_transport=%0d"},
                 catcher.caught_count, bind_succeeded,
                 ops_alias_bind_env.binding_configuration_valid(),
-                ops_alias_bind_env.v_seqr.pcie_rc_seqr != null,
+                first_function.transport.bar.pcie_rc_seqr != null,
                 ops_alias_bind_env.bound_protocol_vif_count(),
                 first_fsm.ops != null, second_fsm.ops != null,
                 shared_ops.transport != null))
@@ -3128,7 +3099,6 @@ class virtio_dut_caps_test extends uvm_test;
 
         if ((catcher.caught_count != 1) || bind_succeeded ||
             endpoint_bind_env.binding_configuration_valid() ||
-            (endpoint_bind_env.v_seqr.pcie_rc_seqr != null) ||
             (endpoint_bind_env.bound_protocol_vif_count() != 0) ||
             (function_instance.pending_pcie_fsm_candidate() != null) ||
             (function_instance.pending_pcie_ops_candidate() != null) ||
@@ -3207,69 +3177,6 @@ class virtio_dut_caps_test extends uvm_test;
         end
     endtask
 
-    task assert_env_null_vseqr_is_rejected_before_preflight();
-        virtio_net_env base_bind_env;
-        virtio_function_instance function_instance;
-        virtio_virtual_sequencer saved_v_seqr;
-        virtio_wait_policy original_transport_wait_pol;
-        virtio_dut_caps_expected_exact_fatal catcher;
-        bit bind_succeeded;
-
-        function_instance = null_vseqr_bind_env.pf_instances[0].pf_function;
-        base_bind_env = null_vseqr_bind_env;
-        saved_v_seqr = null_vseqr_bind_env.v_seqr;
-        original_transport_wait_pol = function_instance.transport.wait_pol;
-        null_vseqr_bind_env.v_seqr = null;
-        catcher = new(
-            "env_null_vseqr_bind_catcher", null_vseqr_bind_env,
-            "VIRTIO_ENV", "bind_pcie() received a null virtual sequencer");
-        uvm_report_cb::add(null, catcher);
-        bind_succeeded = base_bind_env.bind_pcie(mq_pcie_seqr);
-        null_vseqr_bind_env.v_seqr = saved_v_seqr;
-        uvm_report_cb::delete(null, catcher);
-
-        if ((catcher.caught_count != 1) || bind_succeeded ||
-            null_vseqr_bind_env.binding_configuration_valid() ||
-            (saved_v_seqr.pcie_rc_seqr != null) ||
-            (null_vseqr_bind_env.bound_protocol_vif_count() != 0) ||
-            (function_instance.pending_pcie_fsm_candidate() != null) ||
-            (function_instance.pending_pcie_ops_candidate() != null) ||
-            (function_instance.driver_agent.ops != null) ||
-            (function_instance.driver_agent.fsm != null) ||
-            function_instance.driver_agent.observer.function_bound ||
-            (function_instance.driver_agent.monitor.protocol_vif != null) ||
-            (function_instance.mem != null) ||
-            (function_instance.iommu != null) ||
-            (function_instance.barrier != null) ||
-            (function_instance.err_inj != null) ||
-            (function_instance.wait_pol != null) ||
-            (function_instance.vq_mgr.mem != null) ||
-            (function_instance.vq_mgr.iommu != null) ||
-            (function_instance.vq_mgr.barrier != null) ||
-            (function_instance.vq_mgr.err_inj != null) ||
-            (function_instance.vq_mgr.wait_pol != null) ||
-            (function_instance.transport.wait_pol !=
-                original_transport_wait_pol) ||
-            (function_instance.transport.bar.pcie_rc_seqr != null)) begin
-            `uvm_fatal("DUT_CAPS", $sformatf(
-                {"null virtual sequencer was not rejected before PCIe bind ",
-                 "commit: reports=%0d success=%0d valid=%0d seqr=%0d ",
-                 "vifs=%0d pending_fsm=%0d pending_ops=%0d ops=%0d ",
-                 "fsm=%0d observer=%0d monitor_vif=%0d shared=%0d"},
-                catcher.caught_count, bind_succeeded,
-                null_vseqr_bind_env.binding_configuration_valid(),
-                saved_v_seqr.pcie_rc_seqr != null,
-                null_vseqr_bind_env.bound_protocol_vif_count(),
-                function_instance.pending_pcie_fsm_candidate() != null,
-                function_instance.pending_pcie_ops_candidate() != null,
-                function_instance.driver_agent.ops != null,
-                function_instance.driver_agent.fsm != null,
-                function_instance.driver_agent.observer.function_bound,
-                function_instance.driver_agent.monitor.protocol_vif != null,
-                function_instance.mem != null))
-        end
-    endtask
-
     task assert_env_adapter_bind_failure_returns();
         virtio_tlm_completion_adapter unregistered_adapter;
         virtio_function_instance function_instance;
@@ -3290,7 +3197,6 @@ class virtio_dut_caps_test extends uvm_test;
 
         if ((catcher.caught_count != 1) || bind_succeeded ||
             adapter_bind_env.binding_configuration_valid() ||
-            (adapter_bind_env.v_seqr.pcie_rc_seqr != null) ||
             (adapter_bind_env.bound_protocol_vif_count() != 0) ||
             (function_instance.driver_agent.ops != null) ||
             (function_instance.driver_agent.fsm != null) ||
@@ -3854,7 +3760,6 @@ class virtio_dut_caps_test extends uvm_test;
         assert_env_shared_fsm_alias_is_rejected();
         assert_env_null_transport_endpoint_is_rejected_in_preflight();
         assert_factory_ops_is_created_in_preflight_and_reused();
-        assert_env_null_vseqr_is_rejected_before_preflight();
         assert_env_adapter_bind_failure_returns();
         assert_adapter_registration_failure_is_latched();
         assert_adapter_direct_bind_failure_is_latched();

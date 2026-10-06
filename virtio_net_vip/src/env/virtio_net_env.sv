@@ -20,7 +20,6 @@
 //     wait policy, performance monitor
 //   - Verification: scoreboard, coverage (conditionally created)
 //   - Concurrency controller, dynamic reconfiguration
-//   - Virtual sequencer (aggregates per-VF sequencers)
 //
 // Config is retrieved from uvm_config_db in build_phase. The test must set:
 //   uvm_config_db#(virtio_net_env_config)::set(this, "env", "cfg", cfg)
@@ -77,9 +76,6 @@ class virtio_net_env extends uvm_env;
     // The actual pcie_tl_env is created by the test and passed via config_db
     uvm_object                      pcie_env_ref;
     protected int unsigned           protocol_event_vif_index;
-
-    // ===== Virtual sequencer =====
-    virtio_virtual_sequencer        v_seqr;
 
     // ========================================================================
     // Constructor
@@ -423,16 +419,13 @@ class virtio_net_env extends uvm_env;
             return;
         end
 
-        // 虚拟 sequencer 汇聚所有活动 PF/VF 的 driver sequencer，供跨功能场景使用。
-        v_seqr = virtio_virtual_sequencer::type_id::create("v_seqr", this);
-
     endfunction
 
     // ========================================================================
     // Connect Phase
     //
-    // Wire shared components into VF instances, connect analysis ports to
-    // scoreboard/coverage, and set up the virtual sequencer.
+    // Wire shared components into VF instances and connect analysis ports to
+    // scoreboard/coverage.
     //
     // Note: wire_shared() for VF instances requires pcie_rc_seqr which
     // comes from the PCIe TL env. That connection is deferred to the
@@ -495,16 +488,6 @@ class virtio_net_env extends uvm_env;
             end
         end
 
-        // 将各功能的 sequencer 和共享 Host/IOMMU 引用接入虚拟 sequencer。
-        v_seqr.vf_seqrs = new[vf_instances.size()];
-        foreach (vf_instances[i])
-            v_seqr.vf_seqrs[i] = vf_instances[i].driver_agent.sequencer;
-
-        // Wire virtual sequencer shared refs
-        v_seqr.pf_mgr_ref   = pf_mgr;
-        v_seqr.iommu_ref    = iommu;
-        v_seqr.host_mem_ref = host_mem;
-
         // Wire concurrency controller
         conc_ctrl.vf_instances = vf_instances;
         conc_ctrl.wait_pol     = wait_pol;
@@ -539,12 +522,6 @@ class virtio_net_env extends uvm_env;
             return 0;
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("VIRTIO_ENV", "bind_pcie() received a null PCIe RC sequencer")
-            configuration_valid = 0;
-            return 0;
-        end
-        if (v_seqr == null) begin
-            `uvm_fatal("VIRTIO_ENV",
-                "bind_pcie() received a null virtual sequencer")
             configuration_valid = 0;
             return 0;
         end
@@ -683,7 +660,6 @@ class virtio_net_env extends uvm_env;
                 return 0;
             end
         end
-        v_seqr.pcie_rc_seqr = pcie_rc_seqr;
         protocol_event_vif_index = next_protocol_event_vif_index;
         return 1;
     endfunction
@@ -693,7 +669,7 @@ class virtio_net_env extends uvm_env;
     // 中文：输入 endpoint 数组，输出全部 Function 的原子化绑定结果，失败不保留部分状态。
     // Bind every snapshot function to one explicitly keyed external path.
     // Validation and function preflight finish before adapter, observer,
-    // monitor, FSM, or virtual-sequencer state is committed.
+    // monitor, or FSM state is committed.
     function bit bind_pcie_endpoints(
         input virtio_pcie_function_endpoint endpoints[$]
     );
@@ -709,12 +685,6 @@ class virtio_net_env extends uvm_env;
 
         if (!configuration_valid)
             return 0;
-        if (v_seqr == null) begin
-            `uvm_fatal("VIRTIO_ENV",
-                "bind_pcie_endpoints() received a null virtual sequencer")
-            configuration_valid = 0;
-            return 0;
-        end
 
         foreach (function_instances[function_index])
             active_functions.push_back(function_instances[function_index]);
@@ -967,8 +937,6 @@ class virtio_net_env extends uvm_env;
                 return 0;
             end
         end
-        if (selected_endpoints.size() != 0)
-            v_seqr.pcie_rc_seqr = selected_endpoints[0].rc_seqr;
         protocol_event_vif_index = next_protocol_event_vif_index;
         return 1;
     endfunction
