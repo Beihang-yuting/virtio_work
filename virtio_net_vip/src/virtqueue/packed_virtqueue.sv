@@ -184,10 +184,7 @@ class packed_virtqueue extends virtqueue_base;
     // free_rings -- Deallocate all ring memory
     // ------------------------------------------------------------------
     virtual function void free_rings();
-        release_all_dma_mappings();
-        discard_staged_migration_ownership();
-        token_map.delete();
-        release_all_indirect_tables();
+        release_queue_ownership();
         if (desc_table_addr != 0) mem.free(desc_table_addr);
 
         desc_table_addr   = 0;
@@ -215,35 +212,10 @@ class packed_virtqueue extends virtqueue_base;
         in_order_enabled   = 0;
         desc_ring_size     = 0;
         free_id_list.delete();
-        token_map.delete();
-        release_all_dma_mappings();
-        discard_staged_migration_ownership();
-        release_all_indirect_tables();
-        total_add_buf_ops   = 0;
-        total_poll_used_ops = 0;
-        total_kick_ops      = 0;
+        clear_op_counters();
 
         `uvm_info("PACKED_VQ",
             $sformatf("reset_queue: queue_id=%0d", queue_id), UVM_HIGH)
-    endfunction
-
-    // ------------------------------------------------------------------
-    // detach_all_unused -- Collect all outstanding tokens and clean up
-    // ------------------------------------------------------------------
-    virtual function void detach_all_unused(ref uvm_object tokens[$]);
-        foreach (token_map[desc_id]) begin
-            tokens.push_back(token_map[desc_id]);
-        end
-
-        token_map.delete();
-        release_all_dma_mappings();
-        discard_staged_migration_ownership();
-        release_all_indirect_tables();
-
-        `uvm_info("PACKED_VQ",
-            $sformatf("detach_all_unused: queue_id=%0d returned %0d tokens",
-                      queue_id, tokens.size()),
-            UVM_HIGH)
     endfunction
 
     // =================================================================
@@ -646,15 +618,9 @@ class packed_virtqueue extends virtqueue_base;
         int unsigned total_size = desc_ring_size + 4 + 4;
         byte ring_data[];
 
-        snap.queue_id       = queue_id;
-        snap.queue_size     = queue_size;
-        snap.desc_addr      = desc_table_addr;
-        snap.driver_addr    = driver_event_addr;
-        snap.device_addr    = device_event_addr;
-        snap.last_avail_idx = next_avail_idx;
-        snap.last_used_idx  = next_used_idx;
-        snap.avail_wrap     = avail_wrap_counter;
-        snap.used_wrap      = used_wrap_counter;
+        // driver/device_ring_addr 与 event 地址在 alloc_rings/free_rings 中同步维护。
+        fill_snapshot_header(next_avail_idx, next_used_idx,
+                             avail_wrap_counter, used_wrap_counter, snap);
 
         // Read entire ring + event suppression areas
         mem.read_mem(desc_table_addr, total_size, ring_data);

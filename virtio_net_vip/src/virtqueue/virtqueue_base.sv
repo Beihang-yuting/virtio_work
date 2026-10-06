@@ -152,12 +152,10 @@ virtual class virtqueue_base extends uvm_object;
     // ----- Lifecycle -----
     // alloc_rings：按队列格式在 host memory 分配并清零 ring 结构，填写
     //   desc/driver/device 三个基址；free_rings：逆向释放；reset_queue：清空
-    //   运行态（索引/token/DMA）但保留 ring 内存；detach_all_unused：摘除所有
-    //   尚未被设备消费的缓冲并把对应 token 交还调用方（tokens 输出队列）。
+    //   运行态（索引/token/DMA）但保留 ring 内存；detach_all_unused 见基类实现。
     pure virtual function void alloc_rings();
     pure virtual function void free_rings();
     pure virtual function void reset_queue();
-    pure virtual function void detach_all_unused(ref uvm_object tokens[$]);
 
     // 驱动侧核心三件套：add_buf 把 SG 列表序列化成描述符（前 n_out_sgs 个为
     // 设备只读、后 n_in_sgs 个为设备可写，indirect=1 走间接表）并发布给设备，
@@ -673,6 +671,53 @@ virtual class virtqueue_base extends uvm_object;
     protected function void discard_staged_migration_ownership();
         staged_migration_dma_mappings.delete();
         staged_indirect_table_records.delete();
+    endfunction
+
+    // free_rings/detach 的公共前段：释放队列登记的全部 DMA 映射、丢弃迁移
+    // 暂存、清空 token 并释放全部间接表。四个结构互不引用，顺序无关。
+    protected function void release_queue_ownership();
+        release_all_dma_mappings();
+        discard_staged_migration_ownership();
+        token_map.delete();
+        release_all_indirect_tables();
+    endfunction
+
+    // reset_queue 的统计清零。
+    protected function void clear_op_counters();
+        total_add_buf_ops   = 0;
+        total_poll_used_ops = 0;
+        total_kick_ops      = 0;
+    endfunction
+
+    // save_state 的公共快照头；ring 内容与格式私有字段由各格式补充。
+    protected function void fill_snapshot_header(
+        int unsigned last_avail,
+        int unsigned last_used,
+        bit          avail_wrap,
+        bit          used_wrap,
+        ref virtqueue_snapshot_t snap
+    );
+        snap.queue_id       = queue_id;
+        snap.queue_size     = queue_size;
+        snap.desc_addr      = desc_table_addr;
+        snap.driver_addr    = driver_ring_addr;
+        snap.device_addr    = device_ring_addr;
+        snap.last_avail_idx = last_avail;
+        snap.last_used_idx  = last_used;
+        snap.avail_wrap     = avail_wrap;
+        snap.used_wrap      = used_wrap;
+    endfunction
+
+    // 摘除所有尚未被设备消费的缓冲：token 按 token_map 键序交还调用方，
+    // 随后释放队列所有权。custom 队列覆盖为回调。
+    virtual function void detach_all_unused(ref uvm_object tokens[$]);
+        foreach (token_map[desc_id])
+            tokens.push_back(token_map[desc_id]);
+        release_queue_ownership();
+        `uvm_info(log_tag,
+            $sformatf("detach_all_unused: queue_id=%0d returned %0d tokens",
+                      queue_id, tokens.size()),
+            UVM_HIGH)
     endfunction
 
     // Save queue-owned request identity separately from the device-visible

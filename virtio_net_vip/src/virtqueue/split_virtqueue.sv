@@ -159,10 +159,7 @@ class split_virtqueue extends virtqueue_base;
     // free_rings -- Deallocate all three ring regions
     // ------------------------------------------------------------------
     virtual function void free_rings();
-        release_all_dma_mappings();
-        discard_staged_migration_ownership();
-        token_map.delete();
-        release_all_indirect_tables();
+        release_queue_ownership();
         if (desc_table_addr != 0)  mem.free(desc_table_addr);
         if (driver_ring_addr != 0) mem.free(driver_ring_addr);
         if (device_ring_addr != 0) mem.free(device_ring_addr);
@@ -187,35 +184,10 @@ class split_virtqueue extends virtqueue_base;
         num_free          = 0;
         avail_idx         = 0;
         event_idx_enabled = 0;
-        token_map.delete();
-        release_all_dma_mappings();
-        discard_staged_migration_ownership();
-        total_add_buf_ops   = 0;
-        total_poll_used_ops = 0;
-        total_kick_ops      = 0;
+        clear_op_counters();
 
         `uvm_info("SPLIT_VQ",
             $sformatf("reset_queue: queue_id=%0d", queue_id), UVM_HIGH)
-    endfunction
-
-    // ------------------------------------------------------------------
-    // detach_all_unused -- Collect all outstanding tokens and clean up
-    // ------------------------------------------------------------------
-    virtual function void detach_all_unused(ref uvm_object tokens[$]);
-        // Collect all tokens
-        foreach (token_map[desc_id]) begin
-            tokens.push_back(token_map[desc_id]);
-        end
-
-        token_map.delete();
-        release_all_dma_mappings();
-        discard_staged_migration_ownership();
-        release_all_indirect_tables();
-
-        `uvm_info("SPLIT_VQ",
-            $sformatf("detach_all_unused: queue_id=%0d returned %0d tokens",
-                      queue_id, tokens.size()),
-            UVM_HIGH)
     endfunction
 
     // =================================================================
@@ -571,15 +543,7 @@ class split_virtqueue extends virtqueue_base;
         byte avail_data[];
         byte used_data[];
 
-        snap.queue_id       = queue_id;
-        snap.queue_size     = queue_size;
-        snap.desc_addr      = desc_table_addr;
-        snap.driver_addr    = driver_ring_addr;
-        snap.device_addr    = device_ring_addr;
-        snap.last_avail_idx = avail_idx;
-        snap.last_used_idx  = last_used_idx;
-        snap.avail_wrap     = 0;
-        snap.used_wrap      = 0;
+        fill_snapshot_header(avail_idx, last_used_idx, 1'b0, 1'b0, snap);
 
         // Read all ring memory
         mem.read_mem(desc_table_addr, desc_size, desc_data);
