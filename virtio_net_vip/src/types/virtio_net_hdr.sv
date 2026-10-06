@@ -1,6 +1,9 @@
 `ifndef VIRTIO_NET_HDR_SV
 `define VIRTIO_NET_HDR_SV
 
+// build_tx_hdr 借用 offload 引擎解析报文；该类在数据面层定义，这里前置声明。
+typedef class virtio_offload_engine;
+
 // ============================================================================
 // virtio_net_hdr_util
 //
@@ -164,6 +167,42 @@ class virtio_net_hdr_util;
             // bytes 18-19 are padding, ignored
         end
     endfunction : unpack_hdr
+
+    // ------------------------------------------------------------------------
+    // build_tx_hdr
+    //
+    // 由线速帧与协商特性推导 TX virtio_net_hdr：CSUM 时置 NEEDS_CSUM 与
+    // csum_start/offset；需要 GSO 时只填 gso_type/gso_size/hdr_len（分段由设备
+    // 完成）；HASH_REPORT 时填哈希。offload 只被借用来解析报文，不改变其状态。
+    // ------------------------------------------------------------------------
+    static function void build_tx_hdr(
+        input  byte unsigned         pkt_data[$],
+        input  bit [63:0]            features,
+        input  virtio_offload_engine offload,
+        output virtio_net_hdr_t      hdr
+    );
+        hdr = '{default: 0};
+
+        // ---- Checksum offload ----
+        if (features[VIRTIO_NET_F_CSUM]) begin
+            hdr.flags       = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+            hdr.csum_start  = offload.calc_csum_start(pkt_data);
+            hdr.csum_offset = offload.calc_csum_offset(pkt_data);
+        end
+
+        // ---- GSO/TSO (header fields only -- device handles segmentation) ----
+        if (offload.needs_gso(pkt_data)) begin
+            hdr.gso_type = offload.get_gso_type(pkt_data);
+            hdr.gso_size = offload.get_mss_value();
+            hdr.hdr_len  = offload.get_all_hdr_len(pkt_data);
+        end
+
+        // ---- Hash report ----
+        if (features[VIRTIO_NET_F_HASH_REPORT]) begin
+            hdr.hash_value  = offload.rss_calc_hash(pkt_data);
+            hdr.hash_report = offload.rss_get_hash_type(pkt_data);
+        end
+    endfunction : build_tx_hdr
 
 endclass : virtio_net_hdr_util
 

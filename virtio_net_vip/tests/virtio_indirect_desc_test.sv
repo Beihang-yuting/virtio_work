@@ -169,6 +169,7 @@ class virtio_indirect_desc_test extends uvm_test;
         test_atomic_tx_queue_full_cleanup();
         test_atomic_notify_cursor();
         test_atomic_rx_num_buffers_without_mrg();
+        test_dataplane_engine_notifies_device();
 
         shared_mem.leak_check();
 
@@ -655,6 +656,9 @@ class virtio_indirect_desc_test extends uvm_test;
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("dataplane_gate_vq_mgr");
         virtio_net_dataplane dataplane =
             virtio_net_dataplane::type_id::create("dataplane_gate");
+        virtio_indirect_desc_test_transport transport =
+            virtio_indirect_desc_test_transport::type_id::create("dataplane_gate_transport");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("dataplane_gate_ops");
         virtqueue_base base_vq;
         split_virtqueue vq;
         virtio_dataplane_indirect_test_packet token;
@@ -678,6 +682,14 @@ class virtio_indirect_desc_test extends uvm_test;
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
                             vq_mgr, mem, iommu, 16'h0703);
+        transport.bdf = 16'h0703;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = wait_pol;
+        ops.negotiated_features = features;
+        dataplane.bind_ops(ops);
         token = virtio_dataplane_indirect_test_packet::type_id::create("dataplane_gate_token");
 
         desc_id = '1;
@@ -695,6 +707,7 @@ class virtio_indirect_desc_test extends uvm_test;
         features[VIRTIO_F_RING_INDIRECT_DESC] = 1'b1;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
                             vq_mgr, mem, iommu, 16'h0703);
+        ops.negotiated_features = features;
         desc_id = '1;
         dataplane.tx_engine.submit_packet(0, token, 1'b1, desc_id);
         assert(desc_id != '1 && vq.get_free_count() == 15 &&
@@ -813,6 +826,9 @@ class virtio_indirect_desc_test extends uvm_test;
         virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("dataplane_full_vq_mgr");
         virtio_net_dataplane dataplane =
             virtio_net_dataplane::type_id::create("dataplane_full");
+        virtio_indirect_desc_test_transport transport =
+            virtio_indirect_desc_test_transport::type_id::create("dataplane_full_transport");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("dataplane_full_ops");
         virtqueue_base base_vq;
         split_virtqueue vq;
         virtio_dataplane_indirect_test_packet filler_token;
@@ -845,6 +861,14 @@ class virtio_indirect_desc_test extends uvm_test;
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
                             vq_mgr, mem, iommu, 16'h0705);
+        transport.bdf = 16'h0705;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = wait_pol;
+        ops.negotiated_features = features;
+        dataplane.bind_ops(ops);
         filler_token = virtio_dataplane_indirect_test_packet::type_id::create(
             "dataplane_full_filler");
         rejected_token = virtio_dataplane_indirect_test_packet::type_id::create(
@@ -1094,6 +1118,78 @@ class virtio_indirect_desc_test extends uvm_test;
             else `uvm_fatal("INDIRECT_TEST", "RX num_buffers test leaked mappings")
 
         `uvm_info("INDIRECT_TEST", "atomic RX num_buffers without MRG_RXBUF test PASSED", UVM_LOW)
+    endtask
+
+    // dataplane 引擎是 atomic ops 的薄适配：TX 提交必须经 transport 发出真实
+    // notify（修复前引擎只 add_buf，从不通知设备）。
+    task test_dataplane_engine_notifies_device();
+        host_mem_manager mem;
+        virtio_iommu_model iommu =
+            virtio_iommu_model::type_id::create("dataplane_notify_iommu");
+        virtio_memory_barrier_model barrier =
+            virtio_memory_barrier_model::type_id::create("dataplane_notify_barrier");
+        virtqueue_error_injector err_inj =
+            virtqueue_error_injector::type_id::create("dataplane_notify_err_inj");
+        virtio_wait_policy wait_pol =
+            virtio_wait_policy::type_id::create("dataplane_notify_wait_pol");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create("dataplane_notify_vq_mgr");
+        virtio_indirect_desc_test_transport transport =
+            virtio_indirect_desc_test_transport::type_id::create("dataplane_notify_transport");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("dataplane_notify_ops");
+        virtio_net_dataplane dataplane =
+            virtio_net_dataplane::type_id::create("dataplane_notify");
+        virtqueue_base base_vq;
+        split_virtqueue tx_vq;
+        virtio_dataplane_indirect_test_packet token;
+        uvm_object completed[$];
+        bit [63:0] features;
+        int unsigned desc_id;
+
+        mem = shared_mem;
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.barrier = barrier;
+        vq_mgr.err_inj = err_inj;
+        vq_mgr.wait_pol = wait_pol;
+        vq_mgr.bdf = 16'h0706;
+        base_vq = vq_mgr.create_queue(1, 8, VQ_SPLIT);
+        assert($cast(tx_vq, base_vq))
+            else `uvm_fatal("INDIRECT_TEST", "failed to create dataplane notify TX queue")
+        tx_vq.alloc_rings();
+
+        transport.bdf = 16'h0706;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = wait_pol;
+        features = '0;
+        ops.negotiated_features = features;
+        dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 0,
+                            vq_mgr, mem, iommu, 16'h0706);
+        dataplane.bind_ops(ops);
+        token = virtio_dataplane_indirect_test_packet::type_id::create(
+            "dataplane_notify_token");
+
+        desc_id = '1;
+        dataplane.tx_engine.submit_packet(1, token, 1'b0, desc_id);
+        assert((desc_id != '1) && (transport.kick_count == 1) &&
+               (transport.last_kick_queue_id == 1) &&
+               (transport.last_kick_next_avail_idx == 1))
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "dataplane TX did not notify the device (desc=%0d kicks=%0d)",
+                desc_id, transport.kick_count))
+
+        complete_split(mem, tx_vq, desc_id, 0);
+        dataplane.tx_engine.complete_tx(1, 1, completed);
+        assert((completed.size() == 1) && (completed[0] == token))
+            else `uvm_fatal("INDIRECT_TEST", "dataplane TX completion did not return the token")
+        tx_vq.free_rings();
+        assert(iommu.total_maps == iommu.total_unmaps)
+            else `uvm_fatal("INDIRECT_TEST", "dataplane notify test leaked mappings")
+
+        `uvm_info("INDIRECT_TEST", "dataplane engine notify test PASSED", UVM_LOW)
     endtask
 
 endclass : virtio_indirect_desc_test

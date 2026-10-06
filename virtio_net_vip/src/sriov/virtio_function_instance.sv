@@ -421,6 +421,8 @@ class virtio_function_instance extends uvm_component;
             dataplane.rx_engine.host_id =
                 transport_ref.iommu_host_id();
             dataplane.rx_engine.bdf = transport_ref.bdf;
+            // 标准引擎经同一个 ops 收发，与 FSM/sequence 共用 DMA 所有权和通知路径。
+            dataplane.bind_ops(ops);
         end
 
         fsm.ops = ops;

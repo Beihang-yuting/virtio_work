@@ -904,7 +904,7 @@ class virtio_atomic_ops extends uvm_object;
     //
     // Steps:
     //   1. Pack virtio_net_hdr to bytes
-    //   2. Get raw packet data via do_pack
+    //   2. Get wire bytes (net_packet adapter, else do_pack)
     //   3. Allocate host_mem for hdr + data buffers
     //   4. Write hdr and data to host_mem
     //   5. Map through IOMMU (DMA_TO_DEVICE)
@@ -938,6 +938,7 @@ class virtio_atomic_ops extends uvm_object;
         byte             hdr_data[];
         byte             pkt_data[];
         normal_dma_record_t dma_record;
+        byte unsigned    wire_bytes[$];
 
         desc_id = '1;
         if (use_indirect &&
@@ -967,8 +968,12 @@ class virtio_atomic_ops extends uvm_object;
         // host_mem block boundary.
         hdr_dma_size = (hdr_size + 3) & ~3;
 
-        // 2. Get raw packet data from pkt via do_pack
-        begin
+        // 2. Get wire bytes.  packet_item.do_pack() 带 32-bit UVM 长度前缀，不是
+        // 线速帧，先经 adapter 取 raw_data；其他对象保留原 do_pack 字节流。
+        if (virtio_net_packet_adapter::pack(pkt, wire_bytes)) begin
+            pkt_bytes = new[wire_bytes.size()];
+            foreach (wire_bytes[i]) pkt_bytes[i] = wire_bytes[i];
+        end else begin
             uvm_packer packer;
             packer = new();
             pkt.do_pack(packer);

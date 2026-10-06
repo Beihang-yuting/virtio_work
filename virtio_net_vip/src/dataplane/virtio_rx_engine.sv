@@ -62,6 +62,8 @@ class virtio_rx_engine extends uvm_object;
     `uvm_object_utils(virtio_rx_engine)
 
     // ===== External references (set by parent before use) =====
+    // ops 是规范 RX 路径（借用）：buffer 分配、通知、取包与 DMA 回收由它执行。
+    virtio_atomic_ops           ops;
     virtqueue_manager           vq_mgr;
     host_mem_manager            mem;
     virtio_iommu_model          iommu;

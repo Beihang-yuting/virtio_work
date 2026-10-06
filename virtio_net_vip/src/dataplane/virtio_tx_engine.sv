@@ -42,8 +42,9 @@ typedef byte unsigned virtio_byte_queue_t[$];
 // Handles packet transmission on the driver (guest) side:
 //   1. Builds virtio_net_hdr from raw packet data (checksum, GSO fields).
 //   2. Constructs scatter-gather chains (header buffer + data buffer).
-//   3. Submits chains to a transmit virtqueue via virtqueue_manager.
-//   4. Handles TX completion: polls used ring, unmaps DMA, frees memory.
+//   3. Delegates DMA, descriptor publication and the PCIe notify to
+//      virtio_atomic_ops.tx_submit (bound through virtio_net_dataplane.bind_ops).
+//   4. Delegates TX completion and DMA reclamation to virtio_atomic_ops.tx_complete.
 //
 // The packet is passed as a uvm_object handle (packet_item from net_packet).
 // The adapter extracts packet.pkt.raw_data so the UVM length prefix is never
@@ -63,6 +64,8 @@ class virtio_tx_engine extends uvm_object;
     `uvm_object_utils(virtio_tx_engine)
 
     // ===== External references (set by parent before use) =====
+    // ops 是规范 TX 路径（借用）：DMA、描述符发布、通知与完成回收都由它执行。
+    virtio_atomic_ops           ops;
     virtqueue_manager           vq_mgr;
     host_mem_manager            mem;
     virtio_iommu_model          iommu;
@@ -123,6 +126,12 @@ class virtio_tx_engine extends uvm_object;
                 queue_id))
             return;
         end
+        if ((ops == null) || (ops.vq_mgr == null)) begin
+            `uvm_error("TX_ENG", $sformatf(
+                "submit_packet: queue %0d has no bound atomic ops", queue_id))
+            total_tx_errors++;
+            return;
+        end
 
         // ---- 1. Extract raw packet bytes ----
         pkt_data = extract_pkt_data(pkt);
@@ -132,18 +141,30 @@ class virtio_tx_engine extends uvm_object;
             total_tx_errors++;
             return;
         end
+        if (ops.vq_mgr.get_queue(queue_id) == null) begin
+            `uvm_error("TX_ENG",
+                $sformatf("submit_packet: queue %0d not found", queue_id))
+            total_tx_errors++;
+            return;
+        end
 
-        // ---- 2. Build virtio_net_hdr ----
-        build_net_hdr(pkt_data, hdr);
+        // ---- 2. Build virtio_net_hdr (device performs GSO segmentation) ----
+        virtio_net_hdr_util::build_tx_hdr(pkt_data, negotiated_features,
+                                          offload, hdr);
 
-        // ---- 3. GSO: for virtio TX the driver sends the full large packet
-        //         with GSO fields set in the header. The device performs
-        //         segmentation. So we do NOT segment here — just set the
-        //         header fields (already done in build_net_hdr). ----
+        // ---- 3. ops 拥有 DMA、描述符发布与真实 notify；拒绝时已自行回滚 ----
+        ops.tx_submit(queue_id, hdr, pkt, use_indirect, desc_id);
+        if (desc_id == '1)
+            return;
 
-        // ---- 4. Submit to virtqueue ----
-        submit_single(queue_id, pkt_data, hdr, pkt, use_indirect, desc_id);
+        total_tx_packets++;
+        total_tx_bytes    += pkt_data.size();
+        total_tx_sg_count += 2;   // [net_hdr] + [payload]
 
+        `uvm_info("TX_ENG",
+            $sformatf("submit_packet: queue=%0d desc_id=%0d pkt_size=%0d",
+                      queue_id, desc_id, pkt_data.size()),
+            UVM_HIGH)
     endtask : submit_packet
 
     // ==================================================================
@@ -271,40 +292,6 @@ class virtio_tx_engine extends uvm_object;
     endtask : standard_tx_build_chain
 
     // ==================================================================
-    // build_net_hdr (protected)
-    //
-    // Populates virtio_net_hdr fields based on raw packet data and
-    // negotiated features. Sets checksum offload, GSO/TSO, and
-    // hash report fields as appropriate.
-    // ==================================================================
-    protected virtual function void build_net_hdr(
-        byte unsigned        pkt_data[$],
-        ref virtio_net_hdr_t hdr
-    );
-        hdr = '{default: 0};
-
-        // ---- Checksum offload ----
-        if (negotiated_features[VIRTIO_NET_F_CSUM]) begin
-            hdr.flags       = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-            hdr.csum_start  = offload.calc_csum_start(pkt_data);
-            hdr.csum_offset = offload.calc_csum_offset(pkt_data);
-        end
-
-        // ---- GSO/TSO (header fields only -- device handles segmentation) ----
-        if (offload.needs_gso(pkt_data)) begin
-            hdr.gso_type = offload.get_gso_type(pkt_data);
-            hdr.gso_size = offload.get_mss_value();
-            hdr.hdr_len  = offload.get_all_hdr_len(pkt_data);
-        end
-
-        // ---- Hash report ----
-        if (negotiated_features[VIRTIO_NET_F_HASH_REPORT]) begin
-            hdr.hash_value  = offload.rss_calc_hash(pkt_data);
-            hdr.hash_report = offload.rss_get_hash_type(pkt_data);
-        end
-    endfunction : build_net_hdr
-
-    // ==================================================================
     // complete_tx
     //
     // Polls the used ring for completed TX descriptors, cleans up DMA
@@ -320,34 +307,23 @@ class virtio_tx_engine extends uvm_object;
         int unsigned      budget,
         ref uvm_object    completed[$]
     );
-        virtqueue_base   vq;
-        uvm_object       token;
-        int unsigned     len;
-        int unsigned     count;
+        int unsigned before_count;
 
-        vq = vq_mgr.get_queue(queue_id);
-        if (vq == null) begin
+        if ((ops == null) || (ops.vq_mgr == null) ||
+            (ops.vq_mgr.get_queue(queue_id) == null)) begin
             `uvm_error("TX_ENG",
                 $sformatf("complete_tx: queue %0d not found", queue_id))
             return;
         end
 
-        count = 0;
-        while (count < budget) begin
-            if (!vq.poll_used(token, len))
-                break;
-
-            // Cleanup DMA buffers for this token
-            cleanup_tx_buffers(token);
-
-            completed.push_back(token);
-            count++;
-        end
+        // ops 按提交顺序回收每包的 header/payload DMA 所有权。
+        before_count = completed.size();
+        ops.tx_complete(queue_id, completed, budget);
 
         `uvm_info("TX_ENG",
-            $sformatf("complete_tx: queue=%0d completed=%0d", queue_id, count),
+            $sformatf("complete_tx: queue=%0d completed=%0d",
+                      queue_id, completed.size() - before_count),
             UVM_HIGH)
-
     endtask : complete_tx
 
     // ==================================================================

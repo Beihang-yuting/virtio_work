@@ -99,6 +99,17 @@ class virtio_net_dataplane extends uvm_object;
     endfunction
 
     // ========================================================================
+    // bind_ops -- 绑定规范数据路径
+    //
+    // 引擎只做 header 构造与统计；DMA、描述符、通知与回收全部委托 ops。ops 由
+    // Function 或测试持有，这里只借用；须在首次收发前调用。
+    // ========================================================================
+    virtual function void bind_ops(virtio_atomic_ops ops);
+        tx_engine.ops = ops;
+        rx_engine.ops = ops;
+    endfunction
+
+    // ========================================================================
     // set_dataplane_callback -- Install custom TX/RX hooks
     // ========================================================================
     virtual function void set_dataplane_callback(virtio_dataplane_callback cb);
