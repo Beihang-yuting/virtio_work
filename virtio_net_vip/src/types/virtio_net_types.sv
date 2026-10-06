@@ -360,6 +360,16 @@ typedef struct {
     bit [31:0] hash_value; bit [15:0] hash_report;
 } virtio_net_hdr_t;
 
+// 一次 RX 完成（含 MRG_RXBUF 合并）的结果：去掉 virtio-net header 的 payload、
+// 解析出的 header、首个 used 项的 token 以及消耗的 buffer 数。由
+// virtio_atomic_ops.rx_receive_frames 产生，DMA 所有权在返回前已退休。
+typedef struct {
+    byte unsigned    payload[$];
+    virtio_net_hdr_t net_hdr;
+    uvm_object       token;
+    int unsigned     num_buffers;
+} virtio_rx_frame_t;
+
 typedef struct {
     bit [47:0] mac; bit [15:0] status, max_virtqueue_pairs, mtu;
     bit [31:0] speed; bit [7:0] duplex, rss_max_key_size;

@@ -1151,12 +1151,14 @@ class virtio_atomic_ops extends uvm_object;
     // ------------------------------------------------------------------------
     // rx_refill -- Pre-fill receive queue with empty buffers
     // ------------------------------------------------------------------------
+    // buf_size 为描述符可写长度（含 virtio-net header）；0 表示默认 header+1514，
+    // dataplane 引擎传入其配置容量。所有覆写须保持同一签名。
     virtual task rx_refill(
         int unsigned     queue_id,
-        int unsigned     num_bufs
+        int unsigned     num_bufs,
+        int unsigned     buf_size = 0
     );
         virtqueue_base   vq;
-        int unsigned     buf_size;
         int unsigned     buf_dma_size;
         int unsigned     hdr_size;
         int unsigned     filled = 0;
@@ -1168,7 +1170,8 @@ class virtio_atomic_ops extends uvm_object;
         hdr_size = virtio_net_hdr_util::get_hdr_size(negotiated_features);
 
         // Use reasonable default: header + 1514 (standard Ethernet MTU)
-        buf_size = hdr_size + 1514;
+        if (buf_size == 0)
+            buf_size = hdr_size + 1514;
         buf_dma_size = (buf_size + 3) & ~3;
 
         while (filled < num_bufs && vq.get_free_count() > 0) begin
@@ -1244,12 +1247,15 @@ class virtio_atomic_ops extends uvm_object;
     endtask
 
     // ------------------------------------------------------------------------
-    // rx_receive -- Poll used ring for received packets
+    // rx_receive_frames -- Poll used ring and return header + payload frames
+    //
+    // 每个 used 项按 MRG_RXBUF 语义合并后续 buffer；每个描述符的 IOVA/GPA
+    // 所有权在复制后立即退休。帧追加到 frames，不解析报文协议。
     // ------------------------------------------------------------------------
-    virtual task rx_receive(
-        int unsigned     queue_id,
-        ref uvm_object   received_pkts[$],
-        int unsigned     max_budget
+    virtual task rx_receive_frames(
+        int unsigned          queue_id,
+        int unsigned          max_budget,
+        ref virtio_rx_frame_t frames[$]
     );
         virtqueue_base   vq;
         uvm_object       token;
@@ -1266,11 +1272,8 @@ class virtio_atomic_ops extends uvm_object;
             if (vq.poll_used(token, len)) begin
                 normal_dma_record_t record;
                 byte buf_data[];
-                byte unsigned payload[$];
                 byte unsigned first_bytes[$];
-                virtio_net_hdr_t net_hdr;
-                packet_item parsed_item;
-                int unsigned num_buffers;
+                virtio_rx_frame_t frame;
 
                 if (!rx_dma_map.exists(queue_id) ||
                     (rx_dma_map[queue_id].size() == 0)) begin
@@ -1290,20 +1293,21 @@ class virtio_atomic_ops extends uvm_object;
                     break;
                 end
                 virtio_net_hdr_util::unpack_hdr(first_bytes,
-                                                negotiated_features, net_hdr);
+                                                negotiated_features, frame.net_hdr);
                 for (int unsigned i = hdr_size; i < buf_data.size(); i++)
-                    payload.push_back(buf_data[i]);
+                    frame.payload.push_back(buf_data[i]);
                 // Only MRG_RXBUF gives num_buffers meaning; a VERSION_1
                 // header carries the field for a single-buffer packet.
-                num_buffers = ((net_hdr.num_buffers == 0) ||
-                               !negotiated_features[VIRTIO_NET_F_MRG_RXBUF]) ? 1 :
-                              net_hdr.num_buffers;
+                frame.num_buffers = ((frame.net_hdr.num_buffers == 0) ||
+                                     !negotiated_features[VIRTIO_NET_F_MRG_RXBUF]) ? 1 :
+                                    frame.net_hdr.num_buffers;
+                frame.token = token;
                 retire_normal_dma_record(record);
 
-                // Merge continuation buffers exactly as the production RX
-                // engine does.  Every consumed descriptor retires its own
-                // IOVA/GPA ownership only after its bytes are copied.
-                for (int unsigned merge = 1; merge < num_buffers; merge++) begin
+                // Merge continuation buffers.  Every consumed descriptor
+                // retires its own IOVA/GPA ownership only after its bytes
+                // are copied.
+                for (int unsigned merge = 1; merge < frame.num_buffers; merge++) begin
                     normal_dma_record_t merge_record;
                     byte merge_data[];
                     uvm_object merge_token;
@@ -1313,19 +1317,16 @@ class virtio_atomic_ops extends uvm_object;
                         (rx_dma_map[queue_id].size() == 0)) begin
                         `uvm_error("ATOMIC_OPS", $sformatf(
                             "rx_receive: missing merged buffer queue=%0d expected=%0d got=%0d",
-                            queue_id, num_buffers, merge))
+                            queue_id, frame.num_buffers, merge))
                         break;
                     end
                     merge_record = rx_dma_map[queue_id].pop_front();
                     mem.read_mem(merge_record.gpa, merge_len, merge_data);
-                    foreach (merge_data[i]) payload.push_back(merge_data[i]);
+                    foreach (merge_data[i]) frame.payload.push_back(merge_data[i]);
                     retire_normal_dma_record(merge_record);
                 end
 
-                if (virtio_net_packet_adapter::unpack(payload, parsed_item))
-                    received_pkts.push_back(parsed_item);
-                else if (token != null)
-                    received_pkts.push_back(token);
+                frames.push_back(frame);
                 count++;
             end else begin
                 break;
@@ -1335,10 +1336,32 @@ class virtio_atomic_ops extends uvm_object;
         if (rx_dma_map.exists(queue_id) &&
             (rx_dma_map[queue_id].size() == 0))
             rx_dma_map.delete(queue_id);
+    endtask
 
-        if (count > 0)
+    // ------------------------------------------------------------------------
+    // rx_receive -- Poll used ring for received packets
+    //
+    // 合法以太网帧解析为 packet_item；解析失败时若 used 项带 token 则返回 token。
+    // ------------------------------------------------------------------------
+    virtual task rx_receive(
+        int unsigned     queue_id,
+        ref uvm_object   received_pkts[$],
+        int unsigned     max_budget
+    );
+        virtio_rx_frame_t frames[$];
+
+        rx_receive_frames(queue_id, max_budget, frames);
+        foreach (frames[i]) begin
+            packet_item parsed_item;
+            if (virtio_net_packet_adapter::unpack(frames[i].payload, parsed_item))
+                received_pkts.push_back(parsed_item);
+            else if (frames[i].token != null)
+                received_pkts.push_back(frames[i].token);
+        end
+
+        if (frames.size() > 0)
             `uvm_info("ATOMIC_OPS",
-                $sformatf("rx_receive: queue_id=%0d received=%0d", queue_id, count), UVM_HIGH)
+                $sformatf("rx_receive: queue_id=%0d received=%0d", queue_id, frames.size()), UVM_HIGH)
     endtask
 
     // ========================================================================

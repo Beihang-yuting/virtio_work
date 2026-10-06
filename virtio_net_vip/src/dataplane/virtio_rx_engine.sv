@@ -147,68 +147,23 @@ class virtio_rx_engine extends uvm_object;
     //   queue_id -- RX virtqueue ID
     //   count    -- Number of buffers to add (capped by free descriptors)
     // ==================================================================
-    // 向 queue_id 最多补充 count 个可写 buffer，受空闲描述符数量限制；记录本引擎
-    // 的 GPA/IOVA 所有权，完成后回收。队列不存在则报错返回，成功投递后按需 kick。
+    // 向 queue_id 最多补充 count 个可写 buffer（容量取 get_rx_buf_size()），受空闲
+    // 描述符限制；分配、映射、所有权登记与真实 notify 由 ops 执行。队列不存在则报错。
     virtual task refill_buffers(
         int unsigned queue_id,
         int unsigned count
     );
-        virtqueue_base     vq;
-        int unsigned       alloc_size;
-        int unsigned       filled;
-
-        vq = vq_mgr.get_queue(queue_id);
-        if (vq == null) begin
+        if ((ops == null) || (ops.vq_mgr == null) ||
+            (ops.vq_mgr.get_queue(queue_id) == null)) begin
             `uvm_error("RX_ENG",
                 $sformatf("refill_buffers: queue %0d not found", queue_id))
             return;
         end
-
-        alloc_size = get_rx_buf_size();
-        filled = 0;
-
-        while (filled < count && vq.get_free_count() > 0) begin
-            bit [63:0]         buf_gpa, buf_iova;
-            virtio_sg_list     sg;
-            virtio_sg_list     sgs_arr[];
-            virtio_buf_tracker tracker;
-
-            // 1. Allocate host memory (64-byte aligned for cache line)
-            buf_gpa = mem.alloc(alloc_size, .align(64));
-            mem.mem_set(buf_gpa, 0, alloc_size);
-
-            // 2. DMA map (device writes into these buffers)
-            buf_iova = iommu.map_for_host(host_id, bdf, buf_gpa, alloc_size,
-                                          DMA_FROM_DEVICE);
-
-            // 3. Track for cleanup
-            rx_buf_gpa_to_iova[buf_gpa] = buf_iova;
-            rx_buf_gpa_to_size[buf_gpa] = alloc_size;
-
-            // 4. Create tracker as token (carries GPA for retrieval at poll time)
-            tracker = virtio_buf_tracker::type_id::create("rx_buf_tracker");
-            tracker.add(buf_gpa, buf_iova, alloc_size);
-
-            // 5. Build single-entry SG list (device-writable)
-            sg.entries.push_back('{addr: buf_iova, len: alloc_size, is_indirect: 0});
-            sgs_arr = new[1];
-            sgs_arr[0] = sg;
-
-            // 6. Submit: n_out=0, n_in=1 (device-writable)
-            vq.add_buf(sgs_arr, 0, 1, tracker, 0);
-
-            filled++;
-        end
-
-        // Kick if device needs notification about new buffers
-        if (filled > 0 && vq.needs_notification())
-            vq.kick();
-
+        ops.rx_refill(queue_id, count, get_rx_buf_size());
         `uvm_info("RX_ENG",
-            $sformatf("refill_buffers: queue=%0d filled=%0d buf_size=%0d",
-                      queue_id, filled, alloc_size),
+            $sformatf("refill_buffers: queue=%0d requested=%0d buf_size=%0d",
+                      queue_id, count, get_rx_buf_size()),
             UVM_HIGH)
-
     endtask : refill_buffers
 
     // ==================================================================
@@ -222,30 +177,50 @@ class virtio_rx_engine extends uvm_object;
     //   budget   -- Maximum number of packets to receive
     //   received -- [output] List of received packet tokens (uvm_object)
     // ==================================================================
-    // 按回调或 buffer 模式取得至多 budget 个包，追加到 received；之后按现有
-    // free-count 门限触发补充。外部依赖须已绑定，私有布局由派生类覆写该入口。
+    // 经 ops 取得至多 budget 个帧（ops 完成合包与 DMA 回收），可选校验 RX checksum，
+    // 合法帧返回 packet_item、非法帧返回 wrapper；之后按 free-count 门限补充。
     virtual task receive_packets(
         int unsigned      queue_id,
         int unsigned      budget,
         ref uvm_object    received[$]
     );
-        virtqueue_base vq;
+        virtqueue_base    vq;
+        virtio_rx_frame_t frames[$];
 
-        if (custom_cb != null) begin
-            custom_receive(queue_id, budget, received);
-        end else begin
-            case (buf_mode)
-                RX_MODE_MERGEABLE: receive_mergeable(queue_id, budget, received);
-                RX_MODE_BIG:       receive_big(queue_id, budget, received);
-                RX_MODE_SMALL:     receive_small(queue_id, budget, received);
-            endcase
+        if ((ops == null) || (ops.vq_mgr == null)) begin
+            `uvm_error("RX_ENG", $sformatf(
+                "receive_packets: queue %0d has no bound atomic ops", queue_id))
+            return;
+        end
+        vq = ops.vq_mgr.get_queue(queue_id);
+        if (vq == null) begin
+            `uvm_error("RX_ENG",
+                $sformatf("receive_packets: queue %0d not found", queue_id))
+            return;
         end
 
-        // Auto-refill if free count drops below threshold
-        vq = vq_mgr.get_queue(queue_id);
-        if (vq != null && vq.get_free_count() < refill_threshold)
-            refill_buffers(queue_id, refill_threshold);
+        ops.rx_receive_frames(queue_id, budget, frames);
+        foreach (frames[i]) begin
+            if (negotiated_features[VIRTIO_NET_F_GUEST_CSUM] &&
+                !offload.verify_rx_csum(frames[i].net_hdr, frames[i].payload))
+                `uvm_warning("RX_ENG", $sformatf(
+                    "receive_packets: RX checksum verification failed, pkt_size=%0d",
+                    frames[i].payload.size()))
+            if (frames[i].num_buffers > 1)
+                total_rx_merged++;
+            received.push_back(build_received_packet(frames[i].payload,
+                                                     frames[i].net_hdr));
+            total_rx_packets++;
+            total_rx_bytes += frames[i].payload.size();
+        end
 
+        `uvm_info("RX_ENG",
+            $sformatf("receive_packets: queue=%0d received=%0d", queue_id, frames.size()),
+            UVM_HIGH)
+
+        // Auto-refill if free count drops below threshold
+        if (vq.get_free_count() < refill_threshold)
+            refill_buffers(queue_id, refill_threshold);
     endtask : receive_packets
 
     // ==================================================================

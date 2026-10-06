@@ -339,6 +339,10 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
             dataplane.rx_engine.refill_buffers(qid, PACKETS_PER_QUEUE);
             assert(read_u16(queues[qid].driver_ring_addr + 2) == PACKETS_PER_QUEUE)
                 else `uvm_fatal("NET_PACKET_TEST", "RX avail index mismatch")
+            assert(transport.kicks(qid) == 1)
+                else `uvm_fatal("NET_PACKET_TEST", $sformatf(
+                    "RX q%0d refill notified %0d times, expected 1", qid,
+                    transport.kicks(qid)))
 
             for (int unsigned i = 0; i < PACKETS_PER_QUEUE; i++) begin
                 packet_item item;

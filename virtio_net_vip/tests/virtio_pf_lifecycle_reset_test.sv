@@ -92,7 +92,8 @@ class virtio_pf_lifecycle_blocking_ops extends virtio_atomic_ops;
         worker_active = 0;
     endfunction
 
-    virtual task rx_refill(int unsigned queue_id, int unsigned num_bufs);
+    virtual task rx_refill(int unsigned queue_id, int unsigned num_bufs,
+                           int unsigned buf_size = 0);
         rx_refill_call_count++;
         if (rx_refill_call_count == 1)
             return;

@@ -1141,8 +1141,16 @@ class virtio_indirect_desc_test extends uvm_test;
             virtio_net_dataplane::type_id::create("dataplane_notify");
         virtqueue_base base_vq;
         split_virtqueue tx_vq;
+        split_virtqueue rx_vq;
         virtio_dataplane_indirect_test_packet token;
         uvm_object completed[$];
+        uvm_object received[$];
+        byte frame[];
+        iommu_fault_e fault;
+        bit [63:0] addr;
+        bit [31:0] len;
+        bit [15:0] flags;
+        bit [15:0] next;
         bit [63:0] features;
         int unsigned desc_id;
 
@@ -1157,6 +1165,10 @@ class virtio_indirect_desc_test extends uvm_test;
         assert($cast(tx_vq, base_vq))
             else `uvm_fatal("INDIRECT_TEST", "failed to create dataplane notify TX queue")
         tx_vq.alloc_rings();
+        base_vq = vq_mgr.create_queue(0, 8, VQ_SPLIT);
+        assert($cast(rx_vq, base_vq))
+            else `uvm_fatal("INDIRECT_TEST", "failed to create dataplane notify RX queue")
+        rx_vq.alloc_rings();
 
         transport.bdf = 16'h0706;
         ops.transport = transport;
@@ -1185,6 +1197,30 @@ class virtio_indirect_desc_test extends uvm_test;
         dataplane.tx_engine.complete_tx(1, 1, completed);
         assert((completed.size() == 1) && (completed[0] == token))
             else `uvm_fatal("INDIRECT_TEST", "dataplane TX completion did not return the token")
+
+        // RX 补充同样必须经 transport 通知；修复前引擎只调 virtqueue::kick()。
+        dataplane.rx_engine.refill_buffers(0, 1);
+        assert((transport.kick_count == 2) && (transport.last_kick_queue_id == 0) &&
+               (rx_vq.get_pending_count() == 1))
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "dataplane RX refill did not notify the device (kicks=%0d pending=%0d)",
+                transport.kick_count, rx_vq.get_pending_count()))
+
+        read_desc(mem, rx_vq.desc_table_addr, 0, addr, len, flags, next);
+        assert(len == 1526)
+            else `uvm_fatal("INDIRECT_TEST", $sformatf(
+                "dataplane RX buffer length %0d, expected engine buf_size 1526", len))
+        frame = new[10 + 64];
+        for (int unsigned i = 0; i < 10; i++) frame[i] = 8'h00;
+        for (int unsigned i = 10; i < frame.size(); i++) frame[i] = i[7:0];
+        assert(iommu.write_from_device_for_host(0, mem, 16'h0706, addr, frame, fault))
+            else `uvm_fatal("INDIRECT_TEST", "device RX write failed")
+        complete_split(mem, rx_vq, 0, frame.size());
+        dataplane.rx_engine.receive_packets(0, 1, received);
+        assert((received.size() == 1) && (rx_vq.get_pending_count() == 0) &&
+               (dataplane.rx_engine.total_rx_packets == 1))
+            else `uvm_fatal("INDIRECT_TEST", "dataplane RX did not return the completed frame")
+        rx_vq.free_rings();
         tx_vq.free_rings();
         assert(iommu.total_maps == iommu.total_unmaps)
             else `uvm_fatal("INDIRECT_TEST", "dataplane notify test leaked mappings")

@@ -295,8 +295,10 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
     endtask
 
     // 按配置容量投递零初始化 RX buffer，无 Virtio header 预留；申请失败停止补充，
-    // 已投递部分仍保持有效，随后用私有 doorbell 发布。
-    virtual task rx_refill(int unsigned queue_id, int unsigned num_bufs);
+    // 已投递部分仍保持有效，随后用私有 doorbell 发布。容量固定取私有配置
+    // rx_size，忽略 buf_size（参数仅为保持统一 ops 签名）。
+    virtual task rx_refill(int unsigned queue_id, int unsigned num_bufs,
+                           int unsigned buf_size = 0);
         virtqueue_base vq;
         int unsigned dma_size, result, filled;
         if (!contexts.exists(queue_id) || contexts[queue_id].tx_mode) return;
