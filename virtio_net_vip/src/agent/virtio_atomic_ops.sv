@@ -1342,19 +1342,13 @@ class virtio_atomic_ops extends uvm_object;
         ref bit                 ok,
         input bit               lock_already_held = 0
     );
-        bit [63:0]       request_gpa;
-        bit [63:0]       response_gpa;
-        bit [63:0]       request_iova;
-        bit [63:0]       response_iova;
-        bit              request_allocated;
-        bit              response_allocated;
-        bit              request_mapped;
-        bit              response_mapped;
+        virtio_dma_buffer_set dma_set;
+        int              request_idx;
+        int              response_idx;
         bit              submitted;
         bit              completion_seen;
         bit              reset_required;
         bit              reset_complete;
-        bit              release_safe;
         int unsigned     desc_id;
         int unsigned     used_len;
         int unsigned     max_polls;
@@ -1372,19 +1366,11 @@ class virtio_atomic_ops extends uvm_object;
 
         ok = 0;
         result = new[0];
-        request_gpa = '0;
-        response_gpa = '0;
-        request_iova = '0;
-        response_iova = '0;
-        request_allocated = 0;
-        response_allocated = 0;
-        request_mapped = 0;
-        response_mapped = 0;
         submitted = 0;
         completion_seen = 0;
         reset_required = 0;
         reset_complete = 0;
-        release_safe = 1;
+        dma_set = new("admin_vq_dma");
 
         if (admin_context == null) begin
             `uvm_error("ATOMIC_OPS", "admin_vq_submit: null Admin VQ context")
@@ -1438,116 +1424,107 @@ class virtio_atomic_ops extends uvm_object;
             break;
         end
 
-        request_gpa = admin_context.mem.alloc(cmd_data.size(), .align(1));
-        if (request_gpa == '1) begin
+        dma_set.bind_domain(admin_context.mem, admin_context.iommu,
+                            get_iommu_host_id(admin_context.transport),
+                            admin_context.transport.bdf);
+        request_idx = dma_set.alloc(cmd_data.size());
+        if (request_idx < 0) begin
             `uvm_error("ATOMIC_OPS", "admin_vq_submit: request allocation failed")
             break;
         end
-        request_allocated = 1;
-
-        response_gpa = admin_context.mem.alloc(admin_context.response_capacity, .align(1));
-        if (response_gpa == '1) begin
+        response_idx = dma_set.alloc(admin_context.response_capacity);
+        if (response_idx < 0) begin
             `uvm_error("ATOMIC_OPS", "admin_vq_submit: response allocation failed")
             break;
         end
-        response_allocated = 1;
 
         write_buf = new[cmd_data.size()];
         foreach (cmd_data[index])
             write_buf[index] = cmd_data[index];
-        admin_context.mem.write_mem(request_gpa, write_buf);
-        admin_context.mem.mem_set(response_gpa, 8'hFF, admin_context.response_capacity);
+        dma_set.write(request_idx, write_buf);
+        dma_set.fill(response_idx, 8'hFF);
 
-        request_iova = admin_context.iommu.map_for_host(
-            get_iommu_host_id(admin_context.transport),
-            admin_context.transport.bdf, request_gpa, cmd_data.size(), DMA_TO_DEVICE
-        );
-        if (request_iova == '1 || request_iova == 0) begin
+        if (!dma_set.map(request_idx, DMA_TO_DEVICE)) begin
             `uvm_error("ATOMIC_OPS", "admin_vq_submit: request DMA map failed")
+            break;
+        end
+        if (!dma_set.map(response_idx, DMA_FROM_DEVICE)) begin
+            `uvm_error("ATOMIC_OPS", "admin_vq_submit: response DMA map failed")
+            break;
+        end
+
+        sgs = new[2];
+        entry.addr = dma_set.get_iova(request_idx);
+        entry.len = cmd_data.size();
+        entry.is_indirect = 0;
+        sgs[0].entries.push_back(entry);
+        entry.addr = dma_set.get_iova(response_idx);
+        entry.len = admin_context.response_capacity;
+        entry.is_indirect = 0;
+        sgs[1].entries.push_back(entry);
+
+        desc_id = admin_context.vq.add_buf(sgs, 1, 1, null, 0);
+        if (desc_id == '1) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "admin_vq_submit: queue %0d rejected Admin VQ descriptor chain",
+                admin_context.queue_id))
+            break;
+        end
+
+        submitted = 1;
+        kick_with_fault(admin_context.vq, admin_context.queue_id,
+                        admin_context.transport);
+
+        // Both timeout and interval derive from the shared wait policy;
+        // there is no operation-specific arbitrary delay here.
+        effective_timeout = admin_context.wait_pol.effective_timeout(
+            admin_context.wait_pol.default_timeout_ns
+        );
+        poll_interval = admin_context.wait_pol.default_poll_interval_ns;
+        if (poll_interval == 0)
+            poll_interval = 1;
+        // Cap the widened quotient before adding one.  A saturated
+        // UINT_MAX timeout with interval one must not wrap its poll count
+        // to zero.
+        poll_quotient = effective_timeout / poll_interval;
+        if (poll_quotient >= admin_context.wait_pol.max_poll_attempts)
+            max_polls = admin_context.wait_pol.max_poll_attempts;
+        else
+            max_polls = poll_quotient + 1;
+        poll_count = 0;
+
+        while (poll_count < max_polls) begin
+            if (admin_context.vq.poll_used(completed_token, used_len)) begin
+                completion_seen = 1;
+                break;
+            end
+            poll_count++;
+            if (poll_count < max_polls)
+                #(poll_interval * 1ns);
+        end
+
+        if (!completion_seen) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "admin_vq_submit: timeout waiting for Admin VQ %0d completion after %0dns",
+                admin_context.queue_id, effective_timeout))
+            reset_required = 1;
+        end else if ((used_len == 0) || (used_len > admin_context.response_capacity)) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "admin_vq_submit: invalid Admin VQ response length %0d (capacity=%0d)",
+                used_len, admin_context.response_capacity))
+            reset_required = 1;
         end else begin
-            request_mapped = 1;
-            response_iova = admin_context.iommu.map_for_host(
-                get_iommu_host_id(admin_context.transport),
-                admin_context.transport.bdf, response_gpa, admin_context.response_capacity,
-                DMA_FROM_DEVICE
-            );
-            if (response_iova == '1 || response_iova == 0) begin
-                `uvm_error("ATOMIC_OPS", "admin_vq_submit: response DMA map failed")
+            response_len = used_len - 1;
+            admin_context.mem.read_mem(dma_set.get_gpa(response_idx), used_len, response_buf);
+            result = new[response_len];
+            foreach (result[index])
+                result[index] = response_buf[index + 1];
+            if (response_buf[0] != VIRTIO_NET_OK) begin
+                `uvm_error("ATOMIC_OPS", $sformatf(
+                    "admin_vq_submit: device rejected Admin VQ request with status 0x%02h",
+                    response_buf[0]))
             end else begin
-                response_mapped = 1;
-                sgs = new[2];
-                entry.addr = request_iova;
-                entry.len = cmd_data.size();
-                entry.is_indirect = 0;
-                sgs[0].entries.push_back(entry);
-                entry.addr = response_iova;
-                entry.len = admin_context.response_capacity;
-                entry.is_indirect = 0;
-                sgs[1].entries.push_back(entry);
-
-                desc_id = admin_context.vq.add_buf(sgs, 1, 1, null, 0);
-                if (desc_id == '1) begin
-                    `uvm_error("ATOMIC_OPS", $sformatf(
-                        "admin_vq_submit: queue %0d rejected Admin VQ descriptor chain",
-                        admin_context.queue_id))
-                end else begin
-                    submitted = 1;
-                    kick_with_fault(admin_context.vq, admin_context.queue_id,
-                                    admin_context.transport);
-
-                    // Both timeout and interval derive from the shared wait policy;
-                    // there is no operation-specific arbitrary delay here.
-                    effective_timeout = admin_context.wait_pol.effective_timeout(
-                        admin_context.wait_pol.default_timeout_ns
-                    );
-                    poll_interval = admin_context.wait_pol.default_poll_interval_ns;
-                    if (poll_interval == 0)
-                        poll_interval = 1;
-                    // Cap the widened quotient before adding one.  A
-                    // saturated UINT_MAX timeout with interval one must not
-                    // wrap its poll count to zero.
-                    poll_quotient = effective_timeout / poll_interval;
-                    if (poll_quotient >= admin_context.wait_pol.max_poll_attempts)
-                        max_polls = admin_context.wait_pol.max_poll_attempts;
-                    else
-                        max_polls = poll_quotient + 1;
-                    poll_count = 0;
-
-                    while (poll_count < max_polls) begin
-                        if (admin_context.vq.poll_used(completed_token, used_len)) begin
-                            completion_seen = 1;
-                            break;
-                        end
-                        poll_count++;
-                        if (poll_count < max_polls)
-                            #(poll_interval * 1ns);
-                    end
-
-                    if (!completion_seen) begin
-                        `uvm_error("ATOMIC_OPS", $sformatf(
-                            "admin_vq_submit: timeout waiting for Admin VQ %0d completion after %0dns",
-                            admin_context.queue_id, effective_timeout))
-                        reset_required = 1;
-                    end else if ((used_len == 0) || (used_len > admin_context.response_capacity)) begin
-                        `uvm_error("ATOMIC_OPS", $sformatf(
-                            "admin_vq_submit: invalid Admin VQ response length %0d (capacity=%0d)",
-                            used_len, admin_context.response_capacity))
-                        reset_required = 1;
-                    end else begin
-                        response_len = used_len - 1;
-                        admin_context.mem.read_mem(response_gpa, used_len, response_buf);
-                        result = new[response_len];
-                        foreach (result[index])
-                            result[index] = response_buf[index + 1];
-                        if (response_buf[0] != VIRTIO_NET_OK) begin
-                            `uvm_error("ATOMIC_OPS", $sformatf(
-                                "admin_vq_submit: device rejected Admin VQ request with status 0x%02h",
-                                response_buf[0]))
-                        end else begin
-                            ok = 1;
-                        end
-                    end
-                end
+                ok = 1;
             end
         end
         end while (0);
@@ -1559,7 +1536,6 @@ class virtio_atomic_ops extends uvm_object;
         // only when VIRTIO_F_RING_RESET was negotiated; Admin VQ alone does
         // not imply that feature, so otherwise reset the whole device.
         if (submitted && reset_required) begin
-            release_safe = 0;
             if (admin_context.negotiated_features[VIRTIO_F_RING_RESET])
                 admin_context.transport.write_queue_reset_verified(
                     admin_context.queue_id, reset_complete
@@ -1572,35 +1548,19 @@ class virtio_atomic_ops extends uvm_object;
                 admin_context.vq.detach_all_unused(detached_tokens);
                 admin_context.vq.reset_queue();
                 admin_context.vq.alloc_rings();
-                release_safe = 1;
             end else begin
                 admin_context.dma_quarantined = 1;
-                if (response_mapped)
-                    admin_context.quarantined_iovas.push_back(response_iova);
-                if (request_mapped)
-                    admin_context.quarantined_iovas.push_back(request_iova);
-                if (response_allocated)
-                    admin_context.quarantined_gpas.push_back(response_gpa);
-                if (request_allocated)
-                    admin_context.quarantined_gpas.push_back(request_gpa);
+                dma_set.quarantine_into(admin_context.quarantined_iovas,
+                                        admin_context.quarantined_gpas);
                 `uvm_error("ATOMIC_OPS", $sformatf(
                     "admin_vq_submit: Admin VQ %0d reset did not complete; DMA is quarantined",
                     admin_context.queue_id))
             end
         end
 
-        if (release_safe && response_mapped)
-            admin_context.iommu.unmap_for_host(
-                get_iommu_host_id(admin_context.transport),
-                admin_context.transport.bdf, response_iova);
-        if (release_safe && request_mapped)
-            admin_context.iommu.unmap_for_host(
-                get_iommu_host_id(admin_context.transport),
-                admin_context.transport.bdf, request_iova);
-        if (release_safe && response_allocated)
-            admin_context.mem.free(response_gpa);
-        if (release_safe && request_allocated)
-            admin_context.mem.free(request_gpa);
+        // 未隔离时（各失败路径、正常完成、已确认复位）统一释放本次缓冲；
+        // 隔离后集合已为空，这里是空操作。
+        dma_set.release_all();
         end : admin_vq_submit_locked
         if (!lock_already_held)
             admin_context.submit_lock.put(1);
@@ -1628,8 +1588,10 @@ class virtio_atomic_ops extends uvm_object;
         virtqueue_base   ctrl_vq;
         int unsigned     ctrl_qid;
         byte unsigned    hdr_buf[2];
-        bit [63:0]       hdr_gpa, data_gpa, ack_gpa;
-        bit [63:0]       hdr_iova, data_iova, ack_iova;
+        virtio_dma_buffer_set dma_set;
+        int              hdr_idx;
+        int              ack_idx;
+        int              data_idx;
         virtio_sg_list   sgs[3];
         virtio_sg_entry  entry;
         int unsigned     result;
@@ -1643,6 +1605,9 @@ class virtio_atomic_ops extends uvm_object;
         `uvm_info("ATOMIC_OPS",
             $sformatf("ctrl_send: class=%s cmd=0x%02h data_len=%0d",
                       ctrl_class.name(), cmd, data.size()), UVM_MEDIUM)
+
+        // 所有失败路径都返回 ERR；只有读到设备写回的 OK 才改为 OK。
+        ack = VIRTIO_NET_CTRL_ACK_ERR;
 
         // Find control queue (highest queue ID among managed queues)
         ctrl_qid = 0;
@@ -1658,7 +1623,6 @@ class virtio_atomic_ops extends uvm_object;
         if (ctrl_vq == null) begin
             `uvm_error("ATOMIC_OPS",
                 $sformatf("ctrl_send: control queue %0d not found", ctrl_qid))
-            ack = VIRTIO_NET_CTRL_ACK_ERR;
             return;
         end
 
@@ -1666,90 +1630,78 @@ class virtio_atomic_ops extends uvm_object;
         hdr_buf[0] = ctrl_class;
         hdr_buf[1] = cmd;
 
-        // 2. Allocate host_mem for hdr, data, and ack.  每次失败都回滚本次已分配
-        // 的缓冲；此时尚无映射和描述符引用它们，直接 free 即可。
-        hdr_gpa = mem.alloc(2, .align(1));
-        if (hdr_gpa == '1) begin
+        // 2. Allocate host_mem in the original hdr -> ack -> data order.  每次
+        // 失败都回滚本次已分配的缓冲（尚无映射和描述符引用它们）。
+        data_alloc_size = (data.size() > 0) ? data.size() : 1;
+        dma_set = new("ctrl_dma");
+        dma_set.bind_domain(mem, iommu, get_iommu_host_id(transport), transport.bdf);
+        hdr_idx = dma_set.alloc(2);
+        if (hdr_idx < 0) begin
             `uvm_error("ATOMIC_OPS", "ctrl_send: host_mem alloc failed for control header")
-            ack = VIRTIO_NET_CTRL_ACK_ERR;
             return;
         end
-        ack_gpa = mem.alloc(1, .align(1));
-        if (ack_gpa == '1) begin
-            mem.free(hdr_gpa);
+        ack_idx = dma_set.alloc(1);
+        if (ack_idx < 0) begin
+            dma_set.release_all();
             `uvm_error("ATOMIC_OPS", "ctrl_send: host_mem alloc failed for control ack")
-            ack = VIRTIO_NET_CTRL_ACK_ERR;
+            return;
+        end
+        data_idx = dma_set.alloc(data_alloc_size);
+        if (data_idx < 0) begin
+            dma_set.release_all();
+            `uvm_error("ATOMIC_OPS", "ctrl_send: host_mem alloc failed for control data")
             return;
         end
 
         write_buf = new[2];
         write_buf[0] = hdr_buf[0];
         write_buf[1] = hdr_buf[1];
-        mem.write_mem(hdr_gpa, write_buf);
-
-        data_alloc_size = (data.size() > 0) ? data.size() : 1;
-        data_gpa = mem.alloc(data_alloc_size, .align(1));
-        if (data_gpa == '1) begin
-            mem.free(hdr_gpa);
-            mem.free(ack_gpa);
-            `uvm_error("ATOMIC_OPS", "ctrl_send: host_mem alloc failed for control data")
-            ack = VIRTIO_NET_CTRL_ACK_ERR;
-            return;
-        end
+        dma_set.write(hdr_idx, write_buf);
 
         if (data.size() > 0) begin
             write_buf = new[data.size()];
             foreach (data[i]) write_buf[i] = data[i];
-            mem.write_mem(data_gpa, write_buf);
+            dma_set.write(data_idx, write_buf);
         end
 
         // Initialize ack to 0xFF (invalid)
         write_buf = new[1];
         write_buf[0] = 8'hFF;
-        mem.write_mem(ack_gpa, write_buf);
+        dma_set.write(ack_idx, write_buf);
 
-        // 3. Map through IOMMU.  任一映射失败即停止后续映射，撤销已成功的映射并
-        // 释放三块缓冲；描述符尚未发布，设备不可能访问这些 IOVA。
-        data_iova = '1;
-        ack_iova  = '1;
-        hdr_iova  = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, hdr_gpa, 2, DMA_TO_DEVICE);
-        if ((hdr_iova != '1) && (hdr_iova != 0))
-            data_iova = iommu.map_for_host(get_iommu_host_id(transport),
-                transport.bdf, data_gpa, data_alloc_size, DMA_TO_DEVICE);
-        if ((data_iova != '1) && (data_iova != 0))
-            ack_iova  = iommu.map_for_host(get_iommu_host_id(transport),
-                transport.bdf, ack_gpa, 1, DMA_FROM_DEVICE);
-        if ((ack_iova == '1) || (ack_iova == 0)) begin
-            if ((hdr_iova != '1) && (hdr_iova != 0))
-                iommu.unmap_for_host(get_iommu_host_id(transport),
-                                     transport.bdf, hdr_iova);
-            if ((data_iova != '1) && (data_iova != 0))
-                iommu.unmap_for_host(get_iommu_host_id(transport),
-                                     transport.bdf, data_iova);
-            mem.free(hdr_gpa);
-            mem.free(data_gpa);
-            mem.free(ack_gpa);
+        // 3. Map through IOMMU in the original hdr -> data -> ack order.  `||`
+        // 短路：任一映射失败即停止后续映射，撤销已成功的映射并释放三块缓冲；
+        // 描述符尚未发布，设备不可能访问这些 IOVA。
+        if (!dma_set.map(hdr_idx, DMA_TO_DEVICE) ||
+            !dma_set.map(data_idx, DMA_TO_DEVICE) ||
+            !dma_set.map(ack_idx, DMA_FROM_DEVICE)) begin
+            dma_set.release_all();
             `uvm_error("ATOMIC_OPS", "ctrl_send: failed to map control buffers")
-            ack = VIRTIO_NET_CTRL_ACK_ERR;
             return;
         end
 
         // 4. Build scatter-gather: [hdr(out)] [data(out)] [ack(in)]
-        entry.addr = hdr_iova;
+        entry.addr = dma_set.get_iova(hdr_idx);
         entry.len  = 2;
         sgs[0].entries.push_back(entry);
 
-        entry.addr = data_iova;
+        entry.addr = dma_set.get_iova(data_idx);
         entry.len  = data_alloc_size;
         sgs[1].entries.push_back(entry);
 
-        entry.addr = ack_iova;
+        entry.addr = dma_set.get_iova(ack_idx);
         entry.len  = 1;
         sgs[2].entries.push_back(entry);
 
-        // 5. Add to control queue (n_out=2, n_in=1)
+        // 5. Add to control queue (n_out=2, n_in=1); a rejected chain owns
+        //    no descriptor, so roll back without notifying.
         result = ctrl_vq.add_buf(sgs, 2, 1, null, 0);
+        if (result == '1) begin
+            dma_set.release_all();
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "ctrl_send: control queue %0d rejected descriptor chain", ctrl_qid))
+            return;
+        end
 
         // 6. Kick control queue
         if (ctrl_vq.needs_notification())
@@ -1779,28 +1731,15 @@ class virtio_atomic_ops extends uvm_object;
 
         if (!got_used) begin
             `uvm_error("ATOMIC_OPS", "ctrl_send: timeout waiting for control VQ completion")
-            ack = VIRTIO_NET_CTRL_ACK_ERR;
         end else begin
             // 8. Read ack status from host_mem
-            mem.read_mem(ack_gpa, 1, ack_readback);
+            mem.read_mem(dma_set.get_gpa(ack_idx), 1, ack_readback);
             if (ack_readback[0] == VIRTIO_NET_OK)
                 ack = VIRTIO_NET_CTRL_ACK_OK;
-            else
-                ack = VIRTIO_NET_CTRL_ACK_ERR;
         end
 
-        // Cleanup IOMMU mappings
-        iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
-                             hdr_iova);
-        iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
-                             data_iova);
-        iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
-                             ack_iova);
-
-        // Free host memory
-        mem.free(hdr_gpa);
-        mem.free(data_gpa);
-        mem.free(ack_gpa);
+        // Cleanup IOMMU mappings and host memory
+        dma_set.release_all();
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("ctrl_send: class=%s cmd=0x%02h ack=%s",
