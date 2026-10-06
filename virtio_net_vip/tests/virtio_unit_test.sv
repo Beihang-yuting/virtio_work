@@ -133,6 +133,32 @@ class virtio_expected_iommu_map_error_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_expected_iommu_map_error_catcher
 
+// 记录型发现策略：只统计调用与入参，验证 transport 把发现完全委托给策略对象。
+class virtio_unit_recording_discovery extends virtio_discovery_strategy;
+    `uvm_object_utils(virtio_unit_recording_discovery)
+
+    int unsigned discover_count;
+    virtio_pci_transport last_transport;
+
+    function new(string name = "virtio_unit_recording_discovery");
+        super.new(name);
+        discover_count = 0;
+        last_transport = null;
+    endfunction
+
+    virtual function string strategy_name();
+        return "unit_recording";
+    endfunction
+
+    virtual task discover(virtio_pci_transport transport, output bit ok,
+                          output string why);
+        discover_count++;
+        last_transport = transport;
+        why = "";
+        ok = 1;
+    endtask
+endclass : virtio_unit_recording_discovery
+
 // ============================================================================
 // virtio_unit_test
 //
@@ -198,6 +224,7 @@ class virtio_unit_test extends uvm_test;
         test_tlm_config_write_completion_lifecycle();
         test_tlm_completion_factory_owner();
         test_late_driver_agent_binding();
+        test_discovery_strategy_selection();
         test_dma_buffer_set();
 
         `uvm_info("UNIT_TEST", "All unit tests PASSED", UVM_NONE)
@@ -1023,6 +1050,33 @@ class virtio_unit_test extends uvm_test;
             else `uvm_error("TEST", "config-write factory adapter was replaced")
 
         `uvm_info("UNIT_TEST", "test_tlm_completion_factory_owner PASSED", UVM_LOW)
+    endtask
+
+    // transport 的发现路径只由策略对象决定：默认 enumerate，Fabric 托管切换为
+    // fabric_preconfigured，外部可注入新策略（后续 verify_snapshot 的接入点）。
+    task test_discovery_strategy_selection();
+        virtio_pci_transport transport;
+        virtio_unit_recording_discovery recorder;
+        virtio_resource_client client;
+
+        transport = virtio_pci_transport::type_id::create("discovery_transport");
+        if (transport.discovery_strategy_name() != "enumerate")
+            `uvm_error("TEST", {"default discovery strategy is ",
+                                transport.discovery_strategy_name()})
+        client = virtio_resource_client::type_id::create("discovery_client");
+        transport.configure_fabric_managed(client);
+        if (transport.discovery_strategy_name() != "fabric_preconfigured")
+            `uvm_error("TEST", {"Fabric-managed transport selected ",
+                                transport.discovery_strategy_name()})
+        recorder = virtio_unit_recording_discovery::type_id::create(
+            "discovery_recorder");
+        transport.set_discovery_strategy(recorder);
+        transport.discover_and_init_bars();
+        if ((recorder.discover_count != 1) || (recorder.last_transport != transport))
+            `uvm_error("TEST", $sformatf(
+                "discover_and_init_bars did not delegate exactly once (count=%0d)",
+                recorder.discover_count))
+        `uvm_info("UNIT_TEST", "test_discovery_strategy_selection PASSED", UVM_LOW)
     endtask
 
 endclass

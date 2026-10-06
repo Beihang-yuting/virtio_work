@@ -234,6 +234,7 @@ virtio_net_vip/
 │   │   ├── virtio_bar_accessor.sv          ← BAR 读写 → PCIe TLP 翻译
 │   │   ├── virtio_pci_cap_manager.sv       ← PCI Capability 链表发现
 │   │   ├── virtio_notification_manager.sv  ← MSI-X/INTx/轮询/自适应中断管理
+│   │   ├── virtio_discovery_strategy.sv    ← BAR/capability 发现策略（enumerate / fabric_preconfigured）
 │   │   └── virtio_pci_transport.sv         ← 传输层顶层封装（完整初始化序列）
 │   ├── agent/                              ← UVM 驱动代理
 │   │   ├── virtio_atomic_ops.sv            ← 原子操作库（约 30 个方法）

@@ -65,6 +65,10 @@ class virtio_pci_transport extends uvm_object;
     bit                     fabric_capability_discovered = 0;
     virtio_resource_client  fabric_resource_client;
 
+    // 当前 BAR/capability 发现策略：构造时为 enumerate，configure_fabric_managed()
+    // 切换为 fabric_preconfigured；后续设计经 set_discovery_strategy() 注入 verify_snapshot。
+    virtio_discovery_strategy discovery_strategy;
+
     // ========================================================================
     // 构造：创建并拥有四个子组件，随即完成交叉接线(cap_mgr.bar_ref 与
     // notify_mgr.bar 都指向同一个 bar 实例)。此时 BDF/identity 均未配置，
@@ -87,6 +91,7 @@ class virtio_pci_transport extends uvm_object;
         driver_features = '0;
         bdf             = 16'h0;
         pcie_id_valid   = 0;
+        discovery_strategy = virtio_enumerate_discovery::type_id::create("enumerate_discovery");
     endfunction
 
     // 冻结本 function 的完整 PCIe identity({host, segment, BDF})，并同步
@@ -132,8 +137,8 @@ class virtio_pci_transport extends uvm_object;
         return 1;
     endfunction
 
-    // 切换到 Fabric 托管模式：BAR 布局由 DPU 资源管理器下发、发现流程改走
-    // discover_fabric_preconfigured_bars()。会清掉能力发现完成标志；
+    // 切换到 Fabric 托管模式：BAR 布局由 DPU 资源管理器下发、发现策略切换为
+    // fabric_preconfigured。会清掉能力发现完成标志；
     // resource_client 为借用引用，负责 device-ready 生命周期上报。
     virtual function void configure_fabric_managed(
         input virtio_resource_client resource_client
@@ -141,11 +146,27 @@ class virtio_pci_transport extends uvm_object;
         fabric_managed = 1;
         fabric_capability_discovered = 0;
         fabric_resource_client = resource_client;
+        discovery_strategy = virtio_fabric_preconfigured_discovery::type_id::create(
+            "fabric_preconfigured_discovery");
     endfunction
 
     // 查询是否处于 Fabric 托管模式；纯查询，无副作用。
     function bit is_fabric_managed();
         return fabric_managed;
+    endfunction
+
+    // 替换发现策略（例如核对 snapshot 的 verify_snapshot）；null 被拒绝并保持原策略。
+    function void set_discovery_strategy(virtio_discovery_strategy strategy);
+        if (strategy == null) begin
+            `uvm_error("TRANSPORT", "set_discovery_strategy received null")
+            return;
+        end
+        discovery_strategy = strategy;
+    endfunction
+
+    // 当前发现策略名；纯查询。
+    function string discovery_strategy_name();
+        return discovery_strategy.strategy_name();
     endfunction
 
     // ========================================================================
@@ -692,103 +713,31 @@ class virtio_pci_transport extends uvm_object;
     // ========================================================================
     // discover_and_init_bars
     //
-    //   1. bar.enumerate_bars()
-    //   2. cap_mgr.bar_ref = bar
-    //   3. cap_mgr.discover_capabilities()
+    // 唯一的发现入口：委托当前 discovery_strategy（enumerate / fabric_preconfigured /
+    // 后续 verify_snapshot）。策略失败时 fatal，因为后续所有寄存器访问都依赖它。
     // ========================================================================
 
     virtual task discover_and_init_bars();
-        if (fabric_managed) begin
-            discover_fabric_preconfigured_bars();
-            return;
-        end
-        `uvm_info("TRANSPORT", "Starting BAR discovery and capability enumeration", UVM_MEDIUM)
-
-        // Set BDF on bar accessor
-        bar.requester_id = bdf;
-
-        // Step 1: Enumerate BARs
-        bar.enumerate_bars();
-
-        // Step 2: Wire bar reference into cap manager
-        cap_mgr.bar_ref = bar;
-
-        // Step 3: Discover virtio PCI capabilities
-        cap_mgr.discover_capabilities();
-
-        `uvm_info("TRANSPORT", "BAR discovery and capability enumeration complete", UVM_MEDIUM)
-    endtask
-
-    // Fabric 专用校验(无副作用)：确认发现到的 virtio 能力落在 Fabric 约定的
-    // BAR 角色窗口内——common/ISR/device/pci cfg 在 BAR0、notify 在 BAR2
-    // (mailbox)、MSI-X 在 BAR4；任何偏离都拒绝并经 why 说明原因，
-    // 防止把错误的 BAR 角色布局当成合法 DUT profile。
-    protected function bit fabric_capabilities_use_device_window(
-        output string why
-    );
-        why = "";
-        if (!cap_mgr.common_cfg_found || !cap_mgr.notify_found ||
-            !cap_mgr.isr_found) begin
-            why = "mandatory virtio capabilities were not discovered";
-            return 0;
-        end
-        // The Fabric profile has a split functional layout: BAR0/1 carries
-        // common/ISR/device configuration, while BAR2/3 is the mailbox and
-        // therefore owns the virtio notification capability.  Do not force
-        // notify into BAR0; doing so rejects the real-DUT profile even though
-        // the discovered BAR role and notify address are correct.
-        if ((cap_mgr.common_cfg_cap.bar != 0) ||
-            (cap_mgr.notify_cap.bar != 2) ||
-            (cap_mgr.isr_cap.bar != 0) ||
-            (cap_mgr.device_cfg_found && (cap_mgr.device_cfg_cap.bar != 0)) ||
-            (cap_mgr.pci_cfg_found && (cap_mgr.pci_cfg_cap.bar != 0))) begin
-            why = "virtio functional capability did not resolve to Fabric BAR0/1";
-            return 0;
-        end
-        if (cap_mgr.msix_found && (cap_mgr.msix_table_bir != 4)) begin
-            why = "MSI-X capability did not resolve to Fabric BAR4/5";
-            return 0;
-        end
-        return 1;
-    endfunction
-
-    // Fabric owns BAR placement, but the root complex still must program all
-    // three 64-bit BAR pairs through PCI config space before discovery.  This
-    // path then scans capabilities and lets the virtio resource client mark
-    // the function device-ready.
-    virtual task discover_fabric_preconfigured_bars();
+        bit ok;
         string why;
 
-        if (!fabric_managed) begin
-            `uvm_fatal("TRANSPORT",
-                "Fabric preconfigured discovery requested for a non-Fabric function")
-        end
-        if (!bar.fabric_bar_layout_is_active()) begin
-            `uvm_fatal("TRANSPORT",
-                "Fabric function has no preconfigured BAR role layout")
-        end
-        if (fabric_resource_client == null) begin
-            `uvm_fatal("TRANSPORT",
-                "Fabric function has no resource client for device-ready lifecycle")
-        end
+        discovery_strategy.discover(this, ok, why);
+        if (!ok)
+            `uvm_fatal("TRANSPORT", {"BAR/capability discovery failed: ", why})
+    endtask
 
-        bar.requester_id = bdf;
-        cap_mgr.bar_ref = bar;
-        notify_mgr.bar = bar;
-        bar.program_fabric_bar_pairs();
-        cap_mgr.discover_capabilities();
-        if (!fabric_capabilities_use_device_window(why)) begin
-            `uvm_fatal("TRANSPORT", $sformatf(
-                "Fabric capability discovery rejected BAR roles: %s", why))
-        end
-        fabric_capability_discovered = 1;
-        if (!fabric_resource_client.mark_runtime_ready(why)) begin
-            `uvm_fatal("TRANSPORT", $sformatf(
-                "Fabric device-ready transition failed after discovery: %s", why))
-        end
-        `uvm_info("TRANSPORT",
-            "Fabric BAR configuration and capability discovery complete without BAR enumeration",
-            UVM_MEDIUM)
+    // Fabric 预配置发现的显式入口（virtio_fabric_resource_test 直接调用）；与
+    // configure_fabric_managed() 安装的策略为同一实现，不经 discovery_strategy 分派。
+    virtual task discover_fabric_preconfigured_bars();
+        virtio_fabric_preconfigured_discovery fabric_discovery;
+        bit ok;
+        string why;
+
+        fabric_discovery = virtio_fabric_preconfigured_discovery::type_id::create(
+            "fabric_preconfigured_discovery");
+        fabric_discovery.discover(this, ok, why);
+        if (!ok)
+            `uvm_fatal("TRANSPORT", {"Fabric discovery failed: ", why})
     endtask
 
 endclass : virtio_pci_transport

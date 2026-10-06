@@ -69,6 +69,7 @@ package virtio_net_pkg;
   `include "transport/virtio_pcie_function_endpoint.sv"
   `include "transport/virtio_pci_cap_manager.sv"
   `include "transport/virtio_notification_manager.sv"
+  `include "transport/virtio_discovery_strategy.sv"
   `include "transport/virtio_pci_transport.sv"
   `include "dpu_priv/dpu_priv_driver_config.sv"
 

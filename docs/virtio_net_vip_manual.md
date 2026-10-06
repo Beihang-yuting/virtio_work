@@ -340,6 +340,7 @@ virtio_net_vip/
 |   |   +-- virtio_bar_accessor.sv          -- BAR MMIO/Config -> PCIe TLP 翻译
 |   |   +-- virtio_pci_cap_manager.sv       -- PCI Capability 链表遍历与解析
 |   |   +-- virtio_notification_manager.sv  -- MSI-X/INTx/polling 中断管理
+|   |   +-- virtio_discovery_strategy.sv    -- BAR/capability 发现策略
 |   |   +-- virtio_pci_transport.sv         -- PCI 传输封装 (完整初始化序列)
 |   +-- agent/
 |   |   +-- virtio_atomic_ops.sv            -- 原子操作库 (~30 个方法)
@@ -2176,7 +2177,7 @@ legacy/TLM 模型路径；Fabric-owned function 会明确报告 `BAR_FABRIC_OWNE
 
 | 方法 | 类型 | 说明 |
 |------|------|------|
-| `discover_and_init_bars` | task | BAR 枚举 + capability 发现 |
+| `discover_and_init_bars` | task | 委托当前发现策略（enumerate / fabric_preconfigured） |
 | `reset_device` | task | 写 status=0, 轮询 |
 | `read_device_status` | task | 读取设备状态 |
 | `write_device_status` | task | 写入设备状态 |

@@ -759,7 +759,7 @@ class virtio_auto_fsm extends uvm_report_object;
     endtask
 
     // full_init 的实现体（入参已由 full_init 校验）：按 virtio 1.x 顺序推进
-    // DISCOVERING（BAR 发现，Fabric 托管走预配置路径）→ NEGOTIATING（复位、
+    // DISCOVERING（BAR 发现，按 transport 的发现策略）→ NEGOTIATING（复位、
     // ACK/DRIVER、特性协商、FEATURES_OK）→ QUEUE_SETUP（按队列对数建队，
     // CTRL_VQ 协商成功时额外 +1 队列）→ MSIX_SETUP → FSM_READY。
     // 任一步失败置 FSM_ERROR 并向设备写 FAILED 后返回。
@@ -776,10 +776,7 @@ class virtio_auto_fsm extends uvm_report_object;
         state = FSM_DISCOVERING;
         `uvm_info("AUTO_FSM",
             $sformatf("full_init: state=%s -- discovering BARs", state.name()), UVM_MEDIUM)
-        if (ops.transport.is_fabric_managed())
-            ops.transport.discover_fabric_preconfigured_bars();
-        else
-            ops.transport.discover_and_init_bars();
+        ops.transport.discover_and_init_bars();
 
         // ---- Step 2: Feature negotiation ----
         state = FSM_NEGOTIATING;
