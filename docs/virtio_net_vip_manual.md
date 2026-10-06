@@ -25,8 +25,6 @@
   - [4.8 数据面 (dataplane/)](#48-数据面-dataplane)
   - [4.9 SR-IOV (sriov/)](#49-sr-iov-sriov)
   - [4.10 环境层 (env/)](#410-环境层-env)
-  - [4.11 Sequence 库 (seq/)](#411-sequence-库-seq)
-  - [4.12 回调扩展点 (callbacks/)](#412-回调扩展点-callbacks)
 - [5. Feature 支持矩阵](#5-feature-支持矩阵)
 - [6. 使用指南](#6-使用指南)
 - [7. 测试方法论](#7-测试方法论)
@@ -140,7 +138,6 @@ disable fork;  // 杀死调用线程中的所有子进程!
 |  |   +-- ref: pcie_tl_env.func_manager    <-- 复用 PCIe PF/VF 管理        |
 |  |   +-- virtio_vf_resource_pool          <-- virtio 专用队列映射          |
 |  |   +-- admin_vq                         <-- PF 管理 virtqueue (1.2+)    |
-|  |   +-- failover_manager                 <-- STANDBY/failover            |
 |  |                                                                        |
 |  +-- vf_instances[N]                      <-- 每个 VF 一个实例            |
 |  |   +-- virtio_driver_agent              <-- 核心 UVM Agent              |
@@ -165,17 +162,12 @@ disable fork;  // 杀死调用线程中的所有子进程!
 |  +-- error_injector                       <-- 统一错误注入控制器           |
 |  +-- virtio_scoreboard                    <-- 数据/协议/offload/DMA 验证  |
 |  +-- virtio_coverage                      <-- 8 个 covergroup, 惰性构造  |
-|  +-- concurrency_controller              <-- 多 VF 并发操作 + 竞争注入    |
-|  +-- dynamic_reconfig                     <-- 运行时 MQ/MTU/IRQ/MAC/VLAN  |
+|  +-- concurrency_controller              <-- 多 VF 并发操作               |
+|  +-- dynamic_reconfig                     <-- 运行时 MQ 调整              |
 |  |                                                                        |
 |  +-- host_mem_manager (external)          <-- 共享实例                     |
 |  +-- net_packet (external)                <-- 共享实例                     |
 |  +-- pcie_tl_env (subenv)                 <-- PCIe TL 子环境              |
-|  |                                                                        |
-|  +-- virtio_virtual_sequencer                                             |
-|      +-- pf_seqr                                                          |
-|      +-- vf_seqrs[N]                                                      |
-|      +-- pcie_rc_seqr                                                     |
 +===========================================================================+
 ```
 
@@ -187,11 +179,10 @@ VIP 采用分层架构，从底层到顶层依次为：
 2. **共享基础设施层**（Phase 1-2）：wait_policy、memory_barrier_model、IOMMU 模型
 3. **Virtqueue 引擎层**（Phase 3）：抽象基类 + 三种实现 + 管理器
 4. **PCI 传输层**（Phase 4）：寄存器定义、capability 发现、BAR 访问、通知管理
-5. **驱动层**（Phase 5）：回调接口、事务类、原子操作库、自动 FSM、UVM Agent
-6. **数据面层**（Phase 6）：TX/RX 引擎、offload 引擎、failover 管理
+5. **驱动层**（Phase 5）：事务类、原子操作库、自动 FSM、UVM Agent
+6. **数据面层**（Phase 6）：TX/RX 引擎、offload 引擎
 7. **SR-IOV 层**（Phase 7）：VF 资源池、VF 实例、PF 管理器
 8. **环境层**（Phase 8）：配置、scoreboard、coverage、性能监控、并发控制
-9. **序列层**（Phase 9）：基础序列、场景序列、虚拟序列
 
 ### 2.3 数据流图
 
@@ -204,13 +195,15 @@ VIP 采用分层架构，从底层到顶层依次为：
  virtio_driver (process_transaction)
       |
       v
- virtio_auto_fsm.send_packets() / virtio_atomic_ops.tx_submit()
+ virtio_auto_fsm.send_packets()（直接构造默认头） / tx_engine.submit_packet()
       |
       v
- +--build_net_hdr()                    -- 构建 virtio-net 头部
- |  +-- offload_engine.compute_csum()  -- 如果需要 checksum offload
- |  +-- tso_engine.segment()           -- 如果需要 TSO
- |  +-- uso_engine.segment()           -- 如果需要 USO
+ +--virtio_net_hdr_util::build_tx_hdr()  -- tx_engine 路径：按 offload feature 构建 virtio-net 头部
+ |  +-- offload_engine.calc_csum_start()/calc_csum_offset()  -- 如果需要 checksum offload
+ |  +-- offload_engine.get_gso_type()/get_all_hdr_len()      -- 如果需要 TSO/USO（分段由设备完成）
+      |
+      v
+ virtio_atomic_ops.tx_submit()  -- tx_engine 经 virtio_net_dataplane::bind_ops 委托
       |
       v
  host_mem.alloc() --> 分配 hdr+data buffer
@@ -348,10 +341,6 @@ virtio_net_vip/
 |   |   +-- virtio_pci_cap_manager.sv       -- PCI Capability 链表遍历与解析
 |   |   +-- virtio_notification_manager.sv  -- MSI-X/INTx/polling 中断管理
 |   |   +-- virtio_pci_transport.sv         -- PCI 传输封装 (完整初始化序列)
-|   +-- callbacks/
-|   |   +-- virtio_dataplane_callback.sv    -- 数据面自定义回调 (TX chain/RX parse)
-|   |   +-- virtio_scoreboard_callback.sv   -- Scoreboard 自定义比较回调
-|   |   +-- virtio_coverage_callback.sv     -- Coverage 自定义采样回调
 |   +-- agent/
 |   |   +-- virtio_atomic_ops.sv            -- 原子操作库 (~30 个方法)
 |   |   +-- virtio_auto_fsm.sv             -- 自动生命周期状态机 (12 状态)
@@ -361,13 +350,11 @@ virtio_net_vip/
 |   |   +-- virtio_driver_agent.sv         -- UVM Agent 封装
 |   +-- dataplane/
 |   |   +-- virtio_csum_engine.sv           -- Checksum offload 引擎
-|   |   +-- virtio_tso_engine.sv            -- TCP Segmentation Offload 引擎
-|   |   +-- virtio_uso_engine.sv            -- UDP Segmentation Offload 引擎
+|   |   +-- virtio_tso_engine.sv            -- TCP/UDP GSO 头长度判定 (不分段)
 |   |   +-- virtio_rss_engine.sv            -- RSS 分发引擎 (Toeplitz hash)
 |   |   +-- virtio_offload_engine.sv        -- Offload 统一封装
 |   |   +-- virtio_tx_engine.sv             -- TX 引擎 (报文组装 + SG 链)
 |   |   +-- virtio_rx_engine.sv             -- RX 引擎 (buffer merge + parse)
-|   |   +-- virtio_failover_manager.sv      -- STANDBY/failover 管理
 |   |   +-- virtio_net_dataplane.sv         -- 数据面顶层封装
 |   +-- sriov/
 |   |   +-- virtio_vf_resource_pool.sv      -- VF 队列资源池 (local_qid <-> global_qid)
@@ -375,62 +362,14 @@ virtio_net_vip/
 |   |   +-- virtio_pf_manager.sv            -- PF 管理器 (委托 pcie_tl_func_manager)
 |   +-- env/
 |   |   +-- virtio_net_env_config.sv        -- 环境配置对象
-|   |   +-- virtio_virtual_sequencer.sv     -- 虚拟 Sequencer
-|   |   +-- virtio_scoreboard.sv            -- 8 类检查的 Scoreboard
+|   |   +-- virtio_scoreboard.sv            -- 7 类检查的 Scoreboard
 |   |   +-- virtio_coverage.sv              -- 8 个 Covergroup
 |   |   +-- virtio_perf_monitor.sv          -- 性能监控 (带宽限制+延迟剖析)
-|   |   +-- virtio_concurrency_controller.sv -- 多 VF 并发控制 + 竞争注入
-|   |   +-- virtio_dynamic_reconfig.sv      -- 运行时动态重配置
+|   |   +-- virtio_concurrency_controller.sv -- 多 VF 并发控制
+|   |   +-- virtio_dynamic_reconfig.sv      -- 运行时 MQ 调整
 |   |   +-- virtio_net_env.sv               -- 顶层环境
-|   +-- seq/
-|       +-- base/                            -- 7 个基础序列
-|       |   +-- virtio_base_seq.sv
-|       |   +-- virtio_init_seq.sv
-|       |   +-- virtio_tx_seq.sv
-|       |   +-- virtio_rx_seq.sv
-|       |   +-- virtio_ctrl_seq.sv
-|       |   +-- virtio_queue_setup_seq.sv
-|       |   +-- virtio_kick_seq.sv
-|       +-- scenario/                        -- 22 个场景序列 (9 个子目录)
-|       |   +-- lifecycle/
-|       |   |   +-- virtio_lifecycle_full_seq.sv
-|       |   |   +-- virtio_status_error_seq.sv
-|       |   |   +-- virtio_feature_error_seq.sv
-|       |   +-- dataplane/
-|       |   |   +-- virtio_tso_seq.sv
-|       |   |   +-- virtio_mrg_rxbuf_seq.sv
-|       |   |   +-- virtio_rss_distribution_seq.sv
-|       |   |   +-- virtio_csum_offload_seq.sv
-|       |   |   +-- virtio_tunnel_pkt_seq.sv
-|       |   +-- interrupt/
-|       |   |   +-- virtio_adaptive_irq_seq.sv
-|       |   |   +-- virtio_event_idx_boundary_seq.sv
-|       |   +-- migration/
-|       |   |   +-- virtio_live_migration_seq.sv
-|       |   |   +-- virtio_failover_seq.sv
-|       |   +-- sriov/
-|       |   |   +-- virtio_multi_vf_init_seq.sv
-|       |   |   +-- virtio_vf_flr_isolation_seq.sv
-|       |   |   +-- virtio_mixed_vq_type_seq.sv
-|       |   +-- error/
-|       |   |   +-- virtio_desc_error_seq.sv
-|       |   |   +-- virtio_iommu_fault_seq.sv
-|       |   |   +-- virtio_pcie_cross_error_seq.sv
-|       |   |   +-- virtio_bad_packet_seq.sv
-|       |   +-- concurrency/
-|       |   |   +-- virtio_concurrent_vf_traffic_seq.sv
-|       |   +-- dynamic/
-|       |   |   +-- virtio_live_mq_resize_seq.sv
-|       |   +-- boundary/
-|       |       +-- virtio_boundary_seq.sv
-|       +-- virtual/                         -- 4 个虚拟序列
-|           +-- virtio_smoke_vseq.sv
-|           +-- virtio_full_init_traffic_vseq.sv
-|           +-- virtio_multi_vf_vseq.sv
-|           +-- virtio_stress_vseq.sv
 +-- tests/
 |   +-- virtio_tb_top.sv                    -- 顶层 testbench module
-|   +-- virtio_base_test.sv                 -- 基础 test 类
 |   +-- virtio_smoke_test.sv                -- 冒烟测试
 |   +-- virtio_unit_test.sv                 -- 单元测试 (无 PCIe 依赖)
 |   +-- virtio_stress_unit_test.sv          -- 压力单元测试
@@ -443,7 +382,7 @@ virtio_net_vip/
 # 分别由 $DPU_COMMON_ROOT、$HOST_MEM_ROOT、$PCIE_WORK_ROOT、$NET_PACKET_ROOT 指定。
 ```
 
-**总计：约 75 个源文件（含测试）。**
+**总计：`src/` 61 个 `.sv` 文件，`tests/` 34 个 `.sv` 文件。**
 
 ### 3.2 目录职责说明
 
@@ -454,12 +393,10 @@ virtio_net_vip/
 | `src/iommu/` | IOMMU 地址翻译模型 |
 | `src/virtqueue/` | Virtqueue 引擎：抽象基类 + 三种实现 + 管理器 + 错误注入 |
 | `src/transport/` | PCI 传输层：寄存器定义、BAR 访问、capability 发现、通知管理 |
-| `src/callbacks/` | 用户扩展回调接口定义 |
 | `src/agent/` | UVM Agent 组件：驱动、监控器、sequencer |
-| `src/dataplane/` | 数据面引擎：TX/RX、offload、failover |
+| `src/dataplane/` | 数据面引擎：TX/RX、offload |
 | `src/sriov/` | SR-IOV 支持：PF/VF 管理、资源池 |
 | `src/env/` | 顶层环境：配置、scoreboard、coverage、性能监控 |
-| `src/seq/` | 序列库：基础序列、场景序列、虚拟序列 |
 | `tests/` | 测试用例和 testbench 顶层 |
 
 ---
@@ -503,7 +440,7 @@ VIP 中所有 virtio feature bit 均以 `parameter int` 定义，与 virtio 规�
 | `VIRTIO_NET_F_HOST_USO` | 56 | 设备可处理 USO（1.2+） |
 | `VIRTIO_NET_F_HASH_REPORT` | 57 | Hash 值报告 |
 | `VIRTIO_NET_F_RSS` | 60 | RSS 分发 |
-| `VIRTIO_NET_F_STANDBY` | 62 | failover 待机模式 |
+| `VIRTIO_NET_F_STANDBY` | 62 | failover 待机模式（仅特性位） |
 | `VIRTIO_NET_F_SPEED_DUPLEX` | 63 | 速率/双工报告 |
 
 **通用 Feature（bit 28-40）：**
@@ -530,21 +467,18 @@ VIP 定义了以下枚举类型：
 | `virtqueue_state_e` | `VQ_RESET`, `VQ_CONFIGURE`, `VQ_ENABLED` | 队列生命周期状态 |
 | `device_status_e` | `RESET(0x00)`, `ACKNOWLEDGE(0x01)`, `DRIVER(0x02)`, `FEATURES_OK(0x08)`, `DRIVER_OK(0x04)`, `DEVICE_NEEDS_RESET(0x40)`, `FAILED(0x80)` | 设备状态寄存器值 |
 | `driver_mode_e` | `DRV_MODE_AUTO`, `DRV_MODE_MANUAL`, `DRV_MODE_HYBRID` | 驱动模式 |
-| `rx_buf_mode_e` | `RX_MODE_MERGEABLE`, `RX_MODE_BIG`, `RX_MODE_SMALL` | RX 缓冲区模式 |
+| `rx_buf_mode_e` | `RX_MODE_MERGEABLE` | RX 缓冲区模式（仅 mergeable） |
 | `interrupt_mode_e` | `IRQ_MSIX_PER_QUEUE`, `IRQ_MSIX_SHARED`, `IRQ_INTX`, `IRQ_POLLING` | 中断模式 |
 | `dma_dir_e` | `DMA_TO_DEVICE`, `DMA_FROM_DEVICE`, `DMA_BIDIRECTIONAL` | DMA 方向 |
 | `fsm_state_e` | 12 个状态（IDLE 到 RECOVERING） | 自动 FSM 状态 |
 | `vf_state_e` | `VF_CREATED` 到 `VF_DISABLED` | VF 生命周期 |
-| `failover_state_e` | `FO_NORMAL` 到 `FO_FAILBACK` | Failover 状态 |
 | `iommu_fault_e` | 6 种 fault 类型 | IOMMU 故障分类 |
 | `virtqueue_error_e` | 27 种错误类型 | 描述符/ring/DMA/通知错误（语义枚举；不代表每一项都有通用自动变异） |
 | `virtio_txn_type_e` | 16 种事务类型 | 驱动事务分类 |
 | `virtio_atomic_op_e` | 10 种原子操作 | MANUAL 模式操作 |
 | `scb_error_e` | 12 种 scoreboard 错误 | 验证错误分类 |
-| `race_point_e` | 7 种竞争点 | 并发竞争注入位置 |
 | `status_error_e` | 5 种状态错误 | 状态转换错误注入 |
 | `feature_error_e` | 5 种 feature 错误 | Feature 协商错误注入 |
-| `queue_setup_error_e` | 6 种队列配置错误 | 队列配置错误注入 |
 
 `virtqueue_error_e` 的 27 个枚举值与源码保持一致：
 
@@ -818,7 +752,7 @@ bit [63:0] dirty_pages[$];
 iommu.capture_dirty_generation_for_host(host_id, dirty_pages);
 ```
 
-`begin_dirty_generation()` / `capture_dirty_generation()` 和旧 dirty helper 仍表示
+`begin_dirty_generation()` / `capture_dirty_generation()` 仍表示
 host0。Host-scoped bitmap、mapping snapshot 和 generation state 不会因相同 GPA
 page number 而在不同 Host 之间合并。
 
@@ -1085,8 +1019,6 @@ BAR 访问器将 MMIO 寄存器访问翻译为 PCIe TLP：
 | `config_read(addr, data)` | Config Read Type 0 | 配置空间读 |
 | `config_write(addr, data, be)` | Config Write Type 0 | 配置空间写 |
 | `enumerate_bars()` | Config Read/Write | PCI BAR 枚举 |
-| `read_reg_with_error(...)` | Memory Read (BE=0) | 错误注入读 |
-| `write_reg_with_error(...)` | Memory Write (BE=0) | 错误注入写 |
 
 `enumerate_bars()` 的“保存原值 → 写全 1 → 读回 → 计算大小 → 分配地址 → 写入”
 流程仅适用于 legacy/TLM 模型路径，支持 32/64 位 BAR。Fabric-owned REAL_DUT
@@ -1125,11 +1057,6 @@ INTx fallback
 **NAPI 模式支持：**
 - `enter_polling_mode(queue_id)` -- 禁用该队列的中断回调
 - `exit_polling_mode(queue_id)` -- 恢复中断回调
-
-**错误注入：**
-- `inject_spurious_interrupt(vector)` -- 注入虚假中断
-- `inject_missed_interrupt(queue_id)` -- 注入丢失中断
-- `inject_wrong_vector(queue_id)` -- 注入错误向量中断
 
 #### 4.6.5 PCI Transport 封装 (`virtio_pci_transport`)
 
@@ -1280,21 +1207,20 @@ endcase
 
 TX 引擎负责将 `net_packet` 生成的报文组装成 virtio 描述符链：
 
-1. **build_net_hdr()**: 根据 offload feature 构建 virtio-net 头部
-2. **offload 检查**: 如果需要 TSO/USO，调用相应分段引擎
-3. **standard_tx_build_chain()**: 构建 SG 链 `[net_hdr_sg] [pkt_data_sg]`
-4. **vq.add_buf()**: 填写描述符
-5. **kick()**: 如果 `needs_notification()` 返回 true
+1. **`virtio_net_hdr_util::build_tx_hdr()`**: 根据协商的 offload feature 构建 virtio-net 头部
+   （`csum_start/csum_offset`、`gso_type/hdr_len`；VIP 不做分段，分段由设备完成）
+2. **`ops.tx_submit()`**: TX 引擎是薄适配层，经 `virtio_net_dataplane::bind_ops` 绑定的
+   `virtio_atomic_ops` 负责 DMA 分配与 IOMMU 映射、构建 SG 链 `[net_hdr] [pkt_data]`、
+   `vq.add_buf()` 发布描述符，并在 `needs_notification()` 返回 true 时 kick
+3. **`ops.tx_complete()`**: 回收 used 描述符及其 DMA 资源
 
 #### 4.8.2 RX Engine
 
-RX 引擎支持三种 buffer 模式：
+RX 引擎只支持 mergeable buffer 模式：
 
 | 模式 | Feature | Buffer 大小 | 说明 |
 |------|---------|-------------|------|
 | `RX_MODE_MERGEABLE` | `MRG_RXBUF` | 小 buffer (如 1526) | 通过 `num_buffers` 合并多个 buffer |
-| `RX_MODE_BIG` | - | 大 buffer (如 65535) | 单个 buffer 容纳完整报文 |
-| `RX_MODE_SMALL` | - | 页大小 (4096) | 单页 buffer |
 
 RX 自动补充：当空闲描述符数量低于阈值（默认 `queue_size / 4`）时自动补充。
 
@@ -1333,29 +1259,9 @@ ingress callback；不能把 MODEL 注入路径当作 RTL RX 覆盖。
 
 | 引擎 | 功能 |
 |------|------|
-| `virtio_csum_engine` | TX: 计算伪头部 checksum; RX: 验证完整 checksum |
-| `virtio_tso_engine` | TCP 分段，更新 IP/TCP 头部 |
-| `virtio_uso_engine` | UDP 分段（1.2+） |
+| `virtio_csum_engine` | TX: 计算 csum_start/csum_offset; RX: 验证完整 checksum |
+| `virtio_tso_engine` | TCP/UDP GSO 头长度及是否超过 MSS 的判定（分段由设备完成） |
 | `virtio_rss_engine` | Toeplitz hash 计算, 间接表查找, 队列选择 |
-
-#### 4.8.5 Failover Manager
-
-管理 `VIRTIO_NET_F_STANDBY` 的 failover 状态机：
-
-```
-FO_NORMAL -----(primary down)----> FO_PRIMARY_DOWN
-                                        |
-                                        v
-                                   FO_SWITCHING
-                                        |
-                                        v
-                                   FO_STANDBY_ACTIVE
-                                        |
-                              (primary recovered)
-                                        |
-                                        v
-                                   FO_FAILBACK -> FO_NORMAL
-```
 
 ### 4.9 SR-IOV (sriov/)
 
@@ -1368,7 +1274,6 @@ FO_NORMAL -----(primary down)----> FO_PRIMARY_DOWN
 
 virtio 层只管理 virtio 专有状态：
 - `virtio_vf_resource_pool`: local_qid <-> global_qid 映射
-- `failover_manager`: STANDBY feature
 - `admin_vq`: PF 管理队列（1.2+）
 - VF 生命周期: 创建/配置/激活/FLR/禁用
 
@@ -1529,11 +1434,8 @@ PREMAP 初始化没有检查失败哨兵，因此不保证额外产生 `PCIE_TL_
 | | `bw_limit_mbps` | 0 | 带宽限制值 (Mbps) |
 | 验证 | `scb_enable` | 1 | Scoreboard 开关 |
 | | `cov_enable` | 0 | Coverage 开关 |
-| Failover | `failover_enable` | 0 | Failover 开关 |
-| | `primary_vf_id` | 0 | 主 VF ID |
-| | `standby_vf_id` | 1 | 备 VF ID |
 
-#### 4.10.2 Scoreboard（8 个检查类别）
+#### 4.10.2 Scoreboard（7 个检查类别）
 
 | 类别 | 开关 | 检查内容 |
 |------|------|----------|
@@ -1544,7 +1446,6 @@ PREMAP 初始化没有检查失败哨兵，因此不保证额外产生 `PCIE_TL_
 | 通知 | `chk_notification` | kick/中断协议正确性 |
 | DMA 合规 | `chk_dma_compliance` | 地址范围、方向、映射有效性 |
 | 顺序 | `chk_ordering` | 队列内完成顺序 |
-| 配置一致性 | `chk_config_consistency` | 设备配置值匹配 |
 
 #### 4.10.3 Coverage（8 个 Covergroup）
 
@@ -1570,91 +1471,6 @@ PREMAP 初始化没有检查失败哨兵，因此不保证额外产生 `PCIE_TL_
 
 报告: min/max/avg/p50/p95/p99 延迟。
 
-### 4.11 Sequence 库 (seq/)
-
-#### 4.11.1 Base Sequences
-
-| 序列 | 功能 |
-|------|------|
-| `virtio_base_seq` | 所有序列的基类 |
-| `virtio_init_seq` | 完整初始化（INIT + START_DP） |
-| `virtio_tx_seq` | 发送 N 个报文 |
-| `virtio_rx_seq` | 等待接收 N 个报文 |
-| `virtio_ctrl_seq` | 控制 VQ 命令 |
-| `virtio_queue_setup_seq` | 单队列配置 |
-| `virtio_kick_seq` | 显式 kick |
-
-#### 4.11.2 Scenario Sequences
-
-| 目录 | 序列 | 测试场景 |
-|------|------|----------|
-| `lifecycle/` | `virtio_lifecycle_full_seq` | 完整 init-traffic-shutdown 生命周期 |
-| | `virtio_status_error_seq` | 状态转换错误（跳过 ACKNOWLEDGE 等） |
-| | `virtio_feature_error_seq` | Feature 协商错误（部分写入等） |
-| `dataplane/` | `virtio_tso_seq` | TCP/UDP 分段验证 |
-| | `virtio_mrg_rxbuf_seq` | MRG_RXBUF 合并接收 |
-| | `virtio_rss_distribution_seq` | RSS 队列分发验证 |
-| | `virtio_csum_offload_seq` | Checksum offload 验证 |
-| | `virtio_tunnel_pkt_seq` | 隧道报文处理 |
-| `interrupt/` | `virtio_adaptive_irq_seq` | 自适应 IRQ 切换 |
-| | `virtio_event_idx_boundary_seq` | EVENT_IDX 边界条件 |
-| `migration/` | `virtio_live_migration_seq` | 热迁移 freeze/restore |
-| | `virtio_failover_seq` | STANDBY failover |
-| `sriov/` | `virtio_multi_vf_init_seq` | 多 VF 并行初始化 |
-| | `virtio_vf_flr_isolation_seq` | VF FLR 隔离验证 |
-| | `virtio_mixed_vq_type_seq` | 混合队列类型 |
-| `error/` | `virtio_desc_error_seq` | 描述符错误注入 |
-| | `virtio_iommu_fault_seq` | IOMMU fault 注入 |
-| | `virtio_pcie_cross_error_seq` | PCIe 层错误 |
-| | `virtio_bad_packet_seq` | 异常报文 |
-| `concurrency/` | `virtio_concurrent_vf_traffic_seq` | 多 VF 并发流量 |
-| `dynamic/` | `virtio_live_mq_resize_seq` | 运行时 MQ 调整 |
-| `boundary/` | `virtio_boundary_seq` | 边界条件（min/max queue 等） |
-
-#### 4.11.3 Virtual Sequences
-
-| 序列 | 用途 |
-|------|------|
-| `virtio_smoke_vseq` | 冒烟测试：init -> 少量 traffic -> reset |
-| `virtio_full_init_traffic_vseq` | 完整 init + 中等流量 |
-| `virtio_multi_vf_vseq` | 多 VF 并行操作 |
-| `virtio_stress_vseq` | 压力测试：大流量、极端参数 |
-
-### 4.12 回调扩展点 (callbacks/)
-
-#### 4.12.1 数据面回调 (`virtio_dataplane_callback`)
-
-```systemverilog
-virtual class virtio_dataplane_callback extends uvm_object;
-    // TX: 自定义描述符链组装
-    pure virtual function void custom_tx_build_chain(
-        uvm_object pkt, virtio_net_hdr_t hdr, ref virtio_sg_list sgs[$]);
-    // RX: 自定义 buffer 解析
-    pure virtual function void custom_rx_parse_buf(
-        byte unsigned raw_data[$], ref virtio_net_hdr_t hdr, ref uvm_object pkt);
-    // 自定义头部大小/打包/解包
-    pure virtual function int unsigned custom_hdr_size();
-    pure virtual function void custom_hdr_pack(...);
-    pure virtual function void custom_hdr_unpack(...);
-endclass
-```
-
-#### 4.12.2 Scoreboard 回调 (`virtio_scoreboard_callback`)
-
-```systemverilog
-virtual class virtio_scoreboard_callback extends uvm_object;
-    // 自定义报文比较（替代 uvm_object::compare()）
-    pure virtual function bit custom_compare(uvm_object expected, uvm_object actual);
-    // 自定义字段提取（用于调试 vendor-specific 描述符格式）
-    pure virtual function void custom_extract_fields(
-        byte unsigned raw_desc[], ref string field_values[string]);
-endclass
-```
-
-#### 4.12.3 Coverage 回调 (`virtio_coverage_callback`)
-
-用于注册用户自定义 covergroup 采样。
-
 ---
 
 ## 5. Feature 支持矩阵
@@ -1677,7 +1493,7 @@ endclass
 | `VIRTIO_NET_F_GUEST_USO4/6` | 54/55 | 完整 | `default_driver_features[54:55]` |
 | `VIRTIO_NET_F_HOST_USO` | 56 | 完整 | `default_driver_features[56]` |
 | `VIRTIO_NET_F_RSS` | 60 | 完整 | `default_driver_features[60]` |
-| `VIRTIO_NET_F_STANDBY` | 62 | 完整 | `failover_enable` |
+| `VIRTIO_NET_F_STANDBY` | 62 | 仅协商（不建模 failover） | `default_driver_features[62]` |
 | `VIRTIO_F_RING_INDIRECT_DESC` | 28 | 框架 | `default_driver_features[28]` |
 | `VIRTIO_F_RING_EVENT_IDX` | 29 | 完整 | `default_driver_features[29]` |
 | `VIRTIO_F_VERSION_1` | 32 | 完整（必需） | 始终开启 |
@@ -2082,29 +1898,24 @@ ring 消费和 teardown 后必须通过 `leak_check()`。大流量测试则通�
 #### 6.2.1 基本测试模板
 
 ```systemverilog
-class my_test extends virtio_base_test;
+// 继承维护中的 tests/virtio_e2e_test.sv：它负责创建 pcie_tl_env、
+// dpu_device_env、virtio_net_env 并在 connect_phase 调用 bind_pcie()。
+// 配置在其 build_phase 中通过 virtio_cfg（virtio_net_env_config）设置。
+class my_test extends virtio_e2e_test;
     `uvm_component_utils(my_test)
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
 
-    // 自定义配置
-    virtual function void configure_default(virtio_net_env_config cfg);
-        super.configure_default(cfg);
-        cfg.default_num_pairs    = 2;
-        cfg.default_queue_size   = 128;
-        cfg.default_vq_type      = VQ_PACKED;
-        cfg.scb_enable           = 1;
-    endfunction
-
     virtual task run_phase(uvm_phase phase);
-        virtio_full_init_traffic_vseq vseq;
         phase.raise_objection(this);
-
-        vseq = virtio_full_init_traffic_vseq::type_id::create("vseq");
-        vseq.start(env.v_seqr);
-
+        #200ns;
+        phase1_setup_transport();
+        phase2_virtio_init();
+        phase3_dataplane();
+        release_e2e_allocations();
+        phase4_verify();
         phase.drop_objection(this);
     endtask
 endclass
@@ -2162,26 +1973,19 @@ txn.net_hdr = my_hdr;
 VIP 通过 `pcie_tl_vip` 的 RC Agent 与 DUT 的 EP 端交互：
 
 ```systemverilog
-class my_dut_test extends virtio_base_test;
-    pcie_tl_env  pcie_env;
-
-    virtual function void build_phase(uvm_phase phase);
-        super.build_phase(phase);
-        pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
-    endfunction
-
-    virtual function void connect_phase(uvm_phase phase);
-        super.connect_phase(phase);
-        // nonvirtual bind_pcie() 统一绑定所有 PF/VF，并逐层传播失败。
-        if (!env.bind_pcie(pcie_env.rc_agent.sequencer)) begin
-            `uvm_fatal("DUT_BIND", "virtio environment PCIe bind failed")
-            return;
-        end
-    endfunction
-endclass
+// 摘自 tests/virtio_e2e_test.sv::connect_phase；pcie_env/virtio_env/tlm_adapter
+// 均由该测试的 build_phase 创建。
+virtual function void connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+    // nonvirtual bind_pcie() 统一绑定所有 PF/VF，并逐层传播失败。
+    if (!virtio_env.bind_pcie(pcie_env.rc_agent.sequencer, tlm_adapter)) begin
+        `uvm_fatal("DUT_BIND", "virtio environment PCIe bind failed")
+        return;
+    end
+endfunction
 ```
 
-`bind_pcie()` 返回 1 前会验证每个 function 的 driver/monitor/observer、独立 protocol-event VIF 和 MQ capability；任一项失败都会返回 0，并且不会提交环境级 RC sequencer 或 protocol-VIF 计数。调用方必须检查返回值。
+`bind_pcie()` 返回 1 前会验证每个 function 的 driver/monitor/observer、独立 protocol-event VIF 和 MQ capability；任一项失败都会返回 0，并且不会向任何 function 提交 RC sequencer，也不会推进 protocol-VIF 计数。调用方必须检查返回值。
 
 #### 6.3.1a 执行模式与 REAL_DUT 前置条件
 
@@ -2266,7 +2070,7 @@ legacy/TLM 模型路径；Fabric-owned function 会明确报告 `BAR_FABRIC_OWNE
 4. **第四优先：Offload 验证** -- checksum, TSO, USO, RSS
 5. **第五优先：错误恢复** -- 描述符错误、IOMMU fault、DEVICE_NEEDS_RESET
 6. **第六优先：性能基准** -- 延迟分段、带宽极限
-7. **第七优先：高级场景** -- 热迁移、failover、多 VF 并发、动态重配置
+7. **第七优先：高级场景** -- 热迁移、多 VF 并发、动态 MQ 调整
 
 #### 覆盖率目标
 
@@ -2285,18 +2089,18 @@ legacy/TLM 模型路径；Fabric-owned function 会明确报告 `BAR_FABRIC_OWNE
 
 | 限制 | 说明 | 影响 |
 |------|------|------|
-| TLM loopback `get_response()` | 在 TLM loopback 模式下，PCIe RC driver 的 `get_response()` 可能死锁 | 使用 `virtio_cpl_bridge` 中间件解决（见 `virtio_full_test.sv`） |
+| TLM loopback `get_response()` | 在 TLM loopback 模式下，PCIe RC driver 的 `get_response()` 可能死锁 | 使用 `virtio_tlm_completion_adapter` + `virtio_tlm_rc_driver_shim` 解决（见 `virtio_full_test.sv`） |
 | Indirect Descriptors | 框架已定义但未完整实现间接描述符表的分配和填写 | 不影响标准流量测试 |
 | IN_ORDER Completion | Packed Queue 的 `VIRTIO_F_IN_ORDER` 快速路径为框架级实现 | 功能正确但未优化 |
-| net_packet 集成 | TX/RX engine 使用 `uvm_object` 封装 `packet_item` | 需要 `virtio_dataplane_callback` |
+| net_packet 集成 | TX/RX engine 使用 `uvm_object` 封装 `packet_item` | 字节流转换由 `virtio_net_packet_adapter` 完成 |
 
 ### 8.2 Completion Bridge 中间件
 
-为解决 TLM loopback 模式下的 `get_response()` 死锁问题，`virtio_full_test.sv` 引入了三层中间件架构：
+为解决 TLM loopback 模式下的 `get_response()` 死锁问题，`src/transport/virtio_tlm_completion_adapter.sv` 提供三部分（`virtio_full_test.sv` 与 `virtio_e2e_test.sv` 在 build_phase 调用 `install_factory_overrides()` 安装；`virtio_e2e_test.sv` 另经 `virtio_net_env.bind_pcie(rc_seqr, tlm_adapter)` 接入）：
 
-1. **`virtio_cpl_bridge`** -- FIFO 化的 completion 存储（单 mailbox，因 virtio 寄存器访问是顺序的）
-2. **`virtio_rc_driver_shim`** -- 继承 `pcie_tl_rc_driver`，将 completion 推入 bridge
-3. **Bridged Sequences** -- 使用 bridge 的 `wait_completion()` 替代 `get_response()`
+1. **`virtio_tlm_completion_adapter`** -- 按 `{tag, requester_id}` 暂存 completion，直到对应等待方认领
+2. **`virtio_tlm_rc_driver_shim`** -- 经 factory 替换 `pcie_tl_rc_driver`，在父类处理后把 completion 复制进 adapter
+3. **BAR helper sequences** -- `virtio_bar_accessor` 的读写序列使用 adapter 的 `wait_matching_completion()` 替代 `get_response()`
 
 ### 8.3 建议的后续改进
 
@@ -2334,7 +2138,6 @@ legacy/TLM 模型路径；Fabric-owned function 会明确报告 `BAR_FABRIC_OWNE
 | `snapshot_live_mappings_for_host` | function | 快照指定 Host/BDF 的 live mappings |
 | `add_fault_rule` | `function void add_fault_rule(iommu_fault_rule_t rule)` | 添加 fault 规则 |
 | `clear_fault_rules` | `function void clear_fault_rules()` | 清除规则 |
-| `get_and_clear_dirty` | `function void get_and_clear_dirty(ref bit[63:0] dirty_pages[$])` | 获取并清除脏页 |
 | `begin_dirty_generation_for_host` / `capture_dirty_generation_for_host` | function | Host-scoped dirty generation |
 | `leak_check` | `function void leak_check()` | 泄漏检查 |
 | `reset` | `function void reset()` | 重置 |
@@ -2389,9 +2192,6 @@ legacy/TLM 模型路径；Fabric-owned function 会明确报告 `BAR_FABRIC_OWNE
 | `setup_single_queue` | task | 单队列完整配置 |
 | `kick` | task | 通知 (标准或 NOTIFICATION_DATA) |
 | `read_net_config_atomic` | task | 原子读取设备配置 (config generation check) |
-| `inject_status_error` | task | 状态错误注入 |
-| `inject_feature_error` | task | Feature 错误注入 |
-| `inject_queue_setup_error` | task | 队列配置错误注入 |
 
 ### 9.5 virtio_auto_fsm
 

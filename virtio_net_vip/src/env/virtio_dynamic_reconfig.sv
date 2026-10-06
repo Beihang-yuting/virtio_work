@@ -17,7 +17,7 @@
 //
 // Depends on:
 //   - virtio_vf_instance (per-VF driver wrapper)
-//   - virtio_net_types.sv (interrupt_mode_e, virtio_rss_config_t, etc.)
+//   - virtio_net_types.sv (virtio_ctrl_ack_e)
 // ============================================================================
 
 class virtio_dynamic_reconfig extends uvm_report_object;

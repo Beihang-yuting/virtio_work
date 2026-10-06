@@ -1,5 +1,5 @@
 // 目录层次：src/dataplane；提供标准 Virtio RX buffer 投递、取包与解析引擎。
-// 依赖队列管理器、Host memory、IOMMU、packet adapter 和 offload/callback；外部
+// 依赖队列管理器、Host memory、IOMMU、packet adapter 和 offload 引擎；外部
 // 依赖由 Function 借用注入，引擎拥有自己分配的 RX buffer 及其 DMA 映射，完成时
 // 回收。停机前上层必须确认设备停止 DMA，并完成未消费 buffer 的生命周期处理。
 // 私有派生引擎覆写投递/收包与容量查询，把所有权统一交给私有 ops，不使用此表。

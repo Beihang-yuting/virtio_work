@@ -12,12 +12,12 @@
 
 | 指标 | 数值 |
 |------|------|
-| 源文件数 | 90 个 `.sv` 文件 |
-| 代码行数 | 约 20,000 行 SystemVerilog |
+| 源文件数 | 61 个 `.sv` 文件（`virtio_net_vip/src`），另有 34 个测试文件 |
+| 代码行数 | 27,390 行 SystemVerilog（`virtio_net_vip/src`） |
 | 支持规范 | virtio 1.2 / 1.3 |
 | Virtqueue 类型 | Split / Packed / 自定义 |
 | 验证目标 | DPU/SmartNIC virtio-net 设备端 RTL |
-| EDA 工具 | Synopsys VCS（通过 `$VCS_HOME` 配置；当前固定依赖阻断编译） |
+| EDA 工具 | Synopsys VCS（通过 `$VCS_HOME` 配置；外部依赖版本由 `scripts/check_deps.sh` 校验） |
 
 ---
 
@@ -33,7 +33,7 @@ virtio_net_env（顶层环境）
 │   ├── virtqueue_manager                    ← 队列管理（split/packed/自定义）
 │   ├── virtio_net_dataplane                 ← 数据面
 │   │   ├── tx_engine                        ← 发送引擎（集成 net_packet 报文产生器）
-│   │   ├── rx_engine                        ← 接收引擎（三种 buffer 模式）
+│   │   ├── rx_engine                        ← 接收引擎（mergeable buffer 模式）
 │   │   └── offload_engine                   ← 硬件卸载（校验和/TSO/USO/RSS）
 │   └── virtio_pci_transport                 ← PCIe 传输层
 │       ├── pci_cap_manager                  ← PCI Capability 链表发现
@@ -44,7 +44,7 @@ virtio_net_env（顶层环境）
 ├── iommu_model                              ← IOMMU 地址翻译 + 权限检查 + 故障注入
 ├── wait_policy                              ← 统一的超时与轮询等待框架
 ├── perf_monitor                             ← 性能监控（带宽限制 + 延迟剖析）
-├── scoreboard                               ← 记分板（8 类检查项）
+├── scoreboard                               ← 记分板（7 类检查项）
 ├── coverage                                 ← 覆盖率（8 组 covergroup）
 │
 ├── host_mem_manager（外部组件）               ← Buddy/Linear Host memory 后端
@@ -186,7 +186,7 @@ BAR 配置/发现（Fabric: program frozen lease；legacy: enumerate）
 **高级 Feature**：
 - **SR-IOV** — 完整 PF/VF 生命周期（创建/配置/FLR/热迁移）
 - `RING_RESET` — 单队列复位（1.2 新增）
-- `STANDBY` — 主备切换（failover）
+- `STANDBY` — 主备切换特性位（仅参与协商，VIP 不建模 failover 切换）
 - **热迁移** — 队列状态冻结/恢复 + 脏页追踪
 - **Admin VQ** — PF 级 VF 管理队列（1.2 新增）
 
@@ -195,7 +195,7 @@ BAR 配置/发现（Fabric: program frozen lease；legacy: enumerate）
 | 层级 | 注入类型 |
 |------|---------|
 | **Virtqueue 层** | 循环描述符链、越界 index、零长度 buffer、内存屏障跳过、描述符 double-free、use-after-free、avail ring 溢出 |
-| **PCIe 传输层** | 设备状态转换违规、Feature 协商异常、队列配置错误、通知错误（虚假中断/丢失中断） |
+| **PCIe 传输层** | Capability 信息破坏（`virtio_pci_cap_manager.inject_cap_error`） |
 | **IOMMU 层** | 地址未映射、权限不足、use-after-unmap、可编程故障规则（按 Host/BDF/地址范围/方向/触发次数） |
 | **数据面** | 错误校验和、超 MTU 包、零长度包、截断包 |
 
@@ -211,7 +211,7 @@ BAR 配置/发现（Fabric: program frozen lease；legacy: enumerate）
 
 ```
 virtio_net_vip/
-├── src/                                    ← 源代码（90 个文件）
+├── src/                                    ← 源代码（61 个文件）
 │   ├── virtio_net_pkg.sv                   ← 顶层 Package（包含所有源文件）
 │   ├── types/                              ← 类型定义
 │   │   ├── virtio_net_types.sv             ← 所有枚举、结构体、Feature 位定义
@@ -224,8 +224,8 @@ virtio_net_vip/
 │   │   └── virtio_iommu_model.sv           ← 地址翻译 + 权限 + 故障注入
 │   ├── virtqueue/                          ← 虚拟队列
 │   │   ├── virtqueue_base.sv               ← 抽象基类（18 个纯虚方法）
-│   │   ├── split_virtqueue.sv              ← Split 实现（约 500 行）
-│   │   ├── packed_virtqueue.sv             ← Packed 实现（约 750 行）
+│   │   ├── split_virtqueue.sv              ← Split 实现（764 行）
+│   │   ├── packed_virtqueue.sv             ← Packed 实现（861 行）
 │   │   ├── custom_virtqueue.sv             ← 自定义扩展
 │   │   ├── virtqueue_manager.sv            ← 队列工厂与生命周期管理
 │   │   └── virtqueue_error_injector.sv     ← 队列错误注入器
@@ -244,47 +244,26 @@ virtio_net_vip/
 │   │   └── virtio_driver_agent.sv          ← UVM Agent 顶层封装
 │   ├── dataplane/                          ← 数据面
 │   │   ├── virtio_tx_engine.sv             ← 发送引擎（net_packet 集成）
-│   │   ├── virtio_rx_engine.sv             ← 接收引擎（三种 buffer 模式）
+│   │   ├── virtio_rx_engine.sv             ← 接收引擎（mergeable buffer 模式）
 │   │   ├── virtio_offload_engine.sv        ← 统一 Offload 引擎入口
 │   │   ├── virtio_csum_engine.sv           ← 校验和计算/验证
-│   │   ├── virtio_tso_engine.sv            ← TCP 分段
-│   │   ├── virtio_uso_engine.sv            ← UDP 分段
+│   │   ├── virtio_tso_engine.sv            ← TCP/UDP GSO 头长度判定（分段由设备完成）
 │   │   ├── virtio_rss_engine.sv            ← RSS Toeplitz 哈希 + 队列选择
-│   │   ├── virtio_failover_manager.sv      ← 主备切换管理
 │   │   └── virtio_net_dataplane.sv         ← 数据面顶层封装
 │   ├── sriov/                              ← SR-IOV 支持
 │   │   ├── virtio_pf_manager.sv            ← PF 管理（委托 pcie_tl_func_manager）
 │   │   ├── virtio_vf_resource_pool.sv      ← VF 队列资源映射
 │   │   └── virtio_vf_instance.sv           ← 单个 VF 实例封装
-│   ├── env/                                ← 验证环境
-│   │   ├── virtio_net_env_config.sv        ← 统一配置对象（25+ 可配参数）
-│   │   ├── virtio_net_env.sv              ← 顶层环境（组件创建与连接）
-│   │   ├── virtio_scoreboard.sv           ← 记分板（8 类检查）
-│   │   ├── virtio_coverage.sv             ← 覆盖率收集器（8 组 covergroup）
-│   │   ├── virtio_perf_monitor.sv         ← 性能监控（带宽 + 延迟）
-│   │   ├── virtio_virtual_sequencer.sv    ← 虚拟序列器
-│   │   ├── virtio_concurrency_controller.sv ← 并发控制器
-│   │   └── virtio_dynamic_reconfig.sv     ← 动态重配置管理
-│   ├── callbacks/                          ← 回调扩展点
-│   │   ├── virtio_dataplane_callback.sv   ← 数据面自定义（TX 链/RX 解析/HDR 格式）
-│   │   ├── virtio_scoreboard_callback.sv  ← 记分板自定义比对
-│   │   └── virtio_coverage_callback.sv    ← 覆盖率自定义采样
-│   └── seq/                                ← 序列库
-│       ├── base/（7 个文件）                ← 基础序列（init/tx/rx/ctrl/kick/queue_setup）
-│       ├── scenario/（22 个文件，9 个子目录） ← 场景序列
-│       │   ├── lifecycle/                  ← 生命周期（完整循环/状态错误/Feature 错误）
-│       │   ├── dataplane/                  ← 数据面（TSO/MRG_RXBUF/RSS/校验和/隧道）
-│       │   ├── interrupt/                  ← 中断（自适应切换/EVENT_IDX 边界）
-│       │   ├── migration/                  ← 热迁移/Failover
-│       │   ├── sriov/                      ← SR-IOV（多 VF 初始化/FLR 隔离/混合队列）
-│       │   ├── error/                      ← 错误注入（描述符/IOMMU/PCIe/坏包）
-│       │   ├── concurrency/                ← 并发（多 VF 同时发包）
-│       │   ├── dynamic/                    ← 动态变更（带流量 MQ 调整）
-│       │   └── boundary/                   ← 边界（最小/最大队列/chain 满/背压/零包）
-│       └── virtual/（4 个文件）             ← 虚拟序列（冒烟/全功能/多 VF/压力）
+│   └── env/                                ← 验证环境
+│       ├── virtio_net_env_config.sv        ← 统一配置对象（25+ 可配参数）
+│       ├── virtio_net_env.sv              ← 顶层环境（组件创建与连接）
+│       ├── virtio_scoreboard.sv           ← 记分板（7 类检查）
+│       ├── virtio_coverage.sv             ← 覆盖率收集器（8 组 covergroup）
+│       ├── virtio_perf_monitor.sv         ← 性能监控（带宽 + 延迟）
+│       ├── virtio_concurrency_controller.sv ← 并发控制器（多 VF 并行操作/流量）
+│       └── virtio_dynamic_reconfig.sv     ← 动态 MQ 调整
 ├── tests/                                  ← 测试文件
 │   ├── virtio_tb_top.sv                    ← 顶层 Testbench 模块
-│   ├── virtio_base_test.sv                 ← 基础测试类（默认配置）
 │   ├── virtio_unit_test.sv                 ← 单元测试
 │   ├── virtio_stress_unit_test.sv          ← 压力测试
 │   ├── virtio_protocol_test.sv             ← 协议正确性测试
@@ -697,35 +676,32 @@ MSI-X info/linear 和 notify 映射，不触碰 BAR4 table、PBA 或其他业务
 ### 自动模式（推荐用于功能测试）
 
 ```systemverilog
-class my_test extends virtio_base_test;
+// tests/virtio_e2e_test.sv 是维护中的参考骨架：build_phase 创建 pcie_tl_env、
+// dpu_device_env 与 virtio_net_env（PF0 上声明一个 VIO-net service），
+// connect_phase 调用 virtio_env.bind_pcie()。自定义测试继承它并只覆盖
+// run_phase，用法与 tests/virtio_smoke_test.sv 相同。
+class my_test extends virtio_e2e_test;
     `uvm_component_utils(my_test)
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
     endfunction
 
-    // 覆盖默认配置
-    virtual function void configure_default(virtio_net_env_config cfg);
-        super.configure_default(cfg);
-        cfg.default_num_pairs    = 4;           // 4 个队列对
-        cfg.default_vq_type      = VQ_PACKED;   // 使用 Packed 队列
-        cfg.default_irq_mode     = IRQ_POLLING;  // 轮询模式
-        cfg.default_driver_mode  = DRV_MODE_AUTO;
-    endfunction
-
     virtual task run_phase(uvm_phase phase);
-        virtio_function_instance pf_vio;
-        virtio_smoke_vseq vseq;
+        virtio_pci_transport xport;
         phase.raise_objection(this);
+        #200ns;
 
-        // virtio_base_test declares a VIO-net service on PF0.  Per-function
-        // behavior is authored by that service key; the runtime owner is the
-        // corresponding PF function, not an undeclared positional VF.
-        pf_vio = env.pf_instances[0].pf_function;
-        vseq = virtio_smoke_vseq::type_id::create("vseq");
-        vseq.vf_seqr = pf_vio.driver_agent.sequencer;
-        vseq.start(env.v_seqr);
+        phase1_setup_transport();   // 直接设置 BAR，不做 BAR 枚举
+        phase2_virtio_init();       // 经 PCIe TLP 完成 virtio 初始化
+        phase3_dataplane();         // 队列配置与 TX 报文提交
 
+        // 运行时 owner 是 PF0 上 service 对应的 Function，而不是按位置索引 VF。
+        xport = virtio_env.function_instances[0].transport;
+        xport.write_device_status(DEV_STATUS_RESET);
+
+        release_e2e_allocations();
+        phase4_verify();
         phase.drop_objection(this);
     endtask
 endclass
@@ -882,7 +858,7 @@ disable fork;             // 会杀死调用线程下的所有子进程！
 
 **根因**：`pcie_tl_base_driver` 设计为 fire-and-forget 模式。Completion 匹配由 TLM 回环通路异步触发，与 UVM 的 response 队列是两条独立的路径。
 
-**解决方案**：通过 Completion Bridge 中间层（`virtio_cpl_bridge` + `virtio_rc_driver_shim` + 桥接序列）弥合异步缺口。详见 `tests/virtio_full_test.sv`。
+**解决方案**：通过 `src/transport/virtio_tlm_completion_adapter.sv` 中的 `virtio_tlm_completion_adapter`（按 `{tag, requester_id}` 暂存 completion）+ `virtio_tlm_rc_driver_shim`（经 factory 替换 RC driver，把 completion 复制进 adapter）+ BAR helper 序列（`wait_matching_completion()` 认领）弥合异步缺口；adapter 通过 `virtio_net_env.bind_pcie(rc_seqr, tlm_adapter)` 接入。详见 `tests/virtio_full_test.sv`。
 
 **影响范围**：仅影响 TLM 回环自测模式。**对接真实 DUT 后此问题不存在**——所有请求-响应匹配都通过 SV Interface 上的信号时序自然完成。
 
@@ -890,7 +866,7 @@ disable fork;             // 会杀死调用线程下的所有子进程！
 
 **现象**：`pcie_tl_mem_wr_seq` 使用 `uvm_do_with` 随机化 payload，覆盖了 `bar_accessor` 设置的写入数据。
 
-**解决方案**：桥接写序列（`virtio_bar_mem_wr_seq_bridged`）使用 `start_item/finish_item` 直接构造 TLP，绕过 `uvm_do_with`。
+**解决方案**：BAR 写 helper 序列（`virtio_bar_mem_wr_seq`）使用 `start_item/finish_item` 直接构造 TLP，绕过 `uvm_do_with`。
 
 ### 3. 性能监控运行时重配
 
@@ -935,7 +911,7 @@ disable fork;             // 会杀死调用线程下的所有子进程！
 
 | 文档 | 路径 | 说明 |
 |------|------|------|
-| 项目手册（Markdown） | `docs/virtio_net_vip_manual.md` | 约 1900 行详细技术文档 |
+| 项目手册（Markdown） | `docs/virtio_net_vip_manual.md` | 2304 行详细技术文档 |
 | 项目手册（Word） | `docs/Virtio-Net_Driver_UVM_VIP_Manual_v1.0.docx` | Word 格式，适合打印 |
 | 设计规格书 | `docs/superpowers/specs/2026-04-23-virtio-net-driver-vip-design.md` | 完整架构设计 |
 | 实施计划 | `docs/superpowers/plans/2026-04-23-virtio-net-driver-vip-plan.md` | 37 个任务的实施计划 |
