@@ -1,62 +1,19 @@
 `ifndef VIRTIO_TX_ENGINE_SV
 `define VIRTIO_TX_ENGINE_SV
 
-// ============================================================================
-// virtio_buf_tracker
-//
-// Lightweight tracker for DMA buffer allocations associated with a single
-// virtqueue operation. Stores parallel lists of GPA, IOVA, and size so that
-// cleanup (iommu.unmap + mem.free) can be performed after completion.
-// ============================================================================
-
-class virtio_buf_tracker extends uvm_object;
-    `uvm_object_utils(virtio_buf_tracker)
-
-    bit [63:0]   gpa_list[$];
-    bit [63:0]   iova_list[$];
-    int unsigned size_list[$];
-
-    // 构造函数：空跟踪器；三个并行列表在 add 时同步增长。
-    function new(string name = "virtio_buf_tracker");
-        super.new(name);
-    endfunction
-
-    // 追加一条缓冲区记录（GPA/IOVA/长度三元组，索引一一对应）。
-    function void add(bit [63:0] gpa, bit [63:0] iova, int unsigned size);
-        gpa_list.push_back(gpa);
-        iova_list.push_back(iova);
-        size_list.push_back(size);
-    endfunction
-
-    // 返回已跟踪的缓冲区条数（以 gpa_list 为准，三表长度恒一致）。
-    function int unsigned count();
-        return gpa_list.size();
-    endfunction
-endclass : virtio_buf_tracker
-
+// 原始字节队列类型；scoreboard 的 get_pkt_data 也使用它。
 typedef byte unsigned virtio_byte_queue_t[$];
 
 // ============================================================================
 // virtio_tx_engine
 //
-// Handles packet transmission on the driver (guest) side:
-//   1. Builds virtio_net_hdr from raw packet data (checksum, GSO fields).
-//   2. Constructs scatter-gather chains (header buffer + data buffer).
-//   3. Delegates DMA, descriptor publication and the PCIe notify to
-//      virtio_atomic_ops.tx_submit (bound through virtio_net_dataplane.bind_ops).
-//   4. Delegates TX completion and DMA reclamation to virtio_atomic_ops.tx_complete.
-//
-// The packet is passed as a uvm_object handle (packet_item from net_packet).
-// The adapter extracts packet.pkt.raw_data so the UVM length prefix is never
-// sent to the device; non-net_packet test objects keep the legacy do_pack path.
-//
-// Depends on:
-//   - virtqueue_manager, virtqueue_base (add_buf, poll_used, kick)
-//   - host_mem_manager (alloc, write_mem, free)
-//   - virtio_iommu_model (map, unmap)
-//   - virtio_offload_engine (checksum, GSO helpers)
-//   - virtio_net_hdr_util (pack_hdr)
-//   - virtio_buf_tracker (buffer lifecycle tracking)
+// Function.dataplane 的 TX 薄适配层：
+//   1. 从 packet 取线速字节，经 virtio_net_hdr_util::build_tx_hdr 推导 header；
+//   2. DMA、描述符发布与 PCIe notify 委托 virtio_atomic_ops.tx_submit
+//      （经 virtio_net_dataplane.bind_ops 绑定）；
+//   3. 完成与 DMA 回收委托 virtio_atomic_ops.tx_complete。
+// 引擎不持有 DMA 缓冲，只维护统计。私有 Function 注入私有 ops，同一引擎类即可。
+// host_id/bdf 记录 Function 的 DMA 身份，供 fabric 测试断言，收发不读取。
 // ============================================================================
 
 class virtio_tx_engine extends uvm_object;
@@ -65,27 +22,18 @@ class virtio_tx_engine extends uvm_object;
     // ===== External references (set by parent before use) =====
     // ops 是规范 TX 路径（借用）：DMA、描述符发布、通知与完成回收都由它执行。
     virtio_atomic_ops           ops;
-    virtqueue_manager           vq_mgr;
-    host_mem_manager            mem;
-    virtio_iommu_model          iommu;
     virtio_offload_engine       offload;
     bit [15:0]                  bdf;
     int unsigned                host_id;
 
     // ===== Configuration =====
     bit [63:0]       negotiated_features;
-    int unsigned     mtu = 1500;
 
     // ===== Statistics =====
     longint unsigned total_tx_packets  = 0;
     longint unsigned total_tx_bytes    = 0;
     longint unsigned total_tx_errors   = 0;
     longint unsigned total_tx_sg_count = 0;
-
-    // ===== Buffer tracking: token -> buf_tracker =====
-    // Each submitted packet gets a virtio_buf_tracker stored here so that
-    // complete_tx can unmap and free the corresponding DMA buffers.
-    protected virtio_buf_tracker tx_buf_map[uvm_object];
 
     // ------------------------------------------------------------------
     // Constructor
@@ -97,9 +45,6 @@ class virtio_tx_engine extends uvm_object;
 
     // ==================================================================
     // submit_packet
-    //
-    // Top-level TX entry point. Builds virtio_net_hdr from the packet,
-    // then submits the header + payload to the specified transmit queue.
     //
     // Parameters:
     //   queue_id     -- Target TX virtqueue ID
@@ -166,135 +111,7 @@ class virtio_tx_engine extends uvm_object;
     endtask : submit_packet
 
     // ==================================================================
-    // submit_single (protected)
-    //
-    // Builds the scatter-gather chain and calls add_buf on the virtqueue.
-    // ==================================================================
-    protected virtual task submit_single(
-        int unsigned     queue_id,
-        byte unsigned    pkt_data[$],
-        virtio_net_hdr_t hdr,
-        uvm_object       token,
-        bit              use_indirect,
-        ref int unsigned desc_id
-    );
-        virtqueue_base     vq;
-        virtio_sg_list     sgs[$];
-        virtio_sg_list     sgs_arr[];
-        virtio_buf_tracker tracker;
-
-        vq = vq_mgr.get_queue(queue_id);
-        if (vq == null) begin
-            `uvm_error("TX_ENG",
-                $sformatf("submit_single: queue %0d not found", queue_id))
-            total_tx_errors++;
-            return;
-        end
-
-        // Build tracker for this submission
-        tracker = virtio_buf_tracker::type_id::create("tx_tracker");
-
-        // Build scatter-gather chain
-        standard_tx_build_chain(pkt_data, hdr, sgs, tracker);
-
-        // Convert dynamic queue to static array for add_buf
-        sgs_arr = new[sgs.size()];
-        foreach (sgs[i])
-            sgs_arr[i] = sgs[i];
-
-        // All SGs are device-readable (out): n_out = sgs.size(), n_in = 0
-        desc_id = vq.add_buf(sgs_arr, sgs_arr.size(), 0, token, use_indirect);
-
-        // add_buf() does not own the caller's TX buffers.  If it rejects the
-        // chain, undo this attempt's maps and allocations before any success
-        // bookkeeping makes the packet visible to completion handling.
-        if (desc_id == '1) begin
-            for (int i = 0; i < tracker.count(); i++) begin
-                iommu.unmap_for_host(host_id, bdf, tracker.iova_list[i]);
-                mem.free(tracker.gpa_list[i]);
-            end
-            return;
-        end
-
-        // Store tracker for cleanup at completion time
-        tx_buf_map[token] = tracker;
-
-        // Update statistics
-        total_tx_packets++;
-        total_tx_bytes    += pkt_data.size();
-        total_tx_sg_count += sgs_arr.size();
-
-        `uvm_info("TX_ENG",
-            $sformatf("submit_single: queue=%0d desc_id=%0d pkt_size=%0d sgs=%0d",
-                      queue_id, desc_id, pkt_data.size(), sgs_arr.size()),
-            UVM_HIGH)
-
-    endtask : submit_single
-
-    // ==================================================================
-    // standard_tx_build_chain (protected)
-    //
-    // Standard TX chain layout: [net_hdr (out)] [pkt_data (out)]
-    // Both buffers are device-readable (DMA_TO_DEVICE).
-    // ==================================================================
-    protected virtual task standard_tx_build_chain(
-        byte unsigned          pkt_data[$],
-        virtio_net_hdr_t       hdr,
-        ref virtio_sg_list     sgs[$],
-        ref virtio_buf_tracker tracker
-    );
-        byte unsigned  hdr_bytes[$];
-        bit [63:0]     hdr_gpa, hdr_iova;
-        bit [63:0]     data_gpa, data_iova;
-        virtio_sg_list hdr_sg, data_sg;
-
-        // ---- 1. Pack net_hdr to bytes ----
-        virtio_net_hdr_util::pack_hdr(hdr, negotiated_features, hdr_bytes);
-
-        // ---- 2. Allocate host memory for header buffer ----
-        hdr_gpa = mem.alloc(hdr_bytes.size(), .align(1));
-        begin
-            byte hdr_tmp[] = new[hdr_bytes.size()];
-            foreach (hdr_bytes[i]) hdr_tmp[i] = hdr_bytes[i];
-            mem.write_mem(hdr_gpa, hdr_tmp);
-        end
-
-        // ---- 3. Allocate host memory for data buffer ----
-        data_gpa = mem.alloc(pkt_data.size(), .align(1));
-        begin
-            byte data_tmp[] = new[pkt_data.size()];
-            foreach (pkt_data[i]) data_tmp[i] = pkt_data[i];
-            mem.write_mem(data_gpa, data_tmp);
-        end
-
-        // ---- 4. DMA map both (device reads these) ----
-        hdr_iova  = iommu.map_for_host(host_id, bdf, hdr_gpa,
-                                       hdr_bytes.size(), DMA_TO_DEVICE);
-        data_iova = iommu.map_for_host(host_id, bdf, data_gpa,
-                                       pkt_data.size(), DMA_TO_DEVICE);
-
-        // ---- 5. Track allocations for cleanup ----
-        tracker.add(hdr_gpa,  hdr_iova,  hdr_bytes.size());
-        tracker.add(data_gpa, data_iova, pkt_data.size());
-
-        // ---- 6. Build scatter-gather lists ----
-        hdr_sg.entries.push_back('{addr: hdr_iova,  len: hdr_bytes.size(), is_indirect: 0});
-        data_sg.entries.push_back('{addr: data_iova, len: pkt_data.size(),  is_indirect: 0});
-        sgs.push_back(hdr_sg);
-        sgs.push_back(data_sg);
-
-    endtask : standard_tx_build_chain
-
-    // ==================================================================
-    // complete_tx
-    //
-    // Polls the used ring for completed TX descriptors, cleans up DMA
-    // mappings and host memory, and returns completed tokens.
-    //
-    // Parameters:
-    //   queue_id  -- TX virtqueue ID to poll
-    //   budget    -- Maximum number of completions to process
-    //   completed -- [output] List of completed packet tokens
+    // complete_tx -- ops 按提交顺序回收每包的 header/payload DMA 所有权
     // ==================================================================
     virtual task complete_tx(
         int unsigned      queue_id,
@@ -321,39 +138,11 @@ class virtio_tx_engine extends uvm_object;
     endtask : complete_tx
 
     // ==================================================================
-    // cleanup_tx_buffers (protected)
-    //
-    // Unmaps IOMMU entries and frees host memory for all buffers
-    // associated with a completed TX token.
-    // ==================================================================
-    protected virtual function void cleanup_tx_buffers(uvm_object token);
-        virtio_buf_tracker tracker;
-
-        if (!tx_buf_map.exists(token)) begin
-            `uvm_info("TX_ENG",
-                "cleanup_tx_buffers: no tracker found (already cleaned)",
-                UVM_HIGH)
-            return;
-        end
-
-        tracker = tx_buf_map[token];
-
-        for (int i = 0; i < tracker.count(); i++) begin
-            iommu.unmap_for_host(host_id, bdf, tracker.iova_list[i]);
-            mem.free(tracker.gpa_list[i]);
-        end
-
-        tx_buf_map.delete(token);
-    endfunction : cleanup_tx_buffers
-
-    // ==================================================================
     // extract_pkt_data (protected)
     //
-    // Extracts raw byte data from a uvm_object packet handle.
-    // Uses uvm_packer to call pack() on the object, converting the
-    // resulting bitstream to a byte queue. In a full net_packet
-    // integration, $cast to packet_item would access pkt.raw_data
-    // directly.
+    // net_packet::packet_item goes through virtio_net_packet_adapter so
+    // the UVM length prefix is never sent; other objects keep the legacy
+    // do_pack() bitstream conversion.
     // ==================================================================
     protected virtual function virtio_byte_queue_t extract_pkt_data(uvm_object pkt);
         byte unsigned data[$];
@@ -398,26 +187,11 @@ class virtio_tx_engine extends uvm_object;
     // ==================================================================
     function void print_stats();
         `uvm_info("TX_ENG_STATS",
-            $sformatf({"TX Stats: packets=%0d bytes=%0d errors=%0d ",
-                       "sg_chains=%0d outstanding=%0d"},
+            $sformatf("TX Stats: packets=%0d bytes=%0d errors=%0d sg_chains=%0d",
                       total_tx_packets, total_tx_bytes, total_tx_errors,
-                      total_tx_sg_count, tx_buf_map.size()),
+                      total_tx_sg_count),
             UVM_LOW)
     endfunction : print_stats
-
-    // ==================================================================
-    // leak_check -- Warn about outstanding TX buffers at test end
-    // ==================================================================
-    function void leak_check();
-        if (tx_buf_map.size() > 0) begin
-            `uvm_warning("TX_ENG_LEAK",
-                $sformatf("%0d outstanding TX buffer tracker(s) -- possible leak",
-                          tx_buf_map.size()))
-        end else begin
-            `uvm_info("TX_ENG_LEAK",
-                "TX engine: clean -- no outstanding buffer trackers", UVM_LOW)
-        end
-    endfunction : leak_check
 
 endclass : virtio_tx_engine
 

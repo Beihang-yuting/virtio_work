@@ -333,10 +333,11 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
         if ((filled != 0) && vq.needs_notification()) kick_queue(queue_id);
     endtask
 
-    // 按 RX CQ pkt_len 读取整个原始帧并解析 packet_item；单 buffer 所有权在复制后
-    // 回收。回调拒绝非法/多 buffer CQ 时保持索引与 DMA 记录不变。
-    virtual task rx_receive(int unsigned queue_id,
-                             ref uvm_object received_pkts[$], int unsigned max_budget);
+    // 按 RX CQ pkt_len 读取整个原始帧；私有 ring 不带 Virtio-net header，帧本身即
+    // payload，net_hdr 置零、num_buffers=1。单 buffer 所有权在复制后回收。回调拒绝
+    // 非法/多 buffer CQ 时保持索引与 DMA 记录不变。dataplane 引擎经此入口收包。
+    virtual task rx_receive_frames(int unsigned queue_id, int unsigned max_budget,
+                                    ref virtio_rx_frame_t frames[$]);
         virtqueue_base vq;
         uvm_object token;
         int unsigned len;
@@ -345,8 +346,7 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
         for (int unsigned n = 0; n < max_budget; n++) begin
             normal_dma_record_t rec;
             byte data[];
-            byte unsigned raw[$];
-            packet_item pkt;
+            virtio_rx_frame_t frame;
             if (!vq.poll_used(token, len)) break;
             if (!rx_dma_map.exists(queue_id) || rx_dma_map[queue_id].size() == 0) begin
                 `uvm_fatal("DPU_PRIV_OPS", "RX 完成缺少 DMA 所有权记录")
@@ -354,15 +354,29 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
             end
             rec = rx_dma_map[queue_id].pop_front();
             mem.read_mem(rec.gpa, len, data);
-            foreach (data[i]) raw.push_back(data[i]);
+            foreach (data[i]) frame.payload.push_back(data[i]);
             retire_normal_dma_record(rec);
-            if (virtio_net_packet_adapter::unpack(raw, pkt))
+            frame.net_hdr = '{default:0};
+            frame.token = token;
+            frame.num_buffers = 1;
+            frames.push_back(frame);
+        end
+        if (rx_dma_map.exists(queue_id) && rx_dma_map[queue_id].size() == 0)
+            rx_dma_map.delete(queue_id);
+    endtask
+
+    // 原始帧解析为 packet_item；私有 ring 只承载以太网帧，无法解析时报错丢弃。
+    virtual task rx_receive(int unsigned queue_id,
+                             ref uvm_object received_pkts[$], int unsigned max_budget);
+        virtio_rx_frame_t frames[$];
+        rx_receive_frames(queue_id, max_budget, frames);
+        foreach (frames[i]) begin
+            packet_item pkt;
+            if (virtio_net_packet_adapter::unpack(frames[i].payload, pkt))
                 received_pkts.push_back(pkt);
             else
                 `uvm_error("DPU_PRIV_OPS", "RX 原始帧无法解析")
         end
-        if (rx_dma_map.exists(queue_id) && rx_dma_map[queue_id].size() == 0)
-            rx_dma_map.delete(queue_id);
     endtask
 
     // 标准控制命令不能发到私有 data ring；返回错误 ACK，不改队列或设备。

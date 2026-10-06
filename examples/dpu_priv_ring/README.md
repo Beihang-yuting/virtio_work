@@ -14,7 +14,6 @@
 | `src/dpu_priv/dpu_priv_ring_callback.sv` | 16B TX/RX 描述符、CQ、wrap、64KiB TX 分片 |
 | `src/dpu_priv/dpu_priv_atomic_ops.sv` | 自动建队、连续 ring DMA 映射、原始帧收发、资源回收 |
 | `src/dpu_priv/dpu_priv_auto_fsm.sv` | 私有初始化与公共 FSM 收发/停止流程 |
-| `src/dpu_priv/dpu_priv_dataplane.sv` | 让 `function.dataplane` 的引擎也共用同一套私有 ops |
 
 ## 1. 在顶层准备设备控制后端
 
@@ -81,7 +80,8 @@ DPU 的全局队列资源编号。同一本地号可出现在不同 Host/Functio
 
 照常构建顶层环境，并使用现有 `bind_pcie_endpoints()`、`bind_pcie()` 或
 Function 的 `wire_shared()` 绑定资源。环境把私有配置交给对应 Function，
-后者自动创建 `dpu_priv_atomic_ops`、`dpu_priv_auto_fsm` 和私有 TX/RX 引擎。
+后者自动创建 `dpu_priv_atomic_ops`、`dpu_priv_auto_fsm`，并把私有 ops 注入
+`function.dataplane` 的标准 TX/RX 引擎。
 不需要全局 factory override，也不需要手动给每条队列设置 `custom_cb`。
 
 ```systemverilog

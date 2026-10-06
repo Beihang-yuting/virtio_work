@@ -1,33 +1,11 @@
-// 目录层次：src/dataplane；提供标准 Virtio RX buffer 投递、取包与解析引擎。
-// 依赖队列管理器、Host memory、IOMMU、packet adapter 和 offload 引擎；外部
-// 依赖由 Function 借用注入，引擎拥有自己分配的 RX buffer 及其 DMA 映射，完成时
-// 回收。停机前上层必须确认设备停止 DMA，并完成未消费 buffer 的生命周期处理。
-// 私有派生引擎覆写投递/收包与容量查询，把所有权统一交给私有 ops，不使用此表。
+// 目录层次：src/dataplane；Function.dataplane 的 RX 薄适配层。
+// buffer 投递、取包、合包、DMA 所有权与 notify 全部由注入的 virtio_atomic_ops
+// （rx_refill / rx_receive_frames）执行；引擎只做可选的 RX checksum 校验、把帧
+// 转为 packet_item（或 wrapper）、维护统计与自动补充门限。私有 Function 注入
+// 私有 ops，并以 refill_threshold=0 关闭自动补充。host_id/bdf 记录 DMA 身份，
+// 供 fabric 测试断言，收发不读取。
 `ifndef VIRTIO_RX_ENGINE_SV
 `define VIRTIO_RX_ENGINE_SV
-
-// ============================================================================
-// virtio_rx_engine
-//
-// Handles packet reception on the driver (guest) side:
-//   1. Pre-fills RX virtqueues with device-writable buffers.
-//   2. Polls used ring for completed RX descriptors.
-//   3. Parses virtio_net_hdr from received buffers.
-//   4. Merges multi-buffer packets (MRG_RXBUF mode).
-//   5. Verifies RX checksums when GUEST_CSUM is negotiated.
-//   6. Auto-refills buffers when free count drops below threshold.
-//
-// Buffer mode: RX_MODE_MERGEABLE only -- several buffers can be merged for
-// one packet; the header carries the num_buffers field.
-//
-// Depends on:
-//   - virtqueue_manager, virtqueue_base (add_buf, poll_used, kick)
-//   - host_mem_manager (alloc, read_mem, mem_set, free)
-//   - virtio_iommu_model (map, unmap)
-//   - virtio_offload_engine (RX checksum verification)
-//   - virtio_net_hdr_util (unpack_hdr, get_hdr_size)
-//   - virtio_buf_tracker (buffer lifecycle tracking)
-// ============================================================================
 
 // ============================================================================
 // virtio_rx_pkt_wrapper
@@ -53,40 +31,28 @@ class virtio_rx_pkt_wrapper extends uvm_object;
 
 endclass : virtio_rx_pkt_wrapper
 
-// 在队列内存操作之上集中处理标准 header、合包和统计；不负责设备控制面停机。
+// 只保存配置与统计；DMA 资源由 ops 所有，停机前由上层确认设备停止 DMA。
 class virtio_rx_engine extends uvm_object;
     `uvm_object_utils(virtio_rx_engine)
 
     // ===== External references (set by parent before use) =====
     // ops 是规范 RX 路径（借用）：buffer 分配、通知、取包与 DMA 回收由它执行。
     virtio_atomic_ops           ops;
-    virtqueue_manager           vq_mgr;
-    host_mem_manager            mem;
-    virtio_iommu_model          iommu;
     virtio_offload_engine       offload;
     bit [15:0]                  bdf;
     int unsigned                host_id;
 
     // ===== Configuration =====
     bit [63:0]       negotiated_features;
-    rx_buf_mode_e    buf_mode         = RX_MODE_MERGEABLE;
-    int unsigned     buf_size         = 1526;    // default for mergeable mode
-    int unsigned     refill_threshold = 16;      // refill when free < this
+    int unsigned     buf_size         = 1526;    // 描述符可写容量
+    int unsigned     refill_threshold = 16;      // free < 此值时自动补充；0 关闭
 
     // ===== Statistics =====
     longint unsigned total_rx_packets = 0;
     longint unsigned total_rx_bytes   = 0;
-    longint unsigned total_rx_errors  = 0;
     longint unsigned total_rx_merged  = 0;       // MRG_RXBUF merge events
 
-    // ===== Buffer tracking: gpa -> {iova, size} for outstanding RX buffers =====
-    protected bit [63:0]   rx_buf_gpa_to_iova[bit [63:0]];
-    protected int unsigned rx_buf_gpa_to_size[bit [63:0]];
-
-    // ------------------------------------------------------------------
-    // Constructor
-    // ------------------------------------------------------------------
-    // 初始化未协商的引擎；构造时不分配 buffer，外部资源须先绑定再投递。
+    // 初始化未协商的引擎；构造时不分配 buffer，ops 须先绑定再投递。
     function new(string name = "virtio_rx_engine");
         super.new(name);
         negotiated_features = 64'h0;
@@ -112,27 +78,11 @@ class virtio_rx_engine extends uvm_object;
         return fallback_obj;
     endfunction
 
-    // ==================================================================
-    // get_rx_buf_size
-    //
-    // Returns the mergeable RX buffer allocation size.
-    // ==================================================================
-    // 查询 mergeable buffer 容量；设为虚接口供私有协议返回不含 Virtio header 的容量。
+    // 查询每个 RX buffer 的可写容量（私有 Function 装配为不含 header 的私有容量）。
     virtual function int unsigned get_rx_buf_size();
         return buf_size;
     endfunction : get_rx_buf_size
 
-    // ==================================================================
-    // refill_buffers
-    //
-    // Pre-fills the RX virtqueue with device-writable buffers.
-    // Each buffer is allocated in host memory, zero-filled, DMA-mapped,
-    // and submitted as a single-entry scatter-gather list with n_in=1.
-    //
-    // Parameters:
-    //   queue_id -- RX virtqueue ID
-    //   count    -- Number of buffers to add (capped by free descriptors)
-    // ==================================================================
     // 向 queue_id 最多补充 count 个可写 buffer（容量取 get_rx_buf_size()），受空闲
     // 描述符限制；分配、映射、所有权登记与真实 notify 由 ops 执行。队列不存在则报错。
     virtual task refill_buffers(
@@ -152,17 +102,6 @@ class virtio_rx_engine extends uvm_object;
             UVM_HIGH)
     endtask : refill_buffers
 
-    // ==================================================================
-    // receive_packets
-    //
-    // Top-level RX entry point. Receives frames through the bound
-    // atomic ops, then auto-refills if needed.
-    //
-    // Parameters:
-    //   queue_id -- RX virtqueue ID to poll
-    //   budget   -- Maximum number of packets to receive
-    //   received -- [output] List of received packet tokens (uvm_object)
-    // ==================================================================
     // 经 ops 取得至多 budget 个帧（ops 完成合包与 DMA 回收），可选校验 RX checksum，
     // 合法帧返回 packet_item、非法帧返回 wrapper；之后按 free-count 门限补充。
     virtual task receive_packets(
@@ -209,201 +148,13 @@ class virtio_rx_engine extends uvm_object;
             refill_buffers(queue_id, refill_threshold);
     endtask : receive_packets
 
-    // ==================================================================
-    // receive_mergeable (protected)
-    //
-    // Mergeable buffer receive: parses net_hdr, checks num_buffers,
-    // merges additional buffers if needed, and builds the packet.
-    // ==================================================================
-    // 解析首 buffer 的标准 header，并按 num_buffers 消费后续完成项合包；复制后
-    // 回收 buffer。非法 token/header 或缺少后续完成项报错计数，供负向场景诊断。
-    protected virtual task receive_mergeable(
-        int unsigned      queue_id,
-        int unsigned      budget,
-        ref uvm_object    received[$]
-    );
-        virtqueue_base     vq;
-        uvm_object         token;
-        int unsigned       len;
-        int unsigned       count;
-        int unsigned       hdr_size;
-
-        vq = vq_mgr.get_queue(queue_id);
-        if (vq == null) begin
-            `uvm_error("RX_ENG",
-                $sformatf("receive_mergeable: queue %0d not found", queue_id))
-            return;
-        end
-
-        hdr_size = virtio_net_hdr_util::get_hdr_size(negotiated_features);
-        count = 0;
-
-        while (count < budget) begin
-            virtio_buf_tracker tracker;
-            byte              buf_data[];
-            byte unsigned      payload[$];
-            virtio_net_hdr_t   net_hdr;
-            bit [63:0]         buf_gpa;
-            int unsigned       num_bufs;
-
-            // 1. Poll for next used buffer
-            if (!vq.poll_used(token, len))
-                break;
-
-            // 2. Recover GPA from tracker token
-            if (!$cast(tracker, token) || tracker.count() == 0) begin
-                `uvm_error("RX_ENG",
-                    "receive_mergeable: invalid tracker token")
-                total_rx_errors++;
-                continue;
-            end
-
-            buf_gpa = tracker.gpa_list[0];
-
-            // 3. Read buffer data from host memory
-            mem.read_mem(buf_gpa, len, buf_data);
-
-            // 4. Parse net_hdr from the beginning of the buffer
-            if (buf_data.size() < hdr_size) begin
-                `uvm_error("RX_ENG",
-                    $sformatf("receive_mergeable: buffer too small (%0d < hdr %0d)",
-                              buf_data.size(), hdr_size))
-                cleanup_rx_buffer(buf_gpa);
-                total_rx_errors++;
-                continue;
-            end
-
-            begin
-                byte unsigned buf_data_u[$];
-                foreach (buf_data[i]) buf_data_u.push_back(buf_data[i]);
-                virtio_net_hdr_util::unpack_hdr(buf_data_u, negotiated_features, net_hdr);
-
-                // 5. Extract payload (everything after the header)
-                for (int i = hdr_size; i < len; i++)
-                    payload.push_back(buf_data_u[i]);
-            end
-
-            // 6. Cleanup first buffer
-            cleanup_rx_buffer(buf_gpa);
-
-            // 7. Merge additional buffers if num_buffers > 1
-            num_bufs = net_hdr.num_buffers;
-            // num_buffers is only meaningful with MRG_RXBUF; a VERSION_1
-            // header carries the field but the packet is always one buffer.
-            if (num_bufs == 0 || !negotiated_features[VIRTIO_NET_F_MRG_RXBUF])
-                num_bufs = 1;  // Spec says 0 means 1 for legacy
-
-            if (num_bufs > 1) begin
-                for (int i = 1; i < num_bufs; i++) begin
-                    uvm_object         merge_token;
-                    int unsigned       merge_len;
-                    virtio_buf_tracker merge_tracker;
-                    byte              merge_data[];
-                    bit [63:0]         merge_gpa;
-
-                    if (!vq.poll_used(merge_token, merge_len)) begin
-                        `uvm_error("RX_ENG",
-                            $sformatf("receive_mergeable: expected %0d buffers, got %0d",
-                                      num_bufs, i))
-                        total_rx_errors++;
-                        break;
-                    end
-
-                    if (!$cast(merge_tracker, merge_token) || merge_tracker.count() == 0) begin
-                        `uvm_error("RX_ENG",
-                            "receive_mergeable: invalid merge tracker token")
-                        total_rx_errors++;
-                        continue;
-                    end
-
-                    merge_gpa = merge_tracker.gpa_list[0];
-                    mem.read_mem(merge_gpa, merge_len, merge_data);
-
-                    // Append all data (no header in continuation buffers)
-                    foreach (merge_data[j])
-                        payload.push_back(merge_data[j]);
-
-                    cleanup_rx_buffer(merge_gpa);
-                end
-                total_rx_merged++;
-            end
-
-            // 8. RX checksum verification
-            if (negotiated_features[VIRTIO_NET_F_GUEST_CSUM]) begin
-                if (!offload.verify_rx_csum(net_hdr, payload)) begin
-                    `uvm_warning("RX_ENG",
-                        $sformatf("receive_mergeable: RX checksum verification failed, pkt_size=%0d",
-                                  payload.size()))
-                end
-            end
-
-            // 9. Return a real net_packet item for valid Ethernet payloads.
-            received.push_back(build_received_packet(payload, net_hdr));
-
-            total_rx_packets++;
-            total_rx_bytes += payload.size();
-            count++;
-        end
-
-        `uvm_info("RX_ENG",
-            $sformatf("receive_mergeable: queue=%0d received=%0d", queue_id, count),
-            UVM_HIGH)
-
-    endtask : receive_mergeable
-
-    // ==================================================================
-    // cleanup_rx_buffer (protected)
-    //
-    // Unmaps IOMMU entry and frees host memory for a single RX buffer.
-    // ==================================================================
-    // 注销指定 GPA 的本引擎映射并释放 Host 内存；只能用于已完成的自有 buffer，
-    // 不能用它释放其他 ops/引擎所有的资源或仍被设备访问的缓冲。
-    protected virtual function void cleanup_rx_buffer(bit [63:0] buf_gpa);
-        if (rx_buf_gpa_to_iova.exists(buf_gpa)) begin
-            iommu.unmap_for_host(host_id, bdf, rx_buf_gpa_to_iova[buf_gpa]);
-            rx_buf_gpa_to_iova.delete(buf_gpa);
-        end
-
-        if (rx_buf_gpa_to_size.exists(buf_gpa))
-            rx_buf_gpa_to_size.delete(buf_gpa);
-
-        mem.free(buf_gpa);
-    endfunction : cleanup_rx_buffer
-
-    // ==================================================================
-    // print_stats -- Log RX engine statistics
-    // ==================================================================
-    // 输出收包、字节、错误与本引擎未回收 buffer 计数，不改变运行态。
+    // 输出收包、字节与合包计数，不改变运行态。
     function void print_stats();
         `uvm_info("RX_ENG_STATS",
-            $sformatf({"RX Stats: packets=%0d bytes=%0d errors=%0d ",
-                       "merged=%0d outstanding_bufs=%0d"},
-                      total_rx_packets, total_rx_bytes, total_rx_errors,
-                      total_rx_merged, rx_buf_gpa_to_iova.size()),
+            $sformatf("RX Stats: packets=%0d bytes=%0d merged=%0d",
+                      total_rx_packets, total_rx_bytes, total_rx_merged),
             UVM_LOW)
     endfunction : print_stats
-
-    // ==================================================================
-    // leak_check -- Warn about outstanding RX buffers at test end
-    // ==================================================================
-    // 检查本引擎持有的未完成 buffer，逐项告警而不强行释放；私有派生类的资源
-    // 由 ops 跟踪，须另外检查 ops/IOMMU，不能以此表为空推断私有队列无泄漏。
-    function void leak_check();
-        if (rx_buf_gpa_to_iova.size() > 0) begin
-            `uvm_warning("RX_ENG_LEAK",
-                $sformatf("%0d outstanding RX buffer(s) -- possible leak",
-                          rx_buf_gpa_to_iova.size()))
-            foreach (rx_buf_gpa_to_iova[gpa]) begin
-                `uvm_warning("RX_ENG_LEAK",
-                    $sformatf("  GPA=0x%016x IOVA=0x%016x size=%0d",
-                              gpa, rx_buf_gpa_to_iova[gpa],
-                              rx_buf_gpa_to_size.exists(gpa) ? rx_buf_gpa_to_size[gpa] : 0))
-            end
-        end else begin
-            `uvm_info("RX_ENG_LEAK",
-                "RX engine: clean -- no outstanding buffers", UVM_LOW)
-        end
-    endfunction : leak_check
 
 endclass : virtio_rx_engine
 

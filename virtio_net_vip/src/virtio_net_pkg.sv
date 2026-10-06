@@ -103,7 +103,6 @@ package virtio_net_pkg;
   `include "dataplane/virtio_tx_engine.sv"
   `include "dataplane/virtio_rx_engine.sv"
   `include "dataplane/virtio_net_dataplane.sv"
-  `include "dpu_priv/dpu_priv_dataplane.sv"
 
   // ---------------------------------------------------------------------------
   // 第 7 层 – SR-IOV PF/VF 编排（sriov/）

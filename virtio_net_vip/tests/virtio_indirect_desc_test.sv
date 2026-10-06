@@ -681,7 +681,7 @@ class virtio_indirect_desc_test extends uvm_test;
 
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
-                            vq_mgr, mem, iommu, 16'h0703);
+                            16'h0703);
         transport.bdf = 16'h0703;
         ops.transport = transport;
         ops.vq_mgr = vq_mgr;
@@ -706,7 +706,7 @@ class virtio_indirect_desc_test extends uvm_test;
 
         features[VIRTIO_F_RING_INDIRECT_DESC] = 1'b1;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
-                            vq_mgr, mem, iommu, 16'h0703);
+                            16'h0703);
         ops.negotiated_features = features;
         desc_id = '1;
         dataplane.tx_engine.submit_packet(0, token, 1'b1, desc_id);
@@ -860,7 +860,7 @@ class virtio_indirect_desc_test extends uvm_test;
 
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
-                            vq_mgr, mem, iommu, 16'h0705);
+                            16'h0705);
         transport.bdf = 16'h0705;
         ops.transport = transport;
         ops.vq_mgr = vq_mgr;
@@ -1179,7 +1179,7 @@ class virtio_indirect_desc_test extends uvm_test;
         features = '0;
         ops.negotiated_features = features;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 0,
-                            vq_mgr, mem, iommu, 16'h0706);
+                            16'h0706);
         dataplane.bind_ops(ops);
         token = virtio_dataplane_indirect_test_packet::type_id::create(
             "dataplane_notify_token");

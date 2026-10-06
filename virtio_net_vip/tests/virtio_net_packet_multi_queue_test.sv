@@ -275,7 +275,7 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
         end
 
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE,
-                            2048, 0, vq_mgr, mem, iommu, DEVICE_BDF, 0);
+                            2048, 0, DEVICE_BDF, 0);
         transport = virtio_net_packet_mq_test_transport::type_id::create(
             "multi_queue_transport");
         transport.bdf = DEVICE_BDF;
@@ -394,7 +394,6 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
             end
         end
 
-        dataplane.cleanup_all();
         foreach (queues[qid])
             queues[qid].free_rings();
         vq_mgr.leak_check();

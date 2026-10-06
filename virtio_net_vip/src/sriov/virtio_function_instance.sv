@@ -395,33 +395,24 @@ class virtio_function_instance extends uvm_component;
 
         // Keep the optional standalone dataplane wrapper in the same
         // host-qualified DMA domain as the function-owned queue/atomic path.
+        // 标准与私有 Function 使用同一引擎类，只是注入的 ops 不同；收发、DMA
+        // 所有权与通知都在 ops 内，engine 与 FSM/sequence 共用同一张所有权表。
         if (dataplane != null) begin
-            // 私有 Function 的引擎也复用同一个 ops，保证 engine 与 sequence/FSM
-            // 不会各自产生一套 DMA tracker 或混入标准 Virtio-net header。
             if (private_cfg != null) begin
-                dpu_priv_tx_engine tx_adapter;
-                dpu_priv_rx_engine rx_adapter;
-                tx_adapter = new({function_name, "_private_tx"});
-                rx_adapter = new({function_name, "_private_rx"});
-                tx_adapter.private_ops = private_ops;
-                rx_adapter.private_ops = private_ops;
-                rx_adapter.buf_size = private_cfg.rx_buf_size;
-                dataplane.tx_engine = tx_adapter;
-                dataplane.rx_engine = rx_adapter;
+                // 私有 buffer 容量不含 Virtio header；补充由调用方/FSM 控制。
+                dataplane.rx_engine.buf_size = private_cfg.rx_buf_size;
+                dataplane.rx_engine.refill_threshold = 0;
             end
-            dataplane.tx_engine.vq_mgr = vq_mgr_ref;
-            dataplane.tx_engine.mem = hmem;
-            dataplane.tx_engine.iommu = iommu_mdl;
+            // Function 不调用 configure()：借用 dataplane 自带的 offload，特性为 0 时
+            // build_tx_hdr 产出全零 header（私有 ops 要求如此）。
+            dataplane.tx_engine.offload = dataplane.offload;
+            dataplane.rx_engine.offload = dataplane.offload;
             dataplane.tx_engine.host_id =
                 transport_ref.iommu_host_id();
             dataplane.tx_engine.bdf = transport_ref.bdf;
-            dataplane.rx_engine.vq_mgr = vq_mgr_ref;
-            dataplane.rx_engine.mem = hmem;
-            dataplane.rx_engine.iommu = iommu_mdl;
             dataplane.rx_engine.host_id =
                 transport_ref.iommu_host_id();
             dataplane.rx_engine.bdf = transport_ref.bdf;
-            // 标准引擎经同一个 ops 收发，与 FSM/sequence 共用 DMA 所有权和通知路径。
             dataplane.bind_ops(ops);
         end
 
@@ -645,11 +636,10 @@ class virtio_function_instance extends uvm_component;
         state = VF_DISABLED;
     endtask
 
-    // 响应 VF/PF FLR：分离队列、清理数据面和运行时 resource-client 状态，
+    // 响应 VF/PF FLR：分离队列、清理运行时 resource-client 状态，
     // 保留静态 Function 身份并进入 FLR 状态。
     virtual function void on_flr();
         vq_mgr.detach_all_queues();
-        dataplane.cleanup_all();
         if (resource_client != null)
             resource_client.reset_runtime_state();
         state = VF_FLR;
