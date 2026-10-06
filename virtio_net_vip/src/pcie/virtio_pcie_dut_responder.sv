@@ -214,24 +214,6 @@ class virtio_pcie_dut_responder extends uvm_subscriber #(virtio_transaction);
             void'(vq.process_error_injection(fault_phase));
     endfunction
 
-    // 该组件是没有 RTL DUT 时使用的设备行为模型。REAL_DUT 模式必须绕过
-    // 它，避免模型和真实 DUT 同时消费 notify 或产生 DMA。
-    // 固定返回 1，供 fixture 在选择 MODEL/REAL_DUT 执行主体时做能力判定。
-    function bit model_only(); return 1'b1; endfunction
-
-    // 能力检查：仅 VIRTIO_EXEC_MODEL 返回成功；不改变运行状态，失败原因写入 why。
-    function bit can_start(
-        input virtio_execution_mode_e mode,
-        output string why
-    );
-        why = "";
-        if (mode != VIRTIO_EXEC_MODEL) begin
-            why = "virtio_pcie_dut_responder is MODEL-only";
-            return 1'b0;
-        end
-        return 1'b1;
-    endfunction
-
     // MODEL-only RX 注入接口：输入 packet 仅被 pack 成待处理字节并排入指定队列，
     // 不立即写 Host memory/used ring/中断；header 按 driver_features 编码。未绑定、
     // packet 为空或 pack 失败时 ok=0。REAL_DUT 没有此 responder，调用必然不可用。

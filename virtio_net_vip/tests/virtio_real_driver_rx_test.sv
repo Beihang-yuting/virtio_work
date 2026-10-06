@@ -54,7 +54,7 @@ class virtio_real_driver_rx_test extends uvm_test;
     // net_packet/physical ingress callback is therefore required before this
     // test can be run against RTL.  Do not silently fall back to the MODEL
     // responder, because that would make a REAL_DUT run a false pass.
-    if (flow.execution_mode() == VIRTIO_EXEC_REAL_DUT)
+    if (!flow.execution_profile().has_model_device())
       `uvm_fatal("REAL_DUT_RX_SOURCE_UNAVAILABLE",
                 {"virtio_real_driver_rx_test requires a platform RX ingress ",
                  "callback; inject_rx() is MODEL-only"})

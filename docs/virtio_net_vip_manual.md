@@ -361,6 +361,7 @@ virtio_net_vip/
 |   |   +-- virtio_vf_instance.sv           -- 单个 VF 实例封装
 |   |   +-- virtio_pf_manager.sv            -- PF 管理器 (委托 pcie_tl_func_manager)
 |   +-- env/
+|   |   +-- virtio_execution_profile.sv     -- MODEL/REAL_DUT 执行策略
 |   |   +-- virtio_net_env_config.sv        -- 环境配置对象
 |   |   +-- virtio_scoreboard.sv            -- 7 类检查的 Scoreboard
 |   |   +-- virtio_coverage.sv              -- 8 个 Covergroup

@@ -57,6 +57,8 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     protected bit                    m_pcie_path_bound;
     protected bit                    m_host_mem_responder_conflict;
     protected int unsigned            m_poll_timeout_ns;
+    // 由 virtio_cfg 的执行模式解析出的执行策略；build_phase 之后不变。
+    protected virtio_execution_profile m_profile;
 
     // pcie_work's plain pcie_tl_if is a single valid/ready direction.  The
     // fixture therefore treats a REAL_DUT physical link as explicitly bound
@@ -92,6 +94,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         m_host_mem_responder_conflict = 0;
         m_poll_timeout_ns = 1000;
         m_selected_function = null;
+        m_profile = null;
         real_dut_host_mem_responder_enable = 0;
     endfunction
 
@@ -136,6 +139,11 @@ class virtio_real_driver_flow_fixture extends uvm_component;
                                            mode_why})
                 return;
             end
+        end
+        m_profile = virtio_cfg.execution_profile();
+        if (m_profile == null) begin
+            `uvm_fatal("REAL_FLOW", "virtio execution mode has no execution profile")
+            return;
         end
 
         // The RC-side Host-memory service is opt-in.  A platform with a
@@ -189,26 +197,24 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         // Completion adapter and endpoint responder are MODEL-only.  Keeping
         // them out of the REAL_DUT hierarchy prevents a passive PCIe monitor
         // from accidentally creating a second device-side implementation.
-        if (virtio_cfg.execution_mode == VIRTIO_EXEC_MODEL) begin
+        if (m_profile.has_model_device()) begin
             tlm_adapter = virtio_tlm_completion_adapter::type_id::create(
                 "tlm_adapter");
             tlm_adapter.install_factory_overrides();
         end else begin
             tlm_adapter = null;
-            host_mem_responder =
-                virtio_pcie_real_dut_host_mem_responder::type_id::create(
-                    "host_mem_responder", this);
+            if (m_profile.supports_host_mem_responder())
+                host_mem_responder =
+                    virtio_pcie_real_dut_host_mem_responder::type_id::create(
+                        "host_mem_responder", this);
         end
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
-        pcie_cfg.if_mode = (virtio_cfg.execution_mode == VIRTIO_EXEC_REAL_DUT) ?
-                            SV_IF_MODE : TLM_MODE;
+        pcie_cfg.if_mode = m_profile.pcie_if_mode();
         pcie_cfg.rc_agent_enable = 1;
         pcie_cfg.ep_agent_enable = 1;
         pcie_cfg.rc_is_active = UVM_ACTIVE;
-        pcie_cfg.ep_is_active = (virtio_cfg.execution_mode == VIRTIO_EXEC_REAL_DUT) ?
-                                UVM_PASSIVE : UVM_ACTIVE;
-        pcie_cfg.ep_auto_response =
-            (virtio_cfg.execution_mode == VIRTIO_EXEC_REAL_DUT) ? 1'b0 : 1'b1;
+        pcie_cfg.ep_is_active = m_profile.ep_is_active();
+        pcie_cfg.ep_auto_response = m_profile.ep_auto_response();
         pcie_cfg.infinite_credit = 1;
         pcie_cfg.scb_enable = 1;
         pcie_cfg.cov_enable = 0;
@@ -232,7 +238,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             this, "pcie_env", "cfg", pcie_cfg);
         m_pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
         // REAL_DUT 模式只保留 PCIe/virtio 观察路径，绝不创建主动模型。
-        if (virtio_cfg.execution_mode == VIRTIO_EXEC_MODEL)
+        if (m_profile.has_model_device())
             responder = virtio_pcie_dut_responder::type_id::create(
                 "responder", this);
     endfunction
@@ -271,7 +277,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         // endpoint image itself is installed later from the frozen snapshot,
         // but all identity/shared handles needed by the responder already
         // exist here.
-        if ((virtio_cfg.execution_mode == VIRTIO_EXEC_MODEL) &&
+        if ((m_profile != null) && m_profile.has_model_device() &&
             (responder != null) && (host_mem_owners != null) &&
             (m_virtio_env.iommu != null) &&
             (m_pcie_env.ep_agent.ep_driver != null) &&
@@ -348,7 +354,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             return;
         // MODEL mode owns a local endpoint image.  In REAL_DUT the endpoint
         // driver is passive/absent and all config/BAR responses come from RTL.
-        if (virtio_cfg.execution_mode == VIRTIO_EXEC_MODEL) begin
+        if (m_profile.has_model_device()) begin
             if ((m_pcie_env.ep_agent.ep_driver == null) ||
                 !install_endpoint_image(why)) begin
                 `uvm_error("REAL_FLOW", {"endpoint image setup failed: ", why})
@@ -367,7 +373,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         // Optional RC service.  The proxy receives the same IOMMU object used
         // by the driver when it authored descriptors, so PCIe IOVA accesses
         // resolve to the shared Host GPA backing without a second allocator.
-        if ((virtio_cfg.execution_mode == VIRTIO_EXEC_REAL_DUT) &&
+        if (m_profile.supports_host_mem_responder() &&
             real_dut_host_mem_responder_enable &&
             (host_mem_responder != null)) begin
             string host_responder_why;
@@ -405,8 +411,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
                 end
             end
         end
-        if ((virtio_cfg.execution_mode == VIRTIO_EXEC_MODEL) &&
-            (responder != null)) begin
+        if (m_profile.has_model_device() && (responder != null)) begin
             virtio_function_instance selected_function;
             foreach (m_virtio_env.function_instances[index]) begin
                 if ((m_virtio_env.function_instances[index] != null) &&
@@ -440,9 +445,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     function bit build_flow(output string why);
         why = "";
         if (!m_endpoint_ready) begin
-            why = (virtio_cfg != null) &&
-                  (virtio_cfg.execution_mode == VIRTIO_EXEC_REAL_DUT) ?
-                  "REAL_DUT endpoint identity/interface was not prepared" :
+            why = (m_profile != null) ? m_profile.endpoint_unready_reason() :
                   "endpoint image was not derived from the frozen snapshot";
             return 0;
         end
@@ -454,8 +457,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             why = "virtio PCIe path was not bound";
             return 0;
         end
-        if ((virtio_cfg != null) &&
-            (virtio_cfg.execution_mode == VIRTIO_EXEC_REAL_DUT)) begin
+        if ((m_profile != null) && m_profile.needs_physical_link()) begin
             if (m_host_mem_responder_conflict) begin
                 why = "REAL_DUT Host-memory responder conflicts with pcie_work backend bridge";
                 return 0;
@@ -476,7 +478,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
                 return 0;
             end
         end
-        if ((virtio_cfg.execution_mode == VIRTIO_EXEC_REAL_DUT) &&
+        if (m_profile.supports_host_mem_responder() &&
             real_dut_host_mem_responder_enable &&
             !m_host_mem_responder_bound) begin
             why = "REAL_DUT Host-memory responder was enabled but not bound";
@@ -595,8 +597,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     endfunction
 
     function bit real_dut_link_ready();
-        return (virtio_cfg != null) &&
-               (virtio_cfg.execution_mode == VIRTIO_EXEC_REAL_DUT) &&
+        return (m_profile != null) && m_profile.needs_physical_link() &&
                m_pcie_vif_bound && m_pcie_path_bound;
     endfunction
 
@@ -609,8 +610,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     // tuple and never creates a virtio device responder.
     function bit enable_real_dut_host_mem_responder(output string why);
         why = "";
-        if ((virtio_cfg == null) ||
-            (virtio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT)) begin
+        if ((m_profile == null) || !m_profile.supports_host_mem_responder()) begin
             why = "Host-memory responder can only be enabled in REAL_DUT mode";
             return 0;
         end
@@ -665,8 +665,10 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             host_mem_responder.shutdown();
     endtask
 
-    function virtio_execution_mode_e execution_mode();
-        return virtio_cfg.execution_mode;
+    // 测试按执行策略选择断言来源（MODEL responder 计数或 REAL_DUT 被动观察），
+    // 不比较执行模式枚举。
+    function virtio_execution_profile execution_profile();
+        return m_profile;
     endfunction
 
     // Optional direct setter for a top-level test/wrapper that obtains the

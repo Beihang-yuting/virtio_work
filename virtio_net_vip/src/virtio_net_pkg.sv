@@ -119,6 +119,7 @@ package virtio_net_pkg;
   // ---------------------------------------------------------------------------
   // 第 8 层 – 顶层环境（env/）
   // ---------------------------------------------------------------------------
+  `include "env/virtio_execution_profile.sv"
   `include "env/virtio_net_env_config.sv"
   `include "env/virtio_scoreboard.sv"
   `include "env/virtio_coverage.sv"

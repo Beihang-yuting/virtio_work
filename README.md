@@ -255,6 +255,7 @@ virtio_net_vip/
 │   │   ├── virtio_vf_resource_pool.sv      ← VF 队列资源映射
 │   │   └── virtio_vf_instance.sv           ← 单个 VF 实例封装
 │   └── env/                                ← 验证环境
+│       ├── virtio_execution_profile.sv     ← MODEL/REAL_DUT 执行策略（唯一选择点）
 │       ├── virtio_net_env_config.sv        ← 统一配置对象（25+ 可配参数）
 │       ├── virtio_net_env.sv              ← 顶层环境（组件创建与连接）
 │       ├── virtio_scoreboard.sv           ← 记分板（7 类检查）

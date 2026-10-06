@@ -43,7 +43,7 @@ class virtio_real_driver_multiqueue_test extends uvm_test;
     if (!flow.build_flow(why))
       `uvm_fatal("REAL_MQ", why)
 
-    is_model = (flow.execution_mode() == VIRTIO_EXEC_MODEL);
+    is_model = flow.execution_profile().has_model_device();
 
     for (int unsigned pair = 0; pair < 2; pair++) begin
       if (!flow.tx_queue_id_for_pair(pair, tx_qids[pair], why) ||

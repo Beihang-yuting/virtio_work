@@ -251,16 +251,19 @@ class virtio_net_env_config extends uvm_object;
         return validate_execution_mode(why);
     endfunction
 
+    // 返回 execution_mode 对应的执行策略；保留编码返回 null。每次调用返回新的
+    // 无状态对象，调用方可缓存。
+    function virtio_execution_profile execution_profile();
+        return virtio_select_execution_profile(execution_mode);
+    endfunction
+
     // 枚举底层值仍可能被强制赋成保留值，因此在环境创建前显式校验。
     function bit validate_execution_mode(output string why);
         why = "";
-        case (execution_mode)
-            VIRTIO_EXEC_MODEL, VIRTIO_EXEC_REAL_DUT: begin end
-            default: begin
-                why = "invalid virtio execution mode";
-                return 0;
-            end
-        endcase
+        if (virtio_select_execution_profile(execution_mode) == null) begin
+            why = "invalid virtio execution mode";
+            return 0;
+        end
         case (completion_mode)
             VIRTIO_COMPLETION_MSIX, VIRTIO_COMPLETION_POLLING: begin end
             default: begin

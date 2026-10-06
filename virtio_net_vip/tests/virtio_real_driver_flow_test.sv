@@ -63,7 +63,7 @@ class virtio_real_driver_flow_test extends uvm_test;
         !flow.snapshot_is_frozen())
       `uvm_error("REAL_FLOW", "flow did not expose frozen snapshot pair")
 
-    is_model = (flow.execution_mode() == VIRTIO_EXEC_MODEL);
+    is_model = flow.execution_profile().has_model_device();
     if (!flow.tx_queue_id_for_pair(0, tx_queue_id, why))
       `uvm_fatal("REAL_FLOW", {"could not resolve TX queue: ", why})
 
