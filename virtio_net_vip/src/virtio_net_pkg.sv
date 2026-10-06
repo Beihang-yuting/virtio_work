@@ -77,6 +77,7 @@ package virtio_net_pkg;
   // The RX responder accepts external net_packet objects, so the byte-stream
   // adapter must be visible before the agent/responder classes are compiled.
   `include "dataplane/virtio_net_packet_adapter.sv"
+  `include "agent/virtio_dma_buffer_set.sv"
   `include "agent/virtio_atomic_ops.sv"
   `include "agent/virtio_auto_fsm.sv"
   `include "dpu_priv/dpu_priv_atomic_ops.sv"

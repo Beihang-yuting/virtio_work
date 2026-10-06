@@ -198,6 +198,7 @@ class virtio_unit_test extends uvm_test;
         test_tlm_config_write_completion_lifecycle();
         test_tlm_completion_factory_owner();
         test_late_driver_agent_binding();
+        test_dma_buffer_set();
 
         `uvm_info("UNIT_TEST", "All unit tests PASSED", UVM_NONE)
         phase.drop_objection(this);
@@ -246,6 +247,91 @@ class virtio_unit_test extends uvm_test;
         assert(late_binding_agent.driver.fsm == late_binding_fsm)
             else `uvm_error("TEST", "late-bound fsm did not reach active driver")
         `uvm_info("UNIT_TEST", "test_late_driver_agent_binding PASSED", UVM_LOW)
+    endtask
+
+    // virtio_dma_buffer_set：alloc→write/fill→map→失败回滚、disown 与隔离转出
+    // 的所有权约定。单页 IOVA aperture 让第二次映射必然失败。
+    task test_dma_buffer_set();
+        host_mem_manager mem = host_mem_manager::type_id::create("dma_set_mem");
+        virtio_iommu_model iommu = virtio_iommu_model::type_id::create("dma_set_iommu");
+        virtio_dma_buffer_set dma_set = new("dma_set");
+        virtio_expected_iommu_map_error_catcher map_error;
+        bit [63:0] q_iovas[$];
+        bit [63:0] q_gpas[$];
+        bit [63:0] kept_gpa;
+        bit [63:0] kept_iova;
+        byte wdata[];
+        byte rdata[];
+        int first_idx;
+        int second_idx;
+        string why;
+
+        mem.init_region(64'h2000_0000, 64'h2000_FFFF);
+        assert(iommu.configure_iova_aperture(64'h0000_0001_0000_0000,
+                                             64'h0000_0001_0000_1000,
+                                             IOMMU_IOVA_FIRST_FIT, why))
+            else `uvm_fatal("TEST", why)
+        dma_set.bind_domain(mem, iommu, 0, 16'h0100);
+
+        // 1. alloc + write/fill：按索引写入各自 GPA
+        first_idx = dma_set.alloc(64);
+        second_idx = dma_set.alloc(32);
+        assert(first_idx == 0 && second_idx == 1 && dma_set.count() == 2)
+            else `uvm_fatal("TEST", "dma_set alloc did not register two buffers")
+        wdata = new[4];
+        foreach (wdata[i]) wdata[i] = 8'h10 + i;
+        dma_set.write(first_idx, wdata);
+        dma_set.fill(second_idx, 8'hFF);
+        mem.read_mem(dma_set.get_gpa(first_idx), 4, rdata);
+        assert(rdata[0] == 8'h10 && rdata[3] == 8'h13)
+            else `uvm_fatal("TEST", "dma_set write landed at the wrong GPA")
+        mem.read_mem(dma_set.get_gpa(second_idx), 32, rdata);
+        assert($unsigned(rdata[31]) == 8'hFF)
+            else `uvm_fatal("TEST", "dma_set fill did not cover the whole buffer")
+
+        // 2. 第二次映射失败：release_all 解除已映射项并释放全部 GPA
+        assert(dma_set.map(first_idx, DMA_TO_DEVICE) && dma_set.get_iova(first_idx) != 0)
+            else `uvm_fatal("TEST", "dma_set first map failed")
+        map_error = new("dma_set_map_error");
+        uvm_report_cb::add(null, map_error);
+        assert(!dma_set.map(second_idx, DMA_FROM_DEVICE))
+            else `uvm_fatal("TEST", "dma_set map succeeded beyond the IOVA aperture")
+        uvm_report_cb::delete(null, map_error);
+        dma_set.release_all();
+        assert(map_error.caught_count == 1 && dma_set.count() == 0 &&
+               iommu.total_maps == 1 && iommu.total_unmaps == 1)
+            else `uvm_fatal("TEST", "dma_set rollback left mappings or registrations")
+
+        // 3. disown：所有权已转交，release_all 不得再触碰资源
+        first_idx = dma_set.alloc(16);
+        assert(first_idx == 0 && dma_set.map(first_idx, DMA_TO_DEVICE))
+            else `uvm_fatal("TEST", "dma_set remap after rollback failed")
+        kept_gpa = dma_set.get_gpa(first_idx);
+        kept_iova = dma_set.get_iova(first_idx);
+        dma_set.disown();
+        dma_set.release_all();
+        assert(dma_set.count() == 0 && iommu.total_unmaps == 1)
+            else `uvm_fatal("TEST", "dma_set released resources it had disowned")
+        iommu.unmap_for_host(0, 16'h0100, kept_iova);
+        mem.free(kept_gpa);
+
+        // 4. quarantine：已映射 IOVA 与全部 GPA 按添加顺序转出
+        first_idx = dma_set.alloc(8);
+        second_idx = dma_set.alloc(8);
+        assert(dma_set.map(first_idx, DMA_TO_DEVICE))
+            else `uvm_fatal("TEST", "dma_set quarantine setup map failed")
+        kept_gpa = dma_set.get_gpa(first_idx);
+        kept_iova = dma_set.get_iova(first_idx);
+        dma_set.quarantine_into(q_iovas, q_gpas);
+        assert(dma_set.count() == 0 && q_iovas.size() == 1 && q_gpas.size() == 2 &&
+               q_iovas[0] == kept_iova && q_gpas[0] == kept_gpa)
+            else `uvm_fatal("TEST", "dma_set quarantine did not transfer ownership in order")
+        iommu.unmap_for_host(0, 16'h0100, q_iovas[0]);
+        foreach (q_gpas[i]) mem.free(q_gpas[i]);
+
+        mem.leak_check();
+        iommu.leak_check();
+        `uvm_info("UNIT_TEST", "test_dma_buffer_set PASSED", UVM_LOW)
     endtask
 
     // Test 1: host_mem alloc/write/read/free
