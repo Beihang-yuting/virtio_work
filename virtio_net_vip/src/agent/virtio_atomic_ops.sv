@@ -106,6 +106,20 @@ class virtio_atomic_ops extends uvm_object;
         return (migration_restore_dma.size() != 0);
     endfunction
 
+    // 生产路径的通知边界：PRE_NOTIFY 故障钩子 → transport 通知（携带 ring 游标
+    // next_idx/wrap）→ POST_NOTIFY 故障钩子。不调用 virtqueue::kick()，那只计数；
+    // 调用方自己决定是否需要通知（needs_notification 等）。via 为空时用本 ops 的
+    // transport，Admin VQ 传入其上下文 transport。
+    protected task kick_with_fault(virtqueue_base vq, int unsigned qid,
+                                   virtio_pci_transport via = null);
+        virtio_pci_transport notify_transport;
+
+        notify_transport = (via != null) ? via : transport;
+        void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
+        notify_transport.kick(qid, vq.get_notify_next_idx(), vq.get_notify_wrap());
+        void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
+    endtask
+
     // Device-side writers must use this completed-write boundary instead of
     // calling IOMMU translate() followed by host_mem.write_mem().  It commits
     // bytes first and lets the IOMMU preserve a migration generation payload
@@ -1070,17 +1084,8 @@ class virtio_atomic_ops extends uvm_object;
         end
 
         // 8. Kick if device needs notification
-        if (vq.needs_notification()) begin
-            // The production atomic path owns the PCIe notify, so it does
-            // not call virtqueue::kick().  Keep the queue fault boundary
-            // around the real transport write; otherwise configured
-            // descriptor corruption is consumed only by legacy callers that
-            // invoke kick() directly and never reaches normal TX flows.
-            void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
-            transport.kick(queue_id, vq.get_notify_next_idx(),
-                           vq.get_notify_wrap());
-            void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
-        end
+        if (vq.needs_notification())
+            kick_with_fault(vq, queue_id);
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("tx_submit: queue_id=%0d desc_id=%0d hdr_iova=0x%016h pkt_iova=0x%016h",
@@ -1217,14 +1222,8 @@ class virtio_atomic_ops extends uvm_object;
         end
 
         // Kick if device needs notification
-        if (filled > 0 && vq.needs_notification()) begin
-            // Mirror tx_submit(): rx_refill also bypasses virtqueue::kick()
-            // and emits the notify through the PCI transport directly.
-            void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
-            transport.kick(queue_id, vq.get_notify_next_idx(),
-                           vq.get_notify_wrap());
-            void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
-        end
+        if (filled > 0 && vq.needs_notification())
+            kick_with_fault(vq, queue_id);
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("rx_refill: queue_id=%0d filled=%0d/%0d", queue_id, filled, num_bufs),
@@ -1517,13 +1516,8 @@ class virtio_atomic_ops extends uvm_object;
                         admin_context.queue_id))
                 end else begin
                     submitted = 1;
-                    void'(admin_context.vq.process_error_injection(
-                        VQ_FAULT_PRE_NOTIFY));
-                    admin_context.transport.kick(admin_context.queue_id,
-                                                 admin_context.vq.get_notify_next_idx(),
-                                                 admin_context.vq.get_notify_wrap());
-                    void'(admin_context.vq.process_error_injection(
-                        VQ_FAULT_POST_NOTIFY));
+                    kick_with_fault(admin_context.vq, admin_context.queue_id,
+                                    admin_context.transport);
 
                     // Both timeout and interval derive from the shared wait policy;
                     // there is no operation-specific arbitrary delay here.
@@ -1782,12 +1776,8 @@ class virtio_atomic_ops extends uvm_object;
         result = ctrl_vq.add_buf(sgs, 2, 1, null, 0);
 
         // 6. Kick control queue
-        if (ctrl_vq.needs_notification()) begin
-            void'(ctrl_vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
-            transport.kick(ctrl_qid, ctrl_vq.get_notify_next_idx(),
-                           ctrl_vq.get_notify_wrap());
-            void'(ctrl_vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
-        end
+        if (ctrl_vq.needs_notification())
+            kick_with_fault(ctrl_vq, ctrl_qid);
 
         // 7. Poll used ring until ack buffer is filled
         got_used = 0;
