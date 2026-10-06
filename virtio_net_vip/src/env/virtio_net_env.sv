@@ -498,9 +498,21 @@ class virtio_net_env extends uvm_env;
 
     endfunction
 
+    // 一个 Function 的 PCIe 绑定计划：bind_pcie 为单 domain 内全部 Function 填入
+    // 同一组 RC sequencer/monitor（endpoint 为空）；bind_pcie_endpoints 为每个
+    // Function 填入按完整身份选中的 endpoint，提交时额外绑定 completion adapter
+    // 与 transport 的 endpoint 通路。
+    typedef struct {
+        virtio_function_instance      function_instance;
+        uvm_sequencer #(pcie_tl_tlp)  rc_seqr;
+        pcie_tl_base_monitor          rc_monitor;
+        pcie_tl_base_monitor          ep_monitor;
+        virtio_pcie_function_endpoint endpoint;
+    } pcie_bind_plan_t;
+
     // 将一个 RC sequencer 及可选 completion/monitor 绑定到全部 VIO Function。
-    // 先对所有对象做无副作用预检，再一次性提交；任一 Function 失败则返回 0、
-    // 标记环境无效，并取消其余预检状态，避免出现部分绑定。
+    // 本函数只负责构造单 domain 计划与入口校验，预检、回滚与提交统一由 bind_all
+    // 完成；任一 Function 失败则返回 0、标记环境无效且不保留部分绑定。
     // Bind one required RC sequencer and optional TLM completion adapter to
     // all snapshot-declared VIO functions.
     function bit bind_pcie(
@@ -509,14 +521,9 @@ class virtio_net_env extends uvm_env;
         input pcie_tl_base_monitor pcie_rc_monitor = null,
         input pcie_tl_base_monitor pcie_ep_monitor = null
     );
-        int unsigned next_protocol_event_vif_index;
-        virtio_function_instance active_functions[$];
-        virtual virtio_protocol_event_if candidate_protocol_vif;
-        virtual virtio_protocol_event_if staged_protocol_vifs[DPU_MAX_FUNCTIONS];
-        virtio_auto_fsm staged_pcie_fsms[DPU_MAX_FUNCTIONS];
-        virtio_atomic_ops staged_pcie_ops[DPU_MAX_FUNCTIONS];
+        pcie_bind_plan_t plan[$];
+        pcie_bind_plan_t entry;
         dpu_pcie_domain_key_t legacy_domain;
-        bit legacy_domain_valid;
 
         if (!configuration_valid)
             return 0;
@@ -526,173 +533,70 @@ class virtio_net_env extends uvm_env;
             return 0;
         end
 
-        foreach (function_instances[function_index])
-            active_functions.push_back(function_instances[function_index]);
-
-        // The scalar compatibility API can identify only one external PCIe
-        // path.  It is valid for several functions in that domain, but must
-        // never silently broadcast that path across independent domains.
-        legacy_domain_valid = 0;
-        foreach (active_functions[function_index]) begin
-            if ((active_functions[function_index] == null) ||
-                !active_functions[function_index].pcie_id_valid) begin
+        // 标量兼容接口只能描述一条外部 PCIe 通路：同一 domain 内可服务多个
+        // Function，但不得把它静默广播到多个独立 domain。
+        foreach (function_instances[function_index]) begin
+            if ((function_instances[function_index] == null) ||
+                !function_instances[function_index].pcie_id_valid) begin
                 `uvm_fatal("VIRTIO_ENV",
                     "bind_pcie() requires snapshot-resolved PCIe identities")
                 configuration_valid = 0;
                 return 0;
             end
-            if (!legacy_domain_valid) begin
-                legacy_domain =
-                    active_functions[function_index].pcie_id.domain;
-                legacy_domain_valid = 1;
-            end
+            if (function_index == 0)
+                legacy_domain = function_instances[0].pcie_id.domain;
             else if (!dpu_same_domain_key(
-                legacy_domain,
-                active_functions[function_index].pcie_id.domain)) begin
+                    legacy_domain,
+                    function_instances[function_index].pcie_id.domain)) begin
                 `uvm_fatal("VIRTIO_ENV",
                     {"bind_pcie() cannot bind VIO functions from multiple ",
                      "PCIe domains; use bind_pcie_endpoints()"})
                 configuration_valid = 0;
                 return 0;
             end
+            entry.function_instance = function_instances[function_index];
+            entry.rc_seqr = pcie_rc_seqr;
+            entry.rc_monitor = pcie_rc_monitor;
+            entry.ep_monitor = pcie_ep_monitor;
+            entry.endpoint = null;
+            plan.push_back(entry);
         end
 
-        // Analysis connections are part of the atomic bind commit.  Validate
-        // every supplied source port before function preflight allocates
-        // candidates and before either the optional adapter or any function
-        // can commit state.
-        if ((pcie_rc_monitor != null) &&
-            (pcie_rc_monitor.tlp_ap == null)) begin
+        // Analysis 连接属于原子提交的一部分：在任何 Function 预检分配候选之前
+        // 校验调用方给出的 monitor。
+        if ((pcie_rc_monitor != null) && (pcie_rc_monitor.tlp_ap == null)) begin
             `uvm_fatal("VIRTIO_ENV",
                 "bind_pcie() received a PCIe RC monitor with a null tlp_ap")
-            foreach (active_functions[cancel_index])
-                active_functions[cancel_index].cancel_preflight_bind_pcie();
-            configuration_valid = 0;
-            return 0;
+            return abort_bind(plan);
         end
-        if ((pcie_ep_monitor != null) &&
-            (pcie_ep_monitor.tlp_ap == null)) begin
+        if ((pcie_ep_monitor != null) && (pcie_ep_monitor.tlp_ap == null)) begin
             `uvm_fatal("VIRTIO_ENV",
                 "bind_pcie() received a PCIe EP monitor with a null tlp_ap")
-            foreach (active_functions[cancel_index])
-                active_functions[cancel_index].cancel_preflight_bind_pcie();
-            configuration_valid = 0;
-            return 0;
+            return abort_bind(plan);
         end
-
-        next_protocol_event_vif_index = 0;
-        foreach (active_functions[function_index]) begin
-            if (!preflight_function_pcie(
-                active_functions[function_index], pcie_rc_seqr,
-                next_protocol_event_vif_index,
-                candidate_protocol_vif)) begin
-                foreach (active_functions[cancel_index])
-                    active_functions[cancel_index].cancel_preflight_bind_pcie();
-                configuration_valid = 0;
-                return 0;
-            end
-            staged_protocol_vifs[function_index] = candidate_protocol_vif;
-            staged_pcie_fsms[function_index] =
-                active_functions[function_index].pending_pcie_fsm_candidate();
-            staged_pcie_ops[function_index] =
-                active_functions[function_index].pending_pcie_ops_candidate();
-            for (int unsigned prior_index = 0;
-                 prior_index < function_index; prior_index++) begin
-                if (staged_protocol_vifs[function_index] ==
-                    staged_protocol_vifs[prior_index]) begin
-                    `uvm_fatal("VIRTIO_ENV", $sformatf(
-                        {"Active function indices %0d and %0d staged the ",
-                         "same protocol event interface"},
-                        prior_index, function_index))
-                    foreach (active_functions[cancel_index])
-                        active_functions[cancel_index].
-                            cancel_preflight_bind_pcie();
-                    configuration_valid = 0;
-                    return 0;
-                end
-                if (staged_pcie_fsms[function_index] ==
-                    staged_pcie_fsms[prior_index]) begin
-                    `uvm_fatal("VIRTIO_ENV", $sformatf(
-                        {"Active function indices %0d and %0d staged the ",
-                         "same PCIe FSM candidate"},
-                        prior_index, function_index))
-                    foreach (active_functions[cancel_index])
-                        active_functions[cancel_index].
-                            cancel_preflight_bind_pcie();
-                    configuration_valid = 0;
-                    return 0;
-                end
-                if (staged_pcie_ops[function_index] ==
-                    staged_pcie_ops[prior_index]) begin
-                    `uvm_fatal("VIRTIO_ENV", $sformatf(
-                        {"Active function indices %0d and %0d staged the ",
-                         "same PCIe ops candidate"},
-                        prior_index, function_index))
-                    foreach (active_functions[cancel_index])
-                        active_functions[cancel_index].
-                            cancel_preflight_bind_pcie();
-                    configuration_valid = 0;
-                    return 0;
-                end
-            end
-        end
-
-        // Bind the optional completion adapter only after every function has
-        // passed side-effect-free preflight and before any function commit.
-        if ((tlm_adapter != null) &&
-            !tlm_adapter.bind_registered_rc_driver()) begin
-            foreach (active_functions[cancel_index])
-                active_functions[cancel_index].cancel_preflight_bind_pcie();
-            configuration_valid = 0;
-            return 0;
-        end
-
-        next_protocol_event_vif_index = 0;
-        foreach (active_functions[function_index]) begin
-            if (!bind_function_pcie(
-                active_functions[function_index], pcie_rc_seqr,
-                pcie_rc_monitor, pcie_ep_monitor,
-                next_protocol_event_vif_index,
-                staged_protocol_vifs[function_index])) begin
-                foreach (active_functions[cancel_index])
-                    active_functions[cancel_index].cancel_preflight_bind_pcie();
-                configuration_valid = 0;
-                return 0;
-            end
-        end
-        protocol_event_vif_index = next_protocol_event_vif_index;
-        return 1;
+        return bind_all(plan, tlm_adapter);
     endfunction
 
-    // 按完整 {host, segment, BDF} 为每个 snapshot Function 选择独立 endpoint。
-    // endpoint 数量、身份或预检不匹配时返回 0，且在全部校验通过前不提交连接。
-    // 中文：输入 endpoint 数组，输出全部 Function 的原子化绑定结果，失败不保留部分状态。
+    // 按完整 {host, segment, BDF} 为每个 snapshot Function 选择独立 endpoint，
+    // 构造计划后交给 bind_all；数量、身份或预检不匹配时返回 0，且全部校验
+    // 通过前不提交任何连接。
     // Bind every snapshot function to one explicitly keyed external path.
-    // Validation and function preflight finish before adapter, observer,
-    // monitor, or FSM state is committed.
     function bit bind_pcie_endpoints(
         input virtio_pcie_function_endpoint endpoints[$]
     );
-        int unsigned next_protocol_event_vif_index;
-        virtio_function_instance active_functions[$];
-        virtio_pcie_function_endpoint selected_endpoints[$];
-        virtual virtio_protocol_event_if candidate_protocol_vif;
-        virtual virtio_protocol_event_if staged_protocol_vifs[DPU_MAX_FUNCTIONS];
-        virtio_auto_fsm staged_pcie_fsms[DPU_MAX_FUNCTIONS];
-        virtio_atomic_ops staged_pcie_ops[DPU_MAX_FUNCTIONS];
+        pcie_bind_plan_t plan[$];
+        pcie_bind_plan_t entry;
         bit endpoint_used[];
+        int selected_index;
         string why;
 
         if (!configuration_valid)
             return 0;
-
-        foreach (function_instances[function_index])
-            active_functions.push_back(function_instances[function_index]);
-        if (endpoints.size() != active_functions.size()) begin
+        if (endpoints.size() != function_instances.size()) begin
             `uvm_fatal("VIRTIO_ENV", $sformatf(
                 {"bind_pcie_endpoints() requires exactly one endpoint per ",
                  "active function: endpoints=%0d functions=%0d"},
-                endpoints.size(), active_functions.size()))
+                endpoints.size(), function_instances.size()))
             configuration_valid = 0;
             return 0;
         end
@@ -724,49 +628,19 @@ class virtio_net_env extends uvm_env;
             end
         end
 
-        foreach (active_functions[function_index]) begin
-            int match_count;
-            int selected_index;
-
-            match_count = 0;
-            selected_index = -1;
-            if ((active_functions[function_index] == null) ||
-                !active_functions[function_index].pcie_id_valid) begin
-                `uvm_fatal("VIRTIO_ENV", $sformatf(
-                    "Active function index %0d has no resolved PCIe identity",
-                    function_index))
-                configuration_valid = 0;
-                return 0;
-            end
-            foreach (endpoints[endpoint_index]) begin
-                if (endpoints[endpoint_index].matches_id(
-                    active_functions[function_index].pcie_id)) begin
-                    match_count++;
-                    selected_index = endpoint_index;
-                end
-            end
-            if (match_count != 1) begin
-                `uvm_fatal("VIRTIO_ENV", $sformatf(
-                    "PCIe endpoint mapping count for %s is %0d, expected 1",
-                    dpu_pcie_function_id_name(
-                        active_functions[function_index].pcie_id),
-                    match_count))
-                configuration_valid = 0;
-                return 0;
-            end
-            if ((active_functions[function_index].transport == null) ||
-                !active_functions[function_index].transport.pcie_id_valid ||
-                !endpoints[selected_index].matches_id(
-                    active_functions[function_index].transport.pcie_id)) begin
-                `uvm_fatal("VIRTIO_ENV", $sformatf(
-                    "Transport identity does not match function %s",
-                    dpu_pcie_function_id_name(
-                        active_functions[function_index].pcie_id)))
+        foreach (function_instances[function_index]) begin
+            if (!select_function_endpoint(
+                    function_index, endpoints, selected_index)) begin
                 configuration_valid = 0;
                 return 0;
             end
             endpoint_used[selected_index] = 1;
-            selected_endpoints.push_back(endpoints[selected_index]);
+            entry.function_instance = function_instances[function_index];
+            entry.endpoint = endpoints[selected_index];
+            entry.rc_seqr = entry.endpoint.rc_seqr;
+            entry.rc_monitor = entry.endpoint.rc_monitor;
+            entry.ep_monitor = entry.endpoint.ep_monitor;
+            plan.push_back(entry);
         end
         foreach (endpoint_used[endpoint_index]) begin
             if (!endpoint_used[endpoint_index]) begin
@@ -778,190 +652,289 @@ class virtio_net_env extends uvm_env;
                 return 0;
             end
         end
+        return bind_all(plan, null);
+    endfunction
+
+    // 为第 function_index 个 Function 选出唯一身份匹配的 endpoint，并确认其
+    // transport 身份一致；失败时 UVM_FATAL 并返回 0（由调用方置环境无效）。
+    protected function bit select_function_endpoint(
+        input int unsigned function_index,
+        input virtio_pcie_function_endpoint endpoints[$],
+        output int selected_index
+    );
+        virtio_function_instance function_instance;
+        int match_count;
+
+        selected_index = -1;
+        match_count = 0;
+        function_instance = function_instances[function_index];
+        if ((function_instance == null) || !function_instance.pcie_id_valid) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "Active function index %0d has no resolved PCIe identity",
+                function_index))
+            return 0;
+        end
+        foreach (endpoints[endpoint_index]) begin
+            if (endpoints[endpoint_index].matches_id(function_instance.pcie_id)) begin
+                match_count++;
+                selected_index = endpoint_index;
+            end
+        end
+        if (match_count != 1) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "PCIe endpoint mapping count for %s is %0d, expected 1",
+                dpu_pcie_function_id_name(function_instance.pcie_id),
+                match_count))
+            return 0;
+        end
+        if ((function_instance.transport == null) ||
+            !function_instance.transport.pcie_id_valid ||
+            !endpoints[selected_index].matches_id(
+                function_instance.transport.pcie_id)) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "Transport identity does not match function %s",
+                dpu_pcie_function_id_name(function_instance.pcie_id)))
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    // 两个公共绑定入口共用的提交路径：
+    //   1) 逐个 Function 无副作用预检，拒绝共享协议接口/FSM/ops 候选；
+    //   2) 校验 endpoint 的 completion adapter 与 RC driver/domain 拓扑；
+    //   3) 绑定 completion adapter（标量 adapter 或按 domain 的 adapter）；
+    //   4) 逐个提交 Function 与 endpoint 通路，最后发布协议接口槽位计数。
+    // 任一步失败都由 abort_bind 统一回滚预检候选并标记环境无效。
+    protected function bit bind_all(
+        input pcie_bind_plan_t plan[$],
+        input virtio_tlm_completion_adapter legacy_adapter
+    );
+        int unsigned next_protocol_event_vif_index;
+        virtual virtio_protocol_event_if staged_protocol_vifs[DPU_MAX_FUNCTIONS];
+
+        if (!preflight_plan(plan, staged_protocol_vifs))
+            return abort_bind(plan);
+        if (!validate_plan_adapters(plan))
+            return abort_bind(plan);
+        if ((legacy_adapter != null) &&
+            !legacy_adapter.bind_registered_rc_driver())
+            return abort_bind(plan);
+        if (!commit_plan_adapters(plan))
+            return abort_bind(plan);
 
         next_protocol_event_vif_index = 0;
-        foreach (active_functions[function_index]) begin
+        foreach (plan[plan_index]) begin
+            if (!bind_function_pcie(
+                    plan[plan_index].function_instance,
+                    plan[plan_index].rc_seqr,
+                    plan[plan_index].rc_monitor,
+                    plan[plan_index].ep_monitor,
+                    next_protocol_event_vif_index,
+                    staged_protocol_vifs[plan_index]))
+                return abort_bind(plan);
+            // 身份匹配已在构造计划时校验；这里只安装选中的 sequencer 与 adapter。
+            if ((plan[plan_index].endpoint != null) &&
+                !plan[plan_index].function_instance.transport.bind_pcie_endpoint(
+                    plan[plan_index].endpoint))
+                return abort_bind(plan);
+        end
+        protocol_event_vif_index = next_protocol_event_vif_index;
+        return 1;
+    endfunction
+
+    // 统一回滚：丢弃计划内所有 Function 的预检候选并标记环境无效；恒返回 0，
+    // 供调用方以 `return abort_bind(plan);` 一行退出。
+    protected function bit abort_bind(input pcie_bind_plan_t plan[$]);
+        foreach (plan[plan_index]) begin
+            if (plan[plan_index].function_instance != null)
+                plan[plan_index].function_instance.cancel_preflight_bind_pcie();
+        end
+        configuration_valid = 0;
+        return 0;
+    endfunction
+
+    // 逐个 Function 预检并暂存其协议接口；若两个 Function 暂存了同一协议接口、
+    // 同一 FSM 或同一 ops 候选（会共享运行态）则 UVM_FATAL 并返回 0。
+    protected function bit preflight_plan(
+        input pcie_bind_plan_t plan[$],
+        output virtual virtio_protocol_event_if staged_protocol_vifs[DPU_MAX_FUNCTIONS]
+    );
+        int unsigned next_protocol_event_vif_index;
+        virtio_auto_fsm staged_fsms[$];
+        virtio_atomic_ops staged_ops[$];
+        string alias_name;
+
+        next_protocol_event_vif_index = 0;
+        foreach (plan[plan_index]) begin
             if (!preflight_function_pcie(
-                active_functions[function_index],
-                selected_endpoints[function_index].rc_seqr,
-                next_protocol_event_vif_index,
-                candidate_protocol_vif)) begin
-                foreach (active_functions[cancel_index])
-                    active_functions[cancel_index].cancel_preflight_bind_pcie();
-                configuration_valid = 0;
+                    plan[plan_index].function_instance,
+                    plan[plan_index].rc_seqr,
+                    next_protocol_event_vif_index,
+                    staged_protocol_vifs[plan_index]))
                 return 0;
-            end
-            staged_protocol_vifs[function_index] = candidate_protocol_vif;
-            staged_pcie_fsms[function_index] =
-                active_functions[function_index].pending_pcie_fsm_candidate();
-            staged_pcie_ops[function_index] =
-                active_functions[function_index].pending_pcie_ops_candidate();
+            staged_fsms.push_back(
+                plan[plan_index].function_instance.pending_pcie_fsm_candidate());
+            staged_ops.push_back(
+                plan[plan_index].function_instance.pending_pcie_ops_candidate());
             for (int unsigned prior_index = 0;
-                 prior_index < function_index; prior_index++) begin
-                if (staged_protocol_vifs[function_index] ==
-                    staged_protocol_vifs[prior_index]) begin
+                 prior_index < plan_index; prior_index++) begin
+                alias_name = "";
+                if (staged_protocol_vifs[plan_index] ==
+                    staged_protocol_vifs[prior_index])
+                    alias_name = "protocol event interface";
+                else if (staged_fsms[plan_index] == staged_fsms[prior_index])
+                    alias_name = "PCIe FSM candidate";
+                else if (staged_ops[plan_index] == staged_ops[prior_index])
+                    alias_name = "PCIe ops candidate";
+                if (alias_name != "") begin
                     `uvm_fatal("VIRTIO_ENV", $sformatf(
-                        {"Active function indices %0d and %0d staged the ",
-                         "same protocol event interface"},
-                        prior_index, function_index))
-                    foreach (active_functions[cancel_index])
-                        active_functions[cancel_index].cancel_preflight_bind_pcie();
-                    configuration_valid = 0;
-                    return 0;
-                end
-                if (staged_pcie_fsms[function_index] ==
-                    staged_pcie_fsms[prior_index]) begin
-                    `uvm_fatal("VIRTIO_ENV", $sformatf(
-                        {"Active function indices %0d and %0d staged the ",
-                         "same PCIe FSM candidate"},
-                        prior_index, function_index))
-                    foreach (active_functions[cancel_index])
-                        active_functions[cancel_index].cancel_preflight_bind_pcie();
-                    configuration_valid = 0;
-                    return 0;
-                end
-                if (staged_pcie_ops[function_index] ==
-                    staged_pcie_ops[prior_index]) begin
-                    `uvm_fatal("VIRTIO_ENV", $sformatf(
-                        {"Active function indices %0d and %0d staged the ",
-                         "same PCIe ops candidate"},
-                        prior_index, function_index))
-                    foreach (active_functions[cancel_index])
-                        active_functions[cancel_index].cancel_preflight_bind_pcie();
-                    configuration_valid = 0;
+                        "Active function indices %0d and %0d staged the same %s",
+                        prior_index, plan_index, alias_name))
                     return 0;
                 end
             end
         end
+        return 1;
+    endfunction
 
-        // Validate the whole adapter/domain topology before binding any shim.
-        foreach (selected_endpoints[endpoint_index]) begin
-            virtio_pcie_function_endpoint endpoint;
+    // 只读校验 endpoint 计划中的 completion adapter 拓扑：一个 RC driver 只能
+    // 喂一个 adapter；同一 adapter 内一个 domain 只能对应一个 RC driver，一个
+    // RC driver 也不能代表多个 domain。标量计划（endpoint 为空）直接通过。
+    protected function bit validate_plan_adapters(input pcie_bind_plan_t plan[$]);
+        virtio_pcie_function_endpoint endpoint;
+        virtio_pcie_function_endpoint prior_endpoint;
+        bit same_domain;
+        string why;
 
-            endpoint = selected_endpoints[endpoint_index];
-            if (endpoint.completion_adapter == null)
+        foreach (plan[plan_index]) begin
+            endpoint = plan[plan_index].endpoint;
+            if ((endpoint == null) || (endpoint.completion_adapter == null))
                 continue;
-            if (!endpoint.completion_adapter.
-                domain_rc_driver_binding_supported(
+            if (!endpoint.completion_adapter.domain_rc_driver_binding_supported(
                     endpoint.pcie_id.domain, endpoint.rc_driver, why)) begin
                 `uvm_fatal("VIRTIO_ENV", why)
-                foreach (active_functions[cancel_index])
-                    active_functions[cancel_index].cancel_preflight_bind_pcie();
-                configuration_valid = 0;
                 return 0;
             end
             for (int unsigned prior_index = 0;
-                 prior_index < endpoint_index; prior_index++) begin
-                virtio_pcie_function_endpoint prior_endpoint;
-
-                prior_endpoint = selected_endpoints[prior_index];
-                if (prior_endpoint.completion_adapter == null)
+                 prior_index < plan_index; prior_index++) begin
+                prior_endpoint = plan[prior_index].endpoint;
+                if ((prior_endpoint == null) ||
+                    (prior_endpoint.completion_adapter == null))
                     continue;
                 if ((prior_endpoint.rc_driver == endpoint.rc_driver) &&
                     (prior_endpoint.completion_adapter !=
                      endpoint.completion_adapter)) begin
                     `uvm_fatal("VIRTIO_ENV",
                         "One RC driver cannot feed distinct completion adapters")
-                    foreach (active_functions[cancel_index])
-                        active_functions[cancel_index].cancel_preflight_bind_pcie();
-                    configuration_valid = 0;
                     return 0;
                 end
-                if (prior_endpoint.completion_adapter ==
-                    endpoint.completion_adapter) begin
-                    if (dpu_same_domain_key(
-                            prior_endpoint.pcie_id.domain,
-                            endpoint.pcie_id.domain) &&
-                        (prior_endpoint.rc_driver != endpoint.rc_driver)) begin
-                        `uvm_fatal("VIRTIO_ENV", $sformatf(
-                            "PCIe domain %s selects distinct RC drivers",
-                            dpu_pcie_domain_key_name(endpoint.pcie_id.domain)))
-                        foreach (active_functions[cancel_index])
-                            active_functions[cancel_index].cancel_preflight_bind_pcie();
-                        configuration_valid = 0;
-                        return 0;
-                    end
-                    if (!dpu_same_domain_key(
-                            prior_endpoint.pcie_id.domain,
-                            endpoint.pcie_id.domain) &&
-                        (prior_endpoint.rc_driver == endpoint.rc_driver)) begin
-                        `uvm_fatal("VIRTIO_ENV",
-                            "One RC driver cannot represent distinct PCIe domains")
-                        foreach (active_functions[cancel_index])
-                            active_functions[cancel_index].cancel_preflight_bind_pcie();
-                        configuration_valid = 0;
-                        return 0;
-                    end
+                if (prior_endpoint.completion_adapter != endpoint.completion_adapter)
+                    continue;
+                same_domain = dpu_same_domain_key(
+                    prior_endpoint.pcie_id.domain, endpoint.pcie_id.domain);
+                if (same_domain && (prior_endpoint.rc_driver != endpoint.rc_driver)) begin
+                    `uvm_fatal("VIRTIO_ENV", $sformatf(
+                        "PCIe domain %s selects distinct RC drivers",
+                        dpu_pcie_domain_key_name(endpoint.pcie_id.domain)))
+                    return 0;
+                end
+                if (!same_domain && (prior_endpoint.rc_driver == endpoint.rc_driver)) begin
+                    `uvm_fatal("VIRTIO_ENV",
+                        "One RC driver cannot represent distinct PCIe domains")
+                    return 0;
                 end
             end
         end
-
-        foreach (selected_endpoints[endpoint_index]) begin
-            bit binding_already_committed;
-            virtio_pcie_function_endpoint endpoint;
-
-            endpoint = selected_endpoints[endpoint_index];
-            if (endpoint.completion_adapter == null)
-                continue;
-            binding_already_committed = 0;
-            for (int unsigned prior_index = 0;
-                 prior_index < endpoint_index; prior_index++) begin
-                if ((selected_endpoints[prior_index].completion_adapter ==
-                     endpoint.completion_adapter) &&
-                    dpu_same_domain_key(
-                        selected_endpoints[prior_index].pcie_id.domain,
-                        endpoint.pcie_id.domain)) begin
-                    binding_already_committed = 1;
-                end
-            end
-            if (!binding_already_committed &&
-                !endpoint.completion_adapter.bind_domain_rc_driver(
-                    endpoint.pcie_id.domain, endpoint.rc_driver)) begin
-                foreach (active_functions[cancel_index])
-                    active_functions[cancel_index].cancel_preflight_bind_pcie();
-                configuration_valid = 0;
-                return 0;
-            end
-        end
-
-        next_protocol_event_vif_index = 0;
-        foreach (active_functions[function_index]) begin
-            if (!bind_function_pcie_endpoint(
-                active_functions[function_index],
-                selected_endpoints[function_index],
-                next_protocol_event_vif_index,
-                staged_protocol_vifs[function_index])) begin
-                foreach (active_functions[cancel_index])
-                    active_functions[cancel_index].cancel_preflight_bind_pcie();
-                configuration_valid = 0;
-                return 0;
-            end
-        end
-        protocol_event_vif_index = next_protocol_event_vif_index;
         return 1;
     endfunction
 
-    // 预检单个 Function 所需的 observer、协议接口池和 FSM/ops；成功时返回 1、
-    // 暂存 protocol_vif 并推进索引，失败时通过 UVM_FATAL 报告且不提交连接。
+    // 每个 (adapter, domain) 组合只绑定一次 RC driver；必须在
+    // validate_plan_adapters 通过之后调用，任一绑定失败返回 0。
+    protected function bit commit_plan_adapters(input pcie_bind_plan_t plan[$]);
+        virtio_pcie_function_endpoint endpoint;
+        bit already_bound;
+
+        foreach (plan[plan_index]) begin
+            endpoint = plan[plan_index].endpoint;
+            if ((endpoint == null) || (endpoint.completion_adapter == null))
+                continue;
+            already_bound = 0;
+            for (int unsigned prior_index = 0;
+                 prior_index < plan_index; prior_index++) begin
+                if ((plan[prior_index].endpoint != null) &&
+                    (plan[prior_index].endpoint.completion_adapter ==
+                     endpoint.completion_adapter) &&
+                    dpu_same_domain_key(
+                        plan[prior_index].endpoint.pcie_id.domain,
+                        endpoint.pcie_id.domain))
+                    already_bound = 1;
+            end
+            if (!already_bound &&
+                !endpoint.completion_adapter.bind_domain_rc_driver(
+                    endpoint.pcie_id.domain, endpoint.rc_driver))
+                return 0;
+        end
+        return 1;
+    endfunction
+
+    // Function 绑定共用的空值检查：Function、driver agent、monitor 与 observer
+    // 都必须存在；失败时 UVM_FATAL 并返回 0。
+    protected function bit function_pcie_handles_valid(
+        input virtio_function_instance function_instance
+    );
+        if ((function_instance == null) ||
+            (function_instance.driver_agent == null) ||
+            (function_instance.driver_agent.monitor == null) ||
+            (function_instance.driver_agent.observer == null)) begin
+            `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    // 解析第 slot_index 个协议接口槽位：先确认槽位池未耗尽；staged_protocol_vif
+    // 非空时沿用预检结果，否则从 config_db 读取 protocol_event_vif_<slot>。
+    // 失败时 UVM_FATAL 并返回 0。
+    protected function bit resolve_protocol_vif(
+        input virtio_function_instance function_instance,
+        input int unsigned slot_index,
+        input virtual virtio_protocol_event_if staged_protocol_vif,
+        output virtual virtio_protocol_event_if protocol_vif
+    );
+        protocol_vif = staged_protocol_vif;
+        if (slot_index >= DPU_MAX_FUNCTIONS) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "Protocol event interface pool exhausted at function BDF 0x%04h",
+                function_instance.bdf))
+            return 0;
+        end
+        if (protocol_vif != null)
+            return 1;
+        if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
+                null, "uvm_test_top",
+                $sformatf("protocol_event_vif_%0d", slot_index), protocol_vif) ||
+            (protocol_vif == null)) begin
+            `uvm_fatal("VIRTIO_ENV", $sformatf(
+                "No protocol event interface configured for active function %0d",
+                slot_index))
+            return 0;
+        end
+        return 1;
+    endfunction
+
+    // 预检单个 Function 所需的 observer、协议接口槽位和 FSM/ops；成功时返回 1、
+    // 暂存 protocol_vif 并推进槽位索引，失败时 UVM_FATAL 且不提交任何连接。
     protected function bit preflight_function_pcie(
         input virtio_function_instance function_instance,
         input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr,
         inout int unsigned next_protocol_event_vif_index,
         output virtual virtio_protocol_event_if protocol_vif
     );
-        string protocol_vif_key;
         string observer_why;
 
-        if (function_instance == null) begin
-            `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
+        protocol_vif = null;
+        if (!function_pcie_handles_valid(function_instance))
             return 0;
-        end
-        if ((function_instance.driver_agent == null) ||
-            (function_instance.driver_agent.monitor == null) ||
-            (function_instance.driver_agent.observer == null)) begin
-            `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
-            return 0;
-        end
         if (!function_instance.driver_agent.observer.
             preflight_mandatory_function_binding(
                 function_instance.transport, observer_why)) begin
@@ -971,22 +944,9 @@ class virtio_net_env extends uvm_env;
                 function_instance.bdf, observer_why))
             return 0;
         end
-        if (next_protocol_event_vif_index >= DPU_MAX_FUNCTIONS) begin
-            `uvm_fatal("VIRTIO_ENV", $sformatf(
-                "Protocol event interface pool exhausted at function BDF 0x%04h",
-                function_instance.bdf))
+        if (!resolve_protocol_vif(function_instance,
+                next_protocol_event_vif_index, null, protocol_vif))
             return 0;
-        end
-        protocol_vif_key = $sformatf("protocol_event_vif_%0d",
-            next_protocol_event_vif_index);
-        if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
-                null, "uvm_test_top", protocol_vif_key, protocol_vif) ||
-            (protocol_vif == null)) begin
-            `uvm_fatal("VIRTIO_ENV", $sformatf(
-                "No protocol event interface configured for active function %0d",
-                next_protocol_event_vif_index))
-            return 0;
-        end
         if (!function_instance.preflight_bind_pcie(pcie_rc_seqr))
             return 0;
         next_protocol_event_vif_index++;
@@ -1004,37 +964,12 @@ class virtio_net_env extends uvm_env;
         input virtual virtio_protocol_event_if staged_protocol_vif = null
     );
         virtual virtio_protocol_event_if protocol_vif;
-        string protocol_vif_key;
 
-        if (function_instance == null) begin
-            `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
+        if (!function_pcie_handles_valid(function_instance) ||
+            !resolve_protocol_vif(function_instance,
+                next_protocol_event_vif_index, staged_protocol_vif,
+                protocol_vif))
             return 0;
-        end
-        if ((function_instance.driver_agent == null) ||
-            (function_instance.driver_agent.monitor == null) ||
-            (function_instance.driver_agent.observer == null)) begin
-            `uvm_fatal("VIRTIO_ENV", "Function PCIe bind requires a monitor observer")
-            return 0;
-        end
-        if (next_protocol_event_vif_index >= DPU_MAX_FUNCTIONS) begin
-            `uvm_fatal("VIRTIO_ENV", $sformatf(
-                "Protocol event interface pool exhausted at function BDF 0x%04h",
-                function_instance.bdf))
-            return 0;
-        end
-        protocol_vif = staged_protocol_vif;
-        if (protocol_vif == null) begin
-            protocol_vif_key = $sformatf("protocol_event_vif_%0d",
-                next_protocol_event_vif_index);
-            if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
-                    null, "uvm_test_top", protocol_vif_key, protocol_vif) ||
-                (protocol_vif == null)) begin
-                `uvm_fatal("VIRTIO_ENV", $sformatf(
-                    "No protocol event interface configured for active function %0d",
-                    next_protocol_event_vif_index))
-                return 0;
-            end
-        end
         if (!function_instance.commit_preflight_bind_pcie(
             host_mem, iommu, barrier, err_inj, wait_pol, pcie_rc_seqr)) begin
             return 0;
@@ -1050,32 +985,6 @@ class virtio_net_env extends uvm_env;
         if ((pcie_ep_monitor != null) && (pcie_ep_monitor != pcie_rc_monitor))
             pcie_ep_monitor.tlp_ap.connect(
                 function_instance.driver_agent.observer.analysis_export);
-        return 1;
-    endfunction
-
-    // 将显式 endpoint 的 sequencer/monitor/completion adapter 提交给指定 Function；
-    // 身份匹配已在上层预检，空对象或任一底层绑定失败时返回 0。
-    protected function bit bind_function_pcie_endpoint(
-        input virtio_function_instance function_instance,
-        input virtio_pcie_function_endpoint endpoint,
-        inout int unsigned next_protocol_event_vif_index,
-        input virtual virtio_protocol_event_if staged_protocol_vif = null
-    );
-        if ((function_instance == null) || (endpoint == null)) begin
-            `uvm_fatal("VIRTIO_ENV",
-                "Endpoint PCIe bind requires a function and endpoint")
-            return 0;
-        end
-        if (!bind_function_pcie(
-            function_instance, endpoint.rc_seqr,
-            endpoint.rc_monitor, endpoint.ep_monitor,
-            next_protocol_event_vif_index, staged_protocol_vif)) begin
-            return 0;
-        end
-        // Identity matching was validated before any commit; this call only
-        // installs the selected sequencer and optional completion adapter.
-        if (!function_instance.transport.bind_pcie_endpoint(endpoint))
-            return 0;
         return 1;
     endfunction
 
