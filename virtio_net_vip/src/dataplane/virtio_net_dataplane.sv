@@ -16,7 +16,6 @@
 //   - virtio_rx_engine (packet reception)
 //   - virtio_offload_engine (checksum, GSO, RSS offloads)
 //   - virtio_failover_manager (VIRTIO_NET_F_STANDBY failover)
-//   - virtio_dataplane_callback (optional custom TX/RX hooks)
 //   - virtqueue_manager, host_mem_manager, virtio_iommu_model
 // ============================================================================
 
@@ -107,14 +106,6 @@ class virtio_net_dataplane extends uvm_object;
     virtual function void bind_ops(virtio_atomic_ops ops);
         tx_engine.ops = ops;
         rx_engine.ops = ops;
-    endfunction
-
-    // ========================================================================
-    // set_dataplane_callback -- Install custom TX/RX hooks
-    // ========================================================================
-    virtual function void set_dataplane_callback(virtio_dataplane_callback cb);
-        tx_engine.custom_cb = cb;
-        rx_engine.custom_cb = cb;
     endfunction
 
     // ========================================================================

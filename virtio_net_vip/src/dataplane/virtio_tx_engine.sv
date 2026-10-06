@@ -55,7 +55,6 @@ typedef byte unsigned virtio_byte_queue_t[$];
 //   - host_mem_manager (alloc, write_mem, free)
 //   - virtio_iommu_model (map, unmap)
 //   - virtio_offload_engine (checksum, GSO helpers)
-//   - virtio_dataplane_callback (optional custom chain builder)
 //   - virtio_net_hdr_util (pack_hdr)
 //   - virtio_buf_tracker (buffer lifecycle tracking)
 // ============================================================================
@@ -70,7 +69,6 @@ class virtio_tx_engine extends uvm_object;
     host_mem_manager            mem;
     virtio_iommu_model          iommu;
     virtio_offload_engine       offload;
-    virtio_dataplane_callback   custom_cb;   // null = standard mode
     bit [15:0]                  bdf;
     int unsigned                host_id;
 
@@ -197,11 +195,7 @@ class virtio_tx_engine extends uvm_object;
         tracker = virtio_buf_tracker::type_id::create("tx_tracker");
 
         // Build scatter-gather chain
-        if (custom_cb != null) begin
-            custom_cb.custom_tx_build_chain(token, hdr, sgs);
-        end else begin
-            standard_tx_build_chain(pkt_data, hdr, sgs, tracker);
-        end
+        standard_tx_build_chain(pkt_data, hdr, sgs, tracker);
 
         // Convert dynamic queue to static array for add_buf
         sgs_arr = new[sgs.size()];
@@ -337,7 +331,7 @@ class virtio_tx_engine extends uvm_object;
 
         if (!tx_buf_map.exists(token)) begin
             `uvm_info("TX_ENG",
-                "cleanup_tx_buffers: no tracker found (custom_cb or already cleaned)",
+                "cleanup_tx_buffers: no tracker found (already cleaned)",
                 UVM_HIGH)
             return;
         end

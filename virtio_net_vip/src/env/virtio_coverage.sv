@@ -21,10 +21,8 @@
 // All covergroups default OFF (cov_enable = 0). Construct all in build_phase
 // but only sample when the corresponding enable flag is set.
 //
-// Supports custom coverage callbacks (virtio_coverage_callback).
-//
 // Depends on:
-//   - virtio_transaction, virtio_coverage_callback
+//   - virtio_transaction
 //   - virtio_net_types.sv (all enums and structs)
 // ============================================================================
 
@@ -41,9 +39,6 @@ class virtio_coverage extends uvm_component;
     bit cov_error_enable        = 0;
     bit cov_lifecycle_enable    = 0;
     bit cov_sriov_enable        = 0;
-
-    // ===== Custom callbacks =====
-    virtio_coverage_callback custom_cov_cbs[$];
 
     // ===== Analysis import =====
     uvm_analysis_imp #(virtio_transaction, virtio_coverage) analysis_imp;
@@ -301,18 +296,10 @@ class virtio_coverage extends uvm_component;
     endfunction
 
     // ========================================================================
-    // register_custom_coverage
-    // ========================================================================
-
-    function void register_custom_coverage(virtio_coverage_callback cb);
-        custom_cov_cbs.push_back(cb);
-    endfunction
-
-    // ========================================================================
     // write -- Analysis port callback
     //
     // Extract sampling state from each transaction and sample enabled
-    // covergroups. Also invokes custom coverage callbacks.
+    // covergroups.
     // ========================================================================
 
     virtual function void write(virtio_transaction txn);
@@ -378,10 +365,6 @@ class virtio_coverage extends uvm_component;
 
         if (cov_sriov_enable)
             cg_sriov.sample();
-
-        // Custom callbacks
-        foreach (custom_cov_cbs[i])
-            custom_cov_cbs[i].custom_sample(txn);
     endfunction
 
     // ========================================================================

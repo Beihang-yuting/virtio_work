@@ -71,11 +71,8 @@ package virtio_net_pkg;
   `include "dpu_priv/dpu_priv_driver_config.sv"
 
   // ---------------------------------------------------------------------------
-  // 第 5 层 – 回调、事务与驱动 agent（callbacks/、types/、agent/）
+  // 第 5 层 – 事务与驱动 agent（types/、agent/）
   // ---------------------------------------------------------------------------
-  `include "callbacks/virtio_dataplane_callback.sv"
-  `include "callbacks/virtio_scoreboard_callback.sv"
-  `include "callbacks/virtio_coverage_callback.sv"
   `include "types/virtio_transaction.sv"
   // The RX responder accepts external net_packet objects, so the byte-stream
   // adapter must be visible before the agent/responder classes are compiled.

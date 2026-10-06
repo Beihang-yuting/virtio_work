@@ -28,7 +28,6 @@
 //   - host_mem_manager (alloc, read_mem, mem_set, free)
 //   - virtio_iommu_model (map, unmap)
 //   - virtio_offload_engine (RX checksum verification)
-//   - virtio_dataplane_callback (optional custom RX parsing)
 //   - virtio_net_hdr_util (unpack_hdr, get_hdr_size)
 //   - virtio_buf_tracker (buffer lifecycle tracking)
 // ============================================================================
@@ -68,7 +67,6 @@ class virtio_rx_engine extends uvm_object;
     host_mem_manager            mem;
     virtio_iommu_model          iommu;
     virtio_offload_engine       offload;
-    virtio_dataplane_callback   custom_cb;   // null = standard mode
     bit [15:0]                  bdf;
     int unsigned                host_id;
 
@@ -489,74 +487,6 @@ class virtio_rx_engine extends uvm_object;
             UVM_HIGH)
 
     endtask : receive_single_buf
-
-    // ==================================================================
-    // custom_receive (protected)
-    //
-    // Delegates reception to the custom callback for non-standard
-    // buffer layouts or parsing.
-    // ==================================================================
-    // 将已完成 buffer 的字节交给 custom_cb 解析，随后回收该 buffer；回调返回 null
-    // 时不追加输出。仍要求本引擎的 tracker，不能混用私有 ops 的 DMA 所有权。
-    protected virtual task custom_receive(
-        int unsigned      queue_id,
-        int unsigned      budget,
-        ref uvm_object    received[$]
-    );
-        virtqueue_base   vq;
-        uvm_object       token;
-        int unsigned     len;
-        int unsigned     count;
-
-        vq = vq_mgr.get_queue(queue_id);
-        if (vq == null) begin
-            `uvm_error("RX_ENG",
-                $sformatf("custom_receive: queue %0d not found", queue_id))
-            return;
-        end
-
-        count = 0;
-        while (count < budget) begin
-            virtio_buf_tracker tracker;
-            byte              buf_data[];
-            virtio_net_hdr_t   net_hdr;
-            uvm_object         parsed_pkt;
-            bit [63:0]         buf_gpa;
-
-            if (!vq.poll_used(token, len))
-                break;
-
-            if (!$cast(tracker, token) || tracker.count() == 0) begin
-                `uvm_error("RX_ENG", "custom_receive: invalid tracker token")
-                total_rx_errors++;
-                continue;
-            end
-
-            buf_gpa = tracker.gpa_list[0];
-            mem.read_mem(buf_gpa, len, buf_data);
-
-            // Delegate to custom callback for parsing
-            begin
-                byte unsigned buf_data_u[$];
-                foreach (buf_data[i]) buf_data_u.push_back(buf_data[i]);
-                custom_cb.custom_rx_parse_buf(buf_data_u, net_hdr, parsed_pkt);
-            end
-
-            cleanup_rx_buffer(buf_gpa);
-
-            if (parsed_pkt != null)
-                received.push_back(parsed_pkt);
-
-            total_rx_packets++;
-            total_rx_bytes += len;
-            count++;
-        end
-
-        `uvm_info("RX_ENG",
-            $sformatf("custom_receive: queue=%0d received=%0d", queue_id, count),
-            UVM_HIGH)
-
-    endtask : custom_receive
 
     // ==================================================================
     // cleanup_rx_buffer (protected)

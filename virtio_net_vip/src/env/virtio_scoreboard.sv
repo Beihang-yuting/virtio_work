@@ -18,11 +18,8 @@
 //   7. Ordering           -- in-order completion within a queue
 //   8. Config consistency -- device config register vs expected values
 //
-// Supports a custom callback (virtio_scoreboard_callback) for
-// vendor-specific packet comparison logic.
-//
 // Depends on:
-//   - virtio_transaction, virtio_scoreboard_callback
+//   - virtio_transaction
 //   - virtio_net_types.sv (scoreboard_stats_t, virtio_net_hdr_t, etc.)
 // ============================================================================
 
@@ -31,9 +28,6 @@ class virtio_scoreboard extends uvm_component;
 
     // ===== Analysis import =====
     uvm_analysis_imp #(virtio_transaction, virtio_scoreboard) txn_imp;
-
-    // ===== Custom callback =====
-    virtio_scoreboard_callback custom_checker;
 
     // ===== Check enable switches (all default ON) =====
     bit chk_data_integrity     = 1;
@@ -170,8 +164,8 @@ class virtio_scoreboard extends uvm_component;
     // ========================================================================
     // check_data_integrity
     //
-    // Compare expected vs actual packet data. Uses custom_checker if
-    // registered, otherwise uses uvm_object::compare().
+    // Compare expected vs actual packet data through the net_packet byte
+    // adapter, falling back to uvm_object::compare().
     // ========================================================================
 
     virtual function void check_data_integrity(uvm_object expected, uvm_object actual);
@@ -183,17 +177,13 @@ class virtio_scoreboard extends uvm_component;
             return;
         end
 
-        if (custom_checker != null) begin
-            match = custom_checker.custom_compare(expected, actual);
-        end else begin
-            // net_packet packet_item compares protocol layers but the
-            // dataplane contract is the exact wire byte stream.  Prefer the
-            // adapter so payload bytes are included, then retain the generic
-            // UVM comparison for legacy synthetic objects.
-            match = virtio_net_packet_adapter::compare(expected, actual);
-            if (!match)
-                match = expected.compare(actual);
-        end
+        // net_packet packet_item compares protocol layers but the
+        // dataplane contract is the exact wire byte stream.  Prefer the
+        // adapter so payload bytes are included, then retain the generic
+        // UVM comparison for legacy synthetic objects.
+        match = virtio_net_packet_adapter::compare(expected, actual);
+        if (!match)
+            match = expected.compare(actual);
 
         if (match) begin
             stats.tx_matched++;
