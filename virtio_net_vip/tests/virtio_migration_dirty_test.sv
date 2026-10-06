@@ -1454,9 +1454,7 @@ class virtio_migration_dirty_test extends uvm_test;
         ref virtqueue_manager                       vq_mgr,
         ref virtio_driver_config_t                  cfg
     );
-        virtio_memory_barrier_model barrier;
-        virtqueue_error_injector   err_inj;
-        virtio_wait_policy         wait_pol;
+        virtio_vq_test_kit         kit;
         bit                        setup_ok;
 
         transport = virtio_migration_dirty_test_transport::type_id::create(
@@ -1469,28 +1467,13 @@ class virtio_migration_dirty_test extends uvm_test;
             $sformatf("%s_iommu", context_name));
         mem = virtio_migration_dirty_tracking_mem::type_id::create(
             $sformatf("%s_mem", context_name));
-        vq_mgr = virtqueue_manager::type_id::create(
-            $sformatf("%s_vq_mgr", context_name));
-        barrier = virtio_memory_barrier_model::type_id::create(
-            $sformatf("%s_barrier", context_name));
-        err_inj = virtqueue_error_injector::type_id::create(
-            $sformatf("%s_err_inj", context_name));
-        wait_pol = virtio_wait_policy::type_id::create(
-            $sformatf("%s_wait_pol", context_name));
 
         mem.init_region(64'h7900_0000, 64'h7903_FFFF);
         transport.bdf = 16'h0910;
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.bdf = transport.bdf;
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.iommu = iommu;
-        ops.mem = mem;
-        ops.wait_pol = wait_pol;
+        kit = virtio_vq_test_kit::create_kit(
+            context_name, mem, iommu, transport.bdf);
+        vq_mgr = kit.vq_mgr;
+        void'(kit.make_ops(transport, "", ops));
         ops.use_full_queue_pair_setup = 1;
         ops.negotiated_features = '0;
         ops.negotiated_features[VIRTIO_F_RING_INDIRECT_DESC] = 1'b1;

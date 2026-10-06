@@ -436,9 +436,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         virtio_pf_lifecycle_blocking_ops   ops;
         virtio_iommu_model                  iommu;
         host_mem_manager                    mem;
-        virtio_memory_barrier_model         barrier;
-        virtqueue_error_injector            err_inj;
-        virtio_wait_policy                  wait_pol;
+        virtio_vq_test_kit                  kit;
         virtio_driver_config_t              cfg;
         bit                                 reset_complete;
         bit                                 reset_returned;
@@ -450,17 +448,10 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
             "real_worker_reset_ops");
         iommu = virtio_iommu_model::type_id::create("real_worker_reset_iommu");
         mem = host_mem_manager::type_id::create("real_worker_reset_mem");
-        barrier = virtio_memory_barrier_model::type_id::create(
-            "real_worker_reset_barrier");
-        err_inj = virtqueue_error_injector::type_id::create(
-            "real_worker_reset_err_inj");
-        wait_pol = virtio_wait_policy::type_id::create(
-            "real_worker_reset_wait_pol");
         reset_owner = virtio_pf_lifecycle_reset_owner::type_id::create(
             "real_worker_reset_owner");
 
         mem.init_region(64'h6100_0000, 64'h6100_FFFF);
-        wait_pol.default_poll_interval_ns = 10;
         cfg.num_queue_pairs = 1;
         cfg.queue_size = 8;
         cfg.vq_type = VQ_SPLIT;
@@ -480,19 +471,13 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         pf_function.state = VF_ACTIVE;
         pf_function.transport = transport;
         transport.bdf = 16'h0030;
-        pf_function.vq_mgr.mem = mem;
-        pf_function.vq_mgr.iommu = iommu;
-        pf_function.vq_mgr.barrier = barrier;
-        pf_function.vq_mgr.err_inj = err_inj;
-        pf_function.vq_mgr.wait_pol = wait_pol;
-        pf_function.vq_mgr.bdf = transport.bdf;
-        pf_function.vq_mgr.create_queue(0, cfg.queue_size, VQ_SPLIT).alloc_rings();
-        pf_function.vq_mgr.create_queue(1, cfg.queue_size, VQ_SPLIT).alloc_rings();
-        ops.transport = transport;
-        ops.vq_mgr = pf_function.vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        kit = virtio_vq_test_kit::create_kit(
+            "real_worker_reset", mem, iommu, transport.bdf,
+            pf_function.vq_mgr.host_id, pf_function.vq_mgr);
+        kit.wait_pol.default_poll_interval_ns = 10;
+        void'(kit.add_split(0, cfg.queue_size));
+        void'(kit.add_split(1, cfg.queue_size));
+        void'(kit.make_ops(transport, "", ops));
         fsm.ops = ops;
         fsm.drv_cfg = cfg;
         fsm.state = FSM_READY;
@@ -587,9 +572,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         virtio_atomic_ops                   ops;
         virtio_pf_lifecycle_tracking_mem    mem;
         virtio_pf_lifecycle_tracking_iommu  iommu;
-        virtio_memory_barrier_model         barrier;
-        virtqueue_error_injector            err_inj;
-        virtio_wait_policy                  wait_pol;
+        virtio_vq_test_kit                  kit;
         virtqueue_base                      rx_vq;
         virtqueue_base                      tx_vq;
         virtio_net_hdr_t                    hdr;
@@ -608,12 +591,6 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
             "pending_dma_reset_mem");
         iommu = virtio_pf_lifecycle_tracking_iommu::type_id::create(
             "pending_dma_reset_iommu");
-        barrier = virtio_memory_barrier_model::type_id::create(
-            "pending_dma_reset_barrier");
-        err_inj = virtqueue_error_injector::type_id::create(
-            "pending_dma_reset_err_inj");
-        wait_pol = virtio_wait_policy::type_id::create(
-            "pending_dma_reset_wait_pol");
         reset_owner = virtio_pf_lifecycle_reset_owner::type_id::create(
             "pending_dma_reset_owner");
 
@@ -623,26 +600,14 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         pf_function.function_kind = DPU_FUNCTION_PF;
         pf_function.state = VF_ACTIVE;
         pf_function.transport = transport;
-        pf_function.vq_mgr.mem = mem;
-        pf_function.vq_mgr.iommu = iommu;
-        pf_function.vq_mgr.barrier = barrier;
-        pf_function.vq_mgr.err_inj = err_inj;
-        pf_function.vq_mgr.wait_pol = wait_pol;
-        pf_function.vq_mgr.bdf = transport.bdf;
-
-        rx_vq = pf_function.vq_mgr.create_queue(0, 8, VQ_SPLIT);
-        tx_vq = pf_function.vq_mgr.create_queue(1, 8, VQ_SPLIT);
-        assert((rx_vq != null) && (tx_vq != null))
-            else `uvm_fatal("PF_LIFECYCLE", "failed to create pending-DMA test queues")
-        rx_vq.alloc_rings();
-        tx_vq.alloc_rings();
+        kit = virtio_vq_test_kit::create_kit(
+            "pending_dma_reset", mem, iommu, transport.bdf,
+            pf_function.vq_mgr.host_id, pf_function.vq_mgr);
+        rx_vq = kit.add_split(0, 8);
+        tx_vq = kit.add_split(1, 8);
         ring_allocation_count = mem.outstanding_allocations();
 
-        ops.transport = transport;
-        ops.vq_mgr = pf_function.vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        void'(kit.make_ops(transport, "", ops));
         fsm.ops = ops;
         fsm.state = FSM_RUNNING;
         pf_function.driver_agent.ops = ops;
@@ -684,12 +649,9 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
     task test_tx_second_allocation_failure_releases_header();
         virtio_mock_transport  transport;
         virtio_atomic_ops                    ops;
-        virtqueue_manager                    vq_mgr;
         virtio_pf_lifecycle_tracking_mem     mem;
         virtio_pf_lifecycle_tracking_iommu   iommu;
-        virtio_memory_barrier_model          barrier;
-        virtqueue_error_injector             err_inj;
-        virtio_wait_policy                   wait_pol;
+        virtio_vq_test_kit                   kit;
         virtio_net_hdr_t                     hdr;
         virtio_pf_lifecycle_test_packet      pkt;
         virtio_pf_lifecycle_tx_alloc_error_catcher catcher;
@@ -699,36 +661,22 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         transport = virtio_mock_transport::type_id::create(
             "tx_second_alloc_fail_transport");
         ops = virtio_atomic_ops::type_id::create("tx_second_alloc_fail_ops");
-        vq_mgr = virtqueue_manager::type_id::create("tx_second_alloc_fail_vq_mgr");
         mem = virtio_pf_lifecycle_tracking_mem::type_id::create(
             "tx_second_alloc_fail_mem");
         iommu = virtio_pf_lifecycle_tracking_iommu::type_id::create(
             "tx_second_alloc_fail_iommu");
-        barrier = virtio_memory_barrier_model::type_id::create(
-            "tx_second_alloc_fail_barrier");
-        err_inj = virtqueue_error_injector::type_id::create(
-            "tx_second_alloc_fail_err_inj");
-        wait_pol = virtio_wait_policy::type_id::create(
-            "tx_second_alloc_fail_wait_pol");
 
         // The basic 10-byte virtio header rounds to this manager's 16-byte
         // minimum block.  No space remains for the minimum 64-byte packet.
         mem.init_region(64'h6200_0000, 64'h6200_000F);
         allocation_baseline = mem.outstanding_allocations();
         transport.bdf = 16'h0040;
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.bdf = transport.bdf;
-        assert(vq_mgr.create_queue(0, 8, VQ_SPLIT) != null)
+        kit = virtio_vq_test_kit::create_kit(
+            "tx_second_alloc_fail", mem, iommu, transport.bdf);
+        // 16 字节的 Host memory 只够 header，队列只登记不分配 ring。
+        assert(kit.vq_mgr.create_queue(0, 8, VQ_SPLIT) != null)
             else `uvm_fatal("PF_LIFECYCLE", "failed to create TX allocation rollback queue")
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        void'(kit.make_ops(transport, "", ops));
         hdr = '{default: 0};
         pkt = virtio_pf_lifecycle_test_packet::type_id::create(
             "tx_second_alloc_fail_packet");
