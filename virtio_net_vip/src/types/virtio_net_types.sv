@@ -266,12 +266,6 @@ typedef enum {
 } feature_error_e;
 
 typedef enum {
-    QSETUP_ERR_ENABLE_BEFORE_ADDR, QSETUP_ERR_SIZE_EXCEEDS_MAX,
-    QSETUP_ERR_SIZE_NOT_POWER_OF_2, QSETUP_ERR_ADDR_UNALIGNED,
-    QSETUP_ERR_ENABLE_TWICE, QSETUP_ERR_SELECT_OOB_QUEUE
-} queue_setup_error_e;
-
-typedef enum {
     VIRTIO_NET_CTRL_ACK_OK  = 0,
     VIRTIO_NET_CTRL_ACK_ERR = 1
 } virtio_ctrl_ack_e;

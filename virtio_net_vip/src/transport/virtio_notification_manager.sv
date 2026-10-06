@@ -403,45 +403,6 @@ class virtio_notification_manager extends uvm_object;
             $sformatf("Queue %0d exited polling mode (NAPI)", queue_id), UVM_HIGH)
     endfunction
 
-    // ========================================================================
-    // 错误注入：直接操纵本地中断模型(不发真实 TLP)，用于验证上层对异常
-    // 中断行为的统计与容错。
-    // ========================================================================
-
-    // 注入伪中断：预先累加 spurious/total 计数后走正常入口再分类一次。
-    virtual task inject_spurious_interrupt(int unsigned vector);
-        `uvm_info("NOTIFY_MGR",
-            $sformatf("Injecting spurious interrupt on vector %0d", vector), UVM_LOW)
-        spurious_interrupts++;
-        total_interrupts++;
-        on_interrupt_received(vector);
-    endtask
-
-    // 注入漏中断：只累加 suppressed 计数、不投递任何回调，模拟通知丢失。
-    virtual task inject_missed_interrupt(int unsigned queue_id);
-        `uvm_info("NOTIFY_MGR",
-            $sformatf("Injecting missed interrupt for queue %0d", queue_id), UVM_LOW)
-        // Suppress the notification for the queue without delivering it
-        suppressed_notifications++;
-    endtask
-
-    // 注入错向量中断：把队列期望向量最低位取反后投递(如 1->0、2->3)，
-    // 验证向量错配时的分类行为；队列越界仅告警。
-    virtual task inject_wrong_vector(int unsigned queue_id);
-        int unsigned wrong_vector;
-        if (queue_id < queue_vectors.size()) begin
-            // Deliver on a different vector than expected
-            wrong_vector = queue_vectors[queue_id] ^ 1;
-            `uvm_info("NOTIFY_MGR",
-                $sformatf("Injecting wrong vector for queue %0d: expected=%0d, delivering=%0d",
-                          queue_id, queue_vectors[queue_id], wrong_vector), UVM_LOW)
-            on_interrupt_received(wrong_vector);
-        end else begin
-            `uvm_warning("NOTIFY_MGR",
-                $sformatf("inject_wrong_vector: queue_id %0d out of range", queue_id))
-        end
-    endtask
-
 endclass : virtio_notification_manager
 
 `endif // VIRTIO_NOTIFICATION_MANAGER_SV
