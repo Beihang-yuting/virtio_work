@@ -29,10 +29,7 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
     virtio_shared_mem_fixture mem_fixture;
     host_mem_manager         mem;
     virtio_iommu_model       iommu;
-    virtio_memory_barrier_model barrier;
-    virtqueue_error_injector err_inj;
-    virtio_wait_policy       wait_pol;
-    virtqueue_manager        vq_mgr;
+    virtio_vq_test_kit       kit;
     virtio_net_dataplane     dataplane;
     virtio_mock_transport transport;
     virtio_atomic_ops        ops;
@@ -189,10 +186,6 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
         if (mem == null)
             `uvm_fatal("NET_PACKET_TEST", "shared Host-0 memory handle is null")
         iommu    = virtio_iommu_model::type_id::create("multi_queue_iommu");
-        barrier  = virtio_memory_barrier_model::type_id::create("multi_queue_barrier");
-        err_inj  = virtqueue_error_injector::type_id::create("multi_queue_err_inj");
-        wait_pol = virtio_wait_policy::type_id::create("multi_queue_wait_pol");
-        vq_mgr   = virtqueue_manager::type_id::create("multi_queue_vq_mgr");
         dataplane = virtio_net_dataplane::type_id::create("multi_queue_dataplane");
 
         begin
@@ -203,22 +196,11 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
                    IOMMU_IOVA_RANDOM, iova_why))
             else `uvm_fatal("NET_PACKET_TEST", "failed to configure IOVA aperture")
         end
-        vq_mgr.mem = mem;
-        vq_mgr.iommu = iommu;
-        vq_mgr.barrier = barrier;
-        vq_mgr.err_inj = err_inj;
-        vq_mgr.wait_pol = wait_pol;
-        vq_mgr.host_id = 0;
-        vq_mgr.bdf = DEVICE_BDF;
+        kit = virtio_vq_test_kit::create_kit("multi_queue", mem, iommu, DEVICE_BDF);
 
         // Four independent split queues, each with four outstanding packets.
         for (int unsigned qid = 0; qid < 4; qid++) begin
-            virtqueue_base base_vq;
-            base_vq = vq_mgr.create_queue(qid, QUEUE_SIZE, VQ_SPLIT);
-            assert($cast(queues[qid], base_vq))
-                else `uvm_fatal("NET_PACKET_TEST", $sformatf(
-                    "queue %0d is not a split virtqueue", qid))
-            queues[qid].alloc_rings();
+            queues[qid] = kit.add_split(qid, QUEUE_SIZE);
             assert(queues[qid].get_free_count() == QUEUE_SIZE)
                 else `uvm_fatal("NET_PACKET_TEST", "queue ring allocation failed")
         end
@@ -228,12 +210,7 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
         transport = virtio_mock_transport::type_id::create(
             "multi_queue_transport");
         transport.bdf = DEVICE_BDF;
-        ops = virtio_atomic_ops::type_id::create("multi_queue_ops");
-        ops.transport = transport;
-        ops.vq_mgr = vq_mgr;
-        ops.mem = mem;
-        ops.iommu = iommu;
-        ops.wait_pol = wait_pol;
+        ops = kit.make_ops(transport, "multi_queue_ops");
         ops.negotiated_features = features;
         dataplane.bind_ops(ops);
 
@@ -268,7 +245,9 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
                     transport.kicks(qid), PACKETS_PER_QUEUE))
 
             for (int unsigned i = 0; i < PACKETS_PER_QUEUE; i++)
-                virtio_vq_test_kit::complete_split_at(mem, queues[qid], i, tx_descs[qid][i], 10 + tx_packets[qid][i].pkt.raw_data.size(), i + 1);
+                virtio_vq_test_kit::complete_split_at(
+                    mem, queues[qid], i, tx_descs[qid][i],
+                    10 + tx_packets[qid][i].pkt.raw_data.size(), i + 1);
 
             begin
                 uvm_object completed[$];
@@ -318,7 +297,8 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
                            0, mem, DEVICE_BDF, buf_iova, rx_data, fault))
                     else `uvm_fatal("NET_PACKET_TEST", $sformatf(
                         "RX q%0d device DMA write failed (%s)", qid, fault.name()))
-                virtio_vq_test_kit::complete_split_at(mem, queues[qid], i, desc_id, rx_data.size(), i + 1);
+                virtio_vq_test_kit::complete_split_at(
+                    mem, queues[qid], i, desc_id, rx_data.size(), i + 1);
             end
 
             begin
@@ -344,7 +324,7 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
 
         foreach (queues[qid])
             queues[qid].free_rings();
-        vq_mgr.leak_check();
+        kit.vq_mgr.leak_check();
         iommu.leak_check();
         mem.leak_check();
         assert(iommu.total_maps == iommu.total_unmaps)

@@ -430,9 +430,7 @@ class virtio_traffic_test extends uvm_test;
     task test_large_traffic();
         host_mem_manager mem;
         virtio_iommu_model iommu;
-        virtio_memory_barrier_model barrier;
-        virtqueue_error_injector err_inj;
-        virtio_wait_policy wait_pol;
+        virtio_vq_test_kit kit;
         split_virtqueue txq, rxq;
 
         int unsigned num_packets = 1000;
@@ -464,21 +462,15 @@ class virtio_traffic_test extends uvm_test;
         if (mem == null)
             `uvm_fatal("TRAFFIC_TEST", "large traffic has no shared Host memory")
         iommu = virtio_iommu_model::type_id::create("lt_iommu");
-        barrier = virtio_memory_barrier_model::type_id::create("lt_bar");
-        err_inj = virtqueue_error_injector::type_id::create("lt_einj");
-        wait_pol = virtio_wait_policy::type_id::create("lt_wp");
+        kit = virtio_vq_test_kit::create_kit("lt", mem, iommu, 16'h0100);
 
         iommu.strict_permission_check = 0;
 
         // Create TX queue (queue_id=1 = transmitq)
-        txq = split_virtqueue::type_id::create("lt_txq");
-        txq.setup(1, queue_size, mem, iommu, barrier, err_inj, wait_pol, 16'h0100);
-        txq.alloc_rings();
+        txq = kit.make_split("lt_txq", 1, queue_size, 16'h0100);
 
         // Create RX queue (queue_id=0 = receiveq)
-        rxq = split_virtqueue::type_id::create("lt_rxq");
-        rxq.setup(0, queue_size, mem, iommu, barrier, err_inj, wait_pol, 16'h0100);
-        rxq.alloc_rings();
+        rxq = kit.make_split("lt_rxq", 0, queue_size, 16'h0100);
         start_time = $realtime;
 
         // Process in batches of queue_size
@@ -496,11 +488,13 @@ class virtio_traffic_test extends uvm_test;
                 // Reset queues for this batch
                 if (batch_num > 0) begin
                     txq.reset_queue();
-                    txq.setup(1, queue_size, mem, iommu, barrier, err_inj, wait_pol, 16'h0100);
+                    txq.setup(1, queue_size, mem, iommu, kit.barrier, kit.err_inj,
+                              kit.wait_pol, 16'h0100);
                     txq.alloc_rings();
 
                     rxq.reset_queue();
-                    rxq.setup(0, queue_size, mem, iommu, barrier, err_inj, wait_pol, 16'h0100);
+                    rxq.setup(0, queue_size, mem, iommu, kit.barrier, kit.err_inj,
+                              kit.wait_pol, 16'h0100);
                     rxq.alloc_rings();
 
                     tx_used_idx = 0;
@@ -1072,9 +1066,7 @@ class virtio_traffic_test extends uvm_test;
     task test_queue_stress();
         host_mem_manager mem;
         virtio_iommu_model iommu;
-        virtio_memory_barrier_model barrier;
-        virtqueue_error_injector err_inj;
-        virtio_wait_policy wait_pol;
+        virtio_vq_test_kit kit;
         split_virtqueue vq;
         int unsigned queue_size = 256;
         int unsigned num_cycles = 10;
@@ -1085,9 +1077,7 @@ class virtio_traffic_test extends uvm_test;
         if (mem == null)
             `uvm_fatal("TRAFFIC_TEST", "queue stress has no shared Host memory")
         iommu = virtio_iommu_model::type_id::create("qs_iommu");
-        barrier = virtio_memory_barrier_model::type_id::create("qs_bar");
-        err_inj = virtqueue_error_injector::type_id::create("qs_einj");
-        wait_pol = virtio_wait_policy::type_id::create("qs_wp");
+        kit = virtio_vq_test_kit::create_kit("qs", mem, iommu, 16'h0100);
 
         iommu.strict_permission_check = 0;
 
@@ -1097,9 +1087,7 @@ class virtio_traffic_test extends uvm_test;
             bit [63:0] buf_addrs[$];
 
             // Create fresh queue each cycle
-            vq = split_virtqueue::type_id::create($sformatf("qs_vq_%0d", cycle));
-            vq.setup(0, queue_size, mem, iommu, barrier, err_inj, wait_pol, 16'h0100);
-            vq.alloc_rings();
+            vq = kit.make_split($sformatf("qs_vq_%0d", cycle), 0, queue_size, 16'h0100);
 
             // Fill all 256 descriptors
             for (int unsigned i = 0; i < queue_size; i++) begin
@@ -1203,9 +1191,7 @@ class virtio_traffic_test extends uvm_test;
     task test_mixed_queue_types();
         host_mem_manager mem;
         virtio_iommu_model iommu;
-        virtio_memory_barrier_model barrier;
-        virtqueue_error_injector err_inj;
-        virtio_wait_policy wait_pol;
+        virtio_vq_test_kit kit;
         virtqueue_manager mgr;
         virtqueue_base split_vq, packed_vq;
 
@@ -1224,19 +1210,11 @@ class virtio_traffic_test extends uvm_test;
         if (mem == null)
             `uvm_fatal("TRAFFIC_TEST", "mixed queue test has no shared Host memory")
         iommu = virtio_iommu_model::type_id::create("mq_iommu");
-        barrier = virtio_memory_barrier_model::type_id::create("mq_bar");
-        err_inj = virtqueue_error_injector::type_id::create("mq_einj");
-        wait_pol = virtio_wait_policy::type_id::create("mq_wp");
 
         iommu.strict_permission_check = 0;
 
-        mgr = virtqueue_manager::type_id::create("mq_mgr");
-        mgr.mem = mem;
-        mgr.iommu = iommu;
-        mgr.barrier = barrier;
-        mgr.err_inj = err_inj;
-        mgr.wait_pol = wait_pol;
-        mgr.bdf = 16'h0500;
+        kit = virtio_vq_test_kit::create_kit("mq", mem, iommu, 16'h0500);
+        mgr = kit.vq_mgr;
 
         // Create split queue (queue 0)
         split_vq = mgr.create_queue(0, split_queue_size, VQ_SPLIT);

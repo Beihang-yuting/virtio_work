@@ -113,25 +113,21 @@ class virtio_dual_test extends uvm_test;
 
     // ---- VIP A components ----
     virtio_pci_transport  transport_a;
-    virtio_wait_policy    wait_pol_a;
     host_mem_manager      mem_a;
     virtio_iommu_model    iommu_a;
     virtqueue_manager     vq_mgr_a;
-    virtio_memory_barrier_model barrier_a;
-    virtqueue_error_injector    err_inj_a;
     virtio_atomic_ops     ops_a;
     virtio_function_instance binding_function_a;
+    virtio_vq_test_kit    kit_a;
 
     // ---- VIP B components ----
     virtio_pci_transport  transport_b;
-    virtio_wait_policy    wait_pol_b;
     host_mem_manager      mem_b;
     virtio_iommu_model    iommu_b;
     virtqueue_manager     vq_mgr_b;
-    virtio_memory_barrier_model barrier_b;
-    virtqueue_error_injector    err_inj_b;
     virtio_atomic_ops     ops_b;
     virtio_function_instance binding_function_b;
+    virtio_vq_test_kit    kit_b;
 
     // Perf monitors
     virtio_perf_monitor   perf_a, perf_b;
@@ -228,12 +224,10 @@ class virtio_dual_test extends uvm_test;
 
         // 5. Create VIP A components
         transport_a = virtio_pci_transport::type_id::create("transport_a");
-        wait_pol_a  = virtio_wait_policy::type_id::create("wait_pol_a");
         mem_a       = host_mem_manager::type_id::create("mem_a");
         iommu_a     = virtio_iommu_model::type_id::create("iommu_a");
+        kit_a       = virtio_vq_test_kit::create_kit("dual_a", mem_a, iommu_a, 16'h0100);
         vq_mgr_a    = virtqueue_manager::type_id::create("vq_mgr_a");
-        barrier_a   = virtio_memory_barrier_model::type_id::create("barrier_a");
-        err_inj_a   = virtqueue_error_injector::type_id::create("err_inj_a");
         ops_a       = virtio_atomic_ops::type_id::create("ops_a");
         uvm_config_db#(uvm_active_passive_enum)::set(
             this, "binding_function_a.driver_agent", "is_active", UVM_PASSIVE);
@@ -242,12 +236,10 @@ class virtio_dual_test extends uvm_test;
 
         // 6. Create VIP B components
         transport_b = virtio_pci_transport::type_id::create("transport_b");
-        wait_pol_b  = virtio_wait_policy::type_id::create("wait_pol_b");
         mem_b       = host_mem_manager::type_id::create("mem_b");
         iommu_b     = virtio_iommu_model::type_id::create("iommu_b");
+        kit_b       = virtio_vq_test_kit::create_kit("dual_b", mem_b, iommu_b, 16'h0200);
         vq_mgr_b    = virtqueue_manager::type_id::create("vq_mgr_b");
-        barrier_b   = virtio_memory_barrier_model::type_id::create("barrier_b");
-        err_inj_b   = virtqueue_error_injector::type_id::create("err_inj_b");
         ops_b       = virtio_atomic_ops::type_id::create("ops_b");
         uvm_config_db#(uvm_active_passive_enum)::set(
             this, "binding_function_b.driver_agent", "is_active", UVM_PASSIVE);
@@ -275,16 +267,16 @@ class virtio_dual_test extends uvm_test;
         binding_function_a.vq_mgr = vq_mgr_a;
         binding_function_a.driver_agent.ops = ops_a;
         if (!binding_function_a.wire_shared(
-            mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a,
+            mem_a, iommu_a, kit_a.barrier, kit_a.err_inj, kit_a.wait_pol,
             pcie_env.rc_agent.sequencer)) begin
             `uvm_fatal("DUAL_TEST", "failed to bind function A to PCIe")
             return;
         end
 
-        wait_pol_a.default_poll_interval_ns = 100;
-        wait_pol_a.reset_timeout_ns = 10000;
-        wait_pol_a.queue_reset_timeout_ns = 10000;
-        wait_pol_a.max_poll_attempts = 100;
+        kit_a.wait_pol.default_poll_interval_ns = 100;
+        kit_a.wait_pol.reset_timeout_ns = 10000;
+        kit_a.wait_pol.queue_reset_timeout_ns = 10000;
+        kit_a.wait_pol.max_poll_attempts = 100;
 
         // ---- Wire VIP B ----
         transport_b.bdf = 16'h0200;
@@ -292,16 +284,16 @@ class virtio_dual_test extends uvm_test;
         binding_function_b.vq_mgr = vq_mgr_b;
         binding_function_b.driver_agent.ops = ops_b;
         if (!binding_function_b.wire_shared(
-            mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b,
+            mem_b, iommu_b, kit_b.barrier, kit_b.err_inj, kit_b.wait_pol,
             pcie_env.rc_agent.sequencer)) begin
             `uvm_fatal("DUAL_TEST", "failed to bind function B to PCIe")
             return;
         end
 
-        wait_pol_b.default_poll_interval_ns = 100;
-        wait_pol_b.reset_timeout_ns = 10000;
-        wait_pol_b.queue_reset_timeout_ns = 10000;
-        wait_pol_b.max_poll_attempts = 100;
+        kit_b.wait_pol.default_poll_interval_ns = 100;
+        kit_b.wait_pol.reset_timeout_ns = 10000;
+        kit_b.wait_pol.queue_reset_timeout_ns = 10000;
+        kit_b.wait_pol.max_poll_attempts = 100;
     endfunction
 
     // ========================================================================
@@ -875,21 +867,13 @@ class virtio_dual_test extends uvm_test;
                 b_batch = (b_remaining > queue_size_b) ? queue_size_b : b_remaining;
 
                 // Create fresh queues for each batch
-                txq_a = split_virtqueue::type_id::create("txq_a");
-                txq_a.setup(1, queue_size_a, mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a, 16'h0100);
-                txq_a.alloc_rings();
+                txq_a = kit_a.make_split("txq_a", 1, queue_size_a, 16'h0100);
 
-                rxq_a = split_virtqueue::type_id::create("rxq_a");
-                rxq_a.setup(0, queue_size_a, mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a, 16'h0100);
-                rxq_a.alloc_rings();
+                rxq_a = kit_a.make_split("rxq_a", 0, queue_size_a, 16'h0100);
 
-                txq_b = split_virtqueue::type_id::create("txq_b");
-                txq_b.setup(1, queue_size_b, mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b, 16'h0200);
-                txq_b.alloc_rings();
+                txq_b = kit_b.make_split("txq_b", 1, queue_size_b, 16'h0200);
 
-                rxq_b = split_virtqueue::type_id::create("rxq_b");
-                rxq_b.setup(0, queue_size_b, mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b, 16'h0200);
-                rxq_b.alloc_rings();
+                rxq_b = kit_b.make_split("rxq_b", 0, queue_size_b, 16'h0200);
 
                 a_desc_ids = {};
                 b_desc_ids = {};
@@ -1095,21 +1079,13 @@ class virtio_dual_test extends uvm_test;
                 batch_size = (remaining > queue_size) ? queue_size : remaining;
 
                 // Create fresh queues for each batch
-                txq_a = split_virtqueue::type_id::create("txq_a_vs");
-                txq_a.setup(1, queue_size, mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a, 16'h0100);
-                txq_a.alloc_rings();
+                txq_a = kit_a.make_split("txq_a_vs", 1, queue_size, 16'h0100);
 
-                rxq_a = split_virtqueue::type_id::create("rxq_a_vs");
-                rxq_a.setup(0, queue_size, mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a, 16'h0100);
-                rxq_a.alloc_rings();
+                rxq_a = kit_a.make_split("rxq_a_vs", 0, queue_size, 16'h0100);
 
-                txq_b = split_virtqueue::type_id::create("txq_b_vs");
-                txq_b.setup(1, queue_size, mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b, 16'h0200);
-                txq_b.alloc_rings();
+                txq_b = kit_b.make_split("txq_b_vs", 1, queue_size, 16'h0200);
 
-                rxq_b = split_virtqueue::type_id::create("rxq_b_vs");
-                rxq_b.setup(0, queue_size, mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b, 16'h0200);
-                rxq_b.alloc_rings();
+                rxq_b = kit_b.make_split("rxq_b_vs", 0, queue_size, 16'h0200);
 
                 a_desc_ids = {};
                 b_desc_ids = {};
@@ -1265,21 +1241,13 @@ class virtio_dual_test extends uvm_test;
                 a_batch = (a_remaining > queue_size) ? queue_size : a_remaining;
                 b_batch = (b_remaining > queue_size) ? queue_size : b_remaining;
 
-                txq_a = split_virtqueue::type_id::create("txq_a_ws");
-                txq_a.setup(1, queue_size, mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a, 16'h0100);
-                txq_a.alloc_rings();
+                txq_a = kit_a.make_split("txq_a_ws", 1, queue_size, 16'h0100);
 
-                rxq_a = split_virtqueue::type_id::create("rxq_a_ws");
-                rxq_a.setup(0, queue_size, mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a, 16'h0100);
-                rxq_a.alloc_rings();
+                rxq_a = kit_a.make_split("rxq_a_ws", 0, queue_size, 16'h0100);
 
-                txq_b = split_virtqueue::type_id::create("txq_b_ws");
-                txq_b.setup(1, queue_size, mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b, 16'h0200);
-                txq_b.alloc_rings();
+                txq_b = kit_b.make_split("txq_b_ws", 1, queue_size, 16'h0200);
 
-                rxq_b = split_virtqueue::type_id::create("rxq_b_ws");
-                rxq_b.setup(0, queue_size, mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b, 16'h0200);
-                rxq_b.alloc_rings();
+                rxq_b = kit_b.make_split("rxq_b_ws", 0, queue_size, 16'h0200);
 
                 a_desc_ids = {};
                 b_desc_ids = {};
@@ -1506,21 +1474,13 @@ class virtio_dual_test extends uvm_test;
                 b_batch = (b_remaining > queue_size) ? queue_size : b_remaining;
 
                 // Create fresh queues
-                txq_a = split_virtqueue::type_id::create("txq_a_bw");
-                txq_a.setup(1, queue_size, mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a, 16'h0100);
-                txq_a.alloc_rings();
+                txq_a = kit_a.make_split("txq_a_bw", 1, queue_size, 16'h0100);
 
-                rxq_a = split_virtqueue::type_id::create("rxq_a_bw");
-                rxq_a.setup(0, queue_size, mem_a, iommu_a, barrier_a, err_inj_a, wait_pol_a, 16'h0100);
-                rxq_a.alloc_rings();
+                rxq_a = kit_a.make_split("rxq_a_bw", 0, queue_size, 16'h0100);
 
-                txq_b = split_virtqueue::type_id::create("txq_b_bw");
-                txq_b.setup(1, queue_size, mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b, 16'h0200);
-                txq_b.alloc_rings();
+                txq_b = kit_b.make_split("txq_b_bw", 1, queue_size, 16'h0200);
 
-                rxq_b = split_virtqueue::type_id::create("rxq_b_bw");
-                rxq_b.setup(0, queue_size, mem_b, iommu_b, barrier_b, err_inj_b, wait_pol_b, 16'h0200);
-                rxq_b.alloc_rings();
+                rxq_b = kit_b.make_split("rxq_b_bw", 0, queue_size, 16'h0200);
 
                 a_desc_ids = {};
                 b_desc_ids = {};
