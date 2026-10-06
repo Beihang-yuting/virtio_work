@@ -747,15 +747,19 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         return null;
     endfunction
 
-    // Run the production PCI transport initialization through capability
-    // discovery, reset/ACK/DRIVER, feature negotiation, queue discovery,
-    // MSI-X setup, and DRIVER_OK.  Ring allocation is intentionally deferred
-    // to setup_queue(), which is the sole atomic-op queue allocator.
+    // 用 atomic ops 的单步接口完成 reset → ACK → DRIVER → 特性协商 → FEATURES_OK
+    // → 设备队列数校验 → MSI-X → DRIVER_OK。不调用 virtio_auto_fsm.full_init()：
+    // 它的队列建立阶段会再分配一次 ring；ring 只由 setup_queue() 这一唯一的
+    // atomic-op 分配入口创建。
     virtual task start_driver_flow(ref bit ok);
         virtio_function_instance function_instance;
         virtio_driver_config_t driver_cfg;
-        bit init_ok;
+        virtio_atomic_ops ops;
+        bit step_ok;
+        bit [63:0] negotiated;
         bit [7:0] status;
+        int unsigned device_queue_count;
+        int unsigned total_queues;
         string why;
 
         ok = 0;
@@ -787,26 +791,45 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             return;
         end
 
+        ops = function_instance.driver_agent.ops;
         function_instance.transport.discover_and_init_bars();
-        function_instance.transport.full_init_sequence(
-            driver_cfg.driver_features, driver_cfg.num_queue_pairs, init_ok);
-        if (!init_ok) begin
-            `uvm_error("REAL_FLOW", "PCI transport full_init_sequence failed")
+        ops.device_reset_verified(step_ok);
+        if (!step_ok) begin
+            `uvm_error("REAL_FLOW", "device reset did not complete")
             return;
         end
+        ops.set_acknowledge();
+        ops.set_driver();
+        // ops 自己记录协商结果，virtio-net header 长度由它推导，无需再手工同步。
+        ops.negotiate_features(driver_cfg.driver_features, negotiated);
+        ops.set_features_ok(step_ok);
+        if (!step_ok) begin
+            ops.set_failed();
+            `uvm_error("REAL_FLOW", "device rejected the negotiated features")
+            return;
+        end
+        // 只校验设备队列数能容纳本配置；各队列 notify 偏移由 setup_queue() 读回。
+        function_instance.transport.read_num_queues(device_queue_count);
+        total_queues = 2 * driver_cfg.num_queue_pairs;
+        if (negotiated[VIRTIO_NET_F_CTRL_VQ])
+            total_queues++;
+        if (total_queues > device_queue_count) begin
+            ops.set_failed();
+            `uvm_error("REAL_FLOW", $sformatf(
+                "configuration needs %0d queues but device supports %0d",
+                total_queues, device_queue_count))
+            return;
+        end
+        ops.setup_msix(total_queues);
+        ops.set_driver_ok();
+
         function_instance.transport.read_device_status(status);
         if (!(status & DEV_STATUS_DRIVER_OK)) begin
             `uvm_error("REAL_FLOW", $sformatf(
                 "transport did not reach DRIVER_OK (status=0x%02h)", status))
             return;
         end
-        // The transport negotiated directly, so give the atomic ops the same
-        // feature view; it sizes the virtio-net header from these bits.
-        function_instance.driver_agent.ops.negotiated_features =
-            function_instance.transport.driver_features;
-        // Keep the shared FSM's lifecycle view consistent for callers that
-        // inspect it, without invoking virtio_auto_fsm.full_init(), whose
-        // queue-setup stage would allocate rings a second time.
+        // 让共享 FSM 的生命周期视图与设备一致，供只读检查的调用方使用。
         if (function_instance.driver_agent.fsm != null)
             function_instance.driver_agent.fsm.state = FSM_READY;
         m_driver_flow_started = 1;

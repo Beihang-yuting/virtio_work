@@ -108,14 +108,14 @@ uvm_test_top.system_env
    （cap_manager.sv:103）——从 cfg 0x34 起遍历，解析 5 种 virtio vendor
    cap（common/notify/ISR/device/pci）与 MSI-X cap；NOTIFY cap 额外读
    `notify_off_multiplier`（:253）。
-3. **spec 7.2 状态机**：`virtio_pci_transport::full_init_sequence`
-   （pci_transport.sv:605），全是 common cfg BAR 的 MemWr/MemRd：
+3. **spec 7.2 状态机**：`virtio_auto_fsm::do_full_init` 经 `virtio_atomic_ops`
+   单步接口执行（真实驱动 fixture 直接调用同一组单步接口），全是 common cfg BAR 的 MemWr/MemRd：
    - reset：status(0x14)=0，轮询读回 0；
    - ACKNOWLEDGE(0x01) → DRIVER(0x03)；
    - **feature 64-bit 两段协商**：DFSELECT(0x00)/DF(0x04) 读两轮拼 64 位，
      GFSELECT(0x08)/GF(0x0C) 写两轮（:225-249）；
    - FEATURES_OK(0x0B) + 回读校验，失败写 FAILED；
-   - 读 num_queues(0x12)。
+   - 读 num_queues(0x12)（仅 fixture 用于校验队列容量）。
 4. **逐队列配置**：`virtio_atomic_ops::setup_queue`（atomic_ops.sv:627）：
    queue_select(0x16) → 读 size max(0x18) → `vq.alloc_rings()`（host_mem
    三块：desc 4K 对齐/avail/used）→ 三段 `iommu.map_for_host()`（失败

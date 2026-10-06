@@ -1062,18 +1062,20 @@ INTx fallback
 
 封装完整的 virtio PCI 传输协议，提供高层接口。
 
-**完整初始化序列** (`full_init_sequence()`)：
+**初始化序列**：transport 只提供寄存器访问；spec 7.2 的 9 步由 `virtio_auto_fsm::full_init()`
+（含队列建立）编排，或由调用方直接按 `virtio_atomic_ops` 单步接口编排（真实驱动 fixture
+即如此，队列只在 `setup_queue()` 中建立）：
 
 ```
-Step 1: reset_device()                    -- 写 status=0, 轮询直到读回 0
-Step 2: write_status(ACKNOWLEDGE)         -- 确认设备存在
-Step 3: write_status(ACKNOWLEDGE|DRIVER)  -- 声明驱动身份
-Step 4: negotiate_features()              -- 两阶段 feature 协商
-Step 5: write_status(|FEATURES_OK)        -- 确认 feature, 轮询验证
-Step 6: read_num_queues()                 -- 获取设备支持的队列数
-Step 7: Per-queue discovery               -- 读取 max_size, notify_off
-Step 8: setup_msix()                      -- MSI-X 表初始化 + 向量绑定
-Step 9: write_status(|DRIVER_OK)          -- 驱动就绪
+Step 1: ops.device_reset_verified()       -- 写 status=0, 轮询直到读回 0
+Step 2: ops.set_acknowledge()             -- 确认设备存在
+Step 3: ops.set_driver()                  -- 声明驱动身份
+Step 4: ops.negotiate_features()          -- 两阶段 feature 协商并记录结果
+Step 5: ops.set_features_ok()             -- 确认 feature, 回读验证
+Step 6: transport.read_num_queues()       -- 获取设备支持的队列数（fixture 校验用）
+Step 7: ops.setup_queue()                 -- 分配 ring、写地址、读 notify_off、使能
+Step 8: ops.setup_msix()                  -- MSI-X 表初始化 + 向量绑定
+Step 9: ops.set_driver_ok()               -- 驱动就绪
 ```
 
 **Kick 机制：**
@@ -2174,7 +2176,6 @@ legacy/TLM 模型路径；Fabric-owned function 会明确报告 `BAR_FABRIC_OWNE
 | 方法 | 类型 | 说明 |
 |------|------|------|
 | `discover_and_init_bars` | task | BAR 枚举 + capability 发现 |
-| `full_init_sequence` | task | 完整 9 步初始化 |
 | `reset_device` | task | 写 status=0, 轮询 |
 | `read_device_status` | task | 读取设备状态 |
 | `write_device_status` | task | 写入设备状态 |
