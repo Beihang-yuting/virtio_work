@@ -4,13 +4,13 @@
 // ============================================================================
 // virtio_offload_engine
 //
-// Unified offload engine wrapping all four sub-engines: checksum, TSO, USO,
-// and RSS. Provides a single interface for TX/RX engines and the scoreboard.
+// Unified offload engine wrapping three sub-engines: checksum, GSO header
+// length (TSO/USO) and RSS. Provides a single interface for TX/RX engines
+// and the scoreboard.
 //
 // Sub-engines:
-//   csum — checksum offload (TX partial csum, RX verification)
-//   tso  — TCP Segmentation Offload
-//   uso  — UDP Segmentation Offload (virtio 1.2+)
+//   csum — checksum offload (TX csum_start/csum_offset, RX verification)
+//   tso  — TCP/UDP GSO header length and MSS decision (no segmentation)
 //   rss  — Receive Side Scaling (Toeplitz hash + queue selection)
 // ============================================================================
 
@@ -20,7 +20,6 @@ class virtio_offload_engine extends uvm_object;
     // Sub-engines
     virtio_csum_engine    csum;
     virtio_tso_engine     tso;
-    virtio_uso_engine     uso;
     virtio_rss_engine     rss;
 
     // Configuration
@@ -28,13 +27,12 @@ class virtio_offload_engine extends uvm_object;
     int unsigned mtu = 1500;
     int unsigned mss = 1460;   // TCP MSS default (MTU - IP(20) - TCP(20))
 
-    // 构造函数：创建 csum/tso/uso/rss 四个子引擎并清零协商特性；
+    // 构造函数：创建 csum/tso/rss 三个子引擎并清零协商特性；
     // 本类是各 offload 子引擎的聚合门面（facade）。
     function new(string name = "virtio_offload_engine");
         super.new(name);
         csum = virtio_csum_engine::type_id::create("csum");
         tso  = virtio_tso_engine::type_id::create("tso");
-        uso  = virtio_uso_engine::type_id::create("uso");
         rss  = virtio_rss_engine::type_id::create("rss");
         negotiated_features = 64'h0;
     endfunction
@@ -68,7 +66,7 @@ class virtio_offload_engine extends uvm_object;
     function bit needs_uso(byte unsigned pkt_data[$]);
         if (!negotiated_features[VIRTIO_NET_F_HOST_USO])
             return 0;
-        return uso.needs_uso(pkt_data, mss);
+        return tso.needs_uso(pkt_data, mss);
     endfunction
 
     // ------------------------------------------------------------------------
@@ -117,23 +115,19 @@ class virtio_offload_engine extends uvm_object;
 
     // ------------------------------------------------------------------------
     // get_all_hdr_len — get total header length for segmentation
-    // Delegates to TSO or USO engine depending on packet type.
+    // Delegates to the TCP or UDP header-length helper of the TSO engine.
     // ------------------------------------------------------------------------
     function int unsigned get_all_hdr_len(byte unsigned pkt_data[$]);
         if (needs_tso(pkt_data))
             return tso.get_all_hdr_len(pkt_data);
         if (needs_uso(pkt_data))
-            return uso.get_all_hdr_len(pkt_data);
+            return tso.get_udp_all_hdr_len(pkt_data);
         return 0;
     endfunction
 
     // ------------------------------------------------------------------------
     // TX checksum helpers — delegate to csum engine
     // ------------------------------------------------------------------------
-    function void prepare_tx_csum(virtio_net_hdr_t hdr, ref byte unsigned pkt_data[$]);
-        csum.prepare_tx_csum(hdr, pkt_data);
-    endfunction
-
     // 委托 csum 引擎：计算 virtio_net_hdr.csum_start（L4 头起始偏移）。
     function int unsigned calc_csum_start(byte unsigned pkt_data[$]);
         return csum.calc_csum_start(pkt_data);

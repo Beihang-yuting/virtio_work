@@ -98,7 +98,6 @@ package virtio_net_pkg;
   // ---------------------------------------------------------------------------
   `include "dataplane/virtio_csum_engine.sv"
   `include "dataplane/virtio_tso_engine.sv"
-  `include "dataplane/virtio_uso_engine.sv"
   `include "dataplane/virtio_rss_engine.sv"
   `include "dataplane/virtio_offload_engine.sv"
   `include "dataplane/virtio_tx_engine.sv"

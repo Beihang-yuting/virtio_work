@@ -4,9 +4,9 @@
 // ============================================================================
 // virtio_csum_engine
 //
-// Checksum offload engine for virtio-net. Handles both TX path (partial
-// checksum preparation for device completion) and RX path (full L4 checksum
-// verification). Parses Ethernet/IP/TCP/UDP headers from raw packet bytes.
+// Checksum offload engine for virtio-net. Provides TX csum_start/csum_offset
+// derivation and RX full L4 checksum verification. Parses Ethernet/IP/TCP/UDP
+// headers from raw packet bytes.
 //
 // Standard header layout assumed:
 //   Ethernet: dst(6) + src(6) + ethertype(2) = 14 bytes (+4 if VLAN 0x8100)
@@ -162,87 +162,6 @@ class virtio_csum_engine extends uvm_object;
             sum = sum[15:0] + sum[31:16];
 
         return sum[15:0];
-    endfunction
-
-    // ------------------------------------------------------------------------
-    // prepare_tx_csum — TX: compute pseudo-header checksum and write it
-    // into the L4 checksum field. The device will complete the full checksum.
-    //
-    // Pseudo-header for IPv4: {src_ip(4), dst_ip(4), zero(1), proto(1), l4_len(2)}
-    // Pseudo-header for IPv6: {src_ip(16), dst_ip(16), l4_len(4), zero(3), next_hdr(1)}
-    // ------------------------------------------------------------------------
-    function void prepare_tx_csum(
-        virtio_net_hdr_t hdr,
-        ref byte unsigned pkt_data[$]
-    );
-        bit [15:0] etype;
-        int unsigned l2_len, l3_hdr_len, l4_off;
-        bit [7:0] proto;
-        byte unsigned pseudo_hdr[$];
-        bit [15:0] pseudo_csum;
-        int unsigned csum_field_off;
-        int unsigned l4_len;
-        int unsigned ip_total_len;
-
-        etype = get_ethertype(pkt_data);
-        l2_len = (({pkt_data[12], pkt_data[13]} == ETHERTYPE_VLAN) ?
-                  ETH_HDR_LEN + VLAN_TAG_LEN : ETH_HDR_LEN);
-        l3_hdr_len = get_l3_hdr_len(pkt_data);
-        l4_off = l2_len + l3_hdr_len;
-        proto = get_l4_proto(pkt_data);
-
-        // Calculate L4 length
-        if (etype == ETHERTYPE_IPV4) begin
-            ip_total_len = {pkt_data[l2_len + 2], pkt_data[l2_len + 3]};
-            l4_len = ip_total_len - l3_hdr_len;
-        end else begin
-            // IPv6 payload length field
-            l4_len = {pkt_data[l2_len + 4], pkt_data[l2_len + 5]};
-        end
-
-        // Build pseudo header
-        pseudo_hdr = {};
-        if (etype == ETHERTYPE_IPV4) begin
-            // src_ip (4 bytes at IP offset 12)
-            for (int i = 0; i < 4; i++)
-                pseudo_hdr.push_back(pkt_data[l2_len + 12 + i]);
-            // dst_ip (4 bytes at IP offset 16)
-            for (int i = 0; i < 4; i++)
-                pseudo_hdr.push_back(pkt_data[l2_len + 16 + i]);
-            // zero + protocol
-            pseudo_hdr.push_back(8'h00);
-            pseudo_hdr.push_back(proto);
-            // L4 length (big-endian)
-            pseudo_hdr.push_back(l4_len[15:8]);
-            pseudo_hdr.push_back(l4_len[7:0]);
-        end else if (etype == ETHERTYPE_IPV6) begin
-            // src_ip (16 bytes at IP offset 8)
-            for (int i = 0; i < 16; i++)
-                pseudo_hdr.push_back(pkt_data[l2_len + 8 + i]);
-            // dst_ip (16 bytes at IP offset 24)
-            for (int i = 0; i < 16; i++)
-                pseudo_hdr.push_back(pkt_data[l2_len + 24 + i]);
-            // L4 length (32-bit big-endian)
-            pseudo_hdr.push_back(8'h00);
-            pseudo_hdr.push_back(8'h00);
-            pseudo_hdr.push_back(l4_len[15:8]);
-            pseudo_hdr.push_back(l4_len[7:0]);
-            // zero(3) + next_header(1)
-            pseudo_hdr.push_back(8'h00);
-            pseudo_hdr.push_back(8'h00);
-            pseudo_hdr.push_back(8'h00);
-            pseudo_hdr.push_back(proto);
-        end
-
-        // Compute pseudo-header checksum
-        pseudo_csum = ones_complement_sum(pseudo_hdr, 0, pseudo_hdr.size());
-
-        // Write pseudo-header checksum into L4 checksum field
-        csum_field_off = l4_off + calc_csum_offset(pkt_data);
-        if (csum_field_off + 1 < pkt_data.size()) begin
-            pkt_data[csum_field_off]     = pseudo_csum[15:8];
-            pkt_data[csum_field_off + 1] = pseudo_csum[7:0];
-        end
     endfunction
 
     // ------------------------------------------------------------------------
