@@ -7,9 +7,10 @@
 // Abstract base class defining the interface all virtqueue implementations
 // must follow. Extends uvm_object (NOT uvm_component).
 //
-// Subclasses (split_virtqueue, packed_virtqueue, custom_virtqueue) must
-// implement all pure virtual methods. This class provides common state,
-// setup logic, and utility methods (dump_ring, leak_check).
+// Subclasses (split_virtqueue, packed_virtqueue, custom_virtqueue) implement
+// the ring-format pure virtual methods. This class provides common state,
+// setup logic, DMA helpers, kick/error-injection defaults and utility methods
+// (dump_ring, leak_check). Subclasses set log_tag in their constructors.
 //
 // Depends on:
 //   - virtio_net_types.sv (virtqueue_state_e, virtqueue_error_e, dma_dir_e,
@@ -45,6 +46,11 @@ virtual class virtqueue_base extends uvm_object;
     // ===== State =====
     virtqueue_state_e state = VQ_RESET;
     bit               queue_enable = 0;
+
+    // ===== Logging =====
+    // 各格式在构造函数里设置自己的报告 ID（SPLIT_VQ/PACKED_VQ/CUSTOM_VQ），
+    // 基类公共实现用它打印，测试 report catcher 匹配的 ID 保持不变。
+    protected string log_tag = "VQ_BASE";
 
     // ===== Token tracking: desc_id -> caller context =====
     protected uvm_object token_map[int unsigned];
@@ -155,9 +161,9 @@ virtual class virtqueue_base extends uvm_object;
 
     // 驱动侧核心三件套：add_buf 把 SG 列表序列化成描述符（前 n_out_sgs 个为
     // 设备只读、后 n_in_sgs 个为设备可写，indirect=1 走间接表）并发布给设备，
-    // 返回描述符头 ID（失败约定返回超界值）；kick 是 task，按需向设备发通知
-    // （可能消耗仿真时间等待）；poll_used 非阻塞收割一条完成：命中时输出
-    // add_buf 存入的 token 与设备写入长度 len 并返回 1，空则返回 0。
+    // 返回描述符头 ID（失败约定返回超界值）；kick 见下方基类实现；poll_used
+    // 非阻塞收割一条完成：命中时输出 add_buf 存入的 token 与设备写入长度 len
+    // 并返回 1，空则返回 0。
     pure virtual function int unsigned add_buf(
         virtio_sg_list  sgs[],
         int unsigned    n_out_sgs,
@@ -165,7 +171,19 @@ virtual class virtqueue_base extends uvm_object;
         uvm_object      token,
         bit             indirect
     );
-    pure virtual task kick();
+
+    // 标准 split/packed 的 kick：计数并在通知边界前后消费 PRE/POST_NOTIFY 故障。
+    // 它不发 PCIe TLP；生产路径由 virtio_atomic_ops 经 transport 发通知。
+    // custom 队列覆盖为回调。
+    virtual task kick();
+        total_kick_ops++;
+        void'(process_error_injection(VQ_FAULT_PRE_NOTIFY));
+        `uvm_info(log_tag,
+            $sformatf("kick: queue_id=%0d next_idx=%0d wrap=%0b",
+                      queue_id, get_notify_next_idx(), get_notify_wrap()),
+            UVM_HIGH)
+        void'(process_error_injection(VQ_FAULT_POST_NOTIFY));
+    endtask
     pure virtual function bit poll_used(
         ref uvm_object      token,
         ref int unsigned     len
@@ -200,12 +218,56 @@ virtual class virtqueue_base extends uvm_object;
 
     // 队列托管 DMA 映射：dma_map_buf 用本队列的 {host_id, bdf} 域把调用方的
     // GPA 映射为 IOVA 并登记到 dma_mappings（GPA 所有权仍归调用方），返回
-    // IOVA；dma_unmap_buf 按 IOVA 解除映射并注销登记。经此登记的映射才会被
-    // leak_check/teardown 统一清理。
-    pure virtual function bit [63:0] dma_map_buf(
+    // IOVA；经此登记的映射才会被 leak_check/teardown 统一清理。映射失败
+    // （IOVA 为 '1）也照常登记，由上层检查返回值。与 ring 格式无关，三种队列共用。
+    virtual function bit [63:0] dma_map_buf(
         bit [63:0] gpa, int unsigned size, dma_dir_e dir
     );
-    pure virtual function void dma_unmap_buf(bit [63:0] iova);
+        bit [63:0] iova;
+        iommu_mapping_t mapping;
+
+        iova = iommu.map_for_host(host_id, bdf, gpa, size, dir);
+
+        mapping.host_id = host_id;
+        mapping.bdf     = bdf;
+        mapping.gpa     = gpa;
+        mapping.iova    = iova;
+        mapping.size    = size;
+        mapping.dir     = dir;
+        mapping.desc_id = 0;
+        dma_mappings.push_back(mapping);
+
+        `uvm_info(log_tag,
+            $sformatf("dma_map_buf: queue_id=%0d gpa=0x%016x iova=0x%016x size=%0d dir=%s",
+                      queue_id, gpa, iova, size, dir.name()),
+            UVM_HIGH)
+
+        return iova;
+    endfunction
+
+    // 按 IOVA 查登记表，命中则经 release_dma_mapping() 解除 IOMMU 映射并注销
+    // 登记；找不到报 uvm_error——重复 unmap 或 unmap 未登记地址属调用方 bug。
+    virtual function void dma_unmap_buf(bit [63:0] iova);
+        int found_idx = -1;
+
+        foreach (dma_mappings[i]) begin
+            if (dma_mappings[i].iova == iova) begin
+                found_idx = i;
+                break;
+            end
+        end
+
+        if (found_idx >= 0) begin
+            release_dma_mapping(found_idx);
+            `uvm_info(log_tag,
+                $sformatf("dma_unmap_buf: queue_id=%0d iova=0x%016x", queue_id, iova),
+                UVM_HIGH)
+        end else begin
+            `uvm_error(log_tag,
+                $sformatf("dma_unmap_buf: queue_id=%0d iova=0x%016x not found in dma_mappings",
+                          queue_id, iova))
+        end
+    endfunction
 
     // ----- Error injection -----
     // Return the serialized descriptor format used by this queue.  Standard
@@ -360,9 +422,34 @@ virtual class virtqueue_base extends uvm_object;
         return 1;
     endfunction
 
-    // 由子类实现的描述符级错误注入入口：按 err_type 直接破坏本队列 ring 中的
-    // 具体字段，供定向错误用例使用（区别于上面按 err_inj 配置消费的通用钩子）。
-    pure virtual function void inject_desc_error(virtqueue_error_e err_type);
+    // 定向错误注入分派：三种 barrier-skip 错误直接交给 barrier 模型（属内存序
+    // 语义，与描述符无关）；其余类型配置给 err_inj 并显式限定到本 queue_id，
+    // 由后续 add_buf/kick 路径上的钩子按 phase 消费。err_inj 为空仅告警。
+    // custom 队列覆盖为回调，因为通用注入器不认识自定义布局。
+    virtual function void inject_desc_error(virtqueue_error_e err_type);
+        case (err_type)
+            VQ_ERR_SKIP_WMB_BEFORE_AVAIL,
+            VQ_ERR_SKIP_RMB_BEFORE_USED,
+            VQ_ERR_SKIP_MB_BEFORE_KICK: begin
+                barrier.inject_barrier_skip(err_type);
+            end
+            default: begin
+                if (err_inj != null)
+                    // Scope the request to this queue; the old zero-argument
+                    // form silently targeted queue 0 even when a fault was
+                    // requested through a VF/PF queue object.
+                    err_inj.configure(err_type, 0, queue_id);
+                else
+                    `uvm_warning(log_tag,
+                        $sformatf("inject_desc_error: queue_id=%0d err_inj is null, cannot inject %s",
+                                  queue_id, err_type.name()))
+            end
+        endcase
+
+        `uvm_info(log_tag,
+            $sformatf("inject_desc_error: queue_id=%0d type=%s", queue_id, err_type.name()),
+            UVM_MEDIUM)
+    endfunction
 
     // 迁移快照对：save_state 把队列运行态（索引、wrap 计数、所有权记录等）
     // 序列化进 snap，不改队列自身；restore_state 在目的端按 snap 重建运行态，

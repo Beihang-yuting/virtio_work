@@ -103,6 +103,7 @@ class custom_virtqueue extends virtqueue_base;
     function new(string name = "custom_virtqueue");
         super.new(name);
         custom_cb = null;
+        log_tag = "CUSTOM_VQ";
     endfunction
 
     // =================================================================
@@ -215,63 +216,6 @@ class custom_virtqueue extends virtqueue_base;
     virtual function bit needs_notification();
         if (!check_cb("needs_notification")) return 1;
         return custom_cb.cb_needs_notification(this);
-    endfunction
-
-    // =================================================================
-    // DMA helpers (transport-independent, same as split/packed)
-    // =================================================================
-
-    // 用本队列 {host_id, bdf} 域把调用方 GPA 映射为 IOVA，并登记到
-    // dma_mappings 供 teardown/leak_check 统一回收；GPA 所有权仍归调用方。
-    // 与 split/packed 实现一致，不经回调——DMA 映射语义与 ring 格式无关。
-    // 注意映射失败（IOVA 返回 '1）也会照常登记，由上层检查返回值。
-    virtual function bit [63:0] dma_map_buf(
-        bit [63:0] gpa, int unsigned size, dma_dir_e dir
-    );
-        bit [63:0] iova;
-        iommu_mapping_t mapping;
-
-        iova = iommu.map_for_host(host_id, bdf, gpa, size, dir);
-
-        mapping.host_id = host_id;
-        mapping.bdf     = bdf;
-        mapping.gpa     = gpa;
-        mapping.iova    = iova;
-        mapping.size    = size;
-        mapping.dir     = dir;
-        mapping.desc_id = 0;
-        dma_mappings.push_back(mapping);
-
-        `uvm_info("CUSTOM_VQ",
-            $sformatf("dma_map_buf: queue_id=%0d gpa=0x%016x iova=0x%016x size=%0d dir=%s",
-                      queue_id, gpa, iova, size, dir.name()),
-            UVM_HIGH)
-
-        return iova;
-    endfunction
-
-    // 按 IOVA 找到登记项后经 release_dma_mapping() 解除 IOMMU 映射并注销；
-    // 找不到报 uvm_error（重复 unmap 或 unmap 未登记地址属调用方 bug）。
-    virtual function void dma_unmap_buf(bit [63:0] iova);
-        int found_idx = -1;
-
-        foreach (dma_mappings[i]) begin
-            if (dma_mappings[i].iova == iova) begin
-                found_idx = i;
-                break;
-            end
-        end
-
-        if (found_idx >= 0) begin
-            release_dma_mapping(found_idx);
-            `uvm_info("CUSTOM_VQ",
-                $sformatf("dma_unmap_buf: queue_id=%0d iova=0x%016x", queue_id, iova),
-                UVM_HIGH)
-        end else begin
-            `uvm_error("CUSTOM_VQ",
-                $sformatf("dma_unmap_buf: queue_id=%0d iova=0x%016x not found in dma_mappings",
-                          queue_id, iova))
-        end
     endfunction
 
     // =================================================================

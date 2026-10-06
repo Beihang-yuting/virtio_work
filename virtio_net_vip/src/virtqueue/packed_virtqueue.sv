@@ -59,6 +59,7 @@ class packed_virtqueue extends virtqueue_base;
         event_idx_enabled  = 0;
         in_order_enabled   = 0;
         desc_ring_size     = 0;
+        log_tag            = "PACKED_VQ";
     endfunction
 
     // =================================================================
@@ -398,23 +399,6 @@ class packed_virtqueue extends virtqueue_base;
     endfunction
 
     // ------------------------------------------------------------------
-    // kick -- Notify the device that new buffers are available
-    // ------------------------------------------------------------------
-    virtual task kick();
-        total_kick_ops++;
-        // PRE/POST hooks bracket the actual notify boundary.  A REAL_DUT
-        // provider may replace the transport notification while retaining
-        // the same shared Host-memory fault contract.
-        void'(process_error_injection(VQ_FAULT_PRE_NOTIFY));
-        `uvm_info("PACKED_VQ",
-            $sformatf("kick: queue_id=%0d next_avail_idx=%0d wrap=%0b",
-                      queue_id, next_avail_idx, avail_wrap_counter),
-            UVM_HIGH)
-        // Actual transport kick (PCIe TLP) connected externally
-        void'(process_error_injection(VQ_FAULT_POST_NOTIFY));
-    endtask
-
-    // ------------------------------------------------------------------
     // poll_used -- Check for completed buffers in the packed ring
     //
     // In packed virtqueue, the device marks descriptors as used by
@@ -642,62 +626,6 @@ class packed_virtqueue extends virtqueue_base;
     endfunction
 
     // =================================================================
-    // DMA helpers (same pattern as split virtqueue)
-    // =================================================================
-
-    // 用本队列 {host_id, bdf} 域把调用方 GPA 映射为 IOVA，并登记到
-    // dma_mappings 供 teardown/leak_check 统一回收；GPA 所有权仍归调用方。
-    // 注意映射失败（IOVA 为 '1）也会照常登记，由上层检查返回值。
-    virtual function bit [63:0] dma_map_buf(
-        bit [63:0] gpa, int unsigned size, dma_dir_e dir
-    );
-        bit [63:0] iova;
-        iommu_mapping_t mapping;
-
-        iova = iommu.map_for_host(host_id, bdf, gpa, size, dir);
-
-        mapping.host_id = host_id;
-        mapping.bdf     = bdf;
-        mapping.gpa     = gpa;
-        mapping.iova    = iova;
-        mapping.size    = size;
-        mapping.dir     = dir;
-        mapping.desc_id = 0;
-        dma_mappings.push_back(mapping);
-
-        `uvm_info("PACKED_VQ",
-            $sformatf("dma_map_buf: queue_id=%0d gpa=0x%016x iova=0x%016x size=%0d dir=%s",
-                      queue_id, gpa, iova, size, dir.name()),
-            UVM_HIGH)
-
-        return iova;
-    endfunction
-
-    // 按 IOVA 查登记表，命中则经 release_dma_mapping() 解除 IOMMU 映射并注销
-    // 登记；找不到报 uvm_error——重复 unmap 或 unmap 未登记地址属调用方 bug。
-    virtual function void dma_unmap_buf(bit [63:0] iova);
-        int found_idx = -1;
-
-        foreach (dma_mappings[i]) begin
-            if (dma_mappings[i].iova == iova) begin
-                found_idx = i;
-                break;
-            end
-        end
-
-        if (found_idx >= 0) begin
-            release_dma_mapping(found_idx);
-            `uvm_info("PACKED_VQ",
-                $sformatf("dma_unmap_buf: queue_id=%0d iova=0x%016x", queue_id, iova),
-                UVM_HIGH)
-        end else begin
-            `uvm_error("PACKED_VQ",
-                $sformatf("dma_unmap_buf: queue_id=%0d iova=0x%016x not found in dma_mappings",
-                          queue_id, iova))
-        end
-    endfunction
-
-    // =================================================================
     // Error injection
     // =================================================================
 
@@ -705,36 +633,6 @@ class packed_virtqueue extends virtqueue_base;
     // addr/len/id/flags 布局），使其能正确定位字段做破坏。
     virtual function virtqueue_type_e descriptor_format();
         return VQ_PACKED;
-    endfunction
-
-    // 定向错误注入分派：三种 barrier-skip 错误直接交给 barrier 模型（属内存序
-    // 语义，与描述符无关）；其余类型配置给 err_inj 并显式限定到本 queue_id，
-    // 由后续 add_buf/kick 路径上的钩子按 phase 消费。err_inj 为空仅告警。
-    virtual function void inject_desc_error(virtqueue_error_e err_type);
-        case (err_type)
-            VQ_ERR_SKIP_WMB_BEFORE_AVAIL,
-            VQ_ERR_SKIP_RMB_BEFORE_USED,
-            VQ_ERR_SKIP_MB_BEFORE_KICK: begin
-                barrier.inject_barrier_skip(err_type);
-            end
-            default: begin
-                if (err_inj != null)
-                    // Scope the default request to this queue; otherwise a
-                    // fault injected through a non-zero PF/VF queue would be
-                    // consumed only by queue 0.
-                    err_inj.configure(err_type, 0, queue_id);
-                else
-                    `uvm_warning("PACKED_VQ",
-                        $sformatf({"inject_desc_error: queue_id=%0d err_inj is null, ",
-                                   "cannot inject %s"},
-                                  queue_id, err_type.name()))
-            end
-        endcase
-
-        `uvm_info("PACKED_VQ",
-            $sformatf("inject_desc_error: queue_id=%0d type=%s",
-                      queue_id, err_type.name()),
-            UVM_MEDIUM)
     endfunction
 
     // =================================================================
