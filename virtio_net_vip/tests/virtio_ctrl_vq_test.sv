@@ -159,6 +159,8 @@ class virtio_ctrl_vq_test extends uvm_test;
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         test_ctrl_vq_at_twice_max_pairs();
+        test_ctrl_send_alloc_failure_rolls_back();
+        test_ctrl_send_map_failure_rolls_back();
         `uvm_info("CTRL_VQ_TEST", "control VQ tests PASSED", UVM_NONE)
         phase.drop_objection(this);
     endtask
@@ -222,11 +224,12 @@ class virtio_ctrl_vq_test extends uvm_test;
         ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
         assert(ok && vq_mgr.has_queue(4) &&
                !vq_mgr.has_queue(2) &&
-               (vq_mgr.get_queue_count() == 3))
+               (vq_mgr.get_queue_count() == 3) &&
+               (transport.net_config_reads == 1))
             else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
-                "control VQ must be queue 2*max_virtqueue_pairs=4 (ok=%0b q2=%0b q4=%0b count=%0d)",
+                "control VQ must be queue 2*max_virtqueue_pairs=4 (ok=%0b q2=%0b q4=%0b count=%0d net_config_reads=%0d)",
                 ok, vq_mgr.has_queue(2), vq_mgr.has_queue(4),
-                vq_mgr.get_queue_count()))
+                vq_mgr.get_queue_count(), transport.net_config_reads))
 
         fsm.ops = ops;
         fsm.drv_cfg.queue_size = 8;
@@ -250,6 +253,123 @@ class virtio_ctrl_vq_test extends uvm_test;
         mem.leak_check();
 
         `uvm_info("CTRL_VQ_TEST", "control VQ at 2*max_virtqueue_pairs test PASSED", UVM_LOW)
+    endtask
+
+    // ops 内存只有一个 16B 最小块：header 占用后 ack 申请失败。ctrl_send 必须释放
+    // header，不映射、不入队、不通知，并以 ACK_ERR 返回。
+    task test_ctrl_send_alloc_failure_rolls_back();
+        virtio_ctrl_vq_test_transport transport =
+            virtio_ctrl_vq_test_transport::type_id::create("alloc_fail_transport");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("alloc_fail_ops");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("alloc_fail_vq_mgr");
+        virtio_ctrl_vq_test_mem ring_mem =
+            virtio_ctrl_vq_test_mem::type_id::create("alloc_fail_ring_mem");
+        virtio_ctrl_vq_test_mem ctrl_mem =
+            virtio_ctrl_vq_test_mem::type_id::create("alloc_fail_ctrl_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("alloc_fail_iommu");
+        virtio_ctrl_vq_test_catcher catcher;
+        virtqueue_base ctrl_vq;
+        virtio_ctrl_ack_e ack;
+        byte unsigned data[];
+        int unsigned maps_before;
+        bit ok;
+
+        ring_mem.init_region(64'h7100_0000, 64'h7100_FFFF);
+        ctrl_mem.init_region(64'h7200_0000, 64'h7200_000F);
+        wire_ops(ops, transport, vq_mgr, ring_mem, ctrl_mem, iommu, 16'h0902);
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        assert(ok) else `uvm_fatal("CTRL_VQ_TEST", "control queue setup failed")
+        ctrl_vq = vq_mgr.get_queue(2);
+        maps_before = iommu.active_mapping_count();
+
+        data = new[2];
+        data[0] = 8'h01;
+        data[1] = 8'h00;
+        ack = VIRTIO_NET_CTRL_ACK_OK;
+        catcher = new("alloc_fail_catcher");
+        catcher.expect_error("HOST_MEM", "*alloc: insufficient space*");
+        catcher.expect_error("ATOMIC_OPS", "*ctrl_send: host_mem alloc failed*");
+        uvm_report_cb::add(null, catcher);
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      data, ack);
+        uvm_report_cb::delete(null, catcher);
+        assert((ack == VIRTIO_NET_CTRL_ACK_ERR) && (catcher.caught_count == 2) &&
+               (ctrl_mem.outstanding_allocations() == 0) &&
+               (iommu.active_mapping_count() == maps_before) &&
+               (transport.kick_count == 0) && (ctrl_vq.get_free_count() == 8))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "ctrl_send ack-allocation failure leaked resources or notified the device (ack=%s caught=%0d allocs=%0d maps=%0d/%0d kicks=%0d free=%0d)",
+                ack.name(), catcher.caught_count, ctrl_mem.outstanding_allocations(),
+                iommu.active_mapping_count(), maps_before, transport.kick_count,
+                ctrl_vq.get_free_count()))
+
+        ops.teardown_queue(2);
+        assert((iommu.active_mapping_count() == 0) &&
+               (ring_mem.outstanding_allocations() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", "alloc-failure test leaked control queue resources")
+        ring_mem.leak_check();
+        ctrl_mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST", "ctrl_send allocation-failure rollback test PASSED", UVM_LOW)
+    endtask
+
+    // header 映射成功、data 映射失败：ctrl_send 必须撤销 header 映射并释放三块缓冲。
+    task test_ctrl_send_map_failure_rolls_back();
+        virtio_ctrl_vq_test_transport transport =
+            virtio_ctrl_vq_test_transport::type_id::create("map_fail_transport");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("map_fail_ops");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("map_fail_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("map_fail_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("map_fail_iommu");
+        virtio_ctrl_vq_test_catcher catcher;
+        virtqueue_base ctrl_vq;
+        virtio_ctrl_ack_e ack;
+        byte unsigned data[];
+        int unsigned maps_before;
+        int unsigned allocs_before;
+        bit ok;
+
+        mem.init_region(64'h7300_0000, 64'h7300_FFFF);
+        wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h0903);
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        assert(ok) else `uvm_fatal("CTRL_VQ_TEST", "control queue setup failed")
+        ctrl_vq = vq_mgr.get_queue(2);
+        maps_before = iommu.active_mapping_count();
+        allocs_before = mem.outstanding_allocations();
+
+        data = new[2];
+        data[0] = 8'h01;
+        data[1] = 8'h00;
+        ack = VIRTIO_NET_CTRL_ACK_OK;
+        iommu.map_calls = 0;
+        iommu.fail_map_after = 2;
+        catcher = new("map_fail_catcher");
+        catcher.expect_error("ATOMIC_OPS", "*ctrl_send: failed to map control buffers*");
+        uvm_report_cb::add(null, catcher);
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      data, ack);
+        uvm_report_cb::delete(null, catcher);
+        iommu.fail_map_after = 0;
+        assert((ack == VIRTIO_NET_CTRL_ACK_ERR) && (catcher.caught_count == 1) &&
+               (mem.outstanding_allocations() == allocs_before) &&
+               (iommu.active_mapping_count() == maps_before) &&
+               (transport.kick_count == 0) && (ctrl_vq.get_free_count() == 8))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "ctrl_send map failure leaked resources or notified the device (ack=%s caught=%0d allocs=%0d/%0d maps=%0d/%0d kicks=%0d free=%0d)",
+                ack.name(), catcher.caught_count, mem.outstanding_allocations(),
+                allocs_before, iommu.active_mapping_count(), maps_before,
+                transport.kick_count, ctrl_vq.get_free_count()))
+
+        ops.teardown_queue(2);
+        assert((iommu.active_mapping_count() == 0) &&
+               (mem.outstanding_allocations() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", "map-failure test leaked control queue resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST", "ctrl_send map-failure rollback test PASSED", UVM_LOW)
     endtask
 endclass : virtio_ctrl_vq_test
 

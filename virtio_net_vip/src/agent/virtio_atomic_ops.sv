@@ -1683,9 +1683,21 @@ class virtio_atomic_ops extends uvm_object;
         hdr_buf[0] = ctrl_class;
         hdr_buf[1] = cmd;
 
-        // 2. Allocate host_mem for hdr, data, and ack
+        // 2. Allocate host_mem for hdr, data, and ack.  每次失败都回滚本次已分配
+        // 的缓冲；此时尚无映射和描述符引用它们，直接 free 即可。
         hdr_gpa = mem.alloc(2, .align(1));
+        if (hdr_gpa == '1) begin
+            `uvm_error("ATOMIC_OPS", "ctrl_send: host_mem alloc failed for control header")
+            ack = VIRTIO_NET_CTRL_ACK_ERR;
+            return;
+        end
         ack_gpa = mem.alloc(1, .align(1));
+        if (ack_gpa == '1) begin
+            mem.free(hdr_gpa);
+            `uvm_error("ATOMIC_OPS", "ctrl_send: host_mem alloc failed for control ack")
+            ack = VIRTIO_NET_CTRL_ACK_ERR;
+            return;
+        end
 
         write_buf = new[2];
         write_buf[0] = hdr_buf[0];
@@ -1694,6 +1706,13 @@ class virtio_atomic_ops extends uvm_object;
 
         data_alloc_size = (data.size() > 0) ? data.size() : 1;
         data_gpa = mem.alloc(data_alloc_size, .align(1));
+        if (data_gpa == '1) begin
+            mem.free(hdr_gpa);
+            mem.free(ack_gpa);
+            `uvm_error("ATOMIC_OPS", "ctrl_send: host_mem alloc failed for control data")
+            ack = VIRTIO_NET_CTRL_ACK_ERR;
+            return;
+        end
 
         if (data.size() > 0) begin
             write_buf = new[data.size()];
@@ -1706,13 +1725,32 @@ class virtio_atomic_ops extends uvm_object;
         write_buf[0] = 8'hFF;
         mem.write_mem(ack_gpa, write_buf);
 
-        // 3. Map through IOMMU
+        // 3. Map through IOMMU.  任一映射失败即停止后续映射，撤销已成功的映射并
+        // 释放三块缓冲；描述符尚未发布，设备不可能访问这些 IOVA。
+        data_iova = '1;
+        ack_iova  = '1;
         hdr_iova  = iommu.map_for_host(get_iommu_host_id(transport),
             transport.bdf, hdr_gpa, 2, DMA_TO_DEVICE);
-        data_iova = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, data_gpa, data_alloc_size, DMA_TO_DEVICE);
-        ack_iova  = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, ack_gpa, 1, DMA_FROM_DEVICE);
+        if ((hdr_iova != '1) && (hdr_iova != 0))
+            data_iova = iommu.map_for_host(get_iommu_host_id(transport),
+                transport.bdf, data_gpa, data_alloc_size, DMA_TO_DEVICE);
+        if ((data_iova != '1) && (data_iova != 0))
+            ack_iova  = iommu.map_for_host(get_iommu_host_id(transport),
+                transport.bdf, ack_gpa, 1, DMA_FROM_DEVICE);
+        if ((ack_iova == '1) || (ack_iova == 0)) begin
+            if ((hdr_iova != '1) && (hdr_iova != 0))
+                iommu.unmap_for_host(get_iommu_host_id(transport),
+                                     transport.bdf, hdr_iova);
+            if ((data_iova != '1) && (data_iova != 0))
+                iommu.unmap_for_host(get_iommu_host_id(transport),
+                                     transport.bdf, data_iova);
+            mem.free(hdr_gpa);
+            mem.free(data_gpa);
+            mem.free(ack_gpa);
+            `uvm_error("ATOMIC_OPS", "ctrl_send: failed to map control buffers")
+            ack = VIRTIO_NET_CTRL_ACK_ERR;
+            return;
+        end
 
         // 4. Build scatter-gather: [hdr(out)] [data(out)] [ack(in)]
         entry.addr = hdr_iova;
