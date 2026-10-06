@@ -33,6 +33,14 @@ class virtio_net_env_config extends uvm_object;
 
     protected service_config_entry_t m_service_configs[string];
 
+    // 私有驱动按完整 service key 选择，避免全局 factory override 影响标准 PF/VF。
+    // 配置及控制后端由上层持有；Function 在 PCIe 绑定时冻结队列配置副本。
+    typedef struct {
+        dpu_service_key_t key;
+        dpu_priv_driver_config cfg;
+    } private_config_entry_t;
+    protected private_config_entry_t m_private_configs[string];
+
     // 可选 service 白名单。空队列保持旧环境的全量消费语义；非空时按完整
     // service key 精确筛选，允许多个子环境共享同一对冻结快照与资源管理器。
     dpu_service_key_t service_keys[$];
@@ -108,6 +116,31 @@ class virtio_net_env_config extends uvm_object;
     // 仅初始化 UVM 配置对象；默认字段在声明处设定，构造函数不创建外部资源。
     function new(string name = "virtio_net_env_config");
         super.new(name);
+    endfunction
+
+    // 给一个 VIO service 选择 DPU 私有驱动；重复键/空配置立即拒绝，具体队列数量
+    // 在 snapshot 限额解析后校验。不改拓扑、Host 内存或其他 service 的驱动类型。
+    function bit add_dpu_private_config(dpu_service_key_t key,
+                                         dpu_priv_driver_config private_cfg,
+                                         output string why);
+        string name_key;
+        name_key = dpu_service_key_name(key);
+        why = "";
+        if ((key.service_kind != DPU_SERVICE_VIO_NET) || (private_cfg == null) ||
+            m_private_configs.exists(name_key)) begin
+            why = "private service key 非法、配置为空或重复登记";
+            return 0;
+        end
+        m_private_configs[name_key] = '{key:key, cfg:private_cfg};
+        return 1;
+    endfunction
+
+    // 按 service 查询借用的私有配置；返回 null 表示保持标准 Virtio 流程。
+    function dpu_priv_driver_config get_dpu_private_config(dpu_service_key_t key);
+        string name_key;
+        name_key = dpu_service_key_name(key);
+        if (m_private_configs.exists(name_key)) return m_private_configs[name_key].cfg;
+        return null;
     endfunction
 
     // 功能：将一个 VIO-net service key 加入可选白名单。
@@ -332,6 +365,20 @@ class virtio_net_env_config extends uvm_object;
         if (driver_cfg.num_queue_pairs > max_pairs)
             driver_cfg.num_queue_pairs = max_pairs;
         driver_cfg.max_vio_net_qpairs_per_device = max_pairs;
+        // 显式私有配置选择私有队列和 polling；没有 service 级行为覆盖时使用
+        // 私有默认环大小。该协议没有 Virtio 特性协商和 Virtio-net header。
+        if (m_private_configs.exists(service_name)) begin
+            dpu_priv_driver_config private_cfg;
+            private_cfg = m_private_configs[service_name].cfg;
+            if (!private_cfg.validate(driver_cfg.num_queue_pairs, why)) return 0;
+            if (!m_service_configs.exists(service_name))
+                driver_cfg.queue_size = private_cfg.default_queue_size;
+            driver_cfg.vq_type = VQ_CUSTOM;
+            driver_cfg.irq_mode = IRQ_POLLING;
+            driver_cfg.driver_features = 0;
+            driver_cfg.rx_buf_mode = RX_MODE_SMALL;
+            driver_cfg.rx_buf_size = private_cfg.rx_buf_size;
+        end
         why = "";
         return 1;
     endfunction
@@ -357,6 +404,13 @@ class virtio_net_env_config extends uvm_object;
             DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE);
         if (!validate_driver_behavior(default_cfg, "default VIO behavior", why))
             return 0;
+        foreach (m_private_configs[private_name]) begin
+            if ((m_private_configs[private_name].cfg == null) ||
+                (m_private_configs[private_name].cfg.control == null)) begin
+                why = {"private service 缺少配置或控制后端 ", private_name};
+                return 0;
+            end
+        end
         foreach (m_service_configs[service_name]) begin
             if (m_service_configs[service_name].key.service_kind !=
                 DPU_SERVICE_VIO_NET) begin
@@ -399,6 +453,15 @@ class virtio_net_env_config extends uvm_object;
         if (snapshot_caps == null) begin
             why = "frozen snapshot has no DUT capabilities";
             return 0;
+        end
+        foreach (m_private_configs[private_name]) begin
+            if (!service_key_selected(m_private_configs[private_name].key) ||
+                !snapshot.get_service_owner(m_private_configs[private_name].key,
+                                              owner, service_why) ||
+                (owner.host_id != host_id)) begin
+                why = {"private service 不在当前 Host 的冻结快照/选择范围内 ", private_name};
+                return 0;
+            end
         end
         if ((snapshot_caps.max_vio_net_qpairs_per_device == 0) ||
             (snapshot_caps.max_vio_net_qpairs_per_device >

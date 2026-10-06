@@ -1,6 +1,9 @@
 `ifndef VIRTIO_FUNCTION_INSTANCE_SV
 `define VIRTIO_FUNCTION_INSTANCE_SV
 
+// 目录层次：src/sriov；每个 PF/VF 拥有 driver、queue manager、transport 和运行态。
+// 依赖冻结 DPU snapshot、共享 Host memory 和标准/私有 ops/FSM；组件生命周期由
+// UVM 管理，private_cfg/control 借用自 env_cfg，DMA 由所选 ops 在停机确认后释放。
 // One independently addressable virtio function.  A PF and every VF own the
 // same driver, transport, queue-manager, dataplane, Fabric identity, and BAR
 // leases; only their function key and transport VF bit differ.
@@ -41,6 +44,8 @@ class virtio_function_instance extends uvm_component;
 
     vf_state_e             state = VF_CREATED;
     virtio_driver_config_t drv_cfg;
+    // 非空时该 Function 使用 DPU 私有队列协议，其他 Function 仍可用标准 Virtio。
+    dpu_priv_driver_config private_cfg;
     local virtio_auto_fsm  pending_pcie_fsm;
     local virtio_atomic_ops pending_pcie_ops;
     local bit              pcie_bind_prepared;
@@ -54,6 +59,38 @@ class virtio_function_instance extends uvm_component;
         pending_pcie_fsm = null;
         pending_pcie_ops = null;
         pcie_bind_prepared = 0;
+    endfunction
+
+    // 根据本 Function 的配置创建匹配的 ops/FSM 候选，预检不访问设备。
+    // 已提供对象类型冲突时拒绝，防止标准 FSM 驱动私有 ring；配置仅在提交时冻结。
+    protected function bit prepare_driver_candidates(
+        string label, virtio_driver_config_t behavior,
+        ref virtio_atomic_ops candidate_ops, ref virtio_auto_fsm candidate_fsm
+    );
+        dpu_priv_atomic_ops private_ops;
+        dpu_priv_auto_fsm private_fsm;
+        string why;
+        if (private_cfg != null) begin
+            if (!private_cfg.validate(behavior.num_queue_pairs, why) ||
+                behavior.vq_type != VQ_CUSTOM || behavior.irq_mode != IRQ_POLLING) begin
+                `uvm_error("FUNCTION_BIND", {"私有驱动配置非法: ", why})
+                return 0;
+            end
+            if (candidate_ops == null)
+                candidate_ops = dpu_priv_atomic_ops::type_id::create({label, "_ops"});
+            if (candidate_fsm == null)
+                candidate_fsm = dpu_priv_auto_fsm::type_id::create({label, "_fsm"});
+            if (!$cast(private_ops, candidate_ops) || !$cast(private_fsm, candidate_fsm)) begin
+                `uvm_error("FUNCTION_BIND", "私有配置与已绑定 ops/FSM 类型冲突")
+                return 0;
+            end
+        end else begin
+            if (candidate_ops == null)
+                candidate_ops = virtio_atomic_ops::type_id::create({label, "_ops"}, this);
+            if (candidate_fsm == null)
+                candidate_fsm = virtio_auto_fsm::type_id::create({label, "_fsm"}, this);
+        end
+        return (candidate_ops != null) && (candidate_fsm != null);
     endfunction
 
     // 创建该 Function 独占的 driver/queue/dataplane/transport 对象，并应用当前
@@ -212,6 +249,10 @@ class virtio_function_instance extends uvm_component;
             return 0;
         end
         candidate_fsm = driver_agent.fsm;
+        candidate_ops = driver_agent.ops;
+        if ((private_cfg != null) &&
+            !prepare_driver_candidates(function_name, drv_cfg, candidate_ops, candidate_fsm))
+            return 0;
         if (candidate_fsm == null)
             candidate_fsm = virtio_auto_fsm::type_id::create(
                 {function_name, "_fsm"}, this);
@@ -220,7 +261,6 @@ class virtio_function_instance extends uvm_component;
                 "%s factory returned a null PCIe FSM", function_name))
             return 0;
         end
-        candidate_ops = driver_agent.ops;
         if (candidate_ops == null)
             candidate_ops = virtio_atomic_ops::type_id::create(
                 {function_name, "_ops"}, this);
@@ -319,6 +359,15 @@ class virtio_function_instance extends uvm_component;
         input virtio_auto_fsm fsm
     );
         string why;
+        dpu_priv_atomic_ops private_ops;
+
+        if (private_cfg != null) begin
+            if (!$cast(private_ops, ops) ||
+                !private_ops.configure_private(private_cfg, driver_cfg.num_queue_pairs, why)) begin
+                `uvm_error("FUNCTION_BIND", {"无法冻结私有驱动配置: ", why})
+                return 0;
+            end
+        end
 
         if (!fsm.bind_mq_pair_limit(
             driver_cfg.max_vio_net_qpairs_per_device, why
@@ -347,6 +396,19 @@ class virtio_function_instance extends uvm_component;
         // Keep the optional standalone dataplane wrapper in the same
         // host-qualified DMA domain as the function-owned queue/atomic path.
         if (dataplane != null) begin
+            // 私有 Function 的引擎也复用同一个 ops，保证 engine 与 sequence/FSM
+            // 不会各自产生一套 DMA tracker 或混入标准 Virtio-net header。
+            if (private_cfg != null) begin
+                dpu_priv_tx_engine tx_adapter;
+                dpu_priv_rx_engine rx_adapter;
+                tx_adapter = new({function_name, "_private_tx"});
+                rx_adapter = new({function_name, "_private_rx"});
+                tx_adapter.private_ops = private_ops;
+                rx_adapter.private_ops = private_ops;
+                rx_adapter.buf_size = private_cfg.rx_buf_size;
+                dataplane.tx_engine = tx_adapter;
+                dataplane.rx_engine = rx_adapter;
+            end
             dataplane.tx_engine.vq_mgr = vq_mgr_ref;
             dataplane.tx_engine.mem = hmem;
             dataplane.tx_engine.iommu = iommu_mdl;
@@ -422,6 +484,10 @@ class virtio_function_instance extends uvm_component;
         end
 
         candidate_fsm = fsm;
+        candidate_ops = ops;
+        if ((private_cfg != null) &&
+            !prepare_driver_candidates(function_name, driver_cfg, candidate_ops, candidate_fsm))
+            return 0;
         if (candidate_fsm == null)
             candidate_fsm = virtio_auto_fsm::type_id::create(
                 {function_name, "_fsm"});
@@ -430,7 +496,6 @@ class virtio_function_instance extends uvm_component;
                 "%s factory returned a null PCIe FSM", function_name))
             return 0;
         end
-        candidate_ops = ops;
         if (candidate_ops == null)
             candidate_ops = virtio_atomic_ops::type_id::create(
                 {function_name, "_ops"});
@@ -547,9 +612,28 @@ class virtio_function_instance extends uvm_component;
         pf_fsm.state = FSM_REINIT_REQUIRED;
     endtask
 
-    // 停止活动数据面、释放运行时资源并把 Function 标记为 DISABLED；不释放
-    // snapshot 所有的静态 BDF/BAR lease。
+    // 停止活动数据面，复位成功后释放运行时资源并把 Function 标记为 DISABLED；
+    // 不释放 snapshot 所有的静态 BDF/BAR lease。私有后端未确认停 DMA 时保留
+    // 全部资源，进入 RESET_FAILED/FSM_ERROR，供调用方诊断或重试；成功时 FSM
+    // 标记 REINIT_REQUIRED，禁止在已经释放的队列上直接重启数据面。
     virtual task shutdown();
+        if (private_cfg != null) begin
+            bit reset_ok;
+            if ((driver_agent.fsm != null) && (driver_agent.fsm.state == FSM_RUNNING))
+                driver_agent.fsm.stop_dataplane();
+            reset_ok = 0;
+            if (driver_agent.ops != null)
+                driver_agent.ops.device_reset_verified(reset_ok);
+            if (!reset_ok) begin
+                state = VF_RESET_FAILED;
+                if (driver_agent.fsm != null) driver_agent.fsm.state = FSM_ERROR;
+                return;
+            end
+            if (resource_client != null) resource_client.reset_runtime_state();
+            state = VF_DISABLED;
+            if (driver_agent.fsm != null) driver_agent.fsm.state = FSM_REINIT_REQUIRED;
+            return;
+        end
         if ((state == VF_ACTIVE) && (driver_agent.fsm != null))
             driver_agent.fsm.stop_dataplane();
         if (driver_agent.ops != null)

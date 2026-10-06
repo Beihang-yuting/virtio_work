@@ -1,3 +1,8 @@
+// 目录层次：src/dataplane；提供标准 Virtio RX buffer 投递、取包与解析引擎。
+// 依赖队列管理器、Host memory、IOMMU、packet adapter 和 offload/callback；外部
+// 依赖由 Function 借用注入，引擎拥有自己分配的 RX buffer 及其 DMA 映射，完成时
+// 回收。停机前上层必须确认设备停止 DMA，并完成未消费 buffer 的生命周期处理。
+// 私有派生引擎覆写投递/收包与容量查询，把所有权统一交给私有 ops，不使用此表。
 `ifndef VIRTIO_RX_ENGINE_SV
 `define VIRTIO_RX_ENGINE_SV
 
@@ -36,6 +41,7 @@
 // malformed data. Valid packets are returned as net_packet::packet_item.
 // ============================================================================
 
+// 协议解析失败时仍保留原始字节和 Virtio header，供错误测试检查；由接收者持有。
 class virtio_rx_pkt_wrapper extends uvm_object;
     `uvm_object_utils(virtio_rx_pkt_wrapper)
 
@@ -51,6 +57,7 @@ class virtio_rx_pkt_wrapper extends uvm_object;
 
 endclass : virtio_rx_pkt_wrapper
 
+// 在队列内存操作之上集中处理标准 header、合包和统计；不负责设备控制面停机。
 class virtio_rx_engine extends uvm_object;
     `uvm_object_utils(virtio_rx_engine)
 
@@ -82,6 +89,7 @@ class virtio_rx_engine extends uvm_object;
     // ------------------------------------------------------------------
     // Constructor
     // ------------------------------------------------------------------
+    // 初始化未协商的引擎；构造时不分配 buffer，外部资源须先绑定再投递。
     function new(string name = "virtio_rx_engine");
         super.new(name);
         negotiated_features = 64'h0;
@@ -113,7 +121,8 @@ class virtio_rx_engine extends uvm_object;
     // Returns the appropriate buffer allocation size based on the
     // current buffer mode.
     // ==================================================================
-    function int unsigned get_rx_buf_size();
+    // 查询模式对应的 buffer 容量；设为虚接口供私有协议返回不含 Virtio header 的容量。
+    virtual function int unsigned get_rx_buf_size();
         int unsigned hdr_size;
         hdr_size = virtio_net_hdr_util::get_hdr_size(negotiated_features);
 
@@ -136,6 +145,8 @@ class virtio_rx_engine extends uvm_object;
     //   queue_id -- RX virtqueue ID
     //   count    -- Number of buffers to add (capped by free descriptors)
     // ==================================================================
+    // 向 queue_id 最多补充 count 个可写 buffer，受空闲描述符数量限制；记录本引擎
+    // 的 GPA/IOVA 所有权，完成后回收。队列不存在则报错返回，成功投递后按需 kick。
     virtual task refill_buffers(
         int unsigned queue_id,
         int unsigned count
@@ -209,6 +220,8 @@ class virtio_rx_engine extends uvm_object;
     //   budget   -- Maximum number of packets to receive
     //   received -- [output] List of received packet tokens (uvm_object)
     // ==================================================================
+    // 按回调或 buffer 模式取得至多 budget 个包，追加到 received；之后按现有
+    // free-count 门限触发补充。外部依赖须已绑定，私有布局由派生类覆写该入口。
     virtual task receive_packets(
         int unsigned      queue_id,
         int unsigned      budget,
@@ -239,6 +252,8 @@ class virtio_rx_engine extends uvm_object;
     // Mergeable buffer receive: parses net_hdr, checks num_buffers,
     // merges additional buffers if needed, and builds the packet.
     // ==================================================================
+    // 解析首 buffer 的标准 header，并按 num_buffers 消费后续完成项合包；复制后
+    // 回收 buffer。非法 token/header 或缺少后续完成项报错计数，供负向场景诊断。
     protected virtual task receive_mergeable(
         int unsigned      queue_id,
         int unsigned      budget,
@@ -376,6 +391,7 @@ class virtio_rx_engine extends uvm_object;
     //
     // Big-buffer mode receive: single large buffer per packet, no merge.
     // ==================================================================
+    // 大 buffer 模式委托单 buffer 接收；容量由投递时确定，本入口不再合包。
     protected virtual task receive_big(
         int unsigned      queue_id,
         int unsigned      budget,
@@ -389,6 +405,7 @@ class virtio_rx_engine extends uvm_object;
     //
     // Small-buffer mode receive: single MTU-sized buffer per packet.
     // ==================================================================
+    // MTU 大小模式委托单 buffer 接收；输出追加到 received，不改变其已有元素。
     protected virtual task receive_small(
         int unsigned      queue_id,
         int unsigned      budget,
@@ -403,6 +420,8 @@ class virtio_rx_engine extends uvm_object;
     // Shared implementation for big and small modes. Each packet is
     // contained in exactly one buffer (no merging).
     // ==================================================================
+    // 每个完成项解析一份标准 header 和 payload，校验可选 checksum 后返回 packet；
+    // 非法 token 或过短 header 报错，合法 tracker 的 buffer 在复制后立即回收。
     protected virtual task receive_single_buf(
         int unsigned      queue_id,
         int unsigned      budget,
@@ -498,6 +517,8 @@ class virtio_rx_engine extends uvm_object;
     // Delegates reception to the custom callback for non-standard
     // buffer layouts or parsing.
     // ==================================================================
+    // 将已完成 buffer 的字节交给 custom_cb 解析，随后回收该 buffer；回调返回 null
+    // 时不追加输出。仍要求本引擎的 tracker，不能混用私有 ops 的 DMA 所有权。
     protected virtual task custom_receive(
         int unsigned      queue_id,
         int unsigned      budget,
@@ -563,6 +584,8 @@ class virtio_rx_engine extends uvm_object;
     //
     // Unmaps IOMMU entry and frees host memory for a single RX buffer.
     // ==================================================================
+    // 注销指定 GPA 的本引擎映射并释放 Host 内存；只能用于已完成的自有 buffer，
+    // 不能用它释放其他 ops/引擎所有的资源或仍被设备访问的缓冲。
     protected virtual function void cleanup_rx_buffer(bit [63:0] buf_gpa);
         if (rx_buf_gpa_to_iova.exists(buf_gpa)) begin
             iommu.unmap_for_host(host_id, bdf, rx_buf_gpa_to_iova[buf_gpa]);
@@ -578,6 +601,7 @@ class virtio_rx_engine extends uvm_object;
     // ==================================================================
     // print_stats -- Log RX engine statistics
     // ==================================================================
+    // 输出收包、字节、错误与本引擎未回收 buffer 计数，不改变运行态。
     function void print_stats();
         `uvm_info("RX_ENG_STATS",
             $sformatf({"RX Stats: packets=%0d bytes=%0d errors=%0d ",
@@ -590,6 +614,8 @@ class virtio_rx_engine extends uvm_object;
     // ==================================================================
     // leak_check -- Warn about outstanding RX buffers at test end
     // ==================================================================
+    // 检查本引擎持有的未完成 buffer，逐项告警而不强行释放；私有派生类的资源
+    // 由 ops 跟踪，须另外检查 ops/IOMMU，不能以此表为空推断私有队列无泄漏。
     function void leak_check();
         if (rx_buf_gpa_to_iova.size() > 0) begin
             `uvm_warning("RX_ENG_LEAK",

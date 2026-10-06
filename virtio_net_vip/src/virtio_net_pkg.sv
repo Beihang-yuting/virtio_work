@@ -50,6 +50,7 @@ package virtio_net_pkg;
   `include "virtqueue/split_virtqueue.sv"
   `include "virtqueue/packed_virtqueue.sv"
   `include "virtqueue/custom_virtqueue.sv"
+  `include "dpu_priv/dpu_priv_ring_callback.sv"
   `include "virtqueue/virtqueue_manager.sv"
 
   // Resource clients are transport discovery callbacks and need to be
@@ -67,6 +68,7 @@ package virtio_net_pkg;
   `include "transport/virtio_pci_cap_manager.sv"
   `include "transport/virtio_notification_manager.sv"
   `include "transport/virtio_pci_transport.sv"
+  `include "dpu_priv/dpu_priv_driver_config.sv"
 
   // ---------------------------------------------------------------------------
   // 第 5 层 – 回调、事务与驱动 agent（callbacks/、types/、agent/）
@@ -80,6 +82,8 @@ package virtio_net_pkg;
   `include "dataplane/virtio_net_packet_adapter.sv"
   `include "agent/virtio_atomic_ops.sv"
   `include "agent/virtio_auto_fsm.sv"
+  `include "dpu_priv/dpu_priv_atomic_ops.sv"
+  `include "dpu_priv/dpu_priv_auto_fsm.sv"
   `include "agent/virtio_driver.sv"
   `include "agent/virtio_monitor.sv"
   `include "pcie/virtio_pcie_model_dma_adapter.sv"
@@ -104,6 +108,7 @@ package virtio_net_pkg;
   `include "dataplane/virtio_rx_engine.sv"
   `include "dataplane/virtio_failover_manager.sv"
   `include "dataplane/virtio_net_dataplane.sv"
+  `include "dpu_priv/dpu_priv_dataplane.sv"
 
   // ---------------------------------------------------------------------------
   // 第 7 层 – SR-IOV PF/VF 编排（sriov/）

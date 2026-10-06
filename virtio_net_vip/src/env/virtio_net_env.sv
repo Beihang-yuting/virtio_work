@@ -479,6 +479,10 @@ class virtio_net_env extends uvm_env;
                 return;
             end
             function_instances[function_index].drv_cfg = driver_cfg;
+            // 每个 Function 单独选择驱动；控制后端由顶层注入，建队回调由私有 ops
+            // 自动创建。这里仅传配置，不在 connect 阶段执行硬件访问或分配 ring。
+            function_instances[function_index].private_cfg =
+                cfg.get_dpu_private_config(function_instances[function_index].service_key);
             if (scb != null) begin
                 function_instances[function_index].driver_agent.monitor.txn_ap.connect(
                     scb.txn_imp
