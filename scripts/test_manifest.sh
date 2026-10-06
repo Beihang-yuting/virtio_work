@@ -40,6 +40,7 @@ VIRTIO_MAINTAINED_TESTS=(
   virtio_indirect_desc_test
   virtio_desc_corruption_test
   virtio_admin_vq_test
+  virtio_ctrl_vq_test
   virtio_migration_dirty_test
   virtio_monitor_test
   virtio_coverage_test

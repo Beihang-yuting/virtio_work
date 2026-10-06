@@ -844,6 +844,7 @@ class virtio_atomic_ops extends uvm_object;
         int unsigned ctrl_qid;
         int unsigned created_qids[$];
         bit queue_ok;
+        virtio_net_device_config_t net_cfg;
 
         ok = 0;
 
@@ -869,9 +870,17 @@ class virtio_atomic_ops extends uvm_object;
             created_qids.push_back(i * 2 + 1);
         end
 
-        // Setup control queue if CTRL_VQ negotiated
+        // Setup control queue if CTRL_VQ negotiated.  virtio 1.2 §5.1.2：
+        // 协商 MQ 时 controlq 编号为 2*max_virtqueue_pairs（设备 config 上限），
+        // 否则为 2（单对）。取 max(num_pairs, 设备上限)，设备上报值小于当前对数时
+        // 也不与数据队列重号；之后 MQ 扩容新建的 RX/TX 不会落到 control VQ 上。
         if (negotiated_features[VIRTIO_NET_F_CTRL_VQ]) begin
             ctrl_qid = num_pairs * 2;
+            if (negotiated_features[VIRTIO_NET_F_MQ]) begin
+                transport.read_net_config(net_cfg);
+                if (net_cfg.max_virtqueue_pairs > num_pairs)
+                    ctrl_qid = 2 * net_cfg.max_virtqueue_pairs;
+            end
             setup_queue(ctrl_qid, queue_size, vq_type, queue_ok);
             if (!queue_ok) begin
                 foreach (created_qids[j])

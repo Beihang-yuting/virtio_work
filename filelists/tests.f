@@ -25,6 +25,7 @@ virtio_net_vip/tests/virtio_protocol_test.sv
 virtio_net_vip/tests/virtio_indirect_desc_test.sv
 virtio_net_vip/tests/virtio_desc_corruption_test.sv
 virtio_net_vip/tests/virtio_admin_vq_test.sv
+virtio_net_vip/tests/virtio_ctrl_vq_test.sv
 virtio_net_vip/tests/virtio_pf_lifecycle_reset_test.sv
 virtio_net_vip/tests/virtio_monitor_test.sv
 virtio_net_vip/tests/virtio_coverage_test.sv

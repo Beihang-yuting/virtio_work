@@ -391,6 +391,7 @@ make test TEST=virtio_unit_test
 `virtio_host_mem_reclaim_test`、`virtio_queue_semantics_test`、
 `virtio_stress_unit_test`、
 `virtio_protocol_test`、`virtio_indirect_desc_test`、`virtio_desc_corruption_test`、`virtio_admin_vq_test`、
+`virtio_ctrl_vq_test`、
 `virtio_migration_dirty_test`、`virtio_monitor_test`、`virtio_coverage_test`、
 `virtio_e2e_test`、`virtio_full_integration_test`、`virtio_pf_lifecycle_reset_test`、
 `virtio_monitor_routing_test`、`virtio_dual_test`、`virtio_smoke_test`、
@@ -399,7 +400,7 @@ make test TEST=virtio_unit_test
 `virtio_real_driver_rx_test`、
 `host_mem_random_test`、`virtio_pcie_host_mem_test`、
 `dpu_pcie_tl_executor_integration_test`、`dpu_priv_driver_flow_test` 和
-`dpu_priv_ring_contract_test`，共 39 项。
+`dpu_priv_ring_contract_test`，共 40 项。
 `make check-deps` 会验证 `host_mem` 外部 checkout 固定 SHA、VCS 环境以及
 `dpu_common` 的固定版本；同时要求 `net_packet` 处于 `master`/`origin/master`、
 `pcie_work` 处于 `main`/`origin/main`，并且二者都来自指定远程。
