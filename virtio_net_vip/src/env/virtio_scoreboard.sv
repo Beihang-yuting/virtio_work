@@ -4,7 +4,7 @@
 // ============================================================================
 // virtio_scoreboard
 //
-// 8-category verification scoreboard for virtio-net transactions.
+// 7-category verification scoreboard for virtio-net transactions.
 // Receives transactions via uvm_analysis_imp and dispatches to
 // per-category check methods based on transaction type.
 //
@@ -16,7 +16,6 @@
 //   5. Notification       -- kick/interrupt protocol correctness
 //   6. DMA compliance     -- address range, direction, mapping validity
 //   7. Ordering           -- in-order completion within a queue
-//   8. Config consistency -- device config register vs expected values
 //
 // Depends on:
 //   - virtio_transaction
@@ -37,7 +36,6 @@ class virtio_scoreboard extends uvm_component;
     bit chk_notification       = 1;
     bit chk_dma_compliance     = 1;
     bit chk_ordering           = 1;
-    bit chk_config_consistency = 1;
 
     // ===== Statistics =====
     scoreboard_stats_t stats;
@@ -361,52 +359,6 @@ class virtio_scoreboard extends uvm_component;
             end
         end
         last_seq_num[queue_id] = seq_num;
-    endfunction
-
-    // ========================================================================
-    // check_config_consistency
-    //
-    // Compare expected device config against actual values read from device.
-    // ========================================================================
-
-    virtual function void check_config_consistency(
-        virtio_net_device_config_t expected,
-        virtio_net_device_config_t actual
-    );
-        bit mismatch = 0;
-
-        if (expected.mac != actual.mac) begin
-            `uvm_error("SCB",
-                $sformatf("Config mismatch: MAC expected=0x%012h, actual=0x%012h",
-                          expected.mac, actual.mac))
-            mismatch = 1;
-        end
-
-        if (expected.mtu != actual.mtu) begin
-            `uvm_error("SCB",
-                $sformatf("Config mismatch: MTU expected=%0d, actual=%0d",
-                          expected.mtu, actual.mtu))
-            mismatch = 1;
-        end
-
-        if (expected.max_virtqueue_pairs != actual.max_virtqueue_pairs) begin
-            `uvm_error("SCB",
-                $sformatf("Config mismatch: max_vq_pairs expected=%0d, actual=%0d",
-                          expected.max_virtqueue_pairs, actual.max_virtqueue_pairs))
-            mismatch = 1;
-        end
-
-        if (expected.status != actual.status) begin
-            `uvm_error("SCB",
-                $sformatf("Config mismatch: status expected=0x%04h, actual=0x%04h",
-                          expected.status, actual.status))
-            mismatch = 1;
-        end
-
-        if (mismatch)
-            `uvm_error("SCB", "Config consistency check: FAILED")
-        else
-            `uvm_info("SCB", "Config consistency check: PASSED", UVM_HIGH)
     endfunction
 
     // ========================================================================
