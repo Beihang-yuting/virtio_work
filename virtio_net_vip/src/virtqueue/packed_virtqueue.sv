@@ -84,6 +84,27 @@ class packed_virtqueue extends virtqueue_base;
         mem.write_mem(desc_table_addr + idx * 16, data);
     endfunction
 
+    // 间接表项按 pvirtq_desc 布局写（virtio 1.1 §2.8.19）：addr、len、id、flags。表内描述符
+    // 顺序排列、数量为 len/16，不使用 NEXT 与 next；buffer id 只取自主环描述符，表项 id 写 0。
+    protected virtual function void write_indirect_desc(
+        bit [63:0] table_gpa,
+        int unsigned index,
+        bit [63:0] addr,
+        bit [31:0] len,
+        bit [15:0] flags,
+        bit [15:0] next
+    );
+        byte data[16];
+        bit [15:0] pflags;
+
+        pflags = flags & ~VIRTQ_DESC_F_NEXT;
+        for (int i = 0; i < 8; i++) data[i]    = addr[i*8 +: 8];
+        for (int i = 0; i < 4; i++) data[8+i]  = len[i*8 +: 8];
+        for (int i = 0; i < 2; i++) data[12+i] = 8'h00;
+        for (int i = 0; i < 2; i++) data[14+i] = pflags[i*8 +: 8];
+        mem.write_mem(table_gpa + index * 16, data);
+    endfunction
+
     // Read packed descriptor fields from host_mem
     protected function void read_packed_desc(int unsigned idx,
                                              ref bit [63:0] addr,

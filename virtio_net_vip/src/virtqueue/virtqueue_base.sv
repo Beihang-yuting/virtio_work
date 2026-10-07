@@ -487,7 +487,7 @@ virtual class virtqueue_base extends uvm_object;
 
     // ------------------------------------------------------------------
     // prepare_indirect_table -- validate, allocate, map and populate one
-    // standard virtq_desc-format indirect table for a main descriptor.
+    // indirect table for a main descriptor (entry layout per ring format, see write_indirect_desc).
     // ------------------------------------------------------------------
     protected function bit prepare_indirect_table(
         virtio_sg_list sgs[],
@@ -611,9 +611,9 @@ virtual class virtqueue_base extends uvm_object;
         return 1;
     endfunction
 
-    // Indirect tables always use the standard (split) virtq_desc layout,
-    // including when their owning main descriptor is in a packed ring.
-    protected function void write_indirect_desc(
+    // 间接表项的 split（virtq_desc）布局：addr、len、flags、next。packed_virtqueue
+    // 覆写为 pvirtq_desc 布局（virtio 1.1 §2.8.19）。
+    protected virtual function void write_indirect_desc(
         bit [63:0] table_gpa,
         int unsigned index,
         bit [63:0] addr,

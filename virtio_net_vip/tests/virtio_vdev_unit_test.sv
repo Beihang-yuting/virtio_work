@@ -969,6 +969,83 @@ class virtio_vdev_unit_test extends uvm_test;
         `uvm_info("VDEV_UNIT", "test_std_split_indirect PASSED", UVM_LOW)
     endtask
 
+    // VIP 缺陷：packed 环的间接表必须按 pvirtq_desc 布局（addr、len、id、flags；顺序排列、
+    // 不置 NEXT，virtio 1.1 §2.8.19）。TX 与 RX 都用两段间接链经设备回环：设备看到的 TX 段
+    // flags 全 0，RX 段全为 WRITE，回环帧原样落进 RX 第二段。
+    task test_std_packed_indirect_loopback();
+        packed_virtqueue rxq, txq;
+        bit [63:0] rx_iovas[$], tx_iovas[$];
+        bit [63:0] h_gpa, h_iova, f_gpa, f_iova, rh_gpa, rh_iova, rf_gpa, rf_iova;
+        virtio_sg_list sgs[];
+        byte unsigned hdr_b[$], frame_b[$], none[$];
+        byte got[];
+        uvm_object tok;
+        int unsigned len;
+        vdev_unit_token rx_tok, tx_tok;
+        vdev_event ev[$];
+        bit [63:0] saved;
+        bit [63:0] drv;
+
+        saved = std.device_features;
+        std.device_features[VIRTIO_F_RING_INDIRECT_DESC] = 1;
+        drv = 64'h0000_0001_0000_0000;
+        drv[VIRTIO_F_RING_PACKED] = 1;
+        drv[VIRTIO_F_RING_INDIRECT_DESC] = 1;
+        if (!(std_negotiate(drv) & DEV_STATUS_FEATURES_OK))
+            `uvm_fatal("VDEV_UNIT", "packed INDIRECT_DESC negotiation rejected")
+        rxq = std_kit.make_packed("pind_rx", 0, 8, STD_BDF);
+        txq = std_kit.make_packed("pind_tx", 1, 8, STD_BDF);
+        std_program_queue(0, rxq, 1, 0, rx_iovas);
+        std_program_queue(1, txq, 1, 0, tx_iovas);
+        std_wr(32'h14, 1, 8'h0f);
+        for (int i = 0; i < 12; i++)
+            hdr_b.push_back(0);
+        frame_b = '{8'h5a, 8'h11, 8'h22, 8'h33, 8'h44, 8'ha5};
+        sgs = new[2];
+        std_buffer(none, 12, DMA_FROM_DEVICE, rh_gpa, rh_iova, sgs[0]);
+        std_buffer(none, 64, DMA_FROM_DEVICE, rf_gpa, rf_iova, sgs[1]);
+        rx_tok = new("pind_rx_tok");
+        void'(rxq.add_buf(sgs, 0, 2, rx_tok, 1));
+        port.host_write(STD_BAR2 + 0, 2, 0);
+        std_buffer(hdr_b, 12, DMA_TO_DEVICE, h_gpa, h_iova, sgs[0]);
+        std_buffer(frame_b, 6, DMA_TO_DEVICE, f_gpa, f_iova, sgs[1]);
+        tx_tok = new("pind_tx_tok");
+        std_log.events.delete();
+        void'(txq.add_buf(sgs, 2, 0, tx_tok, 1));
+        port.host_write(STD_BAR2 + 4, 2, 1);
+        wait_used(txq, tok, len);
+        if (tok != tx_tok)
+            `uvm_fatal("VDEV_UNIT", "packed indirect TX returned the wrong token")
+        wait_used(rxq, tok, len);
+        if ((tok != rx_tok) || (len != 18))
+            `uvm_fatal("VDEV_UNIT", $sformatf("packed indirect RX token/len mismatch (len=%0d)", len))
+        std_log.select(VDEV_DESC_CHAIN, ev);
+        if ((ev.size() != 2) || (ev[0].seg_flags.size() != 2) || (ev[0].seg_flags[0] != 0) ||
+            (ev[0].seg_flags[1] != 0) || (ev[1].seg_flags.size() != 2) ||
+            (ev[1].seg_flags[0] != VIRTQ_DESC_F_WRITE) || (ev[1].seg_flags[1] != VIRTQ_DESC_F_WRITE))
+            `uvm_fatal("VDEV_UNIT", "packed indirect tables were not read as pvirtq_desc entries")
+        mem.read_mem(rf_gpa, 6, got);
+        foreach (frame_b[i])
+            if (got[i] != frame_b[i])
+                `uvm_fatal("VDEV_UNIT", "packed indirect looped frame is not intact in the RX buffer")
+        std_log.select(VDEV_PKT, ev);
+        if ((ev.size() != 2) || (ev[0].bytes != ev[1].bytes) || (ev[0].bytes.size() != 6))
+            `uvm_fatal("VDEV_UNIT", "pkt events do not show the same 6-byte frame on TX and RX")
+        iommu.unmap_for_host(0, STD_BDF, h_iova);
+        iommu.unmap_for_host(0, STD_BDF, f_iova);
+        iommu.unmap_for_host(0, STD_BDF, rh_iova);
+        iommu.unmap_for_host(0, STD_BDF, rf_iova);
+        mem.free(h_gpa);
+        mem.free(f_gpa);
+        mem.free(rh_gpa);
+        mem.free(rf_gpa);
+        std_wr(32'h14, 1, 0);
+        std_release(rxq, rx_iovas);
+        std_release(txq, tx_iovas);
+        std.device_features = saved;
+        `uvm_info("VDEV_UNIT", "test_std_packed_indirect_loopback PASSED", UVM_LOW)
+    endtask
+
     // 独立设备暴露的 VIP 缺陷：common-config 后端 set_msix 必须在设备上打开 MSI-X（Enable=1、
     // Function Mask=0）并清掉所用向量的 Vector Control；clear_msix 必须重新屏蔽。
     task test_vip_msix_enables_device();
@@ -1035,6 +1112,7 @@ class virtio_vdev_unit_test extends uvm_test;
         test_std_event_idx_and_queue_reset();
         test_std_ctrl_without_mq();
         test_std_split_indirect();
+        test_std_packed_indirect_loopback();
         test_vip_msix_enables_device();
         mem.leak_check();
         iommu.leak_check();

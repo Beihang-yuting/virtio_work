@@ -253,9 +253,15 @@ class virtio_indirect_desc_test extends uvm_test;
             bit [15:0] table_next;
             bit [15:0] expected_flags;
 
-            read_desc(mem, table_gpa, i,
-                      table_addr, table_len, table_flags, table_next);
-            expected_flags = (i < 2) ? VIRTQ_DESC_F_NEXT : 16'h0;
+            // split 表按 virtq_desc（flags、next 链接）；packed 表按 pvirtq_desc
+            // （id 写 0、顺序排列不置 NEXT，virtio 1.1 §2.8.19），table_next 此时承载 id。
+            if (is_packed)
+                read_packed_desc(mem, table_gpa, i,
+                                 table_addr, table_len, table_next, table_flags);
+            else
+                read_desc(mem, table_gpa, i,
+                          table_addr, table_len, table_flags, table_next);
+            expected_flags = ((i < 2) && !is_packed) ? VIRTQ_DESC_F_NEXT : 16'h0;
             if (i >= 1)
                 expected_flags |= VIRTQ_DESC_F_WRITE;
 
@@ -269,9 +275,9 @@ class virtio_indirect_desc_test extends uvm_test;
                 else `uvm_fatal("INDIRECT_TEST", $sformatf(
                     "table descriptor %0d flags=0x%04h expected=0x%04h",
                     i, table_flags, expected_flags))
-            assert(table_next == ((i < 2) ? i + 1 : 0))
+            assert(table_next == (((i < 2) && !is_packed) ? i + 1 : 0))
                 else `uvm_fatal("INDIRECT_TEST", $sformatf(
-                    "table descriptor %0d next=%0d", i, table_next))
+                    "table descriptor %0d next/id=%0d", i, table_next))
         end
     endfunction
 
