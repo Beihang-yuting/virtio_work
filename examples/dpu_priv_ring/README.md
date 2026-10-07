@@ -10,34 +10,26 @@
 
 | 源码 | 职责 |
 | --- | --- |
-| `src/dpu_priv/dpu_priv_driver_config.sv` | Function/queue 分层配置，AF/mailbox 控制接口 |
+| `src/dpu_priv/dpu_priv_driver_config.sv` | Function/queue 分层配置 |
 | `src/virtqueue/custom_virtqueue.sv` | 16B 描述符、CQ、wrap、64KiB TX 分片 |
 | `src/dpu_priv/dpu_priv_config_backend.sv` | 队列参数表、doorbell、status/feature 语义 |
 | `src/dpu_priv/dpu_priv_driver_protocol.sv` | 能力与复位语义 |
+| `src/devmodel/vdev_dpu_priv.sv` | 私有设备模型（驱动寄存器序列、16B 描述符与 CQ、qid map 路由） |
 
-## 1. 在顶层准备设备控制后端
+## 1. 设备与配置后端
 
-继承 `dpu_priv_device_control`，实现三个有成功标志的 task：
+私有 Function 的全部设备访问由 `dpu_priv_config_backend` 完成：它按真实驱动 AF 路径（`pfvf_id=0`）
+的寄存器序列访问 BAR0/BAR2——AF 声明（0x1010 魔数 0x5555AAAA、0x60040）、qinfo、MSI-X 映射表、qid map、
+VTX/VRX 队列参数表、共享 doorbell（BAR0+0，`wrap<<31 | tail<<16 | local_qid`）与停队/复位轮询。序列表、
+驱动与 reg plan 的疑点见 `src/devmodel/vdev_dpu_priv.sv` 文件头。PF/VF mailbox 路径未建模。
 
-- `reset_device(host_id, bdf, ok)`：复位指定 Function，确认停止 DMA 后返回成功。
-- `configure_queue(ctx, ok)`：通过 AF 寄存器或 PF/VF mailbox 配置并启动队列。
-  `ctx` 提供 Host、BDF、VIP queue_id、设备 local_qid、方向、容量、连续
-  `ring_iova/cq_iova` 和 RX buffer 大小。失败时必须保证队列未启动 DMA。
-- `disable_queue(ctx, ok)`：停队并确认 DMA 排空；失败时 src 保留全部内存和映射。
-
-默认 `notify_queue()` 已通过 Function 的 BAR accessor 执行 32-bit MMIO 写，
-数据为 `wrap<<31 | tail_ptr<<16 | local_qid`。默认目标 BAR0、offset 0，对应驱动
-`writel(value, hw->hw_addr)`；可按队列覆盖地址，也可覆写通知 task 对接已有后端。
-
-AF/mailbox 的平台实现仍由顶层接入，src 不会用空后端返回配置成功。本目录的
-`dpu_priv_example_control` 是内存测试后端，演示这三个接口及严格 IOVA DMA；
-它不代表真实硬件 AF/mailbox 已验证。PCIe 枚举、BAR 分配及平台初始化须先完成，
-私有 FSM 不执行标准 Virtio capability/feature 握手。
+纯模型测试使用独立设备模型 `vdev_dpu_priv`：本目录的流程测试把它挂在回环端口上（寄存器访问直达设备，
+设备 DMA 经该 Host 的 IOMMU），设备按 qid map 与参数表处理描述符、写 CQ，并把 TX 帧回环到同一队列对的
+RX。测试旋钮 `stall_queue_stop` 让停队/复位永不完成，用来验证“DMA 未停则保留资源”。PCIe 枚举与 BAR 放置
+属于平台，后端不写 BAR。
 
 连接真实 DUT 时，在绑定 PCIe 前设置 `vio_cfg.execution_mode = VIRTIO_EXEC_REAL_DUT`
-和 `vio_cfg.completion_mode = VIRTIO_COMPLETION_POLLING`，由 DUT 产生描述符完成。
-默认标准 Virtio 设备模型不解释这套私有格式；纯模型测试应像本目录示例一样提供
-对应的私有设备控制/DMA 模型。
+和 `vio_cfg.completion_mode = VIRTIO_COMPLETION_POLLING`。
 
 ## 2. 按 service key 注册到 env_cfg
 
@@ -49,7 +41,6 @@ dpu_priv_driver_config private_cfg;
 string why;
 
 private_cfg = new("vf0_private_cfg");
-private_cfg.control = my_device_control;
 private_cfg.default_queue_size = 512;
 private_cfg.rx_buf_size = 2048;
 private_cfg.local_qid_base = 0;      // RX0=0，TX0=1，RX1=2，TX1=3
@@ -106,7 +97,7 @@ if (function_instance.get_state() != VF_DISABLED)
 不能与 ops 管理的投递混用。
 
 内部建队顺序为：创建 `VQ_CUSTOM` → 后端写方向/本地号 → 分配连续 desc+CQ →
-一次映射 → 控制后端配置启动。CQ IOVA 必须等于 ring IOVA 加
+一次映射 → 寄存器级后端写 VTX/VRX 队列参数表并启用（设备侧为 `vdev_dpu_priv`）。CQ IOVA 必须等于 ring IOVA 加
 `queue_size*16`，不能把 CQ 单独随机映射。停队或复位失败会保留资源；上层必须
 检查复位成功标志，并先停止后台数据面再做手工 teardown/reset。
 通过 `Function.shutdown()` 停机成功后，FSM 进入 `FSM_REINIT_REQUIRED`，下次启动
@@ -132,10 +123,11 @@ TEST=dpu_priv_driver_flow_test ./scripts/vcs.sh
 TEST=dpu_priv_ring_contract_test ./scripts/vcs.sh
 ```
 
-流程测试复用 `examples/virtio_system_env` 顶层：两个 Host 各有一个私有 VF 和
-一个标准 VF，验证 env_cfg 到 ops/FSM 的选择、连续 IOVA、TX/RX 原始帧、引擎
-委托、停 DMA 失败保护，以及后台启动/停止后的 DMA 回收。合同测试核对 GCC
-生成的 TX/RX/CQ 黄金字节、默认 512 项布局、65537B TX 分片和环回绕。
+流程测试复用 `examples/virtio_system_env` 顶层：两个 Host 各有一个私有 VF 和一个标准 VF，私有 VF 面对
+`vdev_dpu_priv`；验证 env_cfg 到 ops/FSM 的选择、寄存器级后端、TX/RX 原始帧（从设备事件核对描述符长度、
+帧字节与通知字）、引擎委托、停 DMA 失败保护，以及后台启动/停止后的 DMA 回收。合同测试核对 GCC 生成的
+TX/RX/CQ 黄金字节、默认 512 项布局、65537B TX 分片和环回绕，并让 `vdev_dpu_priv` 写出的 CQ 与同一组黄金值
+对齐。
 
 当前支持 polling、普通 TX（每段最多 65536B、拆分后最多 7 条 data desc）和
 单 buffer RX。TSO 扩展描述符、多 buffer RX、动态 MQ、迁移及标准 control VQ

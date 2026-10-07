@@ -328,7 +328,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             return;
         // Resolve the function identity from the frozen snapshot for every
         // execution mode.  Previously this handle was populated only while
-        // binding the former MODEL responder (or the optional local REAL_DUT
+        // binding the former MODEL device responder (or the optional local REAL_DUT
         // responder), so a REAL_DUT run using an external pcie_work bridge
         // had a valid PCIe path but no semantic monitor/resource client.
         // Queue mapping helpers and passive observers must use the same BDF

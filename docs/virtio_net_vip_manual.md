@@ -300,14 +300,14 @@ VIP 与 DUT 的所有交互都通过 PCIe TLP 完成：
       |<-----------------------------------------------|
       |                                                |
       |  DMA Read/Write (descriptor/data via host_mem) |
-      |  (MODEL responder or REAL_DUT Host-memory proxy |
+      |  (MODEL vdev_uvm_ep_port or REAL_DUT Host-mem   |
       |   translates device IOVA to Host GPA)          |
       |                                                |
 ```
 
 该图的 MSI-X Write 表示 REAL_DUT 下由 RTL 发出并被动观察的真实 PCIe TLP。
-MODEL responder 当前通过 notification manager sideband 产生等价中断事件，不发送
-真实 MSI-X Memory Write TLP。
+MODEL 设备模型按自己的 MSI-X 表构造 MSI-X Memory Write，并发布到 EP monitor（pcie_tl 的 RC
+会把 EP MemWr 写进 Host memory，APIC 窗口没有后备内存）；VIP observer 与 REAL_DUT 下一样解码。
 
 ---
 
@@ -374,9 +374,14 @@ virtio_net_vip/
 |   |   +-- dpu_priv_driver_config.sv       -- 私有队列控制接口与分层配置
 |   |   +-- dpu_priv_config_backend.sv      -- 私有配置后端（队列参数表、status/feature 语义、doorbell）
 |   |   +-- dpu_priv_driver_protocol.sv     -- 私有协议（能力声明、MANUAL kick/poll、复位语义）
+|   +-- devmodel/
+|   |   +-- vdev_port.sv                    -- 端口抽象与语义事件 vdev_event
+|   |   +-- vdev_base.sv                    -- 配置空间/能力链/MSI-X/调试 marker/worker/回环
+|   |   +-- vdev_uvm_ep_port.sv             -- 接 pcie_tl EP driver 的端口
+|   |   +-- vdev_virtio_pci.sv              -- 标准 virtio-net 设备 1af4:1041
+|   |   +-- vdev_dpu_priv.sv                -- DPU 私有设备 20f9:5013
 |   +-- pcie/
 |   |   +-- pcie_tl_dpu_reg_backend.sv      -- dpu_common 寄存器计划 -> PCIe TLP
-|   |   +-- virtio_pcie_dut_responder.sv    -- MODEL 设备侧行为模型 (EP 发起 DMA)
 |   |   +-- virtio_pcie_model_dma_adapter.sv -- MODEL 设备 DMA -> EP MemRd/MemWr
 |   |   +-- virtio_pcie_iova_host_mem_proxy.sv -- REAL_DUT IOVA -> Host memory 适配
 |   |   +-- virtio_pcie_real_dut_host_mem_responder.sv -- REAL_DUT EP->RC Memory TLP 应答
@@ -401,6 +406,8 @@ virtio_net_vip/
 |   +-- virtio_tb_top.sv                    -- 顶层 testbench module
 |   +-- virtio_smoke_test.sv                -- 冒烟测试
 |   +-- virtio_unit_test.sv                 -- 单元测试 (无 PCIe 依赖)
+|   +-- virtio_vdev_unit_test.sv            -- 独立设备模型单元测试 (无 PCIe)
+|   +-- vdev_loopback_port.sv               -- 设备测试件：回环端口/BAR accessor、事件记录器
 |   +-- virtio_stress_unit_test.sv          -- 压力单元测试
 |   +-- virtio_protocol_test.sv             -- 协议合规测试
 |   +-- virtio_traffic_test.sv              -- 大流量 + 带宽控制测试
@@ -411,7 +418,7 @@ virtio_net_vip/
 # 分别由 $DPU_COMMON_ROOT、$HOST_MEM_ROOT、$PCIE_WORK_ROOT、$NET_PACKET_ROOT 指定。
 ```
 
-**总计：`src/` 72 个文件（67 个 `.sv` + 5 个 `.svh`），`tests/` 36 个 `.sv` 文件。**
+**总计：`src/` 76 个文件（71 个 `.sv` + 5 个 `.svh`），`tests/` 38 个 `.sv` 文件。**
 
 ### 3.2 目录职责说明
 
@@ -956,13 +963,13 @@ end
 |------|----------|------------|
 | `VQ_FAULT_PRE_NOTIFY` | 写 avail/提交后、发出 notify 前 | split/packed 队列的生产路径 |
 | `VQ_FAULT_POST_NOTIFY` | notify 已发出、设备读取前 | split/packed 队列的生产路径 |
-| `VQ_FAULT_PRE_DEVICE_READ` | 设备/响应器准备读取 descriptor 前 | MODEL responder；REAL_DUT 需用户/平台另接 fault provider（当前未实现） |
-| `VQ_FAULT_BEFORE_USED` | 写回 used ring 前 | MODEL responder；REAL_DUT 需用户/平台另接 fault provider（当前未实现） |
+| `VQ_FAULT_PRE_DEVICE_READ` | 设备取到链、读 payload 前 | MODEL 设备模型（`ZERO_LEN_BUF`、`WRONG_FLAGS` 作用于设备读到的首描述符）；REAL_DUT 需平台另接 fault provider（当前未实现） |
+| `VQ_FAULT_BEFORE_USED` | 写回 used ring 前 | MODEL 设备模型（`WRONG_USED_LEN` 使完成长度加一）；REAL_DUT 同上 |
 | `VQ_FAULT_ANY` | 匹配任意上述边界 | 通配选择，不是额外的时序点 |
 
 不同阶段只会在相应的生产者或响应器路径消费规则；阶段不匹配时不会递增计数，
 也不会提前消耗一次性注入。`ANY` 适用于测试不关心具体边界的情况，但仍要求
-实际调用方提供一个具体阶段。同一 queue/responder 操作即使依次经过 PRE/POST 两个
+实际调用方提供一个具体阶段。同一队列/设备操作即使依次经过 PRE/POST 两个
 hook，也只在第一个满足条件的边界注入一次；下一次操作会按相同
 countdown/probability 规则重新参与选择。
 
@@ -1267,15 +1274,15 @@ descriptor 中取出 IOVA，经 IOMMU 翻译后校验真实报文字节；RX 侧
 接口完成；需要验证真实 PCIe transport 时使用
 `virtio_real_driver_multiqueue_test`。MODEL 模式下该测试从 PCI capability
 discovery 和两对 queue setup 开始，把外部 `net_packet` 的 `packet_item` 交给生产
-`tx_submit()`，由 `virtio_pcie_dut_responder` 通过 EP-originated PCIe DMA
+`tx_submit()`，由设备模型 `vdev_virtio_pci` 通过 EP-originated PCIe DMA
 读取 descriptor/payload、写 used ring 并产生中断，最后由 driver `tx_complete()`
 回收。测试覆盖冻结映射得到的两对 TX queue（默认 q1/q3），每队列 4 个报文，并
-检查 Host/IOMMU/queue 无泄漏。REAL_DUT 模式不创建这个 responder，只被动观察真实
+检查 Host/IOMMU/queue 无泄漏。REAL_DUT 模式不创建设备模型，只被动观察真实
 notify、DMA、interrupt 和 driver completion；它要求真实 PCIe 双向链路，以及外部
 backend 或显式 Host-memory responder。
 
 `virtio_real_driver_rx_test` 当前仅是 MODEL RX 闭环：driver 通过生产 `rx_refill()`
-分配/映射可写 buffer，MODEL responder 从待注入的 `packet_item` 生成 virtio-net
+分配/映射可写 buffer，MODEL 设备模型从注入的 `packet_item`（或同队列对 TX 回环帧）生成 virtio-net
 header 和线速 payload，再通过 EP-originated PCIe DMA Write 写入 buffer，随后更新
 used ring、产生中断，最后由生产 `rx_receive()` 解码并回收 GPA/IOVA。测试不直接写
 Host memory、descriptor 或 used ring。REAL_DUT 下该测试会明确报告
@@ -2021,8 +2028,8 @@ endfunction
 
 | 模式 | 设备侧实现 | 可验证范围 |
 |------|------------|------------|
-| `VIRTIO_EXEC_MODEL` | `virtio_pcie_dut_responder` 消费 notify，经过 IOMMU/Host-memory 完成 DMA/used ring，并由 notification manager sideband 模拟中断（非真实 MSI-X TLP） | 无 RTL 时的完整 TLM 闭环 |
-| `VIRTIO_EXEC_REAL_DUT` | 不创建本地 device responder；被动观察真实 RTL 的 PCIe TLP | 真实配置、notify、DMA、used/interrupt 事件和 driver 回收 |
+| `VIRTIO_EXEC_MODEL` | 独立设备模型 `vdev_virtio_pci` 应答配置/BAR、消费 notify、经 IOMMU/EP DMA 完成 ring 与 payload，并按设备 MSI-X 表发 MSI-X MemWr | 无 RTL 时的完整 TLM 闭环；VIP 寄存器序列由设备独立校验 |
+| `VIRTIO_EXEC_REAL_DUT` | 不创建设备模型；被动观察真实 RTL 的 PCIe TLP | 真实配置、notify、DMA、used/interrupt 事件和 driver 回收 |
 
 REAL_DUT 的 fixture 使用 `SV_IF_MODE`，必须发布独立的
 `pcie_tl_rc_vif`（RC→EP）和 `pcie_tl_ep_vif`（EP→RC）。plain `pcie_work` 链路还
@@ -2040,7 +2047,20 @@ memory 域。
 REAL_DUT responder 只服务 Host-memory DMA，不生成 notify、used ring 或 RX 入包。
 因此 `virtio_real_driver_rx_test` 目前仅支持 MODEL；REAL_DUT 会报告
 `REAL_DUT_RX_SOURCE_UNAVAILABLE`，待平台提供物理/net_packet ingress callback 后再
-纳入真实 RX 回归。MODEL 的 responder 计数不能作为 RTL 数据面通过的证据。
+纳入真实 RX 回归。MODEL 设备模型的计数不能作为 RTL 数据面通过的证据。
+
+#### 独立设备模型（`src/devmodel/`）
+
+| 设备 | ID | BAR0 | BAR2 | BAR4 |
+|------|----|------|------|------|
+| `vdev_virtio_pci` | 1af4:1041 | common@0x0、ISR@0x1000、device_cfg@0x2000 | notify（off=q，multiplier 4） | MSI-X 表@0、PBA@0x8000（`2*max_pairs+2` 向量） |
+| `vdev_dpu_priv` | 20f9:5013 | doorbell@0、AF 声明 0x1010、qid map、VTX/VRX 参数表等（真实驱动 AF 路径） | qinfo | MSI-X（64 向量） |
+
+设备只依据收到的配置/MMIO 请求维护状态，经 `vdev_port`（`dma_read/dma_write/raise_msix`）访问 Host。
+语义事件经 `event_ap` 输出（`reg_wr/reg_rd/status/features/queue_cfg/notify/desc_chain/pkt/complete/irq/ctrl/marker`，
+`vdev_event::to_json()` 为单行 JSON）。调试 marker：扩展配置空间 0x100 的 VSEC（ID 0x5644），寄存器 0x108，
+写入场景号产生 `marker` 事件。TX 帧原样回环到同队列对的 RX；`inject_rx(pair, frame)` 是设备网络侧激励。
+私有设备的驱动寄存器序列表与疑点见 `vdev_dpu_priv.sv` 文件头；`dpu_priv_config_backend` 按其中 VIP 列访问设备。
 仓库默认 `virtio_tb_top.sv` 尚未实例化或发布这两条 VIF，因此默认顶层只能运行
 MODEL；真实平台 wrapper 必须在 `run_test()` 前创建双向 `pcie_tl_if` 并通过
 `uvm_config_db` 发布上述两个键。
@@ -2060,6 +2080,7 @@ lease，RC 再按 lease 调用 `program_fabric_bar_pairs()` 编程 PCIe config-s
 | 层次 | 测试文件 | 依赖 | 说明 |
 |------|----------|------|------|
 | 单元测试 | `virtio_unit_test.sv` | 无 PCIe | host_mem, IOMMU, split_virtqueue, wait_policy |
+| 设备模型单元测试 | `virtio_vdev_unit_test.sv` | 无 PCIe | vdev_base、vdev_virtio_pci、vdev_dpu_priv、私有后端寄存器序列 |
 | 压力单元 | `virtio_stress_unit_test.sv` | 无 PCIe | packed virtqueue, 大规模操作 |
 | 协议测试 | `virtio_protocol_test.sv` | 无 PCIe | 类型系统、状态机验证 |
 | 流量测试 | `virtio_traffic_test.sv` | 无 PCIe | 1000 报文 TX/RX, 带宽控制, 压力 |

@@ -32,9 +32,9 @@
           MODEL 模式│        │REAL_DUT 模式
      ┌─────────────┴──┐  ┌──┴──────────────────────┐
      │ TLM 回环        │  │ SV 接口（pcie_tl_if ×2） │
-     │ dut_responder + │  │ 真实 RTL DUT             │
-     │ model_dma_adapt │  │ DUT DMA ← real_dut_host_ │
-     │ （发真 EP TLP）  │  │ mem_responder+iova_proxy │
+     │ vdev_virtio_pci │  │ 真实 RTL DUT             │
+     │ + vdev_uvm_ep_  │  │ DUT DMA ← real_dut_host_ │
+     │ port（发真 EP TLP）│  │ mem_responder+iova_proxy │
      └─────────────────┘  └─────────────────────────┘
 ```
 
@@ -149,17 +149,12 @@ uvm_test_top.system_env
      queue_notify_off[qid] × notify_off_multiplier`（cap_manager.sv:387）；
    - notify 值 = `{queue_id}`（NOTIFICATION_DATA 开启时带 avail idx/wrap）；
    - 经 `bar.write_reg` 发出一条 **MemWr TLP**——门铃。
-10. **设备侧收 kick（MODEL）**：`virtio_pcie_observer_adapter::write`
-    （observer_adapter.sv:135）在 monitor 流量中认出落在 notify 窗口的
-    MemWr → `virtio_monitor::observe_queue_notify`（monitor.sv:236，校验
-    门铃地址与队列使能）→ ATOMIC_KICK 事务 → `virtio_pcie_dut_responder`
-    订阅消费（dut_responder.sv:266→354）→ 经
-    `virtio_pcie_model_dma_adapter` 发 **EP→RC MemRd TLP** 读 avail/desc
-    链（IOVA 逐 4KiB 块经 iommu 翻译，dut_responder.sv:730）→ 读/写
-    payload → MemWr 写 used ring（:675-698）→ 中断。
-    注意：MODEL 的 MSI-X 走 sideband 直调
-    `notify_mgr.on_interrupt_received`（:703-716，刻意不发 0xFEE0 TLP，
-    原因见该处注释）；REAL_DUT 才有真实中断 TLP。
+10. **设备侧收 kick（MODEL）**：notify MemWr 到达 EP driver，`vdev_ep_driver::handle_request` 交给
+    `vdev_uvm_ep_port::serve`，按 BAR 窗口分派到 `vdev_virtio_pci::region_write` → `notify()` 核对
+    队列已使能且 DRIVER_OK 后排入设备 worker → worker 经 `vdev_uvm_ep_port::dma_read`（IOVA 逐 4KiB
+    块经 iommu 翻译，再由 `virtio_pcie_model_dma_adapter` 发 **EP→RC MemRd TLP**）读 avail/desc 链 →
+    读/写 payload → MemWr 写 used ring → 按设备 MSI-X 表发 MSI-X MemWr（发布到 EP monitor，observer
+    解码为中断事件）。设备只看到 PCIe 请求，不读取 VIP 的 transport/virtqueue。
 11. **驱动侧完成回收**：中断 → `virtio_monitor::observe_interrupt`
     （monitor.sv:190）→ auto_fsm 的 interrupt/tx_complete 循环唤醒
     （auto_fsm.sv:1955/1907）→ `virtio_atomic_ops::tx_complete`
@@ -176,7 +171,7 @@ tests/virtio_real_driver_flow_fixture.sv:196-237）：
 |---|---|
 | BAR/config 访问 | 不装 TLM override，走基类 seq 发真 TLP 等 `rb_done`；EP 不装寄存器镜像，config/BAR 响应全部来自 RTL |
 | kick | 驱动侧完全不变；MemWr TLP 经 `rc_adapter.vif`（pcie_tl_if）串行化到线上被 DUT 采样 |
-| 设备行为 | 不创建 dut_responder——设备行为全部是 RTL 自己的 |
+| 设备行为 | 不创建设备模型——设备行为全部是 RTL 自己的 |
 | DUT DMA | `virtio_pcie_real_dut_host_mem_responder` 订阅 **RC monitor** 的 EP→RC 流量（real_dut_host_mem_responder.sv:159），按 requester BDF 过滤、串行交 RC driver 回 CplD；内存经 `virtio_pcie_iova_host_mem_proxy`：读走 `translate_for_host`，写走 `write_from_device_for_host`（权限+脏页一体，iova_proxy.sv:160-187） |
 | 中断 | DUT 发真实 MSI-X MemWr（0xFEE0_xxxx），`observer_adapter::decode_msi_memory_write`（:234）比对 MSI-X 表解码 vector；INTx Message 亦有解码分支（:200-224） |
 | used 回收 | 与 MODEL 完全一致——读的是 DUT 经 proxy 写进共享 host_mem 的同一批字节 |
