@@ -131,11 +131,19 @@
         foreach (region_sizes[i])
             ring_bytes += region_sizes[i];
 
-        // 8. Determine MSI-X vector for this queue
-        if (transport.notify_mgr.queue_vectors.size() > queue_id)
-            msix_vector = transport.notify_mgr.queue_vectors[queue_id];
-        else
-            msix_vector = 0;
+        // 8. 本队列的 MSI-X 向量：初始化已分配的直接取用；之后新建的队列（MQ 扩容）
+        // 现分配一个不占用其他队列的向量。configure_queue 在 queue_enable 之前写入并回读。
+        msix_vector = transport.notify_mgr.allocate_queue_vector(queue_id);
+        if (msix_vector == 32'hFFFF) begin
+            foreach (region_iovas[i])
+                iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                                     region_iovas[i]);
+            ring_iovas.delete(queue_id);
+            vq_mgr.destroy_queue(queue_id);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: no free MSI-X vector for queue_id=%0d", queue_id))
+            return;
+        end
 
         // 9. 经配置后端编程并启用队列（common-config：写大小/地址/向量并置
         // Q_ENABLE）。后端拒绝时设备不得访问该队列，因此可以立即回收 ring 映射。

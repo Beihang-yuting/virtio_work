@@ -265,6 +265,54 @@ class virtio_notification_manager extends uvm_object;
     endfunction
 
     // ========================================================================
+    // allocate_queue_vector
+    //
+    // 给初始化之后新建的队列（MQ 扩容、空洞队列号）分配向量，供 setup_queue 在
+    // queue_enable 之前写入（virtio 1.2 §4.1.4.3.2），不改动其他队列已绑定的向量。
+    // 已有有效向量（含拆除后保留的旧绑定）原样返回。per-queue MSI-X 取最小的未被
+    // config 与其他队列占用的表项，无空闲表项时返回 NO_VECTOR(0xFFFF)；shared 按
+    // RX/TX 共用 1/2；INTx 或尚未建 MSI-X 表时为 0（与未分配时的旧行为一致）。
+    // ========================================================================
+
+    function int unsigned allocate_queue_vector(int unsigned queue_id);
+        bit used[int unsigned];
+        int unsigned old_size;
+        int unsigned vector;
+
+        if ((queue_id < queue_vectors.size()) && (queue_vectors[queue_id] != 32'hFFFF))
+            return queue_vectors[queue_id];
+        if ((msix_table.size() == 0) || (irq_mode == IRQ_INTX))
+            return 0;
+        if (irq_mode == IRQ_MSIX_SHARED)
+            vector = (queue_id % 2 == 0) ? 1 : 2;
+        else begin
+            used[config_vector] = 1;
+            foreach (queue_vectors[q])
+                if (q != queue_id)
+                    used[queue_vectors[q]] = 1;
+            vector = 32'hFFFF;
+            for (int unsigned v = 0; v < msix_table.size(); v++)
+                if (!used.exists(v)) begin
+                    vector = v;
+                    break;
+                end
+            if (vector == 32'hFFFF)
+                return vector;
+        end
+        if (queue_id >= queue_vectors.size()) begin
+            old_size = queue_vectors.size();
+            queue_vectors = new[queue_id + 1](queue_vectors);
+            cb_enabled = new[queue_id + 1](cb_enabled);
+            for (int unsigned q = old_size; q <= queue_id; q++) begin
+                queue_vectors[q] = 32'hFFFF;
+                cb_enabled[q] = 1;
+            end
+        end
+        queue_vectors[queue_id] = vector;
+        return vector;
+    endfunction
+
+    // ========================================================================
     // bind_queue_vector
     //
     // Records the MSI-X vector binding for a queue. The actual MMIO write to

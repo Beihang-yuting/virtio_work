@@ -575,8 +575,9 @@ class virtio_auto_fsm extends uvm_report_object;
 
     // configure_mq 的实现体：先经 ctrl VQ 向设备提交 MQ 变更，设备接受后
     // 再收敛队列——缩容拆除多余的 RX/TX 队列，扩容经 ops.setup_queue_range 按对新建
-    // （任一失败拆除本次新建的全部队列并 FSM_ERROR），最后更新 active_num_pairs 与
-    // num_total_queues，并按实际队列集合重建 MSI-X。
+    // （任一失败拆除本次新建的全部队列并 FSM_ERROR；新队列由 setup_queue 分配向量并在
+    // queue_enable 之前写入，已使能队列的向量不变），最后更新 active_num_pairs 与
+    // num_total_queues。
     // 设备拒绝时仅报错、不动现有队列。
     protected virtual task do_configure_mq(int unsigned num_pairs);
         bit success;
@@ -612,10 +613,7 @@ class virtio_auto_fsm extends uvm_report_object;
             end
 
             active_num_pairs = num_pairs;
-            // 队列集合已变化：按 vq_mgr 中的实际队列重新建立 MSI-X，扩容新建的队列
-            // 不得停留在 NO_VECTOR（或误用 config 向量）。
             num_total_queues = ops.vq_mgr.get_queue_count();
-            ops.setup_msix(num_total_queues);
         end else begin
             `uvm_error("AUTO_FSM",
                 $sformatf("configure_mq: device rejected MQ change to %0d pairs", num_pairs))

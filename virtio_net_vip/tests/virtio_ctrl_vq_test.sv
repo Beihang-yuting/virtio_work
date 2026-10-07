@@ -840,6 +840,8 @@ class virtio_ctrl_vq_test extends uvm_test;
 
     // 1 对 + CTRL_VQ（max_virtqueue_pairs=2，队列 {0,1,4}）扩到 2 对：每条实际队列（含新建
     // 的 RX1/TX1）都必须绑定有效、互不相同、非 config 的向量，并与 notification manager 一致。
+    // virtio 1.2 §4.1.4.3.2：新建队列在 queue_enable 前写入最终向量；扩容不得改写已使能队列
+    // 的向量（不再整体重建 MSI-X）。
     task test_mq_expansion_rebinds_msix();
         virtio_ctrl_vq_migration_transport transport =
             virtio_ctrl_vq_migration_transport::type_id::create("mq_msix_transport");
@@ -855,6 +857,9 @@ class virtio_ctrl_vq_test extends uvm_test;
         virtio_wait_policy mq_wait_pol =
             virtio_wait_policy::type_id::create("mq_msix_wait_pol");
         int unsigned qids[$];
+        int unsigned new_qids[$];
+        int unsigned rebinds_before;
+        int unsigned programs_before;
         bit seen_vectors[int unsigned];
         bit ok;
         string why;
@@ -881,10 +886,13 @@ class virtio_ctrl_vq_test extends uvm_test;
         ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
         ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
 
+        // 与 full_init 同序：先按将要建立的队列 {0,1,4} 分配向量，再建队。
+        ops.setup_msix(3);
         ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
         if (!ok || (vq_mgr.get_queue(4) == null))
             `uvm_fatal("CTRL_VQ_TEST", "MQ MSI-X test setup did not create queues {0,1,4}")
-        ops.setup_msix(3);
+        rebinds_before = transport.msix_bound_qids.size();
+        programs_before = transport.programmed_qids.size();
         fsm.ops = ops;
         fsm.drv_cfg.queue_size = 8;
         fsm.drv_cfg.vq_type = VQ_SPLIT;
@@ -896,18 +904,24 @@ class virtio_ctrl_vq_test extends uvm_test;
         if ((fsm.state == FSM_ERROR) || (qids.size() != 5))
             `uvm_fatal("CTRL_VQ_TEST", $sformatf(
                 "MQ expansion 1->2 failed: state=%s queues=%p", fsm.state.name(), qids))
+        for (int unsigned i = programs_before; i < transport.programmed_qids.size(); i++)
+            new_qids.push_back(transport.programmed_qids[i]);
+        if ((new_qids.size() != 2) || (new_qids[0] != 2) || (new_qids[1] != 3) || (transport.msix_bound_qids.size() != rebinds_before))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "MQ expansion must program only new queues {2,3} and not remap live queues: programmed=%p remapped=%p",
+                new_qids, transport.msix_bound_qids))
         foreach (qids[i]) begin
-            if (!transport.msix_bound_vectors.exists(qids[i]) ||
-                (transport.msix_bound_vectors[qids[i]] !=
+            if (!transport.enable_vectors.exists(qids[i]) ||
+                (transport.enable_vectors[qids[i]] !=
                  transport.notify_mgr.queue_vectors[qids[i]]) ||
-                (transport.msix_bound_vectors[qids[i]] == 32'hFFFF) ||
-                (transport.msix_bound_vectors[qids[i]] ==
+                (transport.enable_vectors[qids[i]] == 32'hFFFF) ||
+                (transport.enable_vectors[qids[i]] ==
                  transport.notify_mgr.config_vector) ||
-                seen_vectors.exists(transport.msix_bound_vectors[qids[i]]))
+                seen_vectors.exists(transport.enable_vectors[qids[i]]))
                 `uvm_fatal("CTRL_VQ_TEST", $sformatf(
-                    "MQ expansion left queue %0d without a valid MSI-X vector: bound=%p vectors=%p",
-                    qids[i], transport.msix_bound_vectors, transport.notify_mgr.queue_vectors))
-            seen_vectors[transport.msix_bound_vectors[qids[i]]] = 1;
+                    "MQ expansion enabled queue %0d without its own valid MSI-X vector: at_enable=%p vectors=%p",
+                    qids[i], transport.enable_vectors, transport.notify_mgr.queue_vectors))
+            seen_vectors[transport.enable_vectors[qids[i]]] = 1;
         end
 
         foreach (qids[i])
