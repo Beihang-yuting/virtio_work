@@ -318,6 +318,7 @@ class virtio_ctrl_vq_test extends uvm_test;
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         test_ctrl_vq_at_twice_max_pairs();
+        test_ctrl_vq_at_two_without_mq();
         test_ctrl_send_alloc_failure_rolls_back();
         test_ctrl_send_map_failure_rolls_back();
         test_ctrl_send_timeout_resets_queue();
@@ -417,6 +418,52 @@ class virtio_ctrl_vq_test extends uvm_test;
         mem.leak_check();
 
         `uvm_info("CTRL_VQ_TEST", "control VQ at 2*max_virtqueue_pairs test PASSED", UVM_LOW)
+    endtask
+
+    // 未协商 MQ（virtio 1.2 §5.1.2）：N=1，control VQ 必须是 2，且不读 max_virtqueue_pairs；
+    // 请求 2 对时 control VQ 2 与数据队列 2 冲突，建队必须拒绝且不建任何队列。
+    task test_ctrl_vq_at_two_without_mq();
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("nomq_transport");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("nomq_ops");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("nomq_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("nomq_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("nomq_iommu");
+        virtio_ctrl_vq_test_catcher catcher;
+        bit ok;
+
+        mem.init_region(64'h7000_0000, 64'h7000_FFFF);
+        wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h0902);
+        transport.mock_net_config.max_virtqueue_pairs = 4;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+
+        ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
+        assert(ok && vq_mgr.has_queue(2) && (vq_mgr.get_queue_count() == 3) &&
+               (transport.net_config_reads == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "without MQ the control VQ must be queue 2 (ok=%0b q2=%0b count=%0d net_config_reads=%0d)",
+                ok, vq_mgr.has_queue(2), vq_mgr.get_queue_count(), transport.net_config_reads))
+        for (int unsigned qid = 0; qid < 3; qid++)
+            ops.teardown_queue(qid);
+
+        catcher = new("nomq_pairs_catcher");
+        catcher.expect_error("ATOMIC_OPS", "*requires VIRTIO_NET_F_MQ*");
+        uvm_report_cb::add(null, catcher);
+        ops.setup_all_queues(2, VQ_SPLIT, 8, ok);
+        uvm_report_cb::delete(null, catcher);
+        assert(!ok && (catcher.caught_count == 1) && (vq_mgr.get_queue_count() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "2 pairs without MQ must be rejected before any queue is built (ok=%0b caught=%0d count=%0d)",
+                ok, catcher.caught_count, vq_mgr.get_queue_count()))
+        assert((iommu.active_mapping_count() == 0) && (mem.outstanding_allocations() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", "control VQ without MQ test leaked queue resources")
+        mem.leak_check();
+
+        `uvm_info("CTRL_VQ_TEST", "control VQ at 2 without MQ test PASSED", UVM_LOW)
     endtask
 
     // ops 内存只有一个 16B 最小块：header 占用后 ack 申请失败。ctrl_send 必须释放

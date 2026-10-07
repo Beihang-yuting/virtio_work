@@ -314,6 +314,16 @@
             $sformatf("setup_all_queues: num_pairs=%0d type=%s size=%0d",
                       num_pairs, vq_type.name(), queue_size), UVM_MEDIUM)
 
+        // 未协商 MQ 时 controlq 固定为 2（N=1，virtio 1.2 §5.1.2）；多于 1 对的数据队列
+        // 会占用队列 2，与 control VQ 冲突，必须在建队前拒绝。
+        if (negotiated_features[VIRTIO_NET_F_CTRL_VQ] && !negotiated_features[VIRTIO_NET_F_MQ] &&
+            (num_pairs > 1)) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_all_queues: %0d queue pairs with a control VQ requires VIRTIO_NET_F_MQ",
+                num_pairs))
+            return;
+        end
+
         // Setup receive and transmit queue pairs
         setup_queue_range(0, num_pairs, vq_type, queue_size, queue_ok);
         if (!queue_ok)
@@ -321,7 +331,7 @@
 
         // Setup control queue if CTRL_VQ negotiated.  virtio 1.2 §5.1.2：
         // 协商 MQ 时 controlq 编号为 2*max_virtqueue_pairs（设备 config 上限），
-        // 否则为 2（单对）。取 max(num_pairs, 设备上限)，设备上报值小于当前对数时
+        // 否则为 2（单对，上面已保证 num_pairs == 1）。取 max(num_pairs, 设备上限)，设备上报值小于当前对数时
         // 也不与数据队列重号；之后 MQ 扩容新建的 RX/TX 不会落到 control VQ 上。
         if (negotiated_features[VIRTIO_NET_F_CTRL_VQ]) begin
             ctrl_qid = num_pairs * 2;
