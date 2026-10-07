@@ -679,8 +679,11 @@ class virtio_vdev_unit_test extends uvm_test;
 
     // ctrl VQ：MQ VQ_PAIRS_SET 2 → ACK_OK；5（超过 max_pairs）→ ACK_ERR；ctrl 事件记录 class/cmd/data/ack。
     task test_std_ctrl_mq();
-        split_virtqueue cq, txq;
-        bit [63:0] iovas[$], tx_iovas[$];
+        split_virtqueue cq, txq, rxq;
+        bit [63:0] iovas[$], tx_iovas[$], rx_iovas[$];
+        bit [63:0] rx_gpa, rx_iova;
+        bit [7:0] frame[$];
+        vdev_unit_token rx_tok;
         vdev_expect_catcher catcher;
         bit [63:0] hdr_gpa, hdr_iova, data_gpa, data_iova, ack_gpa, ack_iova;
         virtio_sg_list sgs[];
@@ -700,8 +703,12 @@ class virtio_vdev_unit_test extends uvm_test;
         std_program_queue(4, cq, 1, 0, iovas);
         txq = std_kit.make_split("pair1_tx", 3, 8, STD_BDF);
         std_program_queue(3, txq, 1, 0, tx_iovas);
+        rxq = std_kit.make_split("pair1_rx", 2, 8, STD_BDF);
+        std_program_queue(2, rxq, 1, 0, rx_iovas);
         std_wr(32'h14, 1, 8'h0f);
-        // virtio 1.2 §5.1.6.5.5：VQ_PAIRS_SET 之前只有第 0 对可用，队列 3 的通知被忽略并告警。
+        // virtio 1.2 §5.1.6.5.5：VQ_PAIRS_SET 之前只有第 0 对可用，队列 3（TX）的通知被忽略并告警；
+        // 该节只禁止设备向超出对数的 RX 队列放包，驱动可以先给它们补 buffer（Linux virtnet_open 对全部
+        // max_queue_pairs 使能 NAPI 并 try_fill_recv）：队列 2（RX）的通知记 notify 事件、不告警、不投递。
         catcher = new("pair1_catcher");
         catcher.id = "VDEV_QUEUE";
         catcher.text = "beyond the active queue pairs";
@@ -709,6 +716,20 @@ class virtio_vdev_unit_test extends uvm_test;
         port.host_write(STD_BAR2 + 12, 2, 3);
         if (catcher.caught != 1)
             `uvm_fatal("VDEV_UNIT", "notify on pair 1 before VQ_PAIRS_SET was not rejected")
+        sgs = new[1];
+        std_buffer(none, 64, DMA_FROM_DEVICE, rx_gpa, rx_iova, sgs[0]);
+        rx_tok = new("pair1_rx_tok");
+        void'(rxq.add_buf(sgs, 0, 1, rx_tok, 0));
+        std_log.events.delete();
+        port.host_write(STD_BAR2 + 8, 2, 2);
+        settle();
+        if (catcher.caught != 1)
+            `uvm_fatal("VDEV_UNIT", "RX notify on pair 1 before VQ_PAIRS_SET raised a warning")
+        std_log.select(VDEV_NOTIFY, ev);
+        if ((ev.size() != 1) || (ev[0].q != 2))
+            `uvm_fatal("VDEV_UNIT", "RX notify on pair 1 before VQ_PAIRS_SET produced no notify event")
+        if (rxq.poll_used(tok, len))
+            `uvm_fatal("VDEV_UNIT", "RX buffer on pair 1 was used before VQ_PAIRS_SET")
         std_log.events.delete();
         for (int round = 0; round < 2; round++) begin
             hdr_b = '{VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET};
@@ -737,6 +758,13 @@ class virtio_vdev_unit_test extends uvm_test;
         uvm_report_cb::delete(null, catcher);
         if (catcher.caught != 1)
             `uvm_fatal("VDEV_UNIT", "notify on pair 1 was rejected after VQ_PAIRS_SET=2")
+        // 对数扩到 2 后，第 1 对的入包写进 VQ_PAIRS_SET 之前补的 buffer：12B header + 帧。
+        frame = '{8'hca, 8'hfe, 8'h00, 8'h01, 8'h02, 8'h03};
+        std.inject_rx(1, frame);
+        wait_used(rxq, tok, len);
+        mem.read_mem(rx_gpa, 18, got);
+        if ((tok != rx_tok) || (len != 18) || (got[12] != 8'hca) || (got[17] != 8'h03))
+            `uvm_fatal("VDEV_UNIT", "frame on pair 1 not delivered into the buffer posted before VQ_PAIRS_SET")
         std_log.select(VDEV_CTRL, ev);
         if ((ev.size() != 2) || (ev[0].ctrl_class != VIRTIO_NET_CTRL_MQ) || (ev[0].ack != 0) ||
             (ev[0].ctrl_data.size() != 2) || (ev[0].ctrl_data[0] != 2) || (ev[1].ack != 1))
@@ -744,6 +772,9 @@ class virtio_vdev_unit_test extends uvm_test;
         std_wr(32'h14, 1, 0);
         std_release(cq, iovas);
         std_release(txq, tx_iovas);
+        iommu.unmap_for_host(0, STD_BDF, rx_iova);
+        mem.free(rx_gpa);
+        std_release(rxq, rx_iovas);
         `uvm_info("VDEV_UNIT", "test_std_ctrl_mq PASSED", UVM_LOW)
     endtask
 

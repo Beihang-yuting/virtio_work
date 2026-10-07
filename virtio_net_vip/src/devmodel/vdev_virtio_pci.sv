@@ -450,11 +450,14 @@ class vdev_virtio_pci extends vdev_base;
                 bdf, data, slot))
             return;
         end
-        // 协商 MQ 后，驱动经 VQ_PAIRS_SET 打开的队列对之外的数据队列不可用（virtio 1.2 §5.1.6.5.5）。
+        // 协商 MQ 后，VQ_PAIRS_SET 打开的队列对之外（virtio 1.2 §5.1.6.5.5）：驱动不得在 TX 队列放包，
+        // 告警且不发送；设备不得向 RX 队列放包，但驱动可以先补 buffer（Linux virtnet_open 对全部
+        // max_queue_pairs 补 RX），只记 notify、不调度，对数扩大后 inject_rx 调度时再读 avail。
         if (driver_features[VIRTIO_NET_F_MQ] && (is_rx(q) || is_tx(q)) && (q / 2 >= curr_pairs)) begin
-            `uvm_warning("VDEV_QUEUE", $sformatf(
-                "BDF 0x%04h ignored notify on queue %0d beyond the active queue pairs (%0d)",
-                bdf, q, curr_pairs))
+            if (is_tx(q))
+                `uvm_warning("VDEV_QUEUE", $sformatf(
+                    "BDF 0x%04h ignored notify on queue %0d beyond the active queue pairs (%0d)",
+                    bdf, q, curr_pairs))
             return;
         end
         schedule(q);
