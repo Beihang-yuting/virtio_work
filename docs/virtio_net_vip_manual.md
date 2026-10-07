@@ -209,7 +209,7 @@ VIP 采用分层架构，从底层到顶层依次为：
  host_mem.alloc() --> 分配 hdr+data buffer
       |
       v
- iommu.map() --> GPA -> IOVA 映射
+ iommu.map_for_host() --> GPA -> IOVA 映射
       |
       v
  split/packed_virtqueue.add_buf() --> 填写描述符, 更新 avail ring
@@ -230,7 +230,7 @@ VIP 采用分层架构，从底层到顶层依次为：
  vq.poll_used() --> 读取 Used Ring, 回收描述符
       |
       v
- iommu.unmap() + host_mem.free() --> 释放资源
+ iommu.unmap_for_host() + host_mem.free() --> 释放资源
 ```
 
 #### RX 路径
@@ -242,7 +242,7 @@ VIP 采用分层架构，从底层到顶层依次为：
  host_mem.alloc() --> 分配 RX buffer
       |
       v
- iommu.map() --> GPA -> IOVA 映射
+ iommu.map_for_host() --> GPA -> IOVA 映射
       |
       v
  vq.add_buf() --> 填写描述符 (WRITE 标志), 更新 avail ring
@@ -265,7 +265,7 @@ VIP 采用分层架构，从底层到顶层依次为：
       +-- 如果 MRG_RXBUF: 合并多个 buffer
       |
       v
- iommu.unmap() + host_mem.free() --> 释放 buffer, 准备重新补充
+ iommu.unmap_for_host() + host_mem.free() --> 释放 buffer, 准备重新补充
 ```
 
 ### 2.4 PCIe TLP 交互流程
@@ -683,11 +683,11 @@ barrier.print_stats();
 映射唯一键是 `{host_id[31:0], BDF[15:0], IOVA[63:0]}`。Host 之间拥有独立
 IOVA bump cursor，因此 `host0 + 00:08.2 + 0x80000000` 与
 `host1 + 00:08.2 + 0x80000000` 可以同时存在。生产路径从冻结的
-`dpu_pcie_function_id_t.domain.host_id` 取得 Host；旧 API 和未绑定 PCIe identity
+`dpu_pcie_function_id_t.domain.host_id` 取得 Host；未绑定 PCIe identity
 的 standalone 对象兼容地落到 host0。
 
 IOMMU 只管理 DMA 地址空间。BAR aperture、notify address、MSI-X table/PBA、
-QSCH/DSCH 和 global qpair placement 都由各自配置平面管理，不通过 `iommu.map()`。
+QSCH/DSCH 和 global qpair placement 都由各自配置平面管理，不通过 `iommu.map_for_host()`。
 本模型中的 Host key 不隐式创建独立 host memory：若不同 Host 还要复用相同数值
 GPA、但访问不同字节内容，应分别注入 `host_mem_manager`；共享 manager 表示共享
 GPA backing。
@@ -696,11 +696,8 @@ GPA backing。
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `map()` | `function bit[63:0] map(bdf, gpa, size, dir)` | 分配 IOVA, 创建映射，返回 IOVA |
 | `map_for_host()` | `function bit[63:0] map_for_host(host_id, bdf, gpa, size, dir)` | 在显式 Host requester domain 创建映射 |
-| `unmap()` | `function void unmap(bdf, iova)` | 移除映射，保存到 unmap_history |
 | `unmap_for_host()` | `function void unmap_for_host(host_id, bdf, iova)` | 只移除目标 Host 的映射 |
-| `translate()` | `function bit translate(bdf, iova, size, dir, ref gpa, ref fault)` | 地址翻译，成功返回 1 |
 | `translate_for_host()` | `function bit translate_for_host(host_id, bdf, iova, size, dir, ref gpa, ref fault)` | Host-qualified 地址翻译 |
 | `map_fixed_for_host()` | `function bit[63:0] map_fixed_for_host(host_id, bdf, gpa, size, dir, iova)` | 在迁移恢复时重建稳定 IOVA |
 | `write_from_device_for_host()` | `function bit write_from_device_for_host(host_id, mem, bdf, iova, data, ref fault)` | 完成 device-write 并产生 Host-scoped dirty record |
@@ -721,7 +718,7 @@ IOVA 0 保留为失败返回值；不同 Host 的数值 IOVA 可以相同，因�
 
 #### 4.4.3 翻译检查顺序
 
-`translate()` 按以下顺序执行检查：
+`translate_for_host()` 按以下顺序执行检查：
 
 1. **Fault 注入规则检查** -- 首先检查是否有匹配的注入规则
 2. **映射查找** -- 在目标 `{host_id, BDF}` 中查找覆盖该 IOVA 的有效映射
@@ -759,8 +756,7 @@ bit [63:0] dirty_pages[$];
 iommu.capture_dirty_generation_for_host(host_id, dirty_pages);
 ```
 
-`begin_dirty_generation()` / `capture_dirty_generation()` 仍表示
-host0。Host-scoped bitmap、mapping snapshot 和 generation state 不会因相同 GPA
+Host-scoped bitmap、mapping snapshot 和 generation state 不会因相同 GPA
 page number 而在不同 Host 之间合并。
 
 ### 4.5 Virtqueue 层 (virtqueue/)
@@ -2136,11 +2132,8 @@ legacy/TLM 模型路径；Fabric-owned function 会明确报告 `BAR_FABRIC_OWNE
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `map` | `function bit[63:0] map(bit[15:0] bdf, bit[63:0] gpa, int unsigned size, dma_dir_e dir, string file="", int line=0)` | 创建映射 |
 | `map_for_host` | `function bit[63:0] map_for_host(int unsigned host_id, bit[15:0] bdf, bit[63:0] gpa, int unsigned size, dma_dir_e dir, ...)` | 创建 Host-qualified 映射 |
-| `unmap` | `function void unmap(bit[15:0] bdf, bit[63:0] iova, string file="", int line=0)` | 移除映射 |
 | `unmap_for_host` | `function void unmap_for_host(int unsigned host_id, bit[15:0] bdf, bit[63:0] iova, ...)` | 移除指定 Host 映射 |
-| `translate` | `function bit translate(bit[15:0] bdf, bit[63:0] iova, int unsigned size, dma_dir_e access_dir, ref bit[63:0] gpa, ref iommu_fault_e fault)` | 地址翻译 |
 | `translate_for_host` | `function bit translate_for_host(int unsigned host_id, bit[15:0] bdf, bit[63:0] iova, int unsigned size, dma_dir_e access_dir, ref bit[63:0] gpa, ref iommu_fault_e fault)` | 指定 Host 地址翻译 |
 | `map_fixed_for_host` | function | 指定 Host 重建固定 IOVA |
 | `write_from_device_for_host` | function | 指定 Host 的完成 DMA write/dirty 边界 |

@@ -7,16 +7,16 @@
 // Models IOMMU address translation for DMA operations in the virtio-net VIP.
 //
 // 中文说明（能力全貌，按重要性排序）：
-//   - Host-qualified 域隔离：requester 身份是 {host_id, BDF}，全套
-//     map/unmap/translate/validate 都有 *_for_host() 变体——不同 Host
-//     下相同 BDF 互不可见，这是多 Host DPU 场景的核心语义；
+//   - Host-qualified 域隔离：requester 身份是 {host_id, BDF}，
+//     map/unmap/translate/validate 全部以 *_for_host() 形式显式携带
+//     host_id——不同 Host 下相同 BDF 互不可见，这是多 Host DPU 场景的核心语义；
 //   - GPA↔IOVA 双向翻译：可配置 aperture（configure_iova_aperture），
 //     IOVA 分配策略 IOMMU_IOVA_RANDOM（默认，随机化布局）/ FIRST_FIT
-//     （调试用），并支持 map_fixed() 在指定 IOVA 重建映射（迁移恢复）；
-//   - 设备写唯一入口 write_from_device[_for_host]()：权限检查与脏页
+//     （调试用），并支持 map_fixed_for_host() 在指定 IOVA 重建映射（迁移恢复）；
+//   - 设备写唯一入口 write_from_device_for_host()：权限检查与脏页
 //     记录绑定在同一路径，REAL_DUT 的 IOVA proxy 即走此入口；
 //   - 迁移支撑：4KB 粒度脏页跟踪 + 代际快照
-//     （begin/capture_dirty_generation）、live mapping 快照与校验；
+//     （begin/capture_dirty_generation_for_host）、live mapping 快照与校验；
 //   - 故障注入：add_fault_rule()，6 类故障 × 4 个阶段
 //     （DESC_READ/DATA_READ/DATA_WRITE/USED_WRITE）定点触发；
 //   - use-after-unmap 检测、report_phase 泄漏检查、翻译统计。
@@ -42,9 +42,8 @@ class virtio_iommu_model extends uvm_object;
     // ------------------------------------------------------------------
     // Bump allocator state
     // ------------------------------------------------------------------
-    protected bit [63:0] next_iova = DEFAULT_IOVA_BASE;
-    // IOVA spaces are independent per host/IOMMU requester domain.  Keep the
-    // legacy host0 cursor as an alias for compatibility with existing tests.
+    // IOVA spaces are independent per host/IOMMU requester domain.  A host
+    // without an entry has not allocated yet and starts at iova_base.
     protected bit [63:0] next_iova_by_host[int unsigned];
 
     // ------------------------------------------------------------------
@@ -67,7 +66,6 @@ class virtio_iommu_model extends uvm_object;
     // ------------------------------------------------------------------
     // Dirty page tracking
     // ------------------------------------------------------------------
-    bit dirty_tracking_enable = 0;
     protected bit dirty_bitmap[int unsigned][bit [63:0]];
     // page ID -> mapping key -> completed device-write snapshot.  A device
     // write is not dirty until its bytes have reached host memory; retaining
@@ -76,8 +74,6 @@ class virtio_iommu_model extends uvm_object;
     protected virtio_dirty_page_snapshot_t dirty_page_snapshot[
         int unsigned
     ][bit [63:0]][bit [111:0]];
-    protected bit [63:0] dirty_generation_counter = 0;
-    protected bit [63:0] active_dirty_generation = 0;
     protected bit [63:0] dirty_generation_counter_by_host[int unsigned];
     protected bit [63:0] active_dirty_generation_by_host[int unsigned];
     protected bit dirty_tracking_enable_by_host[int unsigned];
@@ -114,7 +110,7 @@ class virtio_iommu_model extends uvm_object;
     // 配置 IOVA aperture（[base, limit) 左闭右开）与分配策略，并把所有 Host 的
     // 分配游标重置到新 base。为什么要求"无 live mapping 才能改"：已分配的 IOVA
     // 落在旧窗口内，换窗口会让后续 range/collision 检查失去参照。base 不允许为
-    // 0（IOVA 0 被 map() 的失败返回约定和 virtio "无效 DMA 地址"约定双重保留），
+    // 0（IOVA 0 被 map_for_host() 的失败返回约定和 virtio "无效 DMA 地址"约定双重保留），
     // base/limit 必须页对齐且区间非空。失败时 why 给出原因且不改动任何配置。
     function bit configure_iova_aperture(
         input bit [63:0] base,
@@ -127,7 +123,7 @@ class virtio_iommu_model extends uvm_object;
             why = "cannot reconfigure IOVA aperture with live mappings";
             return 0;
         end
-        // IOVA 0 is reserved by the public map() return convention (0 means
+        // IOVA 0 is reserved by the public map_for_host() return convention (0 means
         // allocation failure) and is also conventionally treated as an
         // invalid DMA address by virtio devices.
         if (base == 0 || (base & (PAGE_SIZE - 1)) != 0 ||
@@ -140,12 +136,11 @@ class virtio_iommu_model extends uvm_object;
         iova_base = base;
         iova_limit = limit;
         iova_alloc_policy = policy;
-        next_iova = base;
         next_iova_by_host.delete();
         return 1;
     endfunction
 
-    // 运行时切换 IOVA 分配策略（RANDOM/FIRST_FIT）；只影响后续 map()，
+    // 运行时切换 IOVA 分配策略（RANDOM/FIRST_FIT）；只影响后续 map_for_host()，
     // 不回溯调整已存在的映射。
     function void set_iova_alloc_policy(input iommu_iova_alloc_policy_e policy);
         iova_alloc_policy = policy;
@@ -173,24 +168,13 @@ class virtio_iommu_model extends uvm_object;
     endfunction
 
     // ------------------------------------------------------------------
-    // map -- Allocate IOVA and create a mapping entry
+    // map_for_host -- Allocate IOVA and create a mapping entry
     //
-    // Allocates a page-aligned IOVA region via bump allocator and stores
-    // the mapping in the associative array keyed by {host_id, bdf, iova}.
-    // Returns the allocated IOVA.
-    // ------------------------------------------------------------------
-    virtual function bit [63:0] map(bit [15:0] bdf,
-                            bit [63:0] gpa,
-                            int unsigned size,
-                            dma_dir_e dir,
-                            string file = "",
-                            int line = 0);
-        return map_in_domain(0, bdf, gpa, size, dir, file, line);
-    endfunction
-
     // Map a GPA in one explicit host/IOMMU requester domain.  Each host owns
     // an independent IOVA namespace, so the returned IOVA may equal an IOVA
-    // allocated by another host without aliasing its mapping.
+    // allocated by another host without aliasing its mapping.  Test doubles
+    // that need to observe or fail allocations override this method.
+    // ------------------------------------------------------------------
     virtual function bit [63:0] map_for_host(int unsigned host_id,
                             bit [15:0] bdf,
                             bit [63:0] gpa,
@@ -198,14 +182,10 @@ class virtio_iommu_model extends uvm_object;
                             dma_dir_e dir,
                             string file = "",
                             int line = 0);
-        // Preserve factory/test subtypes that override the original host0
-        // virtual method.  Nonzero hosts use the explicit domain primitive.
-        if (host_id == 0)
-            return map(bdf, gpa, size, dir, file, line);
         return map_in_domain(host_id, bdf, gpa, size, dir, file, line);
     endfunction
 
-    // map()/map_for_host() 的公共实现：在指定 {host_id, BDF} 域内分配一段页
+    // map_for_host() 的实现：在指定 {host_id, BDF} 域内分配一段页
     // 对齐 IOVA 并登记映射。size 按页向上取整参与分配与冲突检查，但 entry.size
     // 记录原始字节数（后续 range check 用真实长度）。成功返回分配到的 IOVA 并
     // 推进域内 bump 游标；size==0、aperture 非法或 IOVA 耗尽时报 uvm_error 并
@@ -225,7 +205,7 @@ class virtio_iommu_model extends uvm_object;
         string allocation_why;
 
         // Keep the legacy bump allocator subject to the same range and
-        // collision rules as map_fixed().  In particular, do not let the
+        // collision rules as map_fixed_for_host().  In particular, do not let the
         // 32-bit caller size overflow while it is rounded to a page span.
         if (size == 0) begin
             `uvm_error("IOMMU_MAP", "map: zero-size mapping is invalid")
@@ -275,7 +255,7 @@ class virtio_iommu_model extends uvm_object;
     endfunction
 
     // ------------------------------------------------------------------
-    // map_fixed -- Create a mapping at a previously assigned stable IOVA
+    // map_fixed_for_host -- Create a mapping at a previously assigned stable IOVA
     //
     // Migration uses this to recreate a retired source mapping without
     // rewriting every possible descriptor format that may retain its IOVA.
@@ -284,19 +264,6 @@ class virtio_iommu_model extends uvm_object;
     // Retired history deliberately does not reserve an IOVA: a restored
     // mapping is allowed to reuse the source address after reset.
     // ------------------------------------------------------------------
-    virtual function bit [63:0] map_fixed(bit [15:0] bdf,
-                                          bit [63:0] gpa,
-                                          int unsigned size,
-                                          dma_dir_e dir,
-                                          bit [63:0] requested_iova,
-                                          string file = "",
-                                          int line = 0);
-        return map_fixed_in_domain(0, bdf, gpa, size, dir, requested_iova,
-                                   file, line);
-    endfunction
-
-    // map_fixed 的 host-qualified 变体：host 0 回落到原 virtual map_fixed()
-    // 以保留 factory/测试子类的覆写，其余 host 直接进入显式域原语。
     virtual function bit [63:0] map_fixed_for_host(int unsigned host_id,
                                           bit [15:0] bdf,
                                           bit [63:0] gpa,
@@ -305,8 +272,6 @@ class virtio_iommu_model extends uvm_object;
                                           bit [63:0] requested_iova,
                                           string file = "",
                                           int line = 0);
-        if (host_id == 0)
-            return map_fixed(bdf, gpa, size, dir, requested_iova, file, line);
         return map_fixed_in_domain(host_id, bdf, gpa, size, dir,
                                    requested_iova, file, line);
     endfunction
@@ -395,29 +360,16 @@ class virtio_iommu_model extends uvm_object;
     endfunction
 
     // ------------------------------------------------------------------
-    // unmap -- Remove a mapping from the table
+    // unmap_for_host -- Remove a mapping from one host requester domain
     //
     // Moves the entry to unmap_history for use-after-unmap detection.
     // Reports an error if the mapping is not found.
     // ------------------------------------------------------------------
-    virtual function void unmap(bit [15:0] bdf,
-                        bit [63:0] iova,
-                        string file = "",
-                        int line = 0);
-        unmap_in_domain(0, bdf, iova, file, line);
-    endfunction
-
-    // unmap 的 host-qualified 变体：host 0 回落到 virtual unmap() 保留子类
-    // 覆写，其余 host 走显式域实现。
     virtual function void unmap_for_host(int unsigned host_id,
                         bit [15:0] bdf,
                         bit [63:0] iova,
                         string file = "",
                         int line = 0);
-        if (host_id == 0) begin
-            unmap(bdf, iova, file, line);
-            return;
-        end
         unmap_in_domain(host_id, bdf, iova, file, line);
     endfunction
 
@@ -455,28 +407,19 @@ class virtio_iommu_model extends uvm_object;
     endfunction
 
     // ------------------------------------------------------------------
-    // translate -- Resolve IOVA to GPA with full checking
+    // translate_for_host -- Resolve IOVA to GPA with full checking
     //
     // Returns 1 on success (gpa set), 0 on fault (fault set).
-    // Device-to-guest writes must use write_from_device() so post-write dirty
-    // capture cannot be bypassed.  This public API is therefore limited to
-    // device reads (DMA_TO_DEVICE); write_from_device() calls the protected
+    // Device-to-guest writes must use write_from_device_for_host() so
+    // post-write dirty capture cannot be bypassed.  This public API is
+    // therefore limited to device reads (DMA_TO_DEVICE);
+    // write_from_device_for_host() calls the protected
     // translation primitive below after it has committed to the write path.
     //
     // Check order for allowed translations: fault injection -> mapping lookup
     // -> use-after-unmap -> range check -> permission check -> compute GPA.
-    //   -> range check -> permission check -> compute GPA.
     // ------------------------------------------------------------------
-    function bit translate(bit [15:0] bdf,
-                           bit [63:0] iova,
-                           int unsigned size,
-                           dma_dir_e access_dir,
-                           ref bit [63:0] gpa,
-                           ref iommu_fault_e fault);
-        return translate_for_host(0, bdf, iova, size, access_dir, gpa, fault);
-    endfunction
-
-    // translate 的 host-qualified 入口：先拦截 DMA 写方向（FROM_DEVICE/
+    // 设备读翻译入口：先拦截 DMA 写方向（FROM_DEVICE/
     // BIDIRECTIONAL）——设备写必须改走 write_from_device_for_host()，否则脏页
     // 记录会被绕过，这里直接报错并计 PERMISSION fault、返回 0；纯读方向
     // （TO_DEVICE）才转入 translate_internal() 做完整检查并输出 GPA。
@@ -503,7 +446,7 @@ class virtio_iommu_model extends uvm_object;
 
     // Validate a device-to-Host access without mutating Host memory.  The
     // normal translate_for_host() API intentionally rejects FROM_DEVICE so
-    // callers cannot bypass write_from_device() dirty tracking.  PCIe-TL
+    // callers cannot bypass write_from_device_for_host() dirty tracking.  PCIe-TL
     // responders need the same permission/range check before issuing an EP
     // Memory Write; the PCIe RC backend performs the actual write after this
     // preflight succeeds.
@@ -518,7 +461,7 @@ class virtio_iommu_model extends uvm_object;
                                   gpa, fault);
     endfunction
 
-    // write_from_device() is the sole device-write boundary.  Keeping this
+    // write_from_device_for_host() is the sole device-write boundary.  Keeping this
     // primitive protected prevents callers from translating a writable DMA
     // range and updating host memory without producing a dirty record.
     protected function bit translate_internal(int unsigned host_id,
@@ -704,14 +647,9 @@ class virtio_iommu_model extends uvm_object;
     // Start a fresh migration generation.  The bitmap is discarded before
     // tracking is enabled, so a subsequent capture can contain only writes
     // performed after this call.
-    function bit [63:0] begin_dirty_generation();
-        return begin_dirty_generation_for_host(0);
-    endfunction
-
     // 按 Host 开启新的脏页代际：代际号自增（0 保留为"未初始化快照"值，遇 0
     // 绕开），先清空该 Host 的脏页位图与写后快照、再打开跟踪开关——保证随后
-    // capture 到的只有本代际内完成的设备写。返回新代际号；host 0 同时维护
-    // legacy 全局字段以兼容旧接口。
+    // capture 到的只有本代际内完成的设备写。返回新代际号。
     function bit [63:0] begin_dirty_generation_for_host(
         int unsigned host_id
     );
@@ -723,8 +661,6 @@ class virtio_iommu_model extends uvm_object;
             next_generation = 1;
         set_dirty_generation_counter(host_id, next_generation);
         active_dirty_generation_by_host[host_id] = next_generation;
-        if (host_id == 0)
-            active_dirty_generation = next_generation;
         if (dirty_bitmap.exists(host_id))
             dirty_bitmap[host_id].delete();
         if (dirty_page_snapshot.exists(host_id))
@@ -736,10 +672,6 @@ class virtio_iommu_model extends uvm_object;
     // Atomically return the dirty set belonging to the active generation and
     // stop collecting it.  SystemVerilog functions execute without advancing
     // simulation time, so a writer cannot interleave with the copy/clear.
-    function void capture_dirty_generation(ref bit [63:0] dirty_pages[$]);
-        capture_dirty_generation_for_host(0, dirty_pages);
-    endfunction
-
     // 原子取走指定 Host 当前代际的脏页号集合并停止收集：function 不消耗仿真
     // 时间，写方无法插入 copy/clear 之间。未开启跟踪时输出空集；dirty_pages
     // 先清空再填充。注意这里只返回页号，写后 payload 由
@@ -812,20 +744,10 @@ class virtio_iommu_model extends uvm_object;
     endfunction
 
     // The one production boundary for a device-to-guest DMA write.  A caller
-    // must use this instead of translate()+host_mem.write_mem(): translation
+    // must use this instead of translate_for_host()+host_mem.write_mem(): translation
     // alone happens before the write and cannot preserve bytes once a
     // completion unmaps and frees the buffer.  The completed mapping span is
     // copied while it remains allocated, then normal cleanup may proceed.
-    function bit write_from_device(
-        host_mem_manager mem,
-        bit [15:0] bdf,
-        bit [63:0] iova,
-        byte data[],
-        ref iommu_fault_e fault
-    );
-        return write_from_device_for_host(0, mem, bdf, iova, data, fault);
-    endfunction
-
     // 设备→Guest 内存写的唯一生产入口（host-qualified）：翻译（含故障注入/
     // 范围/权限检查）→ 写入 host memory → 若脏页跟踪开启则抓取写后快照。快照
     // 必须在本函数返回前完成，因为随后的 completion 可能立刻 unmap+free 该
@@ -1266,63 +1188,46 @@ class virtio_iommu_model extends uvm_object;
         return 0;
     endfunction
 
-    // 读取指定 Host 的 bump 分配游标：host 0 走 legacy 标量字段（兼容既有
-    // 测试），其余 Host 未初始化时懒返回 iova_base。
+    // 读取指定 Host 的 bump 分配游标；未分配过的 Host 懒返回 iova_base。
     protected function bit [63:0] get_next_iova(int unsigned host_id);
-        if (host_id == 0)
-            return next_iova;
         if (!next_iova_by_host.exists(host_id))
             return iova_base;
         return next_iova_by_host[host_id];
     endfunction
 
-    // 写指定 Host 的 bump 游标；host 0 同时更新 legacy 标量和 per-host 表，
-    // 保证两个视图一致。
+    // 写指定 Host 的 bump 游标。
     protected function void set_next_iova(
         int unsigned host_id, bit [63:0] value
     );
-        if (host_id == 0)
-            next_iova = value;
         next_iova_by_host[host_id] = value;
     endfunction
 
-    // 读指定 Host 的脏页代际计数：host 0 走 legacy 标量，未初始化的 Host
-    // 视为 0（即从未开启过代际）。
+    // 读指定 Host 的脏页代际计数；未初始化的 Host 视为 0（从未开启过代际）。
     protected function bit [63:0] get_dirty_generation_counter(
         int unsigned host_id
     );
-        if (host_id == 0)
-            return dirty_generation_counter;
         if (!dirty_generation_counter_by_host.exists(host_id))
             return 0;
         return dirty_generation_counter_by_host[host_id];
     endfunction
 
-    // 写指定 Host 的代际计数；host 0 双写 legacy 标量与 per-host 表以保持
-    // 一致。
+    // 写指定 Host 的代际计数。
     protected function void set_dirty_generation_counter(
         int unsigned host_id, bit [63:0] value
     );
-        if (host_id == 0)
-            dirty_generation_counter = value;
         dirty_generation_counter_by_host[host_id] = value;
     endfunction
 
-    // 查询指定 Host 是否开启脏页跟踪：host 0 走 legacy 开关，其余 Host 表中
-    // 无记录时缺省视为关闭。
+    // 查询指定 Host 是否开启脏页跟踪；表中无记录时缺省视为关闭。
     protected function bit get_dirty_tracking_enable(int unsigned host_id);
-        if (host_id == 0)
-            return dirty_tracking_enable;
         return dirty_tracking_enable_by_host.exists(host_id) &&
                dirty_tracking_enable_by_host[host_id];
     endfunction
 
-    // 设置指定 Host 的脏页跟踪开关；host 0 同步更新 legacy 开关。
+    // 设置指定 Host 的脏页跟踪开关。
     protected function void set_dirty_tracking_enable(
         int unsigned host_id, bit enable
     );
-        if (host_id == 0)
-            dirty_tracking_enable = enable;
         dirty_tracking_enable_by_host[host_id] = enable;
     endfunction
 
@@ -1335,14 +1240,10 @@ class virtio_iommu_model extends uvm_object;
         fault_rules.delete();
         dirty_bitmap.delete();
         dirty_page_snapshot.delete();
-        dirty_tracking_enable = 0;
-        dirty_generation_counter = 0;
-        active_dirty_generation = 0;
         dirty_generation_counter_by_host.delete();
         active_dirty_generation_by_host.delete();
         dirty_tracking_enable_by_host.delete();
         next_iova_by_host.delete();
-        next_iova          = iova_base;
         total_maps         = 0;
         total_unmaps       = 0;
         total_translates   = 0;

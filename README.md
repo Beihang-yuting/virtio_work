@@ -59,7 +59,7 @@ unmap、fault rule、dirty tracking 与迁移快照仍彼此隔离。冻结的 P
 identity 会把 `host_id` 传播到 virtqueue、atomic ops、Admin VQ 和独立 TX/RX
 dataplane；未绑定全局 identity 的旧 standalone 用法默认属于 host0。
 
-这里的 `iommu.map` 只管理 DMA IOVA 到 GPA 的地址空间，不分配 BAR，也不处理
+这里的 `iommu.map_for_host` 只管理 DMA IOVA 到 GPA 的地址空间，不分配 BAR，也不处理
 notify、MSI-X、QSCH 或 global qpair。BAR/notify 属于 PCIe/DUT 配置平面，DMA
 映射属于 function 发起内存访问时的数据面地址翻译，两者不能混为一张表。
 Host-qualified IOMMU key 也不会自动复制 `host_mem_manager`；若两个 Host 需要相同
