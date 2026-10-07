@@ -39,6 +39,8 @@ class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
             discovery_started_before_bar_programming = 1;
         data = '0;
         case (addr)
+            // Command 预置 INTx Disable(bit10)：发现的 MSE|BME 读改写必须保留它。
+            12'h004: data = 32'h0000_0400;
             12'h034: data = 32'h0000_0040;
             12'h040: data = {8'd1, 8'd20, 8'h50, PCI_CAP_ID_VENDOR};
             12'h044: data = 32'h0000_0000;
@@ -730,13 +732,13 @@ class virtio_fabric_resource_test extends uvm_test;
                 function_instance.function_key.kind,
                 function_instance.function_key.vf_id))
         end
-        // 六次 BAR 编程之后是一次 Command 写（Memory Space|Bus Master，低 16 位）。
+        // 六次 BAR 编程之后是一次 Command 写（Memory Space|Bus Master，低 16 位），保留 INTx Disable。
         if ((config_stub.config_write_count != 7) ||
             (config_stub.config_writes[6].addr != PCI_CFG_COMMAND) ||
-            (config_stub.config_writes[6].data != 32'h0000_0006) ||
+            (config_stub.config_writes[6].data != 32'h0000_0406) ||
             (config_stub.config_writes[6].be != 4'h3)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "expected six Fabric BAR config writes then Command=MSE|BME for host %0d PF %0d kind %0d VF %0d, got %0d writes",
+                "expected six Fabric BAR config writes then Command|=MSE|BME (INTx Disable kept) for host %0d PF %0d kind %0d VF %0d, got %0d writes",
                 function_instance.function_key.host_id,
                 function_instance.function_key.pf_id,
                 function_instance.function_key.kind,
