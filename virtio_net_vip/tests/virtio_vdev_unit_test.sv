@@ -1419,6 +1419,50 @@ class virtio_vdev_unit_test extends uvm_test;
                                               label, got.size(), want.size()))
     endfunction
 
+    // #33 单队列停队的寄存器轨迹：TX 读回参数（DW2=rd_dw2）、清 queue_en 写回、等 QSCH、复位、清统计。
+    protected function void push_tx_stop(int unsigned gq, bit [63:0] ring, bit [31:0] rd_dw2,
+                                         ref string w[$]);
+        for (int unsigned i = 0; i < 4; i++)
+            w.push_back($sformatf("R bar0 vtx_para.%0d.dw%0d 0x%0h", gq, i,
+                                  (i == 0) ? ring[31:0] : (i == 1) ? ring[63:32] : (i == 2) ? rd_dw2 : 32'h0));
+        for (int unsigned i = 0; i < 4; i++)
+            w.push_back($sformatf("W bar0 vtx_content.dw%0d 0x%0h", i,
+                                  (i == 0) ? ring[31:0] : (i == 1) ? ring[63:32] : (i == 2) ? (rd_dw2 & ~32'h10) : 32'h0));
+        w.push_back($sformatf("W bar0 vtx_ram_cfg 0x%0h", gq));
+        w.push_back($sformatf("W bar0 vtx_ram_cfg 0x%0h", gq | 32'h2000));
+        w.push_back($sformatf("R bar0 qsch_state.%0d 0x0", gq));
+        w.push_back($sformatf("W bar0 vtx_reset 0x%0h", gq));
+        w.push_back($sformatf("W bar0 vtx_reset 0x%0h", gq | 32'h8000_0000));
+        w.push_back("R bar0 vtx_reset_done 0x1");
+        w.push_back($sformatf("W bar0 vtx_stat_clr_cfg 0x%0h", gq | 32'h1_0000));
+        w.push_back($sformatf("W bar0 vtx_stat_clr_cfg 0x%0h", gq | 32'h8001_0000));
+        w.push_back("R bar0 vtx_stat_clr_done 0x1");
+    endfunction
+
+    // #33 RX：间接读回 3 DW（DW2=rd_dw2）、清 queue_en 写回、复位并等完成（中断 info 在全部停完后清）。
+    protected function void push_rx_stop(int unsigned gq, bit [63:0] ring, bit [31:0] rd_dw2,
+                                         ref string w[$]);
+        bit [31:0] dw[3];
+
+        dw[0] = ring[31:0];
+        dw[1] = ring[63:32];
+        dw[2] = rd_dw2;
+        for (int unsigned i = 0; i < 3; i++) begin
+            w.push_back($sformatf("W bar0 vrx_rd_cfg 0x%0h", (i << 14) | gq));
+            w.push_back($sformatf("W bar0 vrx_rd_cfg 0x%0h", (i << 14) | gq | 32'h1_0000));
+            w.push_back($sformatf("R bar0 vrx_rd_data 0x%0h", dw[i]));
+        end
+        dw[2] = rd_dw2 & ~32'h10;
+        for (int unsigned i = 0; i < 3; i++)
+            w.push_back($sformatf("W bar0 vrx_content.dw%0d 0x%0h", i, dw[i]));
+        w.push_back($sformatf("W bar0 vrx_wr_cfg 0x%0h", gq));
+        w.push_back($sformatf("W bar0 vrx_wr_cfg 0x%0h", gq | 32'h1_0000));
+        w.push_back("W bar0 vrx_reset_done 0x0");
+        w.push_back($sformatf("W bar0 vrx_reset 0x%0h", gq));
+        w.push_back($sformatf("W bar0 vrx_reset 0x%0h", gq | 32'h8000_0000));
+        w.push_back("R bar0 vrx_reset_done 0x1");
+    endfunction
+
     // 规范 Review Focus 5：寄存器级私有后端的访问序列与驱动 AF 路径一致（vdev_dpu_priv 文件头表）。设备重新
     // init 为 host 0 的全新状态（Command 清零），后端经回环 accessor 访问；停队用旋钮制造“DMA 不停”。
     task test_priv_backend_sequence();
@@ -1426,11 +1470,12 @@ class virtio_vdev_unit_test extends uvm_test;
         vdev_loopback_bar_accessor acc;
         dpu_priv_config_backend be;
         dpu_priv_driver_config cfg;
-        virtio_queue_program_t rxp, txp;
+        virtio_queue_program_t rxp, txp, rx1p, tx1p, stray;
+        virtio_queue_program_t progs[4];
         string trace[$];
         string want[$];
         bit [31:0] e[4];
-        bit [63:0] rx_gpa, tx_gpa, rx_ring, tx_ring;
+        bit [63:0] rx_gpa, tx_gpa, rx_ring, tx_ring, rx1_gpa, tx1_gpa, rx1_ring, tx1_ring;
         bit ok;
 
         priv.host_id = 0;
@@ -1540,31 +1585,57 @@ class virtio_vdev_unit_test extends uvm_test;
         if (!ok || priv.queue_enabled(0, 0) || priv.queue_enabled(1, 0))
             `uvm_fatal("VDEV_UNIT", "private reset did not stop both queues")
         priv_log.reg_trace(trace);
-        want = '{$sformatf("R bar0 vtx_para.0.dw0 0x%0h", tx_ring[31:0]),
-                 $sformatf("R bar0 vtx_para.0.dw1 0x%0h", tx_ring[63:32]),
-                 "R bar0 vtx_para.0.dw2 0x83", "R bar0 vtx_para.0.dw3 0x0",
-                 $sformatf("W bar0 vtx_content.dw0 0x%0h", tx_ring[31:0]),
-                 $sformatf("W bar0 vtx_content.dw1 0x%0h", tx_ring[63:32]),
-                 "W bar0 vtx_content.dw2 0x83", "W bar0 vtx_content.dw3 0x0",
-                 "W bar0 vtx_ram_cfg 0x0", "W bar0 vtx_ram_cfg 0x2000",
-                 "R bar0 qsch_state.0 0x0", "W bar0 vtx_reset 0x0", "W bar0 vtx_reset 0x80000000",
-                 "R bar0 vtx_reset_done 0x1", "W bar0 vtx_stat_clr_cfg 0x10000",
-                 "W bar0 vtx_stat_clr_cfg 0x80010000", "R bar0 vtx_stat_clr_done 0x1",
-                 "W bar0 vrx_rd_cfg 0x0", "W bar0 vrx_rd_cfg 0x10000",
-                 $sformatf("R bar0 vrx_rd_data 0x%0h", rx_ring[31:0]),
-                 "W bar0 vrx_rd_cfg 0x4000", "W bar0 vrx_rd_cfg 0x14000",
-                 $sformatf("R bar0 vrx_rd_data 0x%0h", rx_ring[63:32]),
-                 "W bar0 vrx_rd_cfg 0x8000", "W bar0 vrx_rd_cfg 0x18000", "R bar0 vrx_rd_data 0x13",
-                 $sformatf("W bar0 vrx_content.dw0 0x%0h", rx_ring[31:0]),
-                 $sformatf("W bar0 vrx_content.dw1 0x%0h", rx_ring[63:32]),
-                 "W bar0 vrx_content.dw2 0x3", "W bar0 vrx_wr_cfg 0x0", "W bar0 vrx_wr_cfg 0x10000",
-                 "W bar0 vrx_reset_done 0x0", "W bar0 vrx_reset 0x0", "W bar0 vrx_reset 0x80000000",
-                 "R bar0 vrx_reset_done 0x1", "W bar0 msix_info.0 0x0"};
+        want.delete();
+        push_tx_stop(0, tx_ring, 32'h83, want);
+        push_rx_stop(0, rx_ring, 32'h13, want);
+        want.push_back("W bar0 msix_info.0 0x0");
         expect_trace(trace, want, "stop");
+        // 2 个队列对：驱动 dpu_down 先停全部 TX、再停全部 RX，最后 dpu_clear_msix_irqs_conf 按向量升序清 info
+        priv.init();
+        program_bars(PRIV_BDF, PRIV_BAR0, PRIV_BAR2, PRIV_BAR4);
+        be = dpu_priv_config_backend::type_id::create("priv_backend2");
+        be.bind_transport(t);
+        be.bind_private(cfg, 2);
+        be.discover();
+        rx1_ring = map_buffer(PRIV_BDF, 4096, DMA_BIDIRECTIONAL, rx1_gpa);
+        tx1_ring = map_buffer(PRIV_BDF, 4096, DMA_BIDIRECTIONAL, tx1_gpa);
+        rx1p = rxp;
+        rx1p.queue_id = 2;
+        rx1p.local_qid = 2;
+        rx1p.desc_iova = rx1_ring;
+        tx1p = txp;
+        tx1p.queue_id = 3;
+        tx1p.local_qid = 3;
+        tx1p.desc_iova = tx1_ring;
+        progs = '{rxp, txp, rx1p, tx1p};
+        ok = 1;
+        foreach (progs[i]) begin
+            if (ok) be.configure_queue(progs[i], ok);
+            if (ok) be.enable_queue(progs[i], ok);
+        end
+        if (!ok || !priv.queue_enabled(0, 1) || !priv.queue_enabled(1, 1))
+            `uvm_fatal("VDEV_UNIT", "private backend did not configure the second queue pair")
+        // 未配置的队列（teardown 的空编程参数，local_qid=0）：不访问设备，不得停掉 gq0
+        stray = virtio_empty_queue_program();
+        stray.queue_id = 4;
+        priv_log.events.delete();
+        be.disable_queue(stray, ok);
+        priv_log.reg_trace(trace);
+        if (!ok || (trace.size() != 0) || !priv.queue_enabled(0, 0) || !priv.queue_enabled(1, 0))
+            `uvm_fatal("VDEV_UNIT", "disabling an unconfigured private queue touched the device")
+        priv_log.events.delete();
+        be.reset(ok);
+        if (!ok || priv.queue_enabled(0, 0) || priv.queue_enabled(0, 1) ||
+            priv.queue_enabled(1, 0) || priv.queue_enabled(1, 1))
+            `uvm_fatal("VDEV_UNIT", "private reset did not stop both queue pairs")
         iommu.unmap_for_host(0, PRIV_BDF, rx_ring);
         iommu.unmap_for_host(0, PRIV_BDF, tx_ring);
+        iommu.unmap_for_host(0, PRIV_BDF, rx1_ring);
+        iommu.unmap_for_host(0, PRIV_BDF, tx1_ring);
         mem.free(rx_gpa);
         mem.free(tx_gpa);
+        mem.free(rx1_gpa);
+        mem.free(tx1_gpa);
         `uvm_info("VDEV_UNIT", "test_priv_backend_sequence PASSED", UVM_LOW)
     endtask
 

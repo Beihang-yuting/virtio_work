@@ -385,12 +385,15 @@ class dpu_priv_config_backend extends virtio_config_backend;
 
     // #33：TX 置 queue_en=0 → 等 QSCH 空闲 → 队列复位 → 清 TX 统计（stat_clr）；RX 间接读回 3 DW 参数
     // （af_mng.c:1564）→ 置 queue_en=0 → 复位，最后清该队列对的中断 info。任一轮询超时 ok=0（不报错），
-    // 队列仍记为已配置以便重试。
+    // 队列仍记为已配置以便重试。未配置的队列（如 teardown 的空编程参数）没有设备状态，直接 ok=1，不访问设备。
     virtual task disable_queue(virtio_queue_program_t q, output bit ok);
         bit [31:0] dw[4];
         bit [31:0] v;
         int unsigned gq;
 
+        ok = 1;
+        if (!active.exists(q.queue_id))
+            return;
         ok = 0;
         gq = q.local_qid >> 1;
         if (q.tx_mode) begin
