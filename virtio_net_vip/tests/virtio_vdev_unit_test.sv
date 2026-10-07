@@ -1065,7 +1065,8 @@ class virtio_vdev_unit_test extends uvm_test;
     endtask
 
     // 独立设备暴露的 VIP 缺陷：common-config 后端 set_msix 必须在设备上打开 MSI-X（Enable=1、
-    // Function Mask=0）并清掉所用向量的 Vector Control；clear_msix 必须重新屏蔽。
+    // Function Mask=0）并清掉所用向量的 Vector Control；clear_msix 必须重新屏蔽。Message Control
+    // 与 Vector Control 都按读改写更新，保留其余位。
     task test_vip_msix_enables_device();
         virtio_pci_transport t;
         vdev_loopback_bar_accessor acc;
@@ -1074,6 +1075,8 @@ class virtio_vdev_unit_test extends uvm_test;
         bit [31:0] v;
         bit [7:0] cap;
         bit ok;
+        vdev_event ev[$];
+        bit [31:0] mc_writes[$];
 
         t = virtio_pci_transport::type_id::create("vip_msix_transport");
         t.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(STD_BDF));
@@ -1088,10 +1091,11 @@ class virtio_vdev_unit_test extends uvm_test;
         t.notify_mgr.bar = acc;
         t.cap_mgr.discover_capabilities();
         cap = find_cap(STD_BDF, 8'h11);
-        // 回到设备复位后的 MSI-X 状态：关闭使能、全部向量屏蔽。
-        port.host_cfg_write(STD_BDF, {4'h0, cap}, 32'h0, 4'hc);
+        // 关闭使能、置 Function Mask；向量全部屏蔽，Vector Control 另带保留位 bit8。
+        port.host_cfg_write(STD_BDF, {4'h0, cap}, 32'h4000_0000, 4'hc);
         for (int unsigned i = 0; i < 6; i++)
-            port.host_write(STD_BAR4 + 16*i + 12, 4, 1);
+            port.host_write(STD_BAR4 + 16*i + 12, 4, 32'h0000_0101);
+        std_log.events.delete();
         be = virtio_common_cfg_backend::type_id::create("vip_msix_backend");
         be.bind_transport(t);
         qids.push_back(0);
@@ -1102,12 +1106,24 @@ class virtio_vdev_unit_test extends uvm_test;
             `uvm_fatal("VDEV_UNIT", $sformatf(
                 "set_msix left device MSI-X disabled or function-masked (ctrl=0x%04h)", v[31:16]))
         for (int unsigned i = 0; i < 3; i++)
-            if (port.host_read(STD_BAR4 + 16*i + 12, 4) != 0)
-                `uvm_fatal("VDEV_UNIT", $sformatf("set_msix left vector %0d masked in the device table", i))
+            if (port.host_read(STD_BAR4 + 16*i + 12, 4) != 32'h0000_0100)
+                `uvm_fatal("VDEV_UNIT", $sformatf(
+                    "set_msix left vector %0d masked or dropped its other Vector Control bits", i))
         be.clear_msix(ok);
         v = port.host_cfg_read(STD_BDF, {4'h0, cap});
-        if (!ok || !v[30] || (port.host_read(STD_BAR4 + 12, 4) != 1))
+        if (!ok || !v[30] || (port.host_read(STD_BAR4 + 12, 4) != 32'h0000_0101))
             `uvm_fatal("VDEV_UNIT", "clear_msix did not mask the device MSI-X function/vectors")
+        // 每次 Message Control 写都带回读到的只读位（Table Size = 6 个向量 - 1）。
+        std_log.select(VDEV_REG_WR, ev);
+        foreach (ev[i])
+            if ((ev[i].region == "cfg") && (ev[i].field == $sformatf("0x%03h", {4'h0, cap})))
+                mc_writes.push_back(ev[i].val);
+        if (mc_writes.size() != 2)
+            `uvm_fatal("VDEV_UNIT", $sformatf("expected 2 Message Control writes, saw %0d", mc_writes.size()))
+        foreach (mc_writes[i])
+            if (mc_writes[i][26:16] != 11'd5)
+                `uvm_fatal("VDEV_UNIT", $sformatf(
+                    "Message Control write 0x%08h did not preserve the read-only Table Size", mc_writes[i]))
         `uvm_info("VDEV_UNIT", "test_vip_msix_enables_device PASSED", UVM_LOW)
     endtask
 

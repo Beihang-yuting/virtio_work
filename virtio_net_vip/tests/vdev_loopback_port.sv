@@ -123,6 +123,15 @@ class vdev_loopback_bar_accessor extends virtio_bar_accessor;
         port.host_write(bar_base[bar_id] + offset, size, data);
     endtask
 
+    virtual task read_msix_reg(int unsigned bar_id, bit [31:0] offset, int unsigned size,
+                               ref bit [31:0] data);
+        if ((bar_id > 5) || !allow_msix_bar_access(bar_id)) begin
+            data = '0;
+            return;
+        end
+        data = port.host_read(bar_base[bar_id] + offset, size);
+    endtask
+
     virtual task write_msix_reg(int unsigned bar_id, bit [31:0] offset, int unsigned size,
                                 bit [31:0] data);
         if ((bar_id > 5) || !allow_msix_bar_access(bar_id))

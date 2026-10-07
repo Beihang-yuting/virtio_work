@@ -236,8 +236,7 @@ class virtio_common_cfg_backend extends virtio_config_backend;
             // 设备只有看到 Enable=1、Function Mask=0 才会发 MSI-X。向量分配回退到 INTx
             // 时不打开 MSI-X。
             if (actual_mode != IRQ_INTX)
-                transport.bar.config_write({4'h0, transport.cap_mgr.msix_cap_offset},
-                                           32'h8000_0000, 4'hc);
+                update_msix_control(1'b1, 1'b0);
         end else begin
             transport.notify_mgr.irq_mode = IRQ_INTX;
             transport.notify_mgr.intx_enabled = 1;
@@ -248,9 +247,27 @@ class virtio_common_cfg_backend extends virtio_config_backend;
     virtual task clear_msix(output bit ok);
         transport.notify_mgr.mask_all();
         if (transport.cap_mgr.has_msix())
-            transport.bar.config_write({4'h0, transport.cap_mgr.msix_cap_offset},
-                                       32'hc000_0000, 4'hc);
+            update_msix_control(1'b1, 1'b1);
         ok = 1;
+    endtask
+
+    // MSI-X 能力首 DW（高 16 位为 Message Control）。
+    protected task read_msix_control(output bit [31:0] ctrl);
+        bit [31:0] v;
+
+        v = '0;
+        transport.bar.config_read({4'h0, transport.cap_mgr.msix_cap_offset}, v);
+        ctrl = v;
+    endtask
+
+    // Message Control 读改写：只改 Enable(bit15)/Function Mask(bit14)，保留其余位。
+    protected task update_msix_control(bit enable, bit function_mask);
+        bit [31:0] ctrl;
+
+        read_msix_control(ctrl);
+        ctrl[31] = enable;
+        ctrl[30] = function_mask;
+        transport.bar.config_write({4'h0, transport.cap_mgr.msix_cap_offset}, ctrl, 4'hc);
     endtask
 
     virtual task read_net_config(output virtio_net_device_config_t cfg);

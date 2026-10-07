@@ -626,10 +626,6 @@ class virtio_bar_accessor extends uvm_object;
 
     virtual task read_reg(int unsigned bar_id, bit [31:0] offset,
                           int unsigned size, ref bit [31:0] data);
-        bit [63:0] addr;
-        bit [3:0]  be;
-        virtio_bar_mem_rd_seq rd_seq;
-
         if (bar_id > 5) begin
             `uvm_error("BAR_ACCESSOR",
                 $sformatf("Invalid bar_id=%0d (must be 0-5)", bar_id))
@@ -641,6 +637,31 @@ class virtio_bar_accessor extends uvm_object;
             data = '0;
             return;
         end
+        issue_read_reg(bar_id, offset, size, data);
+    endtask
+
+    // MSI-X 表读入口（Vector Control 读改写用）：只走 MSI-X BAR 守卫。
+    virtual task read_msix_reg(int unsigned bar_id, bit [31:0] offset,
+                               int unsigned size, ref bit [31:0] data);
+        if (bar_id > 5) begin
+            `uvm_error("BAR_ACCESSOR",
+                $sformatf("Invalid bar_id=%0d (must be 0-5)", bar_id))
+            data = '0;
+            return;
+        end
+        if (!allow_msix_bar_access(bar_id)) begin
+            data = '0;
+            return;
+        end
+        issue_read_reg(bar_id, offset, size, data);
+    endtask
+
+    // 实际发读的内部路径：不做 BAR 守卫(由 read_reg/read_msix_reg 各自先行检查)。
+    protected task issue_read_reg(int unsigned bar_id, bit [31:0] offset,
+                                  int unsigned size, ref bit [31:0] data);
+        bit [63:0] addr;
+        bit [3:0]  be;
+        virtio_bar_mem_rd_seq rd_seq;
 
         if (pcie_rc_seqr == null) begin
             `uvm_fatal("BAR_ACCESSOR",

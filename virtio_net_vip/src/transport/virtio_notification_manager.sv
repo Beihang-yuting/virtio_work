@@ -138,9 +138,8 @@ class virtio_notification_manager extends uvm_object;
             bar.write_msix_reg(msix_table_bar, entry_offset + 32'h08, 4,
                                msix_table[i].msg_data);
 
-            // Write Vector Control (masked)
-            bar.write_msix_reg(msix_table_bar, entry_offset + 32'h0C, 4,
-                               32'h0000_0001);
+            // Vector Control：读改写置屏蔽位，保留其余位
+            write_vector_control(i);
 
             `uvm_info("NOTIFY_MGR",
                 $sformatf("MSI-X vector %0d: addr=0x%016h data=0x%08h masked=%0b",
@@ -285,12 +284,19 @@ class virtio_notification_manager extends uvm_object;
     // mask/unmask：更新影子位并写回设备端 Vector Control 寄存器。
     // ========================================================================
 
-    // 把向量的影子屏蔽位写进设备 MSI-X 表项 Vector Control；未建表或无 BAR accessor 时不访问设备。
+    // 把向量的影子屏蔽位写进设备 MSI-X 表项 Vector Control（读改写，保留 bit31:1）；
+    // 未建表或无 BAR accessor 时不访问设备。
     protected task write_vector_control(int unsigned vector);
+        bit [31:0] ctrl;
+        bit [31:0] off;
+
         if ((bar == null) || (vector >= msix_mask.size()))
             return;
-        bar.write_msix_reg(msix_table_bar_id, msix_table_base + vector * 16 + 32'hC, 4,
-                           {31'h0, msix_mask[vector]});
+        off = msix_table_base + vector * 16 + 32'hC;
+        ctrl = '0;
+        bar.read_msix_reg(msix_table_bar_id, off, 4, ctrl);
+        ctrl[0] = msix_mask[vector];
+        bar.write_msix_reg(msix_table_bar_id, off, 4, ctrl);
     endtask
 
     // 屏蔽单个向量；越界仅告警不生效。
