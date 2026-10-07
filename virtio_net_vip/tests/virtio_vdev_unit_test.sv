@@ -73,6 +73,26 @@ class vdev_unit_echo_device extends vdev_base;
     endtask
 endclass
 
+// 拒绝把事件映射到 refused_vector 的标准设备：virtio 1.2 §4.1.5.1.2.1 允许设备在无法满足时映射失败，
+// 此时 config_msix_vector/queue_msix_vector 回读 NO_VECTOR。用于检验 VIP 映射后回读核对。
+class vdev_unit_vector_refusing_pci extends vdev_virtio_pci;
+    `uvm_component_utils(vdev_unit_vector_refusing_pci)
+
+    bit [15:0] refused_vector;
+
+    function new(string name = "vdev_unit_vector_refusing_pci", uvm_component parent = null);
+        super.new(name, parent);
+        refused_vector = 16'hffff;
+    endfunction
+
+    virtual function void region_write(int unsigned bar, bit [31:0] off, int unsigned size,
+                                       bit [31:0] data);
+        if ((bar == 0) && ((off == 32'h10) || (off == 32'h1a)) && (data[15:0] == refused_vector))
+            data = 32'h0000_ffff;
+        super.region_write(bar, off, size, data);
+    endfunction
+endclass
+
 class virtio_vdev_unit_test extends uvm_test;
     `uvm_component_utils(virtio_vdev_unit_test)
 
@@ -88,6 +108,10 @@ class virtio_vdev_unit_test extends uvm_test;
     localparam bit [63:0] PRIV_BAR0 = 64'h0000_0042_0000_0000;
     localparam bit [63:0] PRIV_BAR2 = 64'h0000_0042_0200_0000;
     localparam bit [63:0] PRIV_BAR4 = 64'h0000_0042_0201_0000;
+    localparam bit [15:0] REFUSE_BDF  = 16'h0600;
+    localparam bit [63:0] REFUSE_BAR0 = 64'h0000_0043_0000_0000;
+    localparam bit [63:0] REFUSE_BAR2 = 64'h0000_0043_0001_0000;
+    localparam bit [63:0] REFUSE_BAR4 = 64'h0000_0043_0002_0000;
 
     host_mem_manager      mem;
     virtio_iommu_model    iommu;
@@ -100,6 +124,7 @@ class virtio_vdev_unit_test extends uvm_test;
     virtio_vq_test_kit    std_kit;
     vdev_dpu_priv         priv;
     vdev_event_log        priv_log;
+    vdev_unit_vector_refusing_pci refuse;
     int unsigned          irq_base;   // 本子测试开始时的 interrupt_count
 
     function new(string name = "virtio_vdev_unit_test", uvm_component parent = null);
@@ -124,6 +149,7 @@ class virtio_vdev_unit_test extends uvm_test;
         std_log = vdev_event_log::type_id::create("std_log", this);
         priv = vdev_dpu_priv::type_id::create("priv", this);
         priv_log = vdev_event_log::type_id::create("priv_log", this);
+        refuse = vdev_unit_vector_refusing_pci::type_id::create("refuse", this);
     endfunction
 
     virtual function void connect_phase(uvm_phase phase);
@@ -1168,6 +1194,59 @@ class virtio_vdev_unit_test extends uvm_test;
         `uvm_info("VDEV_UNIT", "test_vip_msix_enables_device PASSED", UVM_LOW)
     endtask
 
+    // virtio 1.2 §4.1.5.1.2.2：驱动把事件映射到向量后 MUST 回读 vector 字段核对，失败时读回 NO_VECTOR。
+    // 设备拒绝向量 2：config/queue 映射接口与建队路径（setup_single_queue）都必须报告失败，接受的映射不报。
+    task test_vip_msix_mapping_readback();
+        virtio_pci_transport t;
+        vdev_loopback_bar_accessor acc;
+        vdev_expect_catcher catcher;
+
+        refuse.bdf = REFUSE_BDF;
+        refuse.max_pairs = 1;
+        refuse.device_features = 64'h0000_0001_0000_0000;
+        refuse.init();
+        port.attach(refuse);
+        program_bars(REFUSE_BDF, REFUSE_BAR0, REFUSE_BAR2, REFUSE_BAR4);
+        port.host_cfg_write(REFUSE_BDF, 12'h004, 32'h0000_0006, 4'h3);   // MSE + BME
+        t = virtio_pci_transport::type_id::create("readback_transport");
+        t.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(REFUSE_BDF));
+        acc = vdev_loopback_bar_accessor::type_id::create("readback_bar");
+        acc.port = port;
+        acc.target_bdf = REFUSE_BDF;
+        acc.bar_base[0] = REFUSE_BAR0;
+        acc.bar_base[2] = REFUSE_BAR2;
+        acc.bar_base[4] = REFUSE_BAR4;
+        t.bar = acc;
+        t.cap_mgr.bar_ref = acc;
+        t.notify_mgr.bar = acc;
+        t.cap_mgr.discover_capabilities();
+        // 协商到 FEATURES_OK（只取 VERSION_1），使 setup_single_queue 的使能被设备接受。
+        refuse_wr(32'h14, 1, 32'h03);
+        refuse_wr(32'h08, 4, 1);
+        refuse_wr(32'h0c, 4, 1);
+        refuse_wr(32'h14, 1, 32'h0b);
+        refuse.refused_vector = 2;
+        catcher = new("readback_catcher");
+        catcher.id = "TRANSPORT";
+        catcher.text = "MSI-X mapping";
+        uvm_report_cb::add(null, catcher);
+        t.write_config_msix_vector(0);
+        t.write_queue_msix_vector(0, 1);
+        t.write_queue_msix_vector(1, 2);
+        t.setup_single_queue(0, 8, 64'h1000, 64'h2000, 64'h3000, 2);
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught != 2)
+            `uvm_fatal("VDEV_UNIT", $sformatf(
+                "VIP reported %0d of 2 refused MSI-X mappings (must read back the vector after mapping)",
+                catcher.caught))
+        refuse_wr(32'h14, 1, 0);   // 复位：撤销 setup_single_queue 使能的队列 0
+        `uvm_info("VDEV_UNIT", "test_vip_msix_mapping_readback PASSED", UVM_LOW)
+    endtask
+
+    protected function void refuse_wr(bit [31:0] off, int unsigned size, bit [31:0] data);
+        port.host_write(REFUSE_BAR0 + off, size, data);
+    endfunction
+
     protected function void priv_wr(bit [31:0] off, bit [31:0] data);
         port.host_write(PRIV_BAR0 + off, 4, data);
     endfunction
@@ -1705,6 +1784,7 @@ class virtio_vdev_unit_test extends uvm_test;
         test_std_split_indirect();
         test_std_packed_indirect_loopback();
         test_vip_msix_enables_device();
+        test_vip_msix_mapping_readback();
         test_priv_driver_sequence();
         test_priv_backend_sequence();
         mem.leak_check();
