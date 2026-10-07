@@ -389,8 +389,9 @@ class dpu_priv_config_backend extends virtio_config_backend;
         ok = 1;
     endtask
 
-    // #33：TX 置 queue_en=0 → 等 QSCH 空闲 → 队列复位 → 清 TX 统计（stat_clr）；RX 间接读回 3 DW 参数
-    // （af_mng.c:1564）→ 置 queue_en=0 → 复位。中断 info 不在这里清（见 reset）。任一轮询超时 ok=0（不报错），
+    // #33：TX 置 queue_en=0 → 等 QSCH 空闲 → 队列复位 → 清 TX 统计（stat_clr）；RX 间接读回 4 DW 参数
+    // （af_mng.c:1564 按 sizeof(struct vrx_queue_para_table_entry)/4 读，u64 成员使结构对齐到 16 B）→
+    // 置 queue_en=0 后写回 3 DW → 复位。中断 info 不在这里清（见 reset）。任一轮询超时 ok=0（不报错），
     // 队列仍记为已配置以便重试。未配置的队列（如 teardown 的空编程参数）没有设备状态，直接 ok=1，不访问设备。
     virtual task disable_queue(virtio_queue_program_t q, output bit ok);
         bit [31:0] dw[4];
@@ -420,7 +421,7 @@ class dpu_priv_config_backend extends virtio_config_backend;
             if (!ok)
                 return;
         end else begin
-            for (int unsigned i = 0; i < 3; i++) begin
+            for (int unsigned i = 0; i < 4; i++) begin
                 wr0(VRX_RD_CFG, (i << 14) | gq);
                 wr0(VRX_RD_CFG, (i << 14) | gq | 32'h1_0000);
                 rd0(VRX_RD_DATA, v);

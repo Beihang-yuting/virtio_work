@@ -1549,7 +1549,7 @@ class virtio_vdev_unit_test extends uvm_test;
             `uvm_fatal("VDEV_UNIT", "doorbell for a disabled TX queue was accepted")
         // stop：RX，先以旋钮制造“DMA 不停”，复位完成位必须保持 0
         priv.stall_queue_stop = 1;
-        for (int unsigned i = 0; i < 3; i++) begin
+        for (int unsigned i = 0; i < 4; i++) begin   // 驱动读 sizeof(vrx_queue_para_table_entry)/4 = 4 DW
             priv_wr(32'h90_0210, (i << 14));
             priv_wr(32'h90_0210, (i << 14) | 32'h1_0000);
             para[i] = priv_rd(32'h90_0214);
@@ -1625,15 +1625,17 @@ class virtio_vdev_unit_test extends uvm_test;
         w.push_back("R bar0 vtx_stat_clr_done 0x1");
     endfunction
 
-    // #33 RX：间接读回 3 DW（DW2=rd_dw2）、清 queue_en 写回、复位并等完成（中断 info 在全部停完后清）。
+    // #33 RX：间接读回 4 DW（af_mng.c:1564 按 sizeof(struct vrx_queue_para_table_entry)/4 读；u64 成员使结构
+    // 对齐到 16 B，DW3 为填充；cosim 对比 PRIV-05），清 queue_en 后写回 3 DW、复位并等完成（中断 info 在全部停完后清）。
     protected function void push_rx_stop(int unsigned gq, bit [63:0] ring, bit [31:0] rd_dw2,
                                          ref string w[$]);
-        bit [31:0] dw[3];
+        bit [31:0] dw[4];
 
         dw[0] = ring[31:0];
         dw[1] = ring[63:32];
         dw[2] = rd_dw2;
-        for (int unsigned i = 0; i < 3; i++) begin
+        dw[3] = 32'h0;
+        for (int unsigned i = 0; i < 4; i++) begin
             w.push_back($sformatf("W bar0 vrx_rd_cfg 0x%0h", (i << 14) | gq));
             w.push_back($sformatf("W bar0 vrx_rd_cfg 0x%0h", (i << 14) | gq | 32'h1_0000));
             w.push_back($sformatf("R bar0 vrx_rd_data 0x%0h", dw[i]));
