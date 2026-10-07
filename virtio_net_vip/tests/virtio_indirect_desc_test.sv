@@ -582,7 +582,7 @@ class virtio_indirect_desc_test extends uvm_test;
 
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
-                            16'h0703);
+                            16'h0703, kit.host_id);
         transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0703));
         ops = kit.make_ops(transport, "dataplane_gate_ops");
         ops.negotiated_features = features;
@@ -603,7 +603,7 @@ class virtio_indirect_desc_test extends uvm_test;
 
         features[VIRTIO_F_RING_INDIRECT_DESC] = 1'b1;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
-                            16'h0703);
+                            16'h0703, kit.host_id);
         ops.negotiated_features = features;
         desc_id = '1;
         dataplane.tx_engine.submit_packet(0, token, 1'b1, desc_id);
@@ -725,7 +725,7 @@ class virtio_indirect_desc_test extends uvm_test;
 
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
-                            16'h0705);
+                            16'h0705, kit.host_id);
         transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0705));
         ops = kit.make_ops(transport, "dataplane_full_ops");
         ops.negotiated_features = features;
@@ -966,7 +966,7 @@ class virtio_indirect_desc_test extends uvm_test;
         features = '0;
         ops.negotiated_features = features;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 0,
-                            16'h0706);
+                            16'h0706, kit.host_id);
         dataplane.bind_ops(ops);
         token = virtio_dataplane_indirect_test_packet::type_id::create(
             "dataplane_notify_token");

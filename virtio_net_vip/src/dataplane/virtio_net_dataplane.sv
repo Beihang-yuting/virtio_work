@@ -54,7 +54,7 @@ class virtio_net_dataplane extends uvm_object;
         int unsigned        rx_buf_sz,
         int unsigned        rx_refill_thresh,
         bit [15:0]          device_bdf,
-        int unsigned        device_host_id = 0
+        int unsigned        device_host_id
     );
         negotiated_features = features;
         mtu = mtu_val;
