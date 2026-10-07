@@ -7,6 +7,8 @@
 // config 全零；队列上限为私有默认环大小。VIP 私有数据面固定 polling：不编程 PCI MSI-X 表，但按驱动建立
 // 设备侧 MSI-X 映射。只实现 pfvf_id=0 的 AF 路径（PF/VF mailbox 未建模）。
 // 全局资源（M-9）：gq = gv = 队列对号（local_qid>>1），gfid=0。
+// 已知 F 阶段差异（M-2/M-9）：qid map 槽位与 lq/blk、gq、gv 都取 local_qid>>1；local_qid_base≠0 时（如 Host1 的
+// 本地号从 8 起）它们不从 0 起，而驱动每个 Function 都用连续的 0..n-1。
 `ifndef DPU_PRIV_CONFIG_BACKEND_SV
 `define DPU_PRIV_CONFIG_BACKEND_SV
 

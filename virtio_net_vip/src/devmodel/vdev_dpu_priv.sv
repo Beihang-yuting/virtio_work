@@ -75,6 +75,8 @@
 // - M-7 RX 一帧跨多个描述符（desc_num≤15，`head_idx`=首描述符号）；驱动只用 pkt_len 与 cq_wrapper。
 // - M-8 PF/VF mailbox 路径未建模；qinfo 恒报 `pfvf_id=0`。
 // - M-9 全局资源分配：设备全新时驱动从 0 分配 gq/gfid/gv；VIP 后端取 gq=gv=队列对号（`local_qid>>1`）、gfid=0。
+//   local_qid_base≠0 时，VIP 后端的 qid map 槽位与 lq/blk（M-2）、gq、gv 都不从 0 起，驱动则每个 Function 连续用
+//   0..n-1；这是 F 阶段对比时的已知差异。
 // - M-10 doorbell 路由不比较 qid map DW1 的 host[31:29]：doorbell 写只带地址与 lqid，不带 host；单设备模型只有一个 host，
 //   notify 地址（=本 BAR0）已唯一确定 Function，驱动写入的 host 与 qinfo 报告值相同，比较它不增加区分度。
 // - M-11 全局屏蔽 0x48000+gv*16+0xC 未写时按 0（不屏蔽）处理：驱动只写 0（#27）、从不置 1 也不读，驱动与 reg plan 都未给出
