@@ -450,6 +450,13 @@ class vdev_virtio_pci extends vdev_base;
                 bdf, data, slot))
             return;
         end
+        // 协商 MQ 后，驱动经 VQ_PAIRS_SET 打开的队列对之外的数据队列不可用（virtio 1.2 §5.1.6.5.5）。
+        if (driver_features[VIRTIO_NET_F_MQ] && (is_rx(q) || is_tx(q)) && (q / 2 >= curr_pairs)) begin
+            `uvm_warning("VDEV_QUEUE", $sformatf(
+                "BDF 0x%04h ignored notify on queue %0d beyond the active queue pairs (%0d)",
+                bdf, q, curr_pairs))
+            return;
+        end
         schedule(q);
     endfunction
 

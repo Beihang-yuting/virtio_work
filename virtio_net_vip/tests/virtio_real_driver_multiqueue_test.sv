@@ -24,7 +24,8 @@ class virtio_real_driver_multiqueue_test extends uvm_test;
   function void build_phase(uvm_phase phase);
     super.build_phase(phase);
     flow = virtio_real_driver_flow_fixture::type_id::create("flow", this);
-    // 第二对队列（2/3）只在协商 MQ 后存在（virtio 1.2 §5.1.2）；MQ 依赖 CTRL_VQ。
+    // 第二对队列（2/3）只在协商 MQ 后存在（virtio 1.2 §5.1.2），并须经 control VQ 的
+    // VQ_PAIRS_SET 打开（§5.1.6.5.5）；MQ 依赖 CTRL_VQ。
     flow.device_features[VIRTIO_NET_F_CTRL_VQ] = 1;
     flow.device_features[VIRTIO_NET_F_MQ] = 1;
   endfunction
@@ -41,6 +42,8 @@ class virtio_real_driver_multiqueue_test extends uvm_test;
     int unsigned tx_qids[2];
     int unsigned rx_qids[2];
     int unsigned packets_per_queue = 4;
+    virtio_function_instance function_instance;
+    virtio_net_device_config_t net_cfg;
 
     phase.raise_objection(this);
     if (!flow.build_flow(why))
@@ -70,6 +73,19 @@ class virtio_real_driver_multiqueue_test extends uvm_test;
         `uvm_fatal("REAL_MQ", $sformatf(
             "production setup failed for TX queue %0d", tx_qids[pair]))
     end
+
+    // control VQ（MQ 下为 2*max_virtqueue_pairs），再经它把活动队列对设为 2。
+    function_instance = flow.function_by_bdf(flow.function_bdf());
+    if ((function_instance == null) || (function_instance.driver_agent == null) ||
+        (function_instance.driver_agent.ops == null))
+      `uvm_fatal("REAL_MQ", "fixture function has no driver ops")
+    function_instance.driver_agent.ops.read_net_config(net_cfg);
+    flow.setup_queue(2 * net_cfg.max_virtqueue_pairs, 256, VQ_SPLIT, ok);
+    if (!ok)
+      `uvm_fatal("REAL_MQ", "production setup failed for the control VQ")
+    function_instance.driver_agent.ops.ctrl_set_mq_pairs(2, ok);
+    if (!ok)
+      `uvm_fatal("REAL_MQ", "device rejected VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET 2")
 
     if (is_model) begin
       if (flow.device() == null)

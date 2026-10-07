@@ -670,8 +670,9 @@ class virtio_vdev_unit_test extends uvm_test;
 
     // ctrl VQ：MQ VQ_PAIRS_SET 2 → ACK_OK；5（超过 max_pairs）→ ACK_ERR；ctrl 事件记录 class/cmd/data/ack。
     task test_std_ctrl_mq();
-        split_virtqueue cq;
-        bit [63:0] iovas[$];
+        split_virtqueue cq, txq;
+        bit [63:0] iovas[$], tx_iovas[$];
+        vdev_expect_catcher catcher;
         bit [63:0] hdr_gpa, hdr_iova, data_gpa, data_iova, ack_gpa, ack_iova;
         virtio_sg_list sgs[];
         byte unsigned hdr_b[$], data_b[$], none[$];
@@ -688,7 +689,17 @@ class virtio_vdev_unit_test extends uvm_test;
         void'(std_negotiate(drv));
         cq = std_kit.make_split("ctrl_q", 4, 8, STD_BDF);
         std_program_queue(4, cq, 1, 0, iovas);
+        txq = std_kit.make_split("pair1_tx", 3, 8, STD_BDF);
+        std_program_queue(3, txq, 1, 0, tx_iovas);
         std_wr(32'h14, 1, 8'h0f);
+        // virtio 1.2 §5.1.6.5.5：VQ_PAIRS_SET 之前只有第 0 对可用，队列 3 的通知被忽略并告警。
+        catcher = new("pair1_catcher");
+        catcher.id = "VDEV_QUEUE";
+        catcher.text = "beyond the active queue pairs";
+        uvm_report_cb::add(null, catcher);
+        port.host_write(STD_BAR2 + 12, 2, 3);
+        if (catcher.caught != 1)
+            `uvm_fatal("VDEV_UNIT", "notify on pair 1 before VQ_PAIRS_SET was not rejected")
         std_log.events.delete();
         for (int round = 0; round < 2; round++) begin
             hdr_b = '{VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET};
@@ -711,12 +722,19 @@ class virtio_vdev_unit_test extends uvm_test;
             mem.free(data_gpa);
             mem.free(ack_gpa);
         end
+        // VQ_PAIRS_SET=2 已生效（第二次 5 被拒、不改变当前对数）：队列 3 的通知不再告警。
+        port.host_write(STD_BAR2 + 12, 2, 3);
+        settle();
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught != 1)
+            `uvm_fatal("VDEV_UNIT", "notify on pair 1 was rejected after VQ_PAIRS_SET=2")
         std_log.select(VDEV_CTRL, ev);
         if ((ev.size() != 2) || (ev[0].ctrl_class != VIRTIO_NET_CTRL_MQ) || (ev[0].ack != 0) ||
             (ev[0].ctrl_data.size() != 2) || (ev[0].ctrl_data[0] != 2) || (ev[1].ack != 1))
             `uvm_fatal("VDEV_UNIT", "ctrl events do not record the MQ command sequence")
         std_wr(32'h14, 1, 0);
         std_release(cq, iovas);
+        std_release(txq, tx_iovas);
         `uvm_info("VDEV_UNIT", "test_std_ctrl_mq PASSED", UVM_LOW)
     endtask
 
