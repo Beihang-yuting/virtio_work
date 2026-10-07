@@ -461,7 +461,7 @@ class dpu_priv_config_backend extends virtio_config_backend;
 
     // 私有设备没有 virtio-net device config。
     virtual task read_net_config(output virtio_net_device_config_t cfg);
-        cfg = '{default: 0};
+        cfg = '{default:0};
     endtask
 endclass
 `endif
