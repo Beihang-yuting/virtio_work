@@ -96,6 +96,7 @@ package virtio_net_pkg;
   `include "devmodel/vdev_base.sv"
   `include "devmodel/vdev_uvm_ep_port.sv"
   `include "devmodel/vdev_virtio_pci.sv"
+  `include "devmodel/vdev_dpu_priv.sv"
   // REAL_DUT 可选的 RC 侧 Host-memory DMA responder；不生成 virtio
   // 设备行为，只把 EP-originated MemRd/MemWr 交给 RC driver/backend。
   `include "pcie/virtio_pcie_real_dut_host_mem_responder.sv"

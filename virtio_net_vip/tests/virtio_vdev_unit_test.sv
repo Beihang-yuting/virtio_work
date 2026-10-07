@@ -84,6 +84,10 @@ class virtio_vdev_unit_test extends uvm_test;
     localparam bit [63:0] STD_BAR0  = 64'h0000_0041_0000_0000;
     localparam bit [63:0] STD_BAR2  = 64'h0000_0041_0001_0000;
     localparam bit [63:0] STD_BAR4  = 64'h0000_0041_0002_0000;
+    localparam bit [15:0] PRIV_BDF  = 16'h0500;
+    localparam bit [63:0] PRIV_BAR0 = 64'h0000_0042_0000_0000;
+    localparam bit [63:0] PRIV_BAR2 = 64'h0000_0042_0200_0000;
+    localparam bit [63:0] PRIV_BAR4 = 64'h0000_0042_0201_0000;
 
     host_mem_manager      mem;
     virtio_iommu_model    iommu;
@@ -94,6 +98,8 @@ class virtio_vdev_unit_test extends uvm_test;
     vdev_virtio_pci       std;
     vdev_event_log        std_log;
     virtio_vq_test_kit    std_kit;
+    vdev_dpu_priv         priv;
+    vdev_event_log        priv_log;
     int unsigned          irq_base;   // 本子测试开始时的 interrupt_count
 
     function new(string name = "virtio_vdev_unit_test", uvm_component parent = null);
@@ -116,12 +122,15 @@ class virtio_vdev_unit_test extends uvm_test;
         std_kit = virtio_vq_test_kit::create_kit("vdev_std", mem, iommu, STD_BDF);
         std = vdev_virtio_pci::type_id::create("std", this);
         std_log = vdev_event_log::type_id::create("std_log", this);
+        priv = vdev_dpu_priv::type_id::create("priv", this);
+        priv_log = vdev_event_log::type_id::create("priv_log", this);
     endfunction
 
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
         echo.event_ap.connect(echo_log.analysis_export);
         std.event_ap.connect(std_log.analysis_export);
+        priv.event_ap.connect(priv_log.analysis_export);
     endfunction
 
     // 把三对 64 位 BAR 写进设备配置空间（等价平台枚举）。
@@ -1128,6 +1137,245 @@ class virtio_vdev_unit_test extends uvm_test;
         `uvm_info("VDEV_UNIT", "test_vip_msix_enables_device PASSED", UVM_LOW)
     endtask
 
+    protected function void priv_wr(bit [31:0] off, bit [31:0] data);
+        port.host_write(PRIV_BAR0 + off, 4, data);
+    endfunction
+
+    protected function bit [31:0] priv_rd(bit [31:0] off);
+        return port.host_read(PRIV_BAR0 + off, 4);
+    endfunction
+
+    // 驱动 txrx.h 的 16B 描述符：addr、W1.len、W2.fwd=1、avail=wrap、used=!wrap、next。
+    protected function void priv_desc(bit [63:0] slot_gpa, bit [63:0] buf_iova, int unsigned len,
+                                      bit wrap, bit next_bit);
+        byte d[];
+        bit [31:0] w1;
+        bit [31:0] w2;
+
+        d = new[16];
+        w1 = len[17:0];
+        w2 = 0;
+        w2[16] = next_bit;
+        w2[20:19] = 2'd1;
+        w2[23] = wrap;
+        w2[31] = ~wrap;
+        for (int i = 0; i < 8; i++)
+            d[i] = buf_iova[8*i +: 8];
+        for (int i = 0; i < 4; i++) begin
+            d[8 + i] = w1[8*i +: 8];
+            d[12 + i] = w2[8*i +: 8];
+        end
+        mem.write_mem(slot_gpa, d);
+    endfunction
+
+    protected function void expect_mem(bit [63:0] gpa, byte golden[], string label);
+        byte got[];
+
+        mem.read_mem(gpa, golden.size(), got);
+        foreach (golden[i])
+            if (got[i] !== golden[i])
+                `uvm_fatal("VDEV_UNIT", $sformatf("%s byte[%0d]=%02h expected %02h", label, i, got[i], golden[i]))
+    endfunction
+
+    // 驱动 AF 路径（D4 表 #2–#8、#10、#16、#17、#21、#24、#25、#27、#28、#29、#31、#32、#33）的原始寄存器序列
+    // 驱动私有设备：校验 AF 声明、qid map 路由、VTX/VRX 参数表、TX/RX CQ 黄金字节、MSI-X 自屏蔽与停队完成位。
+    task test_priv_driver_sequence();
+        bit [31:0] v;
+        bit [31:0] para[4];
+        bit [31:0] srcid;
+        bit [2:0] host;
+        bit [7:0] cap;
+        bit [63:0] tx_gpa, tx_ring, rx_gpa, rx_ring, f_gpa, f_iova, r0_gpa, r0_iova, r1_gpa, r1_iova;
+        byte frame[];
+        byte cq_tx1[] = '{8'h01, 8'h80};
+        byte cq_tx2[] = '{8'h02, 8'h80};
+        byte cq_rx0[] = '{8'h00, 8'h00, 8'h00, 8'h10, 8'h00, 8'h00, 8'h40, 8'h80,
+                          8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00};
+        byte cq_rx1[] = '{8'h00, 8'h00, 8'h00, 8'h10, 8'h01, 8'h00, 8'h40, 8'h80};
+        int unsigned irq0;
+        vdev_event ev[$];
+        vdev_expect_catcher catcher;
+
+        priv.bdf = PRIV_BDF;
+        priv.host_id = 1;
+        priv.init();
+        port.attach(priv);
+        program_bars(PRIV_BDF, PRIV_BAR0, PRIV_BAR2, PRIV_BAR4);
+        port.host_cfg_write(PRIV_BDF, 12'h004, 32'h0000_0006, 4'h3);   // #1 MSE + BME
+        if (port.host_cfg_read(PRIV_BDF, 12'h000) != 32'h5013_20f9)
+            `uvm_fatal("VDEV_UNIT", "private device ID mismatch")
+        // probe
+        v = port.host_read(PRIV_BAR2 + 32'h0c, 4);
+        if ((v[6:0] != 0) || (v[9:7] != 1))
+            `uvm_fatal("VDEV_UNIT", "qinfo host_id must report pfvf_id 0 and host 1")
+        host = v[9:7];
+        priv_wr(32'h100_0014, 32'h7);
+        priv_wr(32'h100_0014, 32'h0);
+        if (priv_rd(32'h1010) & 32'h8)
+            `uvm_fatal("VDEV_UNIT", "fresh device reports AF already declared")
+        priv_wr(32'h1010, 32'h5555_aaaa);
+        v = priv_rd(32'h1010);
+        if (v != {28'h0, 1'b1, host})
+            `uvm_fatal("VDEV_UNIT", $sformatf("AF declaration readback 0x%08h", v))
+        priv_wr(32'h6_0040, (v & 32'h7) | 32'h8);
+        if (!(priv_rd(32'h1010) & 32'h8))
+            `uvm_fatal("VDEV_UNIT", "AF declaration lost")
+        port.host_write(PRIV_BAR2 + 32'h04, 4, (32'h1 << 16) | PRIV_BDF);
+        srcid = host << 10;
+        for (int unsigned i = 0; i < 15; i++)
+            priv_wr(32'hc_0000 + 4 * ((srcid << 7) + i), (32'h1 << 11) | i);
+        priv_wr(32'h5_6000, (32'h1 << 16) | PRIV_BDF);
+        priv_wr(32'h2_8000, {PRIV_BAR0[31:7], 1'b0, 5'd0, 1'b1});
+        priv_wr(32'h2_8004, {host, PRIV_BAR0[60:32]});
+        priv_wr(32'h2_8008, 32'h0);
+        priv_wr(32'h2_800c, 32'h0);
+        priv_wr(32'h2_0044, 32'h1);
+        // open：N=8 的 TX/RX ring（各 4 KiB，清零；TX CQ 初值 0x8000）
+        tx_ring = map_buffer(PRIV_BDF, 4096, DMA_BIDIRECTIONAL, tx_gpa);
+        rx_ring = map_buffer(PRIV_BDF, 4096, DMA_BIDIRECTIONAL, rx_gpa);
+        mem.mem_set(tx_gpa, 0, 4096);
+        mem.mem_set(rx_gpa, 0, 4096);
+        frame = new[2];
+        frame[0] = 8'h00;
+        frame[1] = 8'h80;
+        mem.write_mem(tx_gpa + 128, frame);
+        priv_wr(32'h88_0134, tx_ring[31:0]);
+        priv_wr(32'h88_0138, tx_ring[63:32]);
+        priv_wr(32'h88_013c, (host << 12) | (32'h1 << 7) | 32'h3);
+        priv_wr(32'h88_0140, 32'h0);
+        priv_wr(32'h88_0130, 32'h0);
+        priv_wr(32'h88_0130, 32'h2000);
+        if ((priv_rd(32'h89_0000) != tx_ring[31:0]) || (priv_rd(32'h89_0004) != tx_ring[63:32]))
+            `uvm_fatal("VDEV_UNIT", "VTX parameter readback mismatch")
+        if (priv_rd(32'h90_2000) != 32'h8000)
+            `uvm_fatal("VDEV_UNIT", "VRX tail must read 0x8000 before configuration")
+        priv_wr(32'h90_0204, rx_ring[31:0]);
+        priv_wr(32'h90_0208, rx_ring[63:32]);
+        priv_wr(32'h90_020c, (host << 6) | (32'h1 << 4) | 32'h3);
+        priv_wr(32'h90_0200, 32'h0);
+        priv_wr(32'h90_0200, 32'h1_0000);
+        priv_wr(32'h5_4000, (32'h1 << 12) | (32'h1 << 11) | (host << 8));
+        priv_wr(32'h4_800c, 32'h0);
+        // 内核为本地向量 0 编程 MSI-X 并使能
+        port.host_write(PRIV_BAR4 + 0, 4, 32'hfee0_1000);
+        port.host_write(PRIV_BAR4 + 4, 4, 32'h0);
+        port.host_write(PRIV_BAR4 + 8, 4, 32'h500);
+        port.host_write(PRIV_BAR4 + 12, 4, 32'h0);
+        cap = find_cap(PRIV_BDF, 8'h11);
+        port.host_cfg_write(PRIV_BDF, {4'h0, cap}, 32'h8000_0000, 4'hc);
+        for (int unsigned i = 0; i < 4; i++)
+            para[i] = priv_rd(32'h89_0000 + 4*i);
+        para[2][4] = 1;
+        for (int unsigned i = 0; i < 4; i++)
+            priv_wr(32'h88_0134 + 4*i, para[i]);
+        priv_wr(32'h88_0130, 32'h0);
+        priv_wr(32'h88_0130, 32'h2000);
+        priv_log.select(VDEV_QUEUE_CFG, ev);
+        if ((ev.size() != 2) || (ev[0].q != 0) || (ev[1].q != 1) || (ev[1].size != 8) ||
+            (ev[1].vector != 0) || (ev[1].ring_fmt != "priv"))
+            `uvm_fatal("VDEV_UNIT", "VRX/VTX enable did not emit queue_cfg for lqid 0 and 1")
+        // RX 补两个 2048B buffer，doorbell tail=2
+        r0_iova = map_buffer(PRIV_BDF, 2048, DMA_FROM_DEVICE, r0_gpa);
+        r1_iova = map_buffer(PRIV_BDF, 2048, DMA_FROM_DEVICE, r1_gpa);
+        priv_desc(rx_gpa, r0_iova, 2048, 1, 0);
+        priv_desc(rx_gpa + 16, r1_iova, 2048, 1, 0);
+        priv_wr(32'h0, 32'h8002_0000);
+        // TX 一帧 64B
+        frame = new[64];
+        foreach (frame[i])
+            frame[i] = i + 1;
+        f_iova = map_buffer(PRIV_BDF, 64, DMA_TO_DEVICE, f_gpa);
+        mem.write_mem(f_gpa, frame);
+        irq0 = port.msix_addr.size();
+        priv_desc(tx_gpa, f_iova, 64, 1, 0);
+        priv_wr(32'h0, 32'h8001_0001);
+        settle();
+        expect_mem(tx_gpa + 128, cq_tx1, "TX CQ after one packet");
+        expect_mem(rx_gpa + 128, cq_rx0, "RX CQ entry 0");
+        expect_mem(r0_gpa, frame, "RX buffer 0");
+        // TX 与 RX 共用 gv0：TX 完成发一次后自屏蔽，RX 完成不再发
+        if ((port.msix_addr.size() != irq0 + 1) || (port.msix_data[irq0] != 32'h500))
+            `uvm_fatal("VDEV_UNIT", "CQ completion did not raise exactly one self-masked MSI-X")
+        priv_wr(32'h1004, 32'h0);
+        priv_desc(tx_gpa + 16, f_iova, 64, 1, 0);
+        priv_wr(32'h0, 32'h8002_0001);
+        settle();
+        expect_mem(tx_gpa + 128, cq_tx2, "TX CQ after two packets");
+        expect_mem(rx_gpa + 128 + 16, cq_rx1, "RX CQ entry 1");
+        if (port.msix_addr.size() != irq0 + 2)
+            `uvm_fatal("VDEV_UNIT", "0x1004 re-arm did not allow the next MSI-X")
+        priv_log.select(VDEV_PKT, ev);
+        if ((ev.size() != 4) || (ev[0].dir != "tx") || (ev[0].q != 1) || (ev[1].dir != "rx") ||
+            (ev[1].q != 0) || (ev[1].bytes.size() != 64))
+            `uvm_fatal("VDEV_UNIT", "pkt events do not show TX loopback into RX")
+        // stop：TX
+        for (int unsigned i = 0; i < 4; i++)
+            para[i] = priv_rd(32'h89_0000 + 4*i);
+        para[2][4] = 0;
+        for (int unsigned i = 0; i < 4; i++)
+            priv_wr(32'h88_0134 + 4*i, para[i]);
+        priv_wr(32'h88_0130, 32'h0);
+        priv_wr(32'h88_0130, 32'h2000);
+        if (priv_rd(32'hb2_2000) & 32'h0e00)
+            `uvm_fatal("VDEV_UNIT", "idle TX queue reports in-flight QSCH state")
+        priv_wr(32'h88_0100, 32'h0);
+        priv_wr(32'h88_0100, 32'h8000_0000);
+        v = priv_rd(32'h88_0104);
+        if (!v[0])
+            `uvm_fatal("VDEV_UNIT", "TX queue reset did not complete")
+        priv_wr(32'h88_0154, 32'h1_0000);
+        priv_wr(32'h88_0154, 32'h8001_0000);
+        v = priv_rd(32'h88_0158);
+        if (!v[0])
+            `uvm_fatal("VDEV_UNIT", "TX tail reset did not complete")
+        catcher = new("priv_doorbell_catcher");
+        catcher.id = "VDEV_DPU_PRIV";
+        catcher.text = "has no enabled TX queue";
+        uvm_report_cb::add(null, catcher);
+        priv_wr(32'h0, 32'h8003_0001);
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught != 1)
+            `uvm_fatal("VDEV_UNIT", "doorbell for a disabled TX queue was accepted")
+        // stop：RX，先以旋钮制造“DMA 不停”，复位完成位必须保持 0
+        priv.stall_queue_stop = 1;
+        for (int unsigned i = 0; i < 4; i++) begin
+            priv_wr(32'h90_0210, (i << 14));
+            priv_wr(32'h90_0210, (i << 14) | 32'h1_0000);
+            para[i] = priv_rd(32'h90_0214);
+        end
+        if ({para[1], para[0]} != rx_ring)
+            `uvm_fatal("VDEV_UNIT", "VRX indirect read did not return the descriptor address")
+        para[2][4] = 0;
+        for (int unsigned i = 0; i < 3; i++)
+            priv_wr(32'h90_0204 + 4*i, para[i]);
+        priv_wr(32'h90_0200, 32'h0);
+        priv_wr(32'h90_0200, 32'h1_0000);
+        priv_wr(32'h90_010c, 32'h0);
+        priv_wr(32'h90_0108, 32'h0);
+        priv_wr(32'h90_0108, 32'h8000_0000);
+        v = priv_rd(32'h90_010c);
+        if (v[0] || priv.queue_enabled(0, 0))
+            `uvm_fatal("VDEV_UNIT", "stalled RX reset reported completion or left VRX enabled")
+        priv.stall_queue_stop = 0;
+        priv_wr(32'h90_0108, 32'h0);
+        priv_wr(32'h90_0108, 32'h8000_0000);
+        v = priv_rd(32'h90_010c);
+        if (!v[0] || (priv_rd(32'h90_2000) != 32'h8000))
+            `uvm_fatal("VDEV_UNIT", "RX reset did not complete or restore the VRX tail")
+        priv_wr(32'h5_4000, 32'h0);
+        iommu.unmap_for_host(0, PRIV_BDF, tx_ring);
+        iommu.unmap_for_host(0, PRIV_BDF, rx_ring);
+        iommu.unmap_for_host(0, PRIV_BDF, f_iova);
+        iommu.unmap_for_host(0, PRIV_BDF, r0_iova);
+        iommu.unmap_for_host(0, PRIV_BDF, r1_iova);
+        mem.free(tx_gpa);
+        mem.free(rx_gpa);
+        mem.free(f_gpa);
+        mem.free(r0_gpa);
+        mem.free(r1_gpa);
+        `uvm_info("VDEV_UNIT", "test_priv_driver_sequence PASSED", UVM_LOW)
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         echo.bdf = ECHO_BDF;
@@ -1149,6 +1397,7 @@ class virtio_vdev_unit_test extends uvm_test;
         test_std_split_indirect();
         test_std_packed_indirect_loopback();
         test_vip_msix_enables_device();
+        test_priv_driver_sequence();
         mem.leak_check();
         iommu.leak_check();
         `uvm_info("VDEV_UNIT", "virtio_vdev_unit_test PASSED", UVM_NONE)
