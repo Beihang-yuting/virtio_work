@@ -586,30 +586,41 @@ class virtio_pci_transport extends uvm_object;
 
     // 绑定 config change 中断的 MSI-X 向量(写 COMMON_MSIX)。
     virtual task write_config_msix_vector(int unsigned vector);
-        write_msix_mapping(VIRTIO_PCI_COMMON_MSIX, "config", vector);
+        int unsigned mapped;
+
+        write_msix_mapping(VIRTIO_PCI_COMMON_MSIX, "config", vector, mapped);
+        notify_mgr.config_vector = mapped;
 
         `uvm_info("TRANSPORT",
             $sformatf("Config MSI-X vector: %0d", vector), UVM_HIGH)
     endtask
 
     // virtio 1.2 §4.1.5.1.2.2：把事件映射到向量后必须回读 vector 字段核对；设备映射失败时读回
-    // NO_VECTOR。VIP 按设备故障报告（规范允许的处理之一）。
-    protected task write_msix_mapping(bit [31:0] offset, string event_name, int unsigned vector);
-        bit [31:0] mapped;
+    // NO_VECTOR。VIP 按设备故障报告（规范允许的处理之一），并把回读值（失败时为 NO_VECTOR）
+    // 交给调用方记入 notify_mgr，被拒绝的向量不得记为已绑定。
+    protected task write_msix_mapping(bit [31:0] offset, string event_name, int unsigned vector,
+                                      output int unsigned mapped);
+        bit [31:0] readback;
 
         cc_write(offset, 2, vector[15:0]);
-        mapped = '0;
-        cc_read(offset, 2, mapped);
-        if (mapped[15:0] != vector[15:0])
+        readback = '0;
+        cc_read(offset, 2, readback);
+        mapped = readback[15:0];
+        if (readback[15:0] != vector[15:0]) begin
             `uvm_error("TRANSPORT", $sformatf(
                 "%s MSI-X mapping to vector %0d failed: device reads back 0x%04h",
-                event_name, vector, mapped[15:0]))
+                event_name, vector, readback[15:0]))
+            mapped = 32'hFFFF;
+        end
     endtask
 
     // 绑定指定队列的 MSI-X 向量：内部先 select_queue，会改变当前选中队列。
     virtual task write_queue_msix_vector(int unsigned queue_id, int unsigned vector);
+        int unsigned mapped;
+
         select_queue(queue_id);
-        write_msix_mapping(VIRTIO_PCI_COMMON_Q_MSIX, $sformatf("queue %0d", queue_id), vector);
+        write_msix_mapping(VIRTIO_PCI_COMMON_Q_MSIX, $sformatf("queue %0d", queue_id), vector, mapped);
+        notify_mgr.bind_queue_vector(queue_id, mapped);
 
         `uvm_info("TRANSPORT",
             $sformatf("Queue %0d MSI-X vector: %0d", queue_id, vector), UVM_HIGH)
@@ -689,6 +700,7 @@ class virtio_pci_transport extends uvm_object;
         int unsigned msix_vector
     );
         int unsigned q_noff;
+        int unsigned mapped;
 
         select_queue(queue_id);
         write_queue_size(queue_size);
@@ -696,9 +708,10 @@ class virtio_pci_transport extends uvm_object;
         write_queue_driver_addr(driver_addr);
         write_queue_device_addr(device_addr);
 
-        // Bind MSI-X vector
-        write_msix_mapping(VIRTIO_PCI_COMMON_Q_MSIX, $sformatf("queue %0d", queue_id), msix_vector);
-        notify_mgr.bind_queue_vector(queue_id, msix_vector);
+        // Bind MSI-X vector：notify_mgr 记录设备实际接受的映射（被拒绝时为 NO_VECTOR）。
+        write_msix_mapping(VIRTIO_PCI_COMMON_Q_MSIX, $sformatf("queue %0d", queue_id), msix_vector,
+                           mapped);
+        notify_mgr.bind_queue_vector(queue_id, mapped);
 
         // Read and store notify offset
         read_queue_notify_off(q_noff);

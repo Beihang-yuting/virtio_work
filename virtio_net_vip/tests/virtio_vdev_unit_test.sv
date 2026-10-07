@@ -1195,7 +1195,8 @@ class virtio_vdev_unit_test extends uvm_test;
     endtask
 
     // virtio 1.2 §4.1.5.1.2.2：驱动把事件映射到向量后 MUST 回读 vector 字段核对，失败时读回 NO_VECTOR。
-    // 设备拒绝向量 2：config/queue 映射接口与建队路径（setup_single_queue）都必须报告失败，接受的映射不报。
+    // 设备拒绝向量 2：config/queue 映射接口与建队路径（setup_single_queue）都必须报告失败并在 notify_mgr
+    // 中记为 NO_VECTOR，接受的映射不报且按回读值记录。
     task test_vip_msix_mapping_readback();
         virtio_pci_transport t;
         vdev_loopback_bar_accessor acc;
@@ -1229,16 +1230,31 @@ class virtio_vdev_unit_test extends uvm_test;
         catcher = new("readback_catcher");
         catcher.id = "TRANSPORT";
         catcher.text = "MSI-X mapping";
+        // notify_mgr 只记录设备实际接受的映射：被拒绝的事件记为 NO_VECTOR，不得绑定被拒向量。
+        t.notify_mgr.queue_vectors = new[2];
+        t.notify_mgr.queue_vectors[0] = 7;
+        t.notify_mgr.queue_vectors[1] = 7;
+        t.notify_mgr.config_vector = 7;
         uvm_report_cb::add(null, catcher);
         t.write_config_msix_vector(0);
+        if (t.notify_mgr.config_vector != 0)
+            `uvm_fatal("VDEV_UNIT", "accepted config mapping was not recorded")
         t.write_queue_msix_vector(0, 1);
+        if (t.notify_mgr.queue_vectors[0] != 1)
+            `uvm_fatal("VDEV_UNIT", "accepted queue mapping was not recorded")
         t.write_queue_msix_vector(1, 2);
         t.setup_single_queue(0, 8, 64'h1000, 64'h2000, 64'h3000, 2);
+        t.write_config_msix_vector(2);
         uvm_report_cb::delete(null, catcher);
-        if (catcher.caught != 2)
+        if (catcher.caught != 3)
             `uvm_fatal("VDEV_UNIT", $sformatf(
-                "VIP reported %0d of 2 refused MSI-X mappings (must read back the vector after mapping)",
+                "VIP reported %0d of 3 refused MSI-X mappings (must read back the vector after mapping)",
                 catcher.caught))
+        if ((t.notify_mgr.queue_vectors[0] != 32'hFFFF) || (t.notify_mgr.queue_vectors[1] != 32'hFFFF) ||
+            (t.notify_mgr.config_vector != 32'hFFFF))
+            `uvm_fatal("VDEV_UNIT", $sformatf(
+                "refused mappings must be recorded as NO_VECTOR: queues=%p config=0x%0h",
+                t.notify_mgr.queue_vectors, t.notify_mgr.config_vector))
         refuse_wr(32'h14, 1, 0);   // 复位：撤销 setup_single_queue 使能的队列 0
         `uvm_info("VDEV_UNIT", "test_vip_msix_mapping_readback PASSED", UVM_LOW)
     endtask
