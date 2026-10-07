@@ -156,6 +156,16 @@ class virtio_atomic_ops extends uvm_object;
         void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
     endtask
 
+    // MANUAL ATOMIC_KICK 的生产入口：对已建队列无条件发 doorbell（经 PRE/POST_NOTIFY
+    // 故障钩子，携带当前 ring 游标），不做事件抑制判断；队列不存在时报错且不通知。
+    virtual task kick_queue(int unsigned queue_id);
+        if ((vq_mgr == null) || !vq_mgr.has_queue(queue_id)) begin
+            `uvm_error("ATOMIC_OPS", $sformatf("kick_queue: queue %0d not found", queue_id))
+            return;
+        end
+        kick_with_fault(vq_mgr.get_queue(queue_id), queue_id);
+    endtask
+
     // 把 buffer set 中的全部缓冲按添加顺序转成普通 DMA 所有权记录，追加到
     // records，然后让 set 放弃所有权。之后只由完成路径或已确认的设备复位退休。
     // 调用方保证每一项都已映射（只在 add_buf 成功后调用）。

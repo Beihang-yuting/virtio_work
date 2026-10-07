@@ -392,6 +392,7 @@ class virtio_unit_test extends uvm_test;
         test_common_backend_queue_reset_result();
         test_setup_queue_rejects_host_mismatch();
         test_driver_protocol_selection();
+        test_standard_manual_kick_notifies();
         test_fabric_bar_layout_roles();
         test_setup_queue_range_rollback();
         test_dma_buffer_set();
@@ -1569,6 +1570,44 @@ class virtio_unit_test extends uvm_test;
             `uvm_error("TEST", $sformatf("range rollback created %p torn down %p",
                                          ops.setup_qids, ops.teardown_qids))
         `uvm_info("UNIT_TEST", "test_setup_queue_range_rollback PASSED", UVM_LOW)
+    endtask
+
+    // 标准协议 MANUAL ATOMIC_KICK 必须经 ops 向设备发 doorbell（携带 ring 游标），不能只在
+    // 软件队列上计数；队列不存在时报错且不通知。
+    task test_standard_manual_kick_notifies();
+        virtio_standard_driver_protocol proto;
+        virtio_mock_transport transport;
+        virtio_vq_test_kit kit;
+        virtio_atomic_ops ops;
+        host_mem_manager mem;
+        virtio_iommu_model iommu;
+        split_virtqueue vq;
+        virtio_unit_exact_error_catcher catcher;
+
+        mem = host_mem_manager::type_id::create("manual_kick_mem");
+        mem.init_region(64'h7900_0000, 64'h7900_FFFF);
+        iommu = virtio_iommu_model::type_id::create("manual_kick_iommu");
+        transport = virtio_mock_transport::type_id::create("manual_kick_transport");
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0134));
+        kit = virtio_vq_test_kit::create_kit("manual_kick", mem, iommu, 16'h0134);
+        ops = kit.make_ops(transport, "manual_kick_ops");
+        vq = kit.add_split(0, 8);
+        proto = virtio_standard_driver_protocol::type_id::create("manual_kick_protocol");
+
+        proto.kick(ops, 0);
+        catcher = new("manual_kick_missing_catcher", "ATOMIC_OPS",
+                      "kick_queue: queue 5 not found");
+        uvm_report_cb::add(null, catcher);
+        proto.kick(ops, 5);
+        uvm_report_cb::delete(null, catcher);
+        if ((transport.kick_count != 1) || (transport.last_kick_queue_id != 0) ||
+            (transport.last_kick_next_avail_idx != vq.get_notify_next_idx()) ||
+            (catcher.caught_count != 1))
+            `uvm_error("TEST", $sformatf(
+                "standard MANUAL ATOMIC_KICK did not notify the device (kicks=%0d caught=%0d)",
+                transport.kick_count, catcher.caught_count))
+        kit.vq_mgr.destroy_all();
+        `uvm_info("UNIT_TEST", "test_standard_manual_kick_notifies PASSED", UVM_LOW)
     endtask
 
 endclass

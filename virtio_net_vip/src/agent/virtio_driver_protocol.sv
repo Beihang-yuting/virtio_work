@@ -94,15 +94,9 @@ class virtio_standard_driver_protocol extends virtio_driver_protocol;
                                             virtio_atomic_ops ops, string label);
     endfunction
 
+    // 经 ops 发出真实 doorbell；队列不存在由 ops 报告。
     virtual task kick(virtio_atomic_ops ops, int unsigned queue_id);
-        virtqueue_base vq;
-
-        vq = ops.vq_mgr.get_queue(queue_id);
-        if (vq != null)
-            vq.kick();
-        else
-            `uvm_error("VIRTIO_DRV",
-                $sformatf("ATOMIC_KICK: queue %0d not found", queue_id))
+        ops.kick_queue(queue_id);
     endtask
 
     virtual task poll_used(virtio_atomic_ops ops, virtio_transaction req);
