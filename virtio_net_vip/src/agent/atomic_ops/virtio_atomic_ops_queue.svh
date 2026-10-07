@@ -68,6 +68,16 @@
             return;
         end
 
+        // ring DMA 的 host 域必须是 transport 冻结 identity 的 host；vq_mgr.host_id
+        // 接线错误时拒绝建队，不得静默按另一个 host（例如 host0）做 ring DMA。
+        if (transport.pcie_id_valid && (vq.host_id != transport.iommu_host_id())) begin
+            vq_mgr.destroy_queue(queue_id);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: queue_id=%0d vq host_id=%0d does not match transport DMA host %0d",
+                queue_id, vq.host_id, transport.iommu_host_id()))
+            return;
+        end
+
         // 5. Allocate ring memory
         vq.alloc_rings();
 

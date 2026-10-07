@@ -390,6 +390,7 @@ class virtio_unit_test extends uvm_test;
         test_injected_discovery_survives_fabric_config();
         test_config_backend_injection();
         test_common_backend_queue_reset_result();
+        test_setup_queue_rejects_host_mismatch();
         test_driver_protocol_selection();
         test_fabric_bar_layout_roles();
         test_setup_queue_range_rollback();
@@ -1394,6 +1395,54 @@ class virtio_unit_test extends uvm_test;
         if (catcher.caught_count != 1)
             `uvm_error("TEST", "ops.reset_queue did not report the unconfirmed queue reset")
         `uvm_info("UNIT_TEST", "test_common_backend_queue_reset_result PASSED", UVM_LOW)
+    endtask
+
+    // vq_mgr 的 DMA host 与 transport 冻结 identity 不一致时，setup_queue 必须报错
+    // 并回滚（不建 ring、不映射、不编程设备），不得静默用 host0 做 ring DMA。
+    task test_setup_queue_rejects_host_mismatch();
+        virtio_atomic_ops ops;
+        virtio_unit_recording_backend backend;
+        virtio_pci_transport transport;
+        virtqueue_manager vq_mgr;
+        virtio_iommu_model iommu;
+        host_mem_manager mem;
+        dpu_pcie_function_id_t pcie_id;
+        virtio_unit_exact_error_catcher catcher;
+        string expected[$];
+        bit ok;
+
+        ops = virtio_atomic_ops::type_id::create("host_mismatch_ops");
+        backend = virtio_unit_recording_backend::type_id::create("host_mismatch_backend");
+        transport = virtio_pci_transport::type_id::create("host_mismatch_transport");
+        vq_mgr = virtqueue_manager::type_id::create("host_mismatch_vq_mgr");
+        iommu = virtio_iommu_model::type_id::create("host_mismatch_iommu");
+        mem = host_mem_manager::type_id::create("host_mismatch_mem");
+        mem.init_region(64'h7700_0000, 64'h7700_FFFF);
+        pcie_id = virtio_vq_test_kit::host0_pcie_id(16'h0132);
+        pcie_id.domain.host_id = 1;
+        transport.configure_pcie_identity(pcie_id);
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.bdf = transport.bdf;
+        vq_mgr.host_id = 0;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.iommu = iommu;
+        ops.mem = mem;
+        ops.config_backend = backend;
+
+        catcher = new("host_mismatch_catcher", "ATOMIC_OPS",
+                      "setup_queue: queue_id=0 vq host_id=0 does not match transport DMA host 1");
+        uvm_report_cb::add(null, catcher);
+        ops.setup_queue(0, 4, VQ_SPLIT, ok);
+        uvm_report_cb::delete(null, catcher);
+        expected = '{"query_queue_max"};
+        if (ok || (catcher.caught_count != 1) || (vq_mgr.get_queue_count() != 0) ||
+            (backend.calls != expected))
+            `uvm_error("TEST", $sformatf(
+                "host-mismatched setup_queue was not rejected and rolled back (ok=%0d caught=%0d queues=%0d calls=%p)",
+                ok, catcher.caught_count, vq_mgr.get_queue_count(), backend.calls))
+        `uvm_info("UNIT_TEST", "test_setup_queue_rejects_host_mismatch PASSED", UVM_LOW)
     endtask
 
     // 驱动协议决定 ops/FSM 的类型、status 访问权限与关机复位语义；私有协议拒绝
