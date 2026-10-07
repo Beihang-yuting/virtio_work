@@ -2028,7 +2028,8 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
   `virtio_net_vip/src/dpu_priv/dpu_priv_atomic_ops.sv`（过渡改动，C3 删除）
 - 枚举改名波及：`dpu_priv_auto_fsm.sv`、`dpu_priv_driver_protocol.sv`、`dpu_priv_config_backend.sv`、
   `virtio_net_env_config.sv`、`transport/virtio_config_backend.sv`（注释）、`tests/virtio_coverage_test.sv`、
-  `tests/virtio_desc_corruption_test.sv`
+  `tests/virtio_desc_corruption_test.sv`、`tests/virtio_unit_test.sv`、`tests/virtio_dut_caps_test.sv`、
+  `examples/dpu_priv_ring/README.md`（Step 3 的 `sed` 一并改到）
 - Modify: `examples/dpu_priv_ring/dpu_priv_ring_contract_test.sv`
 - Test: `dpu_priv_ring_contract_test`、`dpu_priv_driver_flow_test`、`virtio_desc_corruption_test`、`virtio_coverage_test`
 
@@ -2579,7 +2580,8 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
       virtio_net_vip/src/env/virtio_coverage.sv virtio_net_vip/src/env/virtio_net_env_config.sv \
       virtio_net_vip/src/transport/virtio_config_backend.sv virtio_net_vip/src/dpu_priv \
       virtio_net_vip/tests/virtio_coverage_test.sv virtio_net_vip/tests/virtio_desc_corruption_test.sv \
-      examples/dpu_priv_ring/dpu_priv_ring_contract_test.sv
+      virtio_net_vip/tests/virtio_unit_test.sv virtio_net_vip/tests/virtio_dut_caps_test.sv \
+      examples/dpu_priv_ring/dpu_priv_ring_contract_test.sv examples/dpu_priv_ring/README.md
   git commit -m "refactor: 私有环改为与 split/packed 平级的 dpu_priv_virtqueue，删除 custom_virtqueue 与回调层"
   ```
 
@@ -2626,6 +2628,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
           virtio_standard_driver_protocol standard;
           dpu_priv_driver_protocol private_protocol;
           virtio_atomic_ops ops;
+          virtio_common_cfg_backend std_be;
           virtio_driver_config_t behavior;
           string why;
 
@@ -2643,8 +2646,9 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
               `uvm_error("TEST", "private protocol capabilities differ from the DPU private ring")
 
           ops = virtio_atomic_ops::type_id::create("cap_ops");
+          std_be = virtio_common_cfg_backend::type_id::create("cap_std_backend");
           behavior.num_queue_pairs = 1;
-          if (!standard.bind_ops(ops, behavior, why) || (ops.protocol != standard))
+          if (!standard.bind_ops(ops, std_be, behavior, why) || (ops.protocol != standard))
               `uvm_error("TEST", "standard bind_ops did not bind the protocol into ops")
           `uvm_info("UNIT_TEST", "test_driver_protocol_capabilities PASSED", UVM_LOW)
       endtask
@@ -2820,15 +2824,15 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
           return requested;
       endfunction
   ```
-  标准 `bind_ops` 体 old（位于 `// 标准驱动没有需要冻结的协议专属配置。` 之下）：
+  标准 `bind_ops` 体 old（B2 改写后的形态，位于 `// 标准驱动只下发配置后端，没有其他需要冻结的协议专属配置。` 之下）：
   ```systemverilog
-          why = "";
+          ops.config_backend = backend;
           return 1;
       endfunction
   ```
   new：
   ```systemverilog
-          why = "";
+          ops.config_backend = backend;
           ops.protocol = this;
           return 1;
       endfunction
@@ -2863,13 +2867,15 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
           return VQ_DPU_PRIV;
       endfunction
   ```
-  私有 `bind_ops` old：
+  私有 `bind_ops` old（B2 改写后的两行调用）：
   ```systemverilog
-          return private_ops.configure_private(private_cfg, behavior.num_queue_pairs, why);
+          return private_ops.configure_private(private_cfg, behavior.num_queue_pairs,
+                                               private_backend, why);
   ```
   new：
   ```systemverilog
-          if (!private_ops.configure_private(private_cfg, behavior.num_queue_pairs, why))
+          if (!private_ops.configure_private(private_cfg, behavior.num_queue_pairs,
+                                             private_backend, why))
               return 0;
           ops.protocol = this;
           return 1;
@@ -3105,7 +3111,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
 - Modify: `virtio_net_vip/src/agent/virtio_atomic_ops.sv`、`atomic_ops/virtio_atomic_ops_lifecycle.svh`、
   `atomic_ops/virtio_atomic_ops_queue.svh`、`atomic_ops/virtio_atomic_ops_datapath.svh`、`virtio_auto_fsm.sv`、
   `virtio_driver.sv`（注释）
-- Modify: `virtio_net_vip/src/sriov/virtio_function_instance.sv`（注释；后端赋值顺序仅在 Step 3 核对不符时移动）、
+- Modify: `virtio_net_vip/src/sriov/virtio_function_instance.sv`（注释；Step 3 只核对后端下发顺序，不移动语句）、
   `virtio_net_vip/src/env/virtio_net_env.sv`（注释）、`virtio_net_vip/src/virtio_net_pkg.sv`
 - Delete: `virtio_net_vip/src/dpu_priv/dpu_priv_atomic_ops.sv`、`virtio_net_vip/src/dpu_priv/dpu_priv_auto_fsm.sv`
 - Modify: `examples/dpu_priv_ring/dpu_priv_driver_flow_test.sv`、`virtio_net_vip/tests/virtio_unit_test.sv`、
@@ -3115,19 +3121,21 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
 
 **Interfaces:**
 - Consumes: C1 `dpu_priv_virtqueue` 与 vq 钩子；C2 能力、`ops.protocol`、`ring_iova_of`、FSM `queue_format()`；
-  B 的 `ops.config_backend`（commit 时设置）与后端 device-config 读接口。
+  B 的 `ops.config_backend`（commit 时由协议 `bind_ops(ops, backend, behavior, why)` 设置）与后端
+  `read_net_config`；A3 的 `ops.kick_queue`。
 - Produces（`virtio_config_backend` 非纯虚钩子，基类默认即标准行为）：
   `virtual task discover()`（默认 `transport.discover_and_init_bars()`）、
   `virtual function bit prepare_queue(virtqueue_base vq, ref virtio_queue_program_t q)`（默认 1）、
   `virtual task notify_queue(virtio_queue_program_t q, int unsigned next_idx, bit wrap)`（默认 `transport.kick`）。
-- Produces（`virtio_atomic_ops`）：`virtual task kick_queue(int unsigned queue_id)`、
+- Produces（`virtio_atomic_ops`）：（`virtual task kick_queue(int unsigned queue_id)` 由 A3 提供，C3 只消费）、
   `function bit get_queue_program(int unsigned queue_id, output virtio_queue_program_t q)`、
   `function bit has_active_queues()`、`virtual task discover_device()`。删除 `uses_private_ring()`。
 - Produces（`dpu_priv_config_backend`）：`function void bind_private(dpu_priv_driver_config cfg, int unsigned pairs)`；
   保留 `static function dpu_priv_queue_context_t to_context(virtio_queue_program_t q)`；删除 `from_context`。
 - Produces：私有 Function 构造路径——`env_cfg.add_dpu_private_config(key, cfg, why)` → Function
   `prepare_driver_candidates` 选 `dpu_priv_driver_protocol` → 协议创建通用 `virtio_atomic_ops`/`virtio_auto_fsm`
-  → commit：B 设置 `ops.config_backend = dpu_priv_config_backend` → `protocol.bind_ops` 冻结私有配置进后端、
+  → commit：Function `select_config_backend` 创建 `dpu_priv_config_backend` →
+  `protocol.bind_ops(ops, backend, behavior, why)` 校验后冻结私有配置进后端、赋 `ops.config_backend = backend`、
   `ops.protocol = protocol`。
 
 - [ ] **Step 1: 写失败测试（迁移流程测试、单元测试与 dut_caps 测试）**
@@ -3221,9 +3229,13 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
           virtio_atomic_ops ops;
           virtio_auto_fsm fsm;
           virtio_driver_config_t behavior;
+          virtio_common_cfg_backend std_backend;
+          dpu_priv_config_backend priv_backend;
           string why;
 
           behavior.num_queue_pairs = 1;
+          std_backend = virtio_common_cfg_backend::type_id::create("unit_standard_backend");
+          priv_backend = dpu_priv_config_backend::type_id::create("unit_private_backend");
           standard = virtio_standard_driver_protocol::type_id::create(
               "unit_standard_protocol");
           ops = null;
@@ -3231,7 +3243,8 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
           if (!standard.allows_status_access() || standard.requires_verified_reset() ||
               !standard.prepare_candidates("unit_standard", null, behavior, ops, fsm) ||
               (ops == null) || (fsm == null) ||
-              !standard.bind_ops(ops, behavior, why) || (ops.protocol != standard))
+              !standard.bind_ops(ops, std_backend, behavior, why) ||
+              (ops.config_backend != std_backend) || (ops.protocol != standard))
               `uvm_error("TEST", "standard driver protocol did not select standard ops/FSM")
 
           private_cfg = dpu_priv_driver_config::type_id::create("unit_private_cfg");
@@ -3249,17 +3262,16 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
               (ops == null) || (fsm == null))
               `uvm_error("TEST", "private driver protocol did not create generic ops/FSM")
 
-          // 仍挂标准后端的 ops：私有协议必须拒绝冻结，且不绑定协议。
-          ops.config_backend = virtio_common_cfg_backend::type_id::create(
-              "unit_conflicting_backend");
-          if (private_protocol.bind_ops(ops, behavior, why) ||
-              (why != "私有协议要求 dpu_priv_config_backend") || (ops.protocol != null))
+          // 下发标准后端：私有协议必须拒绝冻结，且不改动 ops（不绑后端、不绑协议）。
+          if (private_protocol.bind_ops(ops, std_backend, behavior, why) ||
+              (why != "私有协议要求 dpu_priv_config_backend") ||
+              (ops.config_backend != null) || (ops.protocol != null))
               `uvm_error("TEST", {"private protocol accepted a standard config backend: ", why})
 
-          ops.config_backend = dpu_priv_config_backend::type_id::create(
-              "unit_private_backend");
-          if (!private_protocol.bind_ops(ops, behavior, why) ||
-              (ops.protocol != private_protocol))
+          if (!private_protocol.bind_ops(ops, priv_backend, behavior, why) ||
+              (ops.config_backend != priv_backend) ||
+              (ops.protocol != private_protocol) ||
+              (priv_backend.control != private_cfg.control))
               `uvm_error("TEST", {"private protocol did not bind its backend: ", why})
           `uvm_info("UNIT_TEST", "test_driver_protocol_selection PASSED", UVM_LOW)
       endtask
@@ -3318,22 +3330,22 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
   grep -n 'config_backend\s*=\|bind_ops' virtio_net_vip/src/sriov/virtio_function_instance.sv
   grep -rn 'transport\.read_net_config\|transport\.read_device_status' virtio_net_vip/src/agent
   ```
-  期望：`ops.config_backend = ...` 出现在 `pending_protocol.bind_ops(ops, ...)` 之前；若在其后，把后端赋值语句
-  整体移到 `if (!pending_protocol.bind_ops(ops, driver_cfg, why)) begin` 之前（不改其内容）。第二条 grep 期望
-  无输出（B1 已把 net config/status 读改走后端）；记下 B 给后端加的 device-config 读方法名，Step 5 覆写它。
+  期望：`backend = select_config_backend(function_name);` 与 `backend.bind_transport(transport_ref);` 出现在
+  `if (!pending_protocol.bind_ops(ops, backend, driver_cfg, why)) begin` 之前，且 Function 内没有直接的
+  `ops.config_backend =` 赋值（B2 已把赋值移进协议 `bind_ops`）；不移动任何语句。第二条 grep 期望
+  无输出（B1 已把 net config/status 读改走后端）；B1 给后端加的 device-config 读方法是
+  `read_net_config(output virtio_net_device_config_t cfg)`，Step 5 覆写它。
 
 - [ ] **Step 4: 后端基类钩子**
 
-  `virtio_config_backend.sv` old：
+  `virtio_config_backend.sv` old（B1 之后的形态）：
   ```systemverilog
-      // 屏蔽全部 MSI-X 向量。
-      pure virtual task clear_msix(output bit ok);
+      pure virtual task read_net_config(output virtio_net_device_config_t cfg);
   endclass
   ```
   new：
   ```systemverilog
-      // 屏蔽全部 MSI-X 向量。
-      pure virtual task clear_msix(output bit ok);
+      pure virtual task read_net_config(output virtio_net_device_config_t cfg);
 
       // 以下钩子的默认实现即标准 virtio-pci 行为；私有后端覆写。
       // 设备发现：BAR/capability 枚举，委托 transport 的发现策略。
@@ -3509,8 +3521,10 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
               dpu_priv_virtqueue::notify_word(wrap, next_idx, q.local_qid));
       endtask
 
-      // （B 新增的 device-config 读方法在此覆写：输出 '{default:0}，不报错、不访问设备。
-      //  方法名与签名照抄 B 在 virtio_config_backend 中的声明。）
+      // 私有 Function 没有 virtio-net device config：全零，不报错、不访问设备。
+      virtual task read_net_config(output virtio_net_device_config_t cfg);
+          cfg = '{default:0};
+      endtask
   endclass
   `endif
   ```
@@ -3597,12 +3611,13 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
                                           candidate_ops, candidate_fsm);
       endfunction
 
-      // 把私有配置冻结进本 Function 的私有配置后端，并把协议绑定进 ops。ops 仍有活动
-      // 队列或后端不是私有后端时拒绝，不改动 ops 与后端。
+      // 把私有配置冻结进 Function 选定的私有配置后端，再把后端与协议绑定进 ops。ops 仍有
+      // 活动队列或后端不是私有后端时拒绝，不改动 ops 与后端。
       virtual function bit bind_ops(virtio_atomic_ops ops,
+                                    virtio_config_backend backend,
                                     virtio_driver_config_t behavior,
                                     output string why);
-          dpu_priv_config_backend backend;
+          dpu_priv_config_backend priv_be;
 
           why = "";
           if ((private_cfg == null) || (ops == null) || ops.has_active_queues()) begin
@@ -3611,11 +3626,12 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
           end
           if (!private_cfg.validate(behavior.num_queue_pairs, why))
               return 0;
-          if (!$cast(backend, ops.config_backend) || (backend == null)) begin
+          if (!$cast(priv_be, backend) || (priv_be == null)) begin
               why = "私有协议要求 dpu_priv_config_backend";
               return 0;
           end
-          backend.bind_private(private_cfg, behavior.num_queue_pairs);
+          priv_be.bind_private(private_cfg, behavior.num_queue_pairs);
+          ops.config_backend = backend;
           ops.negotiated_features = 0;
           ops.protocol = this;
           return 1;
@@ -3712,20 +3728,8 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
           end
           void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
       endtask
-
-      // MANUAL ATOMIC_KICK 与私有协议共用的通知入口。
-      virtual task kick_queue(int unsigned queue_id);
-          virtqueue_base vq;
-
-          if ((vq_mgr == null) || !vq_mgr.has_queue(queue_id)) begin
-              `uvm_error("ATOMIC_OPS", $sformatf("kick_queue: queue %0d not found", queue_id))
-              return;
-          end
-          vq = vq_mgr.get_queue(queue_id);
-          kick_with_fault(vq, queue_id);
-      endtask
   ```
-  （若 A3 已加入等价的公开 kick 入口，保留 A3 的名字与实现、删去此处 `kick_queue`，私有协议 `kick` 调 A3 的入口。）
+  （紧随其后的 `kick_queue` 由 A3 加入，原样保留，不在此重复声明；私有协议 `kick` 调 A3 的 `ops.kick_queue`。）
 
   `virtio_atomic_ops_lifecycle.svh` 在 `    // 便捷入口：执行验证式设备复位但忽略完成标志` 之前插入：
   ```systemverilog
@@ -4190,7 +4194,8 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
   env_cfg.add_dpu_private_config(service_key, cfg, why);` → Function 提交后 `f.driver_agent.ops` 是通用
   `virtio_atomic_ops`，`ops.config_backend` 是 `dpu_priv_config_backend`，`f.protocol.protocol_name()=="dpu_priv"`；
   队列参数用 `ops.get_queue_program(qid, q)` + `dpu_priv_config_backend::to_context(q)` 观察。直接构造（单元测试）：
-  通用 ops + `ops.config_backend = dpu_priv_config_backend::type_id::create(..)` + `private_protocol.bind_ops(ops, behavior, why)`。
+  通用 ops + `backend = dpu_priv_config_backend::type_id::create(..)` + `private_protocol.bind_ops(ops, backend, behavior, why)`
+  （成功时 `bind_ops` 赋 `ops.config_backend`）。
 
 **与接口约定的偏差：**
 1. 约定只列了协议能力；实际还给 `virtqueue_base` 加了 `net_hdr_bytes()`（header 有无属于环格式，避免 ops 再查协议）、
@@ -4202,9 +4207,9 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
    有过渡改动，C3 整体删除。
 
 **依赖 A/B 的假设（实施前核对）：**
-- B：`ops.config_backend` 在 `pending_protocol.bind_ops` 之前赋值（C3 Step 3 核对，必要时只移动该语句）；
+- B：`select_config_backend`/`bind_transport` 在 `pending_protocol.bind_ops(ops, backend, ...)` 之前（C3 Step 3 只核对，不移动）；
   `cfg_backend()` 仍存在并每次重新绑定 transport；B 给后端加的 device-config 读方法由私有后端覆写为全零。
-- A3：若 A3 已提供公开的 kick 入口，用它代替 `kick_queue`，并考虑把两协议相同的 `kick` 上移到基类。
+- A3：`kick_queue` 由 A3 提供（C3 不重复声明）；可考虑把两协议相同的 `kick` 上移到基类。
 - A1/B 若改了 `teardown_queue`/`device_reset_verified` 的错误文案，流程测试 catcher 用当时原文。
 
 **行为变化与风险：**
@@ -6054,6 +6059,8 @@ UVM_WARNING，严格回归会失败；guest 用 `setpci -s <BDF> 0x108.L=<n>`（
           port.host_write(STD_BAR2 + 4, 2, 1);
           wait_used(txq, tok, len);
           std_log.select(VDEV_QUEUE_CFG, ev);
+          if (ev.size() != 0)
+              `uvm_fatal("VDEV_UNIT", "packed TX datapath produced queue_cfg events")
           if (tok != t)
               `uvm_fatal("VDEV_UNIT", "packed used descriptor returned the wrong token")
           std_log.select(VDEV_PKT, ev);
@@ -7193,7 +7200,7 @@ INTx；新设备提供 `2*max_pairs+2` 个向量，fixture 流程改走每队列
 - Modify: `virtio_net_vip/src/transport/virtio_notification_manager.sv`、`virtio_net_vip/src/transport/virtio_config_backend.sv`
 - Modify: `virtio_net_vip/tests/vdev_loopback_port.sv`（回环 BAR accessor）、`virtio_net_vip/tests/virtio_vdev_unit_test.sv`
 - Modify: `virtio_net_vip/tests/virtio_real_driver_flow_fixture.sv`、`virtio_real_driver_flow_test.sv`、
-  `virtio_real_driver_rx_test.sv`、`virtio_real_driver_multiqueue_test.sv`
+  `virtio_real_driver_rx_test.sv`、`virtio_real_driver_multiqueue_test.sv`、`virtio_dual_test.sv`（队列数期望含 ctrl VQ）
 - Modify: `virtio_net_vip/src/virtio_net_pkg.sv`、`virtio_net_vip/src/env/virtio_execution_profile.sv`（注释）、
   `virtio_net_vip/src/types/virtio_net_types.sv`（注释）
 - Delete: `virtio_net_vip/src/pcie/virtio_pcie_dut_responder.sv`
@@ -7206,7 +7213,7 @@ INTx；新设备提供 `2*max_pairs+2` 个向量，fixture 流程改走每队列
 - Produces（fixture）：`device_port`、`devices[]`、`function vdev_virtio_pci device()`；
   `inject_rx(input int unsigned queue_id, input uvm_object pkt, ref bit ok)`（去掉 `net_hdr`：header 由设备生成）。
   删除 `dut_responder()`、`model_responder_active()`、`virtio_feature_select_ep_driver`、`install_endpoint_image`。
-- Changes（VIP）：`set_msix` 末尾写 MSI-X Enable=1/Function Mask=0；`clear_msix` 置 Function Mask；
+- Changes（VIP）：`set_msix` 末尾写 MSI-X Enable=1/Function Mask=0（`allocate_irq_vectors` 回退 INTx 时不写）；`clear_msix` 置 Function Mask；
   `notify_mgr` 的 `mask_vector/unmask_vector/mask_all/unmask_all` 把屏蔽位写进设备表项 Vector Control。
 
 - [ ] **Step 1: 写失败测试**
@@ -7528,9 +7535,11 @@ INTx；新设备提供 `2*max_pairs+2` 个向量，fixture 流程改走每队列
               transport.notify_mgr.unmask_all();
 
               // MSI-X Enable 与 Function Mask 在 PCI 配置空间（能力 +2 的 Message Control）；
-              // 设备只有看到 Enable=1、Function Mask=0 才会发 MSI-X。
-              transport.bar.config_write({4'h0, transport.cap_mgr.msix_cap_offset},
-                                         32'h8000_0000, 4'hc);
+              // 设备只有看到 Enable=1、Function Mask=0 才会发 MSI-X。向量分配回退到 INTx
+              // 时不打开 MSI-X。
+              if (actual_mode != IRQ_INTX)
+                  transport.bar.config_write({4'h0, transport.cap_mgr.msix_cap_offset},
+                                             32'h8000_0000, 4'hc);
   ```
   old：
   ```systemverilog
@@ -7796,6 +7805,15 @@ INTx；新设备提供 `2*max_pairs+2` 个向量，fixture 流程改走每队列
   日志分别含原有 PASS 文案（`real-driver net_packet RX PASSED`、`real-driver net_packet multi-queue TX PASSED`、
   `OVERALL: PASS`）。
 
+  已知必改（运行前做）：设备按 `2*pairs + CTRL_VQ` 报 `num_queues`，而 `virtio_dual_test` 提供 CTRL_VQ。
+  `virtio_net_vip/tests/virtio_dual_test.sv` old：`        expected_queues = flow.virtio_cfg.default_num_pairs * 2;`
+  new：
+  ```systemverilog
+          expected_queues = flow.virtio_cfg.default_num_pairs * 2 +
+                            (flow.device_features[VIRTIO_NET_F_CTRL_VQ] ? 1 : 0);
+  ```
+  （修正期望值，比较仍为精确相等，不放宽。）
+
   失败时逐条判定（规范“风险”表规则，不放宽断言）：
 
   | 现象 | 判定 | 处理 |
@@ -7806,7 +7824,7 @@ INTx；新设备提供 `2*max_pairs+2` 个向量，fixture 流程改走每队列
   | `VDEV_RING` 链非法 | VIP 构链错误 | 同上 |
   | `VDEV_RX` 丢帧 | 测试 RX buffer 小于 header+帧 | 改测试输入（buffer 尺寸），不改断言 |
   | 断言依赖旧 responder 的偷看行为（例如忽略 `VIRTQ_AVAIL_F_NO_INTERRUPT` 仍发中断） | 测试依赖 responder | 改测试输入使其满足协议（例如不置 NO_INTERRUPT），不改断言 |
-  | `num_queues` 读回 5（含 ctrl VQ） | 设备正确（旧镜像漏了 ctrl VQ） | 无 |
+  | `num_queues` 读回 5（含 ctrl VQ） | 设备正确（旧镜像漏了 ctrl VQ） | 修测试期望（见上方 `virtio_dual_test` 改动），不放宽 |
 
   每个新增 VIP 修复单独提交：`fix: <中文描述>`，并在 `virtio_vdev_unit_test` 增加对应失败用例。
 
@@ -8894,7 +8912,8 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
 **Files:**
 - Rewrite: `virtio_net_vip/src/dpu_priv/dpu_priv_config_backend.sv`
 - Modify: `virtio_net_vip/src/dpu_priv/dpu_priv_driver_config.sv`（删 `dpu_priv_device_control`、`dpu_priv_queue_context_t`、
-  `control` 字段）、`virtio_net_vip/src/transport/virtio_config_backend.sv`（注释）
+  `control` 字段）、`virtio_net_vip/src/transport/virtio_config_backend.sv`（注释）、
+  `virtio_net_vip/src/env/virtio_net_env_config.sv`（`validate_local` 去掉 `cfg.control` 检查）
 - Modify: `virtio_net_vip/tests/virtio_vdev_unit_test.sv`、`virtio_net_vip/tests/virtio_unit_test.sv`、
   `virtio_net_vip/tests/virtio_dut_caps_test.sv`、`examples/dpu_priv_ring/dpu_priv_driver_flow_test.sv`、
   `examples/dpu_priv_ring/dpu_priv_ring_contract_test.sv`
@@ -9456,6 +9475,15 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
           private_cfg.control = virtio_unit_priv_control_stub::type_id::create(
               "unit_private_control");
   ```
+  并把 C3 写入的成功断言中的 control 比较去掉（`control` 字段在 Step 3 删除）。old：
+  ```systemverilog
+              (ops.protocol != private_protocol) ||
+              (priv_backend.control != private_cfg.control))
+  ```
+  new：
+  ```systemverilog
+              (ops.protocol != private_protocol))
+  ```
   `virtio_dut_caps_test.sv` 删除 `virtio_dut_caps_priv_control_stub` 整个类（从 `// 私有控制桩：只为满足 private_cfg.validate 的非空要求`
   到其 `endclass`），并删除两行：
   ```systemverilog
@@ -9467,8 +9495,10 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
 - [ ] **Step 2: 运行，确认失败**
 
   `TEST=virtio_vdev_unit_test`：期望 `test_priv_backend_sequence` 报 `UVM_FATAL` “probe: 0 register accesses, driver
-  order has 1051”（C 版 `discover()` 为空）。`TEST=dpu_priv_driver_flow_test`：期望 `FUNCTION_BIND` 错误
-  “私有驱动配置非法: private control/defaults…”（测试不再注入 `control`，C 版 `validate` 仍要求它）。
+  order has 1051”（C 版 `discover()` 为空）。`TEST=dpu_priv_driver_flow_test`：测试不再注入 `control`，期望在 env
+  build 阶段先报 `UVM_FATAL [VIRTIO_ENV] VIO behavior does not match the published device snapshot: private service
+  缺少配置或控制后端 <service>`（`validate_against_snapshot` → `validate_local` 早于 Function 提交）；若该检查未先触发，
+  则为 `FUNCTION_BIND` 错误 “私有驱动配置非法: private control/defaults…”（C 版 `validate` 仍要求 `control`）。
 
 - [ ] **Step 3: `dpu_priv_driver_config.sv` 去掉设备控制接口**
 
@@ -9507,6 +9537,19 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
 
   `virtio_config_backend.sv` 头注释 old：`//   dpu_priv_config_backend   : DPU 私有环控制面（dpu_priv_device_control）。`
   new：`//   dpu_priv_config_backend   : DPU 私有设备寄存器级后端（真实驱动 AF 路径的寄存器序列）。`
+
+  `virtio_net_env_config.sv` `validate_local` old：
+  ```systemverilog
+              if ((m_private_configs[private_name].cfg == null) ||
+                  (m_private_configs[private_name].cfg.control == null)) begin
+                  why = {"private service 缺少配置或控制后端 ", private_name};
+  ```
+  new：
+  ```systemverilog
+              if (m_private_configs[private_name].cfg == null) begin
+                  why = {"private service 缺少配置 ", private_name};
+  ```
+  （无 catcher 匹配旧文案。）
 
 - [ ] **Step 4: 重写 `dpu_priv_config_backend.sv`**（完整文件）
   ```systemverilog
@@ -9941,8 +9984,8 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
   endclass
   `endif
   ```
-  （`prepare_queue` 不变——它只把参数表写进队列对象与编程参数；B 新增的 device-config 读方法名若不是
-  `read_net_config`，按 B 的声明改名。C3 中 `to_context` 随 `dpu_priv_queue_context_t` 一起删除。）
+  （`prepare_queue` 不变——它只把参数表写进队列对象与编程参数；B1 的 device-config 读方法即
+  `read_net_config`。C3 中 `to_context` 随 `dpu_priv_queue_context_t` 一起删除。）
 
 - [ ] **Step 5: 运行，确认通过**
 
@@ -9965,6 +10008,7 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
 - [ ] **Step 8: 提交**
   ```bash
   git add virtio_net_vip/src/dpu_priv virtio_net_vip/src/transport/virtio_config_backend.sv \
+      virtio_net_vip/src/env/virtio_net_env_config.sv \
       virtio_net_vip/tests/virtio_vdev_unit_test.sv virtio_net_vip/tests/virtio_unit_test.sv \
       virtio_net_vip/tests/virtio_dut_caps_test.sv examples/dpu_priv_ring
   git commit -m "refactor: 私有配置后端改为按真实驱动寄存器序列访问 vdev_dpu_priv，删除 dpu_priv_device_control"
@@ -10152,6 +10196,8 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
      TX/RX/CQ 黄金字节、默认 512 项布局、65537B TX 分片和环回绕，并让 `vdev_dpu_priv` 写出的 CQ 与同一组黄金值
      对齐。
      ```
+  5. C4 改写的建队顺序句（“内部建队顺序为：…”）末项 old：`控制后端配置启动`
+     new：“寄存器级后端写 VTX/VRX 队列参数表并启用（设备侧为 `vdev_dpu_priv`）”。
 
 - [ ] **Step 5: 文档校验与最终 grep**
   ```bash
@@ -10220,7 +10266,7 @@ Linux 开放 4 KiB 配置空间，`setpci -s <BDF> 0x108.L=<n>` 可写。
 - 标准 `vdev_virtio_pci`：1af4:1041，类 0x020000；BAR0 16 KiB（common@0x0 长 0x40、ISR@0x1000、device_cfg@0x2000 长 0x100），
   BAR2 4 KiB（notify，`queue_notify_off=q`，multiplier 4），BAR4 64 KiB（MSI-X 表@0、PBA@0x8000，`2*max_pairs+2` 向量）；
   `num_queues = 2*max_pairs + CTRL_VQ`；能力链 PCIe(0x40) → common → notify → ISR → device → MSI-X。
-  **与规范表的偏差：** 规范写“标准：BAR0 virtio 区域，BAR4 MSI-X”，实际 notify 在 BAR2（VIP Fabric 发现强制 notify 位于 mailbox BAR）；E 阶段的 cosim-pcie-pf 需暴露 BAR0/2/4 三对。
+  **与规范表的偏差：** 规范写“标准：BAR0 virtio 区域，BAR4 MSI-X”，实际 notify 在 BAR2（VIP Fabric 发现强制 notify 位于 mailbox BAR）；E 阶段的 cosim-pcie-rc（路线 R 多 BAR 补丁）需暴露 BAR0/2/4 三对。
 - 私有 `vdev_dpu_priv`：20f9:5013，类 0x020000；BAR0 32 MiB，BAR2 64 KiB（qinfo），BAR4 64 KiB（MSI-X 64 向量）。
   参数 `host_id`（qinfo 报告）、`stall_queue_stop`（测试旋钮）；观察 `queue_enabled(tx, gq)`。
 
@@ -10268,7 +10314,7 @@ RX 多描述符、mailbox 未建模、gq/gv 分配）。VIP 后端刻意不做�
 
 1. **`cosim-pcie-pf` 不能直接用于单 PF。** `qemu-plugin/cosim_pcie_pf.c` 中 `cosim_pf_addr_is_local()` 把配置空间 0x34–0x37、0x40–0xFF 和 0x100 以上全部留在 QEMU 本地，不转发到 VCS。结果是设备模型的整条 cap 链在 guest 中不可见，包括 virtio vendor cap、调试 marker cap 和设备侧 MSI-X cap。QEMU 自己的 MSI-X 表放在 BAR0 偏移 0（`msix_init(... bar_nr = 0 ...)`），会盖住 common_cfg。所以规范里“只改 `NUM_PFS=1` 时选 `cosim-pcie-pf`”这一处不够：virtio_pci modern probe 找不到 COMMON_CFG，驱动不会绑定。
 2. **`cosim-pcie-rc`（`NUM_PFS=1` 时 Makefile 的默认选择）转发全部配置空间**，0x100 以上也转发，因为它是 `INTERFACE_PCIE_DEVICE`。设备模型因此可以独占配置空间和 MSI-X。它的缺口是只注册 BAR0，而且是 32 位。59 上已经跑通过一条链路（`docs/COSIM-ETH-MSIX-DEBUG.md` §2.2）：MSI-X 由 VCS 用 `bridge_vcs_dma_write_sync` 写消息地址，经 `pci_dma_write` 投递到 APIC，ICMP 能双向往返。
-3. 因此 E1 推荐**路线 R**：在 `cosim-pcie-rc` 上打一个本地补丁，内容是多 BAR（64 位）注册、MMIO 最大访问宽度改为 4、APIC 区 DMA 写改由 BH 投递。**路线 P**（改 `cosim-pcie-pf`）作为备选。这偏离了规范“使用 cosim-pcie-pf”的字面要求，见 E1 决策点 D-E1，执行前需要用户确认。
+3. 因此 E1 推荐**路线 R**：在 `cosim-pcie-rc` 上打一个本地补丁，内容是多 BAR（64 位）注册、MMIO 最大访问宽度改为 4、APIC 区 DMA 写改由 BH 投递。**路线 P**（改 `cosim-pcie-pf`）作为备选。这偏离了规范“使用 cosim-pcie-pf”的字面要求，见 E1 决策点 D-E1（已由控制者裁决为路线 R）。
 4. Guest 镜像 `guest/images/ubuntu` 的内核是 `6.8.0-107-generic`，用户态却是 **Alpine 3.20**（busybox、openrc），没有 gcc 和 python3。`/usr/sbin/setpci`、`/usr/bin/lspci`、`/usr/sbin/ethtool`、`/sbin/ip` 都有。`modules.builtin` 显示 **virtio、virtio_pci、virtio_net、virtio_blk 都是内建的**：启动时 virtio_net 就会绑定标准设备，`modprobe`/`rmmod` 用不了。标准模式下 S1/S4 改用 sysfs `bind`/`unbind` 代替。
 5. 53 是 Ubuntu 20.04，只有 gcc 9.4。`/usr/local` 下有 glib 2.66.8，满足 QEMU 9.2 的 ≥2.66 要求，系统自带的是 2.64.6。另有 python 3.8.10 + tomli 2.4.1，meson 用 QEMU 自带的 wheel 1.5.0，ninja 1.10.0、pixman 0.38.4、libfdt 1.5.1、cmake 3.16.3、e2fsprogs 1.45.5 均已就绪，`~` 剩余 70G。`/dev/shm` 已用 84%，剩 1.3G，够 16MB SHM。
 6. `dpu_snd1.ko` 不能在 53 上针对 6.8 编译：noble 头文件包里的 `fixdep`/`modpost` 需要 glibc ≥ 2.34，内核 `.config` 打开的编译选项需要 gcc ≥ 12。**本机（Ubuntu 24.04，gcc 13.3）可以 `apt download linux-headers-6.8.0-107{,-generic}`，已确认有候选版本**，所以在本机编译。规范给的回退方案“用 Debian 镜像在 guest 内编译”不可行：Debian 镜像内核 6.1.0-42，没有 gcc、没有头文件，guest 也没有网络。
@@ -10316,14 +10362,14 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
     - 落在 0xFEE00000–0xFEEFFFFF 的 4 字节 DMA 写（MSI-X 消息）由 QEMU 主循环 BH 用 `pci_dma_write` 投递；DMA completion 立即返回给 VCS。
     - 按阶段 D 的设备布局，guest 应看到三对 64 位非预取 BAR：标准 `vdev_virtio_pci`（1af4:1041）BAR0 16 KiB（common/ISR/device_cfg）、BAR2 4 KiB（notify）、BAR4 64 KiB（MSI-X 表@0、PBA@0x8000，6 个向量）；私有 `vdev_dpu_priv`（20f9:5013）BAR0 32 MiB、BAR2 64 KiB（qinfo）、BAR4 64 KiB（MSI-X，64 个向量）。补丁按 sizing 注册，不写死尺寸。
 
-**决策点 D-E1（执行前请用户确认）：** 规范写的是“使用 cosim-pcie-pf”，但调研结论 1 说明 pf 在单 PF 下看不到设备模型的 cap 链。
+**决策点 D-E1（已裁决：路线 R，无需再等用户确认）：** 规范写的是“使用 cosim-pcie-pf”，但调研结论 1 说明 pf 在单 PF 下看不到设备模型的 cap 链。
 
 | 路线 | 改动 | 设备模型看到的东西 | 代价 |
 |---|---|---|---|
 | R（推荐） | `cosim_pcie_rc.{c,h}` 约 80 行：多 BAR 注册、max_access 4、APIC 写转 BH | 全部配置空间、MSI-X 表和 PBA 的 MMIO，与 VCS 回归中的 UVM EP 端口一致 | MSI-X 经 DMA 写投递（59 已验证）。DMA 不转 BH 的话，VCS 同步等待与持 BQL 的 vCPU MMIO 会互等，所以补丁必须带 BH 投递 |
 | P（备选） | `cosim_pcie_pf.c`：`cosim_pf_addr_is_local` 只保留 QEMU 自有 cap 的范围；MSI-X 移到 BAR4（`cap_pos=0xB0`），PCIe cap 移到 0xC0，0xC1 的 next 指向 VCS 的 0x34 链头；VCS 用 `bridge_vcs_raise_msi(vector)` | 设备 cap 链可见，但看不到 MSI-X 使能和屏蔽。D 的 `vdev_base` 能力链从 0x40 起（PCIe cap 在 0x40），与 QEMU 自有 cap 冲突 | 除 QEMU 改动外还要改 D 的设备底座：D 没有“MSI-X 由主机侧持有”开关，`vdev_port::raise_msix(requester, addr, data)` 只给消息地址和数据、不给向量号。本计划不含这些改动 |
 
-用户确认前不进入 Step 4。如果路线 R 在 E2 冒烟中三轮修正后仍不能完成枚举或中断投递，停下汇报：改走路线 P 需要先在 `virtio_sdd` 中给 D 的设备底座加上述开关和按向量投递的端口接口，属于扩大范围，由用户决定。
+D-E1 已裁决为路线 R，按路线 R 进入 Step 4。如果路线 R 在 E2 冒烟中三轮修正后仍不能完成枚举或中断投递，停下汇报：改走路线 P 需要先在 `virtio_sdd` 中给 D 的设备底座加上述开关和按向量投递的端口接口，属于扩大范围，由用户决定。
 
 - [ ] **Step 1: 建目录与本地 git，复制 cosim-platform 工作树**
 
@@ -11748,7 +11794,8 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
                           addr_written.setdefault(ev.get("q"), set()).add(prefix)
               elif kind == "queue_cfg" and int(ev.get("enable", 0)):
                   q = ev.get("q")
-                  if not status & STATUS_FEATURES_OK or status & STATUS_DRIVER_OK:
+                  # 私有模式（status_field 为空）没有 status 事件，不做 status 窗口检查。
+                  if rules["status_field"] and (not status & STATUS_FEATURES_OK or status & STATUS_DRIVER_OK):
                       out.append((scn, f"{trace}: q{q} enable 时 status=0x{status:02x}"
                                        "（应在 FEATURES_OK 之后、DRIVER_OK 之前）"))
                   missing = [p for p in rules["enable_requires"] if p not in addr_written.get(q, set())]
@@ -12026,8 +12073,8 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
 **Interfaces:**
 - Consumes:
   - E3 的帧定义和 marker 号；F1 的记录器与 `vdev_diff.py`。
-  - `virtio_real_driver_flow_fixture` 的 API：`build_flow`、`function_bdf`、`function_by_bdf`、`start_driver_flow`、`setup_queue`、`submit_tx`、`complete_tx`、`refill_rx`、`receive_rx`、`tx_queue_id_for_pair`、`rx_queue_id_for_pair`、`reset_and_teardown`，字段 `device_features`；D3 之后的 `devices[]`（`vdev_virtio_pci`，build_phase 创建）与 `function vdev_virtio_pci device()`（end_of_elaboration 后按 BDF 返回）。
-  - 驱动特性：`virtio_function_instance::drv_cfg.driver_features`（`start_driver_flow` 读它协商）。MQ：`virtio_atomic_ops::ctrl_set_mq_pairs(n, ref bit success)` 与 `setup_msix(n)`（A2 的重建顺序）。
+  - `virtio_real_driver_flow_fixture` 的 API：`build_flow`、`function_bdf`、`function_by_bdf`、`refill_rx`、`receive_rx`、`tx_queue_id_for_pair`、`rx_queue_id_for_pair`、`reset_and_teardown`，字段 `device_features`；D3 之后的 `devices[]`（`vdev_virtio_pci`，build_phase 创建）与 `function vdev_virtio_pci device()`（end_of_elaboration 后按 BDF 返回）。
+  - 驱动：`f.driver_agent.fsm`（`drv_cfg` 副本、`full_init()`、`configure_mq(n)`，含 A2 的 MSI-X 重建）；数据面直接用 `f.driver_agent.ops` 的 `tx_submit/tx_complete`（fixture 的 `submit_tx/complete_tx` 要求 `start_driver_flow`）。
   - E2 的 `vdev_diff_pkg`（`VDEV_DIFF_STD_*`、`vdev_marker`）。
 - Produces:
   - `out/std/scen/linux.jsonl`、`out/std/scen/vip.jsonl`、`out/std/scen/diff.md`。
@@ -12073,6 +12120,7 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
     int unsigned                    frame_len;
     int unsigned                    qsize;
     bit [63:0]                      drv_features;
+    virtio_atomic_ops               ops;
 
     function new(string name, uvm_component parent);
       super.new(name, parent);
@@ -12113,19 +12161,6 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
         `uvm_fatal("VDEV_DIFF", "VIP 一侧设备参数与 cosim 一侧（vdev_diff_pkg）不一致")
     endfunction
 
-    task setup_pair(int unsigned pair, virtqueue_type_e fmt);
-      int unsigned rx_q;
-      int unsigned tx_q;
-      bit          ok;
-      string       why;
-      if (!flow.rx_queue_id_for_pair(pair, rx_q, why) || !flow.tx_queue_id_for_pair(pair, tx_q, why))
-        `uvm_fatal("VDEV_DIFF", why)
-      flow.setup_queue(rx_q, qsize, fmt, ok);
-      if (!ok) `uvm_error("VDEV_DIFF", $sformatf("pair%0d RX 队列建立失败", pair))
-      flow.setup_queue(tx_q, qsize, fmt, ok);
-      if (!ok) `uvm_error("VDEV_DIFF", $sformatf("pair%0d TX 队列建立失败", pair))
-    endtask
-
     task traffic(int unsigned pair);
       int unsigned     rx_q;
       int unsigned     tx_q;
@@ -12142,13 +12177,19 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
       flow.refill_rx(rx_q, n_frames, ok);
       if (!ok) `uvm_error("VDEV_DIFF", $sformatf("pair%0d RX refill 失败", pair))
       hdr = '{default: 0};
+      // FSM 启动的 Function 不能用 fixture 的 submit_tx/complete_tx（它们要求 start_driver_flow），直接调 ops。
       for (int unsigned i = 0; i < n_frames; i++) begin
         frame = vdev_diff_frame::build(i, frame_len);
-        flow.submit_tx(tx_q, hdr, frame, 1'b0, desc_id, ok);
-        if (!ok) `uvm_error("VDEV_DIFF", $sformatf("pair%0d 帧 %0d 提交失败", pair, i))
+        desc_id = '1;
+        ops.tx_submit(tx_q, hdr, frame, 1'b0, desc_id);
+        if (desc_id == '1) `uvm_error("VDEV_DIFF", $sformatf("pair%0d 帧 %0d 提交失败", pair, i))
       end
-      flow.complete_tx(tx_q, completed, n_frames, done_count, ok);
-      if (!ok || done_count != n_frames)
+      for (int unsigned t = 0; (t < 1000) && (completed.size() < n_frames); t++) begin
+        ops.tx_complete(tx_q, completed, n_frames);
+        if (completed.size() < n_frames) #1ns;
+      end
+      done_count = completed.size();
+      if (done_count != n_frames)
         `uvm_error("VDEV_DIFF", $sformatf("pair%0d TX 完成 %0d/%0d", pair, done_count, n_frames))
       flow.receive_rx(rx_q, n_frames, received, done_count, ok);
       if (!ok || done_count != n_frames)
@@ -12158,34 +12199,31 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
     task run_phase(uvm_phase phase);
       bit                      ok;
       string                   why;
-      virtqueue_type_e         fmt;
       virtio_function_instance f;
+      virtio_auto_fsm          fsm;
       phase.raise_objection(this);
       if (flow.build_flow(why) == 0)
         `uvm_fatal("VDEV_DIFF", why)
       f = flow.function_by_bdf(flow.function_bdf());
       if ((f == null) || (flow.device() == null))
         `uvm_fatal("VDEV_DIFF", "选中的 Function 或其 MODEL 设备不存在")
-      // start_driver_flow 用 f.drv_cfg.driver_features 协商；取 Linux S1 实际接受的集合（caps）。
-      f.drv_cfg.driver_features = drv_features;
-      fmt = drv_features[VIRTIO_F_RING_PACKED] ? VQ_PACKED : VQ_SPLIT;
+      ops = f.driver_agent.ops;
+      fsm = f.driver_agent.fsm;
+      // 生产路径（与 Linux probe 同序）：FSM full_init 在 DRIVER_OK 之前建好 2 对 + ctrl 全部队列。
+      // FSM 的 drv_cfg 是 Function 绑定时的副本，直接写它；特性取 Linux S1 实际接受的集合（caps）。
+      fsm.drv_cfg.driver_features = drv_features;
+      fsm.drv_cfg.num_queue_pairs = VDEV_DIFF_STD_PAIRS;
+      fsm.drv_cfg.vq_type = drv_features[VIRTIO_F_RING_PACKED] ? VQ_PACKED : VQ_SPLIT;
+      fsm.drv_cfg.queue_size = qsize;
       vdev_marker(flow.device(), 1);
-      flow.start_driver_flow(ok);
-      if (!ok) `uvm_error("VDEV_DIFF", "S1 初始化失败")
-      setup_pair(0, fmt);
-      if (drv_features[VIRTIO_NET_F_CTRL_VQ]) begin
-        flow.setup_queue(2 * VDEV_DIFF_STD_PAIRS, qsize, fmt, ok);   // ctrl VQ 队列号 2*max_pairs（D2）
-        if (!ok) `uvm_error("VDEV_DIFF", "S1 ctrl VQ 建立失败")
-      end
+      fsm.full_init();
+      if (fsm.state != FSM_READY) `uvm_error("VDEV_DIFF", "S1 full_init 失败")
       vdev_marker(flow.device(), 2);
       traffic(0);
       vdev_marker(flow.device(), 3);
-      // 与 virtio_auto_fsm::do_configure_mq（含 A2 的 MSI-X 重建）同序。fixture 不走 FSM 的 full_init，
-      // FSM 的 active_num_pairs 没有记录，不能直接调 fsm.configure_mq。
-      f.driver_agent.ops.ctrl_set_mq_pairs(2, ok);
-      if (!ok) `uvm_error("VDEV_DIFF", "S3 VQ_PAIRS_SET 2 失败")
-      setup_pair(1, fmt);
-      f.driver_agent.ops.setup_msix(f.vq_mgr.get_queue_count());
+      // 生产路径：virtio_auto_fsm::configure_mq（ctrl VQ VQ_PAIRS_SET + A2 的 MSI-X 重建）。
+      fsm.configure_mq(2);
+      if (fsm.state == FSM_ERROR) `uvm_error("VDEV_DIFF", "S3 configure_mq(2) 失败")
       traffic(1);
       vdev_marker(flow.device(), 4);
       flow.reset_and_teardown(ok);
@@ -12197,8 +12235,13 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
   `endif
   ```
   说明：
-  - VIP 侧按 VIP 正常用法建队列（先 `start_driver_flow` 再 `setup_queue`）。若 VIP 在 DRIVER_OK 之后才 enable 队列，或扩容时没有走 RING_RESET 就新建队列，`vdev_diff.py` 的偏序检查会把它报出来。这正是要找的差异，不在测试里绕开。
-  - 驱动侧配置 `num_queue_pairs` 保持 fixture 的 2（`start_driver_flow` 按 2 对 + ctrl 建 MSI-X），与 Linux 按最大队列数分配向量的做法一致。
+  - VIP 侧走生产路径：S1 用 `fsm.full_init()`（全部队列在 DRIVER_OK 之前 enable，与 Linux probe 同序），S3 用
+    `fsm.configure_mq(2)`。不用 fixture 的 `start_driver_flow` + `setup_queue`：那会在 DRIVER_OK 之后 enable 队列，
+    产生的 order/`strict.queue_cfg` 差异是 fixture 造成的，不是 VIP 行为。VIP 生产路径自身的偏序违例仍由
+    `vdev_diff.py` 报出，不在测试里绕开。
+  - 若 fixture 无法承载 FSM 路径（例如 `full_init` 与 `build_flow` 的状态冲突），在第一次 diff 之前把它作为已知
+    fixture 伪差异记入 `triage_std.md`（写明原因与受影响的规则），再按 Step 5 判定。
+  - 驱动侧 `num_queue_pairs` 设为 `VDEV_DIFF_STD_PAIRS`（2），与 Linux 按最大队列数分配向量的做法一致。
 
 - [ ] **Step 2: 写 `~/cosim_diff/vip_diff.sh`**
 
@@ -12209,6 +12252,7 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
   TEST=${1:?test}; OUT=${2:?out.jsonl}; shift 2
   CD=$HOME/cosim_diff; VW=$HOME/virtio_priv_run/virtio_work
   set +u; source ~/virtio_priv_run/env.sh; set -u
+  export QUEUE_WORK_ROOT=${QUEUE_WORK_ROOT:-$HOME/virtio_priv_run/queue_work}   # queue_work_integration.f 引用
   mkdir -p "$CD/build" "$(dirname "$OUT")"
   cd "$VW"
   vcs -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps \
@@ -12496,8 +12540,7 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
 - JSONL：记录器直接输出 D 的 `vdev_event::to_json()`，再在前面加 `seq`。`kind` 是枚举，字段名是 `from_status/to_status`、`bytes`、`has_hdr`。`vdev_diff.py` 把 `fn`（BDF）加入 `DROP_KEYS`，selftest 仍然通过。
 - VIP 标准测试：fixture 没有 `vdev()`、`set_driver_features()`、`configure_mq()`。现在的做法是：
   - 设备事件接到 `flow.devices[0]`，marker 用 `flow.device()`。
-  - 驱动特性写入 `f.drv_cfg.driver_features`。
-  - S3 按 `do_configure_mq` 的顺序（A2）调用 `ops.ctrl_set_mq_pairs(2)`，接着 `setup_pair(1)`，最后 `ops.setup_msix(queue_count)`。
+  - 驱动特性写入 `fsm.drv_cfg.driver_features`；S1 用 `fsm.full_init()`，S3 用 `fsm.configure_mq(2)`（预检裁决：队列在 DRIVER_OK 之前 enable，与 Linux 同序）。
   - 帧用预填 `raw_data` 的 `packet_item`，因为 adapter 只接受 `packet_item`。
 - VIP 私有测试：fixture 不能建私有 Function（A10 不成立），所以改为继承 D5 之后的 `dpu_priv_driver_flow_test`，用 Host 0 的 `devices[0]` 和 `private_ops[0]`。原 F3 的决策点已经消解。
 - `rules_priv.json`：字段名改为 D 的 `host_id`、`soft_reset`、`af_declaration`、`mb_af_host_id`、`bdf`、`vtx_content.dwN`、`qid_map.*`。
@@ -12506,7 +12549,7 @@ PUT() { sshpass -p ubuntu scp -o StrictHostKeyChecking=no "$1" "ubuntu@10.11.10.
 
 **调研中发现的风险：**
 
-1. **【阻塞，需用户确认】** 规范“只改一处让 `NUM_PFS=1` 用 `cosim-pcie-pf`”不可行，pf 不转发 0x40 以上的配置空间。计划改用路线 R（`cosim-pcie-rc` 多 BAR 补丁，约 80 行）。路线 P 需另改 D 的设备底座，只作为汇报后的备选，见 D-E1。
+1. **【已裁决：路线 R】** 规范“只改一处让 `NUM_PFS=1` 用 `cosim-pcie-pf`”不可行，pf 不转发 0x40 以上的配置空间。计划改用路线 R（`cosim-pcie-rc` 多 BAR 补丁，约 80 行）。路线 P 需另改 D 的设备底座，只作为汇报后的备选，见 D-E1。
 2. **Guest**：
    - Ubuntu 6.8.0-107 内核配 Alpine 3.20 用户态，没有 gcc 和 python。
    - virtio_net、virtio_pci 是内建的：S1/S4 用 sysfs bind/unbind 代替 modprobe/rmmod，启动期的绑定落在段 0。
