@@ -57,6 +57,13 @@
             rx_dma_map.delete(rx_qids[i]);
         end
         release_migration_restore_payloads();
+        foreach (ctrl_quarantined_iovas[i])
+            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                                 ctrl_quarantined_iovas[i]);
+        foreach (ctrl_quarantined_gpas[i])
+            mem.free(ctrl_quarantined_gpas[i]);
+        ctrl_quarantined_iovas.delete();
+        ctrl_quarantined_gpas.delete();
 
         // detach_all_queues() releases descriptor ownership only.  After a
         // verified device reset, free every queue's rings and remove its

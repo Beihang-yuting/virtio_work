@@ -23,6 +23,7 @@ typedef class virtio_iommu_model;
 typedef class virtqueue_base;
 typedef class virtio_pci_transport;
 typedef class virtio_wait_policy;
+typedef class virtio_config_backend;
 
 // ============================================================================
 // Feature Bit Parameters (per virtio spec numbering)
@@ -499,6 +500,9 @@ class virtio_admin_vq_context extends uvm_object;
     bit                   special_vq_lease_valid;
     dpu_resource_lease_t  special_vq_lease;
     virtio_admin_full_reset_owner full_reset_owner;
+    // 本 Admin VQ 所在 PF 的配置后端（必须绑定上面的 transport）；Q_RESET 与 status
+    // 读取都经它发出，Admin 路径不直接访问 common-config 寄存器。
+    virtio_config_backend config_backend;
     // Admin commands share one virtqueue, so they must retain exclusive
     // ownership from descriptor construction through completion/recovery.
     semaphore             submit_lock;

@@ -66,6 +66,10 @@ class virtio_atomic_ops extends uvm_object;
     protected bit [63:0]         ring_iovas[int unsigned][$];  // queue_id -> ring IOVAs (desc, avail, used)
     // 每个已编程队列的设备视角参数；拆除时原样交回后端，复位后清空。
     protected virtio_queue_program_t queue_programs[int unsigned];
+    // control VQ 超时且设备未确认复位时隔离的缓冲（ctrl_send 的 dma_set 移入）。期间
+    // ctrl_send 拒绝提交；只有 device_reset_verified 确认复位后才解除映射并释放。
+    protected bit [63:0] ctrl_quarantined_iovas[$];
+    protected bit [63:0] ctrl_quarantined_gpas[$];
 
     // ========================================================================
     // Constructor
@@ -120,7 +124,7 @@ class virtio_atomic_ops extends uvm_object;
             if (rx_dma_map[qid].size() != 0)
                 return 1;
         end
-        return (migration_restore_dma.size() != 0);
+        return (migration_restore_dma.size() != 0) || (ctrl_quarantined_gpas.size() != 0);
     endfunction
 
     // 返回本 ops 的配置后端：未注入时创建 common-config 后端；每次调用都重新绑定

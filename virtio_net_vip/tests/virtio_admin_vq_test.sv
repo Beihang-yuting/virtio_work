@@ -320,6 +320,8 @@ class virtio_admin_vq_test extends uvm_test;
 
         ctx = virtio_admin_vq_context::type_id::create("admin_vq_context");
         ctx.transport = transport;
+        ctx.config_backend = virtio_common_cfg_backend::type_id::create("admin_cfg_backend");
+        ctx.config_backend.bind_transport(transport);
         ctx.vq = vq;
         ctx.mem = mem;
         ctx.iommu = iommu;

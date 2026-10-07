@@ -214,6 +214,96 @@ class virtio_ctrl_vq_test_migration_fsm extends virtio_auto_fsm;
     endtask
 endclass : virtio_ctrl_vq_test_migration_fsm
 
+// control VQ 设备桩：kick 时从 split avail ring 取走新命令并登记 {head, ack IOVA}；
+// answer_on_kick=1 时立即以 VIRTIO_NET_OK 完成，否则留给 complete_pending()（迟到完成）。
+// Q_RESET 确认后丢弃待完成命令并从 0 重新计数，与真实设备的队列复位语义一致。
+class virtio_ctrl_vq_test_device extends virtio_mock_transport;
+    `uvm_object_utils(virtio_ctrl_vq_test_device)
+
+    virtqueue_manager  vq_mgr;
+    host_mem_manager   mem;
+    virtio_iommu_model iommu;
+    bit                answer_on_kick;
+    int unsigned       seen_avail;
+    int unsigned       used_idx;
+    int unsigned       pending_heads[$];
+    bit [63:0]         pending_acks[$];
+
+    function new(string name = "virtio_ctrl_vq_test_device");
+        super.new(name);
+        answer_on_kick = 0;
+        seen_avail = 0;
+        used_idx = 0;
+    endfunction
+
+    virtual task kick(int unsigned queue_id, int unsigned next_avail_idx,
+                      bit wrap_counter);
+        virtqueue_base vq;
+        byte raw[];
+        int unsigned avail_idx;
+        int unsigned head;
+
+        super.kick(queue_id, next_avail_idx, wrap_counter);
+        vq = vq_mgr.get_queue(queue_id);
+        mem.read_mem(vq.driver_ring_addr + 2, 2, raw);
+        avail_idx = {raw[1], raw[0]};
+        while (seen_avail != avail_idx) begin
+            mem.read_mem(vq.driver_ring_addr + 4 + (seen_avail % vq.queue_size) * 2, 2, raw);
+            head = {raw[1], raw[0]};
+            pending_heads.push_back(head);
+            pending_acks.push_back(chain_tail(vq, head));
+            seen_avail++;
+        end
+        if (answer_on_kick)
+            complete_pending();
+    endtask
+
+    virtual task write_queue_reset_verified(int unsigned queue_id,
+                                            ref bit reset_complete);
+        super.write_queue_reset_verified(queue_id, reset_complete);
+        if (reset_complete) begin
+            pending_heads.delete();
+            pending_acks.delete();
+            seen_avail = 0;
+            used_idx = 0;
+        end
+    endtask
+
+    // 以 VIRTIO_NET_OK 完成全部待完成命令：经 IOMMU 写 ack，再发布 used ring 项。
+    function void complete_pending();
+        virtqueue_base vq;
+        byte ack[];
+        iommu_fault_e fault;
+
+        vq = vq_mgr.get_queue(last_kick_queue_id);
+        ack = new[1];
+        ack[0] = VIRTIO_NET_OK;
+        foreach (pending_heads[i]) begin
+            void'(iommu.write_from_device_for_host(iommu_host_id(), mem, bdf,
+                                                   pending_acks[i], ack, fault));
+            virtio_vq_test_kit::complete_split_at(mem, vq, used_idx % vq.queue_size,
+                                                  pending_heads[i], 1, used_idx + 1);
+            used_idx++;
+        end
+        pending_heads.delete();
+        pending_acks.delete();
+    endfunction
+
+    // 沿 split 描述符链走到末项（ack，设备可写），返回其 IOVA。
+    protected function bit [63:0] chain_tail(virtqueue_base vq, int unsigned head);
+        byte raw[];
+        int unsigned idx;
+
+        idx = head;
+        mem.read_mem(vq.desc_table_addr + idx * 16, 16, raw);
+        while ({raw[13], raw[12]} & VIRTQ_DESC_F_NEXT) begin
+            idx = {raw[15], raw[14]};
+            mem.read_mem(vq.desc_table_addr + idx * 16, 16, raw);
+        end
+        return {raw[7], raw[6], raw[5], raw[4], raw[3], raw[2], raw[1], raw[0]};
+    endfunction
+endclass : virtio_ctrl_vq_test_device
+
 class virtio_ctrl_vq_test extends uvm_test;
     `uvm_component_utils(virtio_ctrl_vq_test)
 
@@ -226,6 +316,8 @@ class virtio_ctrl_vq_test extends uvm_test;
         test_ctrl_vq_at_twice_max_pairs();
         test_ctrl_send_alloc_failure_rolls_back();
         test_ctrl_send_map_failure_rolls_back();
+        test_ctrl_send_timeout_resets_queue();
+        test_ctrl_send_timeout_quarantines_without_ring_reset();
         test_ctrl_vq_outside_data_range_migration_and_msix();
         `uvm_info("CTRL_VQ_TEST", "control VQ tests PASSED", UVM_NONE)
         phase.drop_objection(this);
@@ -540,6 +632,140 @@ class virtio_ctrl_vq_test extends uvm_test;
 
         `uvm_info("CTRL_VQ_TEST",
             "control VQ outside data range migration and MSI-X test PASSED", UVM_LOW)
+    endtask
+
+    // 协商 RING_RESET：第一条命令设备不应答 → 超时后 Q_RESET 并重新启用 control VQ；
+    // 设备随后的迟到完成不得被第二条命令消费，第二条命令拿到自己的 ack，描述符全部归还。
+    task test_ctrl_send_timeout_resets_queue();
+        virtio_ctrl_vq_test_device device =
+            virtio_ctrl_vq_test_device::type_id::create("timeout_reset_device");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("timeout_reset_ops");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("timeout_reset_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("timeout_reset_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("timeout_reset_iommu");
+        virtio_ctrl_vq_test_catcher catcher;
+        virtio_ctrl_ack_e first_ack;
+        virtio_ctrl_ack_e second_ack;
+        byte unsigned data[];
+        int unsigned expected_qids[$];
+        bit ok;
+
+        mem.init_region(64'h7400_0000, 64'h7400_FFFF);
+        wire_ops(ops, device, vq_mgr, mem, mem, iommu, 16'h0904);
+        device.vq_mgr = vq_mgr;
+        device.mem = mem;
+        device.iommu = iommu;
+        ops.wait_pol.default_timeout_ns = 200;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        assert(ok) else `uvm_fatal("CTRL_VQ_TEST", "control queue setup failed")
+
+        data = new[2];
+        data[0] = 8'h01;
+        data[1] = 8'h00;
+        catcher = new("timeout_reset_catcher");
+        catcher.expect_error("ATOMIC_OPS", "*ctrl_send: timeout waiting for control VQ completion*");
+        uvm_report_cb::add(null, catcher);
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      data, first_ack);
+        uvm_report_cb::delete(null, catcher);
+
+        device.complete_pending();   // 迟到完成：已确认复位的设备不再持有该命令
+        device.answer_on_kick = 1;
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      data, second_ack);
+        expected_qids = '{2, 2};
+        assert((first_ack == VIRTIO_NET_CTRL_ACK_ERR) &&
+               (second_ack == VIRTIO_NET_CTRL_ACK_OK) && (catcher.caught_count == 1) &&
+               (device.queue_reset_count == 1) && (device.last_reset_queue_id == 2) &&
+               (device.programmed_qids == expected_qids) &&
+               (vq_mgr.get_queue(2).get_free_count() == 8))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "ctrl_send timeout did not reset the control VQ before reuse (acks=%s/%s caught=%0d resets=%0d programmed=%p free=%0d)",
+                first_ack.name(), second_ack.name(), catcher.caught_count,
+                device.queue_reset_count, device.programmed_qids,
+                vq_mgr.get_queue(2).get_free_count()))
+
+        ops.teardown_queue(2);
+        assert((iommu.active_mapping_count() == 0) && (mem.outstanding_allocations() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", "timeout-reset test leaked control queue resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST", "ctrl_send timeout queue-reset test PASSED", UVM_LOW)
+    endtask
+
+    // 未协商 RING_RESET：超时命令无法单独复位，其缓冲保持映射与分配（IOVA 不会被
+    // 复用），迟到完成写入仍有效；control VQ 拒绝后续命令，确认的设备复位后才回收。
+    task test_ctrl_send_timeout_quarantines_without_ring_reset();
+        virtio_ctrl_vq_test_device device =
+            virtio_ctrl_vq_test_device::type_id::create("quarantine_device");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("quarantine_ops");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("quarantine_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("quarantine_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("quarantine_iommu");
+        virtio_ctrl_vq_test_catcher catcher;
+        virtqueue_base ctrl_vq;
+        virtio_ctrl_ack_e first_ack;
+        virtio_ctrl_ack_e second_ack;
+        byte unsigned data[];
+        int unsigned maps_before;
+        int unsigned allocs_before;
+        bit ok;
+
+        mem.init_region(64'h7500_0000, 64'h7500_FFFF);
+        wire_ops(ops, device, vq_mgr, mem, mem, iommu, 16'h0905);
+        device.vq_mgr = vq_mgr;
+        device.mem = mem;
+        device.iommu = iommu;
+        ops.wait_pol.default_timeout_ns = 200;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        assert(ok) else `uvm_fatal("CTRL_VQ_TEST", "control queue setup failed")
+        ctrl_vq = vq_mgr.get_queue(2);
+        maps_before = iommu.active_mapping_count();
+        allocs_before = mem.outstanding_allocations();
+
+        data = new[2];
+        data[0] = 8'h01;
+        data[1] = 8'h00;
+        catcher = new("quarantine_catcher");
+        catcher.expect_error("ATOMIC_OPS", "*ctrl_send: timeout waiting for control VQ completion*");
+        catcher.expect_error("ATOMIC_OPS", "*DMA is quarantined until device reset*");
+        catcher.expect_error("ATOMIC_OPS", "*ctrl_send: control VQ has quarantined DMA; device reset required*");
+        uvm_report_cb::add(null, catcher);
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      data, first_ack);
+        assert((first_ack == VIRTIO_NET_CTRL_ACK_ERR) && (device.queue_reset_count == 0) &&
+               (mem.outstanding_allocations() == allocs_before + 3) &&
+               (iommu.active_mapping_count() == maps_before + 3) &&
+               (ctrl_vq.get_free_count() == 5))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "ctrl_send timeout released DMA the device may still own (ack=%s resets=%0d allocs=%0d/%0d maps=%0d/%0d free=%0d)",
+                first_ack.name(), device.queue_reset_count, mem.outstanding_allocations(),
+                allocs_before, iommu.active_mapping_count(), maps_before,
+                ctrl_vq.get_free_count()))
+
+        device.complete_pending();   // 迟到完成写入仍映射的隔离缓冲
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      data, second_ack);
+        uvm_report_cb::delete(null, catcher);
+        assert((second_ack == VIRTIO_NET_CTRL_ACK_ERR) && (catcher.caught_count == 3) &&
+               (device.kick_count == 1))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "control VQ accepted a command while DMA was quarantined (ack=%s caught=%0d kicks=%0d)",
+                second_ack.name(), catcher.caught_count, device.kick_count))
+
+        ops.device_reset();
+        assert((vq_mgr.get_queue_count() == 0) && (iommu.active_mapping_count() == 0) &&
+               (mem.outstanding_allocations() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST",
+                "verified device reset did not release quarantined control DMA")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST", "ctrl_send timeout quarantine test PASSED", UVM_LOW)
     endtask
 endclass : virtio_ctrl_vq_test
 

@@ -6,6 +6,34 @@
     // ========================================================================
 
     // ------------------------------------------------------------------------
+    // reset_or_quarantine_vq -- 已发布但未得到有效完成的请求的唯一恢复入口
+    //
+    // 设备可能仍持有该请求的描述符与 DMA 缓冲。先让设备确认停止访问该队列：
+    // ring_reset=1 时经后端 Q_RESET，否则 full_reset_owner 非空时请求 PF 全复位，
+    // 两者皆无视为未确认。未确认时把 dma_set 移入隔离列表（之后 release_all 为空
+    // 操作），调用方不得复用该队列，直到设备复位后回收隔离列表。确认后由调用方按
+    // 各自的队列语义重建 ring。ctrl_send 与 admin_vq_submit 共用，不得复制。
+    // ------------------------------------------------------------------------
+    protected task reset_or_quarantine_vq(
+        int unsigned                  queue_id,
+        virtio_config_backend         backend,
+        bit                           ring_reset,
+        virtio_admin_full_reset_owner full_reset_owner,
+        virtio_dma_buffer_set         dma_set,
+        ref bit [63:0]                quarantined_iovas[$],
+        ref bit [63:0]                quarantined_gpas[$],
+        ref bit                       reset_complete
+    );
+        reset_complete = 0;
+        if (ring_reset)
+            backend.reset_queue(queue_id, reset_complete);
+        else if (full_reset_owner != null)
+            full_reset_owner.reset_pf_lifecycle(reset_complete);
+        if (!reset_complete)
+            dma_set.quarantine_into(quarantined_iovas, quarantined_gpas);
+    endtask
+
+    // ------------------------------------------------------------------------
     // admin_vq_submit -- Submit one PF Admin-VQ request and consume response
     //
     // The PF manager owns feature/lease/target validation.  This helper owns
@@ -68,6 +96,7 @@
         if ((admin_context.vq == null) ||
             (admin_context.transport == null) || (admin_context.mem == null) ||
             (admin_context.iommu == null) || (admin_context.wait_pol == null) ||
+            (admin_context.config_backend == null) ||
             (admin_context.response_capacity == 0) || !admin_context.configured ||
             !admin_context.special_vq_lease_valid || admin_context.special_vq_lease.frozen ||
             !admin_context.negotiated_features[VIRTIO_F_ADMIN_VQ]) begin
@@ -83,7 +112,9 @@
                 admin_context.transport.iommu_host_id()) ||
             (admin_context.vq.bdf != admin_context.transport.bdf) ||
             (admin_context.vq.mem != admin_context.mem) ||
-            (admin_context.vq.iommu != admin_context.iommu)) begin
+            (admin_context.vq.iommu != admin_context.iommu) ||
+            (admin_context.config_backend.bound_transport() !=
+                admin_context.transport)) begin
             `uvm_error("ATOMIC_OPS",
                 "admin_vq_submit: Admin VQ binding is inconsistent")
             break;
@@ -213,12 +244,11 @@
         // only when VIRTIO_F_RING_RESET was negotiated; Admin VQ alone does
         // not imply that feature, so otherwise reset the whole device.
         if (submitted && reset_required) begin
-            if (admin_context.negotiated_features[VIRTIO_F_RING_RESET])
-                admin_context.transport.write_queue_reset_verified(
-                    admin_context.queue_id, reset_complete
-                );
-            else
-                admin_context.full_reset_owner.reset_pf_lifecycle(reset_complete);
+            reset_or_quarantine_vq(admin_context.queue_id, admin_context.config_backend,
+                                   admin_context.negotiated_features[VIRTIO_F_RING_RESET],
+                                   admin_context.full_reset_owner, dma_set,
+                                   admin_context.quarantined_iovas,
+                                   admin_context.quarantined_gpas, reset_complete);
             admin_context.configured = 0;
             admin_context.recovery_required = 1;
             if (reset_complete) begin
@@ -227,8 +257,6 @@
                 admin_context.vq.alloc_rings();
             end else begin
                 admin_context.dma_quarantined = 1;
-                dma_set.quarantine_into(admin_context.quarantined_iovas,
-                                        admin_context.quarantined_gpas);
                 `uvm_error("ATOMIC_OPS", $sformatf(
                     "admin_vq_submit: Admin VQ %0d reset did not complete; DMA is quarantined",
                     admin_context.queue_id))
@@ -278,6 +306,10 @@
         byte             write_buf[];
         bit              got_used;
         int unsigned     data_alloc_size;
+        bit              reset_complete;
+        bit              requeued;
+        int unsigned     ctrl_size;
+        virtqueue_type_e ctrl_type;
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("ctrl_send: class=%s cmd=0x%02h data_len=%0d",
@@ -285,6 +317,14 @@
 
         // 所有失败路径都返回 ERR；只有读到设备写回的 OK 才改为 OK。
         ack = VIRTIO_NET_CTRL_ACK_ERR;
+
+        // 上一条命令超时且设备未确认复位：其缓冲仍在设备可达范围内，迟到完成可能
+        // 随时出现，此时提交会消费别人的完成；必须先完成设备复位。
+        if (ctrl_quarantined_gpas.size() != 0) begin
+            `uvm_error("ATOMIC_OPS",
+                "ctrl_send: control VQ has quarantined DMA; device reset required")
+            return;
+        end
 
         // Find control queue (highest queue ID among managed queues)
         ctrl_qid = 0;
@@ -407,7 +447,26 @@
         end
 
         if (!got_used) begin
+            // 与 Admin VQ 同一恢复路径。确认复位后拆除并按原大小/格式重新启用 control
+            // VQ（ring 与设备编程都重建）；未确认则隔离缓冲，等待设备复位。
             `uvm_error("ATOMIC_OPS", "ctrl_send: timeout waiting for control VQ completion")
+            reset_or_quarantine_vq(ctrl_qid, cfg_backend(),
+                                   negotiated_features[VIRTIO_F_RING_RESET], null, dma_set,
+                                   ctrl_quarantined_iovas, ctrl_quarantined_gpas,
+                                   reset_complete);
+            if (reset_complete) begin
+                ctrl_size = ctrl_vq.queue_size;
+                ctrl_type = ctrl_vq.descriptor_format();
+                teardown_queue(ctrl_qid);
+                setup_queue(ctrl_qid, ctrl_size, ctrl_type, requeued);
+                if (!requeued)
+                    `uvm_error("ATOMIC_OPS", $sformatf(
+                        "ctrl_send: control VQ %0d could not be re-enabled after reset", ctrl_qid))
+            end else begin
+                `uvm_error("ATOMIC_OPS", $sformatf(
+                    "ctrl_send: control VQ %0d reset did not complete; DMA is quarantined until device reset",
+                    ctrl_qid))
+            end
         end else begin
             // 8. Read ack status from host_mem
             mem.read_mem(dma_set.get_gpa(ack_idx), 1, ack_readback);
@@ -415,7 +474,7 @@
                 ack = VIRTIO_NET_CTRL_ACK_OK;
         end
 
-        // Cleanup IOMMU mappings and host memory
+        // 正常完成或已确认复位时释放；隔离后集合为空，这里是空操作。
         dma_set.release_all();
 
         `uvm_info("ATOMIC_OPS",
