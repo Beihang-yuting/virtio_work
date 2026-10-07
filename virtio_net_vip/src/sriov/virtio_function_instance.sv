@@ -317,7 +317,8 @@ class virtio_function_instance extends uvm_component;
     endfunction
 
     // 两阶段绑定的提交半段：把预检成功的候选一次性接入共享 Host/IOMMU/PCIe
-    // 资源；缺少预检状态时 UVM_FATAL 并返回 0，成功后清除暂存句柄。
+    // 资源；缺少预检状态时 UVM_FATAL 并返回 0；接线失败时丢弃候选后返回 0；
+    // 成功后清除暂存句柄。
     function bit commit_bind_pcie(
         input host_mem_manager hmem,
         input virtio_iommu_model iommu_mdl,
@@ -342,6 +343,7 @@ class virtio_function_instance extends uvm_component;
             $sformatf("function_%0d", vf_index), transport, vq_mgr,
             driver_agent, hmem, iommu_mdl, bar_mdl, einj, wpol, drv_cfg,
             pcie_rc_seqr, ops, fsm)) begin
+            cancel_bind_pcie();
             return 0;
         end
         mem = hmem;

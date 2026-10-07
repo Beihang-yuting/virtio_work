@@ -479,6 +479,41 @@ class virtio_dut_caps_malicious_reconfig extends virtio_dynamic_reconfig;
     endtask
 endclass
 
+// 私有控制桩：只为满足 private_cfg.validate 的非空要求，不会被调用到设备操作。
+class virtio_dut_caps_priv_control_stub extends dpu_priv_device_control;
+    `uvm_object_utils(virtio_dut_caps_priv_control_stub)
+
+    function new(string name = "virtio_dut_caps_priv_control_stub");
+        super.new(name);
+    endfunction
+
+    virtual task reset_device(int unsigned host_id, bit [15:0] bdf, output bit ok);
+        ok = 1;
+    endtask
+    virtual task configure_queue(dpu_priv_queue_context_t ctx, output bit ok);
+        ok = 1;
+    endtask
+    virtual task disable_queue(dpu_priv_queue_context_t ctx, output bit ok);
+        ok = 1;
+    endtask
+endclass
+
+// 带一条活动队列上下文的私有 ops：预检通过，但提交时 configure_private 拒绝重配，
+// 用于制造 commit_bind_pcie 的提交半段失败。
+class virtio_dut_caps_busy_priv_ops extends dpu_priv_atomic_ops;
+    `uvm_object_utils(virtio_dut_caps_busy_priv_ops)
+
+    function new(string name = "virtio_dut_caps_busy_priv_ops");
+        super.new(name);
+    endfunction
+
+    function void mark_queue_active();
+        dpu_priv_queue_context_t ctx;
+        ctx = '{default:0};
+        contexts[0] = ctx;
+    endfunction
+endclass
+
 class virtio_dut_caps_malicious_function extends virtio_function_instance;
     `uvm_component_utils(virtio_dut_caps_malicious_function)
 
@@ -2119,7 +2154,9 @@ class virtio_dut_caps_test extends uvm_test;
         if ((rebind_catcher.caught_count != 1) || bind_succeeded ||
             (mq_binding_function.driver_agent.ops != ops_spy) ||
             (mq_binding_function.driver_agent.fsm != fsm_probe) ||
-            (ops_spy.transport != transport) || (ops_spy.vq_mgr != vq_mgr)) begin
+            (ops_spy.transport != transport) || (ops_spy.vq_mgr != vq_mgr) ||
+            (mq_binding_function.pending_pcie_ops_candidate() != null) ||
+            (mq_binding_function.pending_pcie_fsm_candidate() != null)) begin
             `uvm_fatal("DUT_CAPS",
                 "failed MQ-limit rebind partially replaced function bindings")
         end
@@ -2194,6 +2231,86 @@ class virtio_dut_caps_test extends uvm_test;
                 ops_spy.teardown_count,
                 fsm_probe.observed_active_num_pairs(), fsm_probe.state.name()))
         end
+    endtask
+
+    // 提交半段失败（私有 ops 仍有活动队列）必须丢弃预检候选，且不改动已提交连接。
+    task assert_function_commit_failure_discards_candidates();
+        virtio_driver_config_t saved_cfg;
+        virtio_driver_config_t private_behavior;
+        dpu_priv_driver_config saved_private_cfg;
+        virtio_pci_transport saved_transport;
+        virtqueue_manager saved_vq_mgr;
+        virtio_atomic_ops saved_ops;
+        virtio_auto_fsm saved_fsm;
+        virtio_driver_protocol saved_protocol;
+        dpu_priv_driver_config private_cfg;
+        virtio_dut_caps_busy_priv_ops busy_ops;
+        dpu_priv_auto_fsm private_fsm;
+        virtio_dut_caps_expected_exact_error catcher;
+        bit preflight_ok;
+        bit bind_succeeded;
+
+        saved_cfg = mq_binding_function.drv_cfg;
+        saved_private_cfg = mq_binding_function.private_cfg;
+        saved_transport = mq_binding_function.transport;
+        saved_vq_mgr = mq_binding_function.vq_mgr;
+        saved_ops = mq_binding_function.driver_agent.ops;
+        saved_fsm = mq_binding_function.driver_agent.fsm;
+        saved_protocol = mq_binding_function.protocol;
+
+        private_cfg = dpu_priv_driver_config::type_id::create(
+            "commit_failure_private_cfg");
+        private_cfg.control = virtio_dut_caps_priv_control_stub::type_id::create(
+            "commit_failure_private_control");
+        busy_ops = virtio_dut_caps_busy_priv_ops::type_id::create(
+            "commit_failure_busy_ops");
+        busy_ops.mark_queue_active();
+        private_fsm = dpu_priv_auto_fsm::type_id::create(
+            "commit_failure_private_fsm");
+        private_behavior = saved_cfg;
+        private_behavior.num_queue_pairs = 1;
+        private_behavior.max_vio_net_qpairs_per_device = 1;
+        private_behavior.vq_type = VQ_CUSTOM;
+        private_behavior.irq_mode = IRQ_POLLING;
+        mq_binding_function.private_cfg = private_cfg;
+        mq_binding_function.drv_cfg = private_behavior;
+        mq_binding_function.transport = virtio_pci_transport::type_id::create(
+            "commit_failure_transport");
+        mq_binding_function.vq_mgr = virtqueue_manager::type_id::create(
+            "commit_failure_vq_mgr");
+        mq_binding_function.driver_agent.ops = busy_ops;
+        mq_binding_function.driver_agent.fsm = private_fsm;
+
+        catcher = new("commit_failure_catcher", mq_binding_function,
+            "FUNCTION_BIND", {"无法冻结私有驱动配置: ",
+                              "private 配置为空或仍有活动队列"});
+        uvm_report_cb::add(null, catcher);
+        preflight_ok = mq_binding_function.preflight_bind_pcie(mq_pcie_seqr);
+        bind_succeeded = preflight_ok &&
+            mq_binding_function.commit_bind_pcie(
+                null, null, null, null, null, mq_pcie_seqr);
+        uvm_report_cb::delete(null, catcher);
+
+        if (!preflight_ok || bind_succeeded || (catcher.caught_count != 1) ||
+            (mq_binding_function.pending_pcie_ops_candidate() != null) ||
+            (mq_binding_function.pending_pcie_fsm_candidate() != null) ||
+            (mq_binding_function.protocol != saved_protocol) ||
+            (busy_ops.transport != null) || (private_fsm.ops != null)) begin
+            `uvm_fatal("DUT_CAPS", $sformatf(
+                {"function commit failure kept staged candidates or partial ",
+                 "bindings: preflight=%0d result=%0d caught=%0d ",
+                 "pending_ops=%0d pending_fsm=%0d"},
+                preflight_ok, bind_succeeded, catcher.caught_count,
+                mq_binding_function.pending_pcie_ops_candidate() != null,
+                mq_binding_function.pending_pcie_fsm_candidate() != null))
+        end
+
+        mq_binding_function.private_cfg = saved_private_cfg;
+        mq_binding_function.drv_cfg = saved_cfg;
+        mq_binding_function.transport = saved_transport;
+        mq_binding_function.vq_mgr = saved_vq_mgr;
+        mq_binding_function.driver_agent.ops = saved_ops;
+        mq_binding_function.driver_agent.fsm = saved_fsm;
     endtask
 
     task assert_mandatory_fsm_guards_cannot_be_overridden();
@@ -3690,6 +3807,7 @@ class virtio_dut_caps_test extends uvm_test;
         assert_expected_error_catchers_match_client();
         assert_dynamic_resize_limit();
         assert_driver_mq_dispatch_uses_dut_cap();
+        assert_function_commit_failure_discards_candidates();
         assert_mandatory_fsm_guards_cannot_be_overridden();
         assert_dynamic_resize_guard_cannot_be_overridden();
         assert_function_bind_guard_cannot_be_overridden();
