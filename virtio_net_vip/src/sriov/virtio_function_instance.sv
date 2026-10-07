@@ -435,6 +435,7 @@ class virtio_function_instance extends uvm_component;
         if (driver_agent_ref != null) begin
             driver_agent_ref.ops = ops;
             driver_agent_ref.fsm = fsm;
+            driver_agent_ref.protocol = pending_protocol;
             if (driver_agent_ref.driver != null) begin
                 driver_agent_ref.driver.ops = ops;
                 driver_agent_ref.driver.fsm = fsm;

@@ -9,12 +9,12 @@
 //   - virtio_sequencer (active mode only) -- arbitrates sequences
 //   - virtio_monitor   (always)           -- passive protocol observation
 //
-// The agent receives shared component references (ops, fsm) from the env
+// The agent receives shared component references (ops, fsm, protocol) from the env
 // before build_phase and injects them into the driver during connect_phase.
 //
 // Usage:
 //   - Set is_active via uvm_config_db or agent config before build_phase
-//   - Assign ops and fsm from the env before connect_phase
+//   - Assign ops, fsm and (optionally) protocol from the env before connect_phase
 //   - Connect monitor.transport and monitor.vq_mgr from the env
 //
 // Depends on:
@@ -34,6 +34,7 @@ class virtio_driver_agent extends uvm_agent;
     // ===== Shared component references (set by env before build) =====
     virtio_atomic_ops   ops;
     virtio_auto_fsm     fsm;
+    virtio_driver_protocol protocol;
 
     // ========================================================================
     // Constructor
@@ -76,6 +77,8 @@ class virtio_driver_agent extends uvm_agent;
                 driver.ops = ops;
             if (fsm != null)
                 driver.fsm = fsm;
+            if (protocol != null)
+                driver.protocol = protocol;
         end
 
         if (ops != null) begin

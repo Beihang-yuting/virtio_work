@@ -2115,6 +2115,11 @@ class virtio_dut_caps_test extends uvm_test;
                   null, null, null, null, null, mq_pcie_seqr))) begin
             `uvm_fatal("DUT_CAPS", "valid MQ function PCIe bind failed")
         end
+        // 提交路径把驱动协议交给 agent，使之后才创建/绑定的 driver 也拿到同一协议。
+        if ((mq_binding_function.protocol == null) ||
+            (mq_binding_function.driver_agent.protocol != mq_binding_function.protocol))
+            `uvm_fatal("DUT_CAPS",
+                "committed function did not hand its driver protocol to the agent")
         mq_driver.ops = ops;
         mq_driver.fsm = fsm;
         fsm_probe.state = FSM_RUNNING;

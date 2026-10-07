@@ -336,6 +336,7 @@ class virtio_unit_test extends uvm_test;
     virtio_driver_agent late_binding_agent;
     virtio_atomic_ops late_binding_ops;
     virtio_auto_fsm late_binding_fsm;
+    virtio_driver_protocol late_binding_protocol;
 
     function new(string name, uvm_component parent);
         super.new(name, parent);
@@ -352,6 +353,8 @@ class virtio_unit_test extends uvm_test;
             "late_binding_ops");
         late_binding_fsm = virtio_auto_fsm::type_id::create(
             "late_binding_fsm");
+        late_binding_protocol = dpu_priv_driver_protocol::type_id::create(
+            "late_binding_protocol");
         uvm_config_db#(uvm_active_passive_enum)::set(
             this, "late_binding_agent", "is_active", UVM_ACTIVE);
         late_binding_agent = virtio_driver_agent::type_id::create(
@@ -362,6 +365,7 @@ class virtio_unit_test extends uvm_test;
         super.connect_phase(phase);
         late_binding_agent.ops = late_binding_ops;
         late_binding_agent.fsm = late_binding_fsm;
+        late_binding_agent.protocol = late_binding_protocol;
     endfunction
 
     virtual task run_phase(uvm_phase phase);
@@ -459,6 +463,8 @@ class virtio_unit_test extends uvm_test;
             else `uvm_error("TEST", "late-bound ops did not reach active driver")
         assert(late_binding_agent.driver.fsm == late_binding_fsm)
             else `uvm_error("TEST", "late-bound fsm did not reach active driver")
+        assert(late_binding_agent.driver.protocol == late_binding_protocol)
+            else `uvm_error("TEST", "late-bound protocol did not reach active driver")
         `uvm_info("UNIT_TEST", "test_late_driver_agent_binding PASSED", UVM_LOW)
     endtask
 
