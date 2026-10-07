@@ -1065,8 +1065,8 @@ class virtio_vdev_unit_test extends uvm_test;
     endtask
 
     // 独立设备暴露的 VIP 缺陷：common-config 后端 set_msix 必须在设备上打开 MSI-X（Enable=1、
-    // Function Mask=0）并清掉所用向量的 Vector Control；clear_msix 必须重新屏蔽。Message Control
-    // 与 Vector Control 都按读改写更新，保留其余位。
+    // Function Mask=0）并清掉所用向量的 Vector Control；clear_msix 屏蔽向量并清 Enable（同
+    // pci_disable_msix）。Message Control 与 Vector Control 都按读改写更新，保留其余位。
     task test_vip_msix_enables_device();
         virtio_pci_transport t;
         vdev_loopback_bar_accessor acc;
@@ -1111,8 +1111,9 @@ class virtio_vdev_unit_test extends uvm_test;
                     "set_msix left vector %0d masked or dropped its other Vector Control bits", i))
         be.clear_msix(ok);
         v = port.host_cfg_read(STD_BDF, {4'h0, cap});
-        if (!ok || !v[30] || (port.host_read(STD_BAR4 + 12, 4) != 32'h0000_0101))
-            `uvm_fatal("VDEV_UNIT", "clear_msix did not mask the device MSI-X function/vectors")
+        if (!ok || v[31] || v[30] || (port.host_read(STD_BAR4 + 12, 4) != 32'h0000_0101))
+            `uvm_fatal("VDEV_UNIT", $sformatf(
+                "clear_msix must mask the vectors and clear only MSI-X Enable (ctrl=0x%04h)", v[31:16]))
         // 每次 Message Control 写都带回读到的只读位（Table Size = 6 个向量 - 1）。
         std_log.select(VDEV_REG_WR, ev);
         foreach (ev[i])

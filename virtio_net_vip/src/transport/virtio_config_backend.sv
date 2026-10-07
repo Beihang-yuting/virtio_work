@@ -244,10 +244,15 @@ class virtio_common_cfg_backend extends virtio_config_backend;
         ok = 1;
     endtask
 
+    // 同 Linux pci_disable_msix：屏蔽全部向量后清 MSI-X Enable（Function Mask 保持原值）。
     virtual task clear_msix(output bit ok);
+        bit [31:0] ctrl;
+
         transport.notify_mgr.mask_all();
-        if (transport.cap_mgr.has_msix())
-            update_msix_control(1'b1, 1'b1);
+        if (transport.cap_mgr.has_msix()) begin
+            read_msix_control(ctrl);
+            update_msix_control(1'b0, ctrl[30]);
+        end
         ok = 1;
     endtask
 
