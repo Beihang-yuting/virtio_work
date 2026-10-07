@@ -8,6 +8,14 @@ import uvm_pkg::*;
 `include "uvm_macros.svh"
 import virtio_net_pkg::*;
 
+// 最小 token：只用于核对完成返回的对象身份。
+class vdev_unit_token extends uvm_object;
+    `uvm_object_utils(vdev_unit_token)
+    function new(string name = "vdev_unit_token");
+        super.new(name);
+    endfunction
+endclass
+
 // 底座测试设备：BAR0+0 为 scratch 寄存器；BAR0+4 写入任意值触发一次服务：
 // 从 echo_iova 读 4 字节、加一写回 echo_iova+4，然后发向量 0；BAR0+8 写入任意值只发向量 0。
 class vdev_unit_echo_device extends vdev_base;
@@ -72,6 +80,10 @@ class virtio_vdev_unit_test extends uvm_test;
     localparam bit [63:0] ECHO_BAR0 = 64'h0000_0040_0000_0000;
     localparam bit [63:0] ECHO_BAR2 = 64'h0000_0040_0001_0000;
     localparam bit [63:0] ECHO_BAR4 = 64'h0000_0040_0002_0000;
+    localparam bit [15:0] STD_BDF   = 16'h0400;
+    localparam bit [63:0] STD_BAR0  = 64'h0000_0041_0000_0000;
+    localparam bit [63:0] STD_BAR2  = 64'h0000_0041_0001_0000;
+    localparam bit [63:0] STD_BAR4  = 64'h0000_0041_0002_0000;
 
     host_mem_manager      mem;
     virtio_iommu_model    iommu;
@@ -79,6 +91,9 @@ class virtio_vdev_unit_test extends uvm_test;
     vdev_loopback_port    port;
     vdev_unit_echo_device echo;
     vdev_event_log        echo_log;
+    vdev_virtio_pci       std;
+    vdev_event_log        std_log;
+    virtio_vq_test_kit    std_kit;
     int unsigned          irq_base;   // 本子测试开始时的 interrupt_count
 
     function new(string name = "virtio_vdev_unit_test", uvm_component parent = null);
@@ -98,11 +113,15 @@ class virtio_vdev_unit_test extends uvm_test;
         port.host_id = 0;
         echo = vdev_unit_echo_device::type_id::create("echo", this);
         echo_log = vdev_event_log::type_id::create("echo_log", this);
+        std_kit = virtio_vq_test_kit::create_kit("vdev_std", mem, iommu, STD_BDF);
+        std = vdev_virtio_pci::type_id::create("std", this);
+        std_log = vdev_event_log::type_id::create("std_log", this);
     endfunction
 
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
         echo.event_ap.connect(echo_log.analysis_export);
+        std.event_ap.connect(std_log.analysis_export);
     endfunction
 
     // 把三对 64 位 BAR 写进设备配置空间（等价平台枚举）。
@@ -358,6 +377,462 @@ class virtio_vdev_unit_test extends uvm_test;
         `uvm_info("VDEV_UNIT", "test_base_command_gating PASSED", UVM_LOW)
     endtask
 
+    protected function void std_wr(bit [31:0] off, int unsigned size, bit [31:0] data);
+        port.host_write(STD_BAR0 + off, size, data);
+    endfunction
+
+    protected function bit [31:0] std_rd(bit [31:0] off, int unsigned size);
+        return port.host_read(STD_BAR0 + off, size);
+    endfunction
+
+    // 沿能力链找第一个 id（vendor cap 再按 cfg_type 区分）；未找到返回 0。
+    protected function bit [7:0] find_cap(bit [15:0] target, bit [7:0] id, bit [7:0] cfg_type = 0);
+        bit [31:0] v;
+        bit [7:0] ptr;
+
+        v = port.host_cfg_read(target, 12'h034);
+        ptr = v[7:0];
+        while (ptr != 0) begin
+            v = port.host_cfg_read(target, {4'h0, ptr});
+            if ((v[7:0] == id) && ((id != 8'h09) || (v[31:24] == cfg_type)))
+                return ptr;
+            ptr = v[15:8];
+        end
+        return 0;
+    endfunction
+
+    // 标准初始化到 FEATURES_OK（不写 DRIVER_OK）；返回读回的 status。
+    protected function bit [7:0] std_negotiate(bit [63:0] drv);
+        std_wr(32'h14, 1, 0);
+        std_wr(32'h14, 1, 8'h03);
+        std_wr(32'h08, 4, 0);
+        std_wr(32'h0c, 4, drv[31:0]);
+        std_wr(32'h08, 4, 1);
+        std_wr(32'h0c, 4, drv[63:32]);
+        std_wr(32'h14, 1, 8'h0b);
+        return std_rd(32'h14, 1);
+    endfunction
+
+    // MSI-X：向量 v → 地址 0xFEE0_0000+4v、数据 v，全部解除屏蔽，再使能。
+    protected function void std_msix_on();
+        bit [7:0] cap;
+
+        for (int unsigned v = 0; v < 6; v++) begin
+            port.host_write(STD_BAR4 + 16*v, 4, 32'hfee0_0000 + 4*v);
+            port.host_write(STD_BAR4 + 16*v + 4, 4, 0);
+            port.host_write(STD_BAR4 + 16*v + 8, 4, v);
+            port.host_write(STD_BAR4 + 16*v + 12, 4, 0);
+        end
+        cap = find_cap(STD_BDF, 8'h11);
+        port.host_cfg_write(STD_BDF, {4'h0, cap}, 32'h8000_0000, 4'hc);
+    endfunction
+
+    // 把队列 q 的 ring 映射进 IOMMU 并编程（缺 skip_driver 时故意不写 driver 地址）；返回 ring IOVA。
+    protected function void std_program_queue(int unsigned q, virtqueue_base vq, bit enable,
+                                              bit skip_driver, ref bit [63:0] iovas[$]);
+        bit [63:0] gpas[$];
+        int unsigned sizes[$];
+
+        vq.get_ring_regions(gpas, sizes);
+        iovas.delete();
+        foreach (gpas[i])
+            iovas.push_back(iommu.map_for_host(0, STD_BDF, gpas[i], sizes[i], DMA_BIDIRECTIONAL));
+        std_wr(32'h16, 2, q);
+        std_wr(32'h18, 2, vq.queue_size);
+        std_wr(32'h1a, 2, q + 1);
+        std_wr(32'h20, 4, iovas[0][31:0]);
+        std_wr(32'h24, 4, iovas[0][63:32]);
+        if (!skip_driver) begin
+            std_wr(32'h28, 4, iovas[1][31:0]);
+            std_wr(32'h2c, 4, iovas[1][63:32]);
+        end
+        std_wr(32'h30, 4, iovas[2][31:0]);
+        std_wr(32'h34, 4, iovas[2][63:32]);
+        if (enable)
+            std_wr(32'h1c, 2, 1);
+    endfunction
+
+    protected function void std_release(virtqueue_base vq, bit [63:0] iovas[$]);
+        foreach (iovas[i])
+            iommu.unmap_for_host(0, STD_BDF, iovas[i]);
+        vq.free_rings();
+    endfunction
+
+    // 一个单 SG 的 buffer：分配、写入 data、按方向映射；返回 SG 列表（地址为 IOVA）。
+    protected function void std_buffer(byte unsigned data[$], int unsigned size, dma_dir_e dir,
+                                       output bit [63:0] gpa, output bit [63:0] iova,
+                                       output virtio_sg_list sg);
+        byte raw[];
+
+        gpa = mem.alloc(size, 64);
+        raw = new[size];
+        foreach (raw[i])
+            raw[i] = (i < data.size()) ? data[i] : 8'h00;
+        mem.write_mem(gpa, raw);
+        iova = iommu.map_for_host(0, STD_BDF, gpa, size, dir);
+        sg.entries.delete();
+        sg.entries.push_back('{addr: iova, len: size, is_indirect: 0});
+    endfunction
+
+    protected task wait_used(virtqueue_base vq, output uvm_object tok, output int unsigned len);
+        uvm_object t;
+        int unsigned l;
+
+        tok = null;
+        len = 0;
+        for (int i = 0; i < 200; i++) begin
+            if (vq.poll_used(t, l)) begin
+                tok = t;
+                len = l;
+                return;
+            end
+            #10ns;
+        end
+        `uvm_fatal("VDEV_UNIT", $sformatf("queue %0d produced no used entry", vq.queue_id))
+    endtask
+
+    // 配置空间与特性：四个 virtio cap 的 BAR 角色、DFSELECT 窗口、FEATURES_OK 拒绝与 features 事件。
+    task test_std_config_and_features();
+        bit [31:0] v;
+        bit [7:0] cap;
+        vdev_event ev[$];
+
+        std.bdf = STD_BDF;
+        std.max_pairs = 2;
+        std.device_features = 64'h0000_0001_0000_0000;
+        std.device_features[VIRTIO_NET_F_MAC] = 1;
+        std.device_features[VIRTIO_NET_F_CTRL_VQ] = 1;
+        std.device_features[VIRTIO_NET_F_MQ] = 1;
+        std.device_features[VIRTIO_F_RING_PACKED] = 1;
+        std.init();
+        port.attach(std);
+        program_bars(STD_BDF, STD_BAR0, STD_BAR2, STD_BAR4);
+        port.host_cfg_write(STD_BDF, 12'h004, 32'h0000_0006, 4'h3);   // MSE + BME
+        if (port.host_cfg_read(STD_BDF, 12'h000) != 32'h1041_1af4)
+            `uvm_fatal("VDEV_UNIT", "standard device ID mismatch")
+        cap = find_cap(STD_BDF, 8'h09, VIRTIO_PCI_CAP_NOTIFY_CFG);
+        v = port.host_cfg_read(STD_BDF, {4'h0, cap} + 4);
+        if ((cap == 0) || (v[7:0] != 2) ||
+            (port.host_cfg_read(STD_BDF, {4'h0, cap} + 16) != 4) ||
+            (find_cap(STD_BDF, 8'h09, VIRTIO_PCI_CAP_COMMON_CFG) == 0) ||
+            (find_cap(STD_BDF, 8'h09, VIRTIO_PCI_CAP_ISR_CFG) == 0) ||
+            (find_cap(STD_BDF, 8'h09, VIRTIO_PCI_CAP_DEVICE_CFG) == 0))
+            `uvm_fatal("VDEV_UNIT", "virtio capabilities or notify BAR/multiplier mismatch")
+        if ((std_rd(32'h12, 2) != 5) || (std_rd(32'h2008, 2) != 2))
+            `uvm_fatal("VDEV_UNIT", "num_queues/max_virtqueue_pairs mismatch")
+        std_wr(32'h00, 4, 0);
+        v = std_rd(32'h04, 4);
+        std_wr(32'h00, 4, 1);
+        if ((v != std.device_features[31:0]) || (std_rd(32'h04, 4) != std.device_features[63:32]))
+            `uvm_fatal("VDEV_UNIT", "DFSELECT window did not select the feature word")
+        std_log.events.delete();
+        v = std_negotiate(64'h0000_0001_0000_0001);     // 设备未提供 CSUM
+        std_log.select(VDEV_FEATURES, ev);
+        if ((v & DEV_STATUS_FEATURES_OK) || (ev.size() != 1) ||
+            (ev[0].drv_accepted != 64'h0000_0001_0000_0001))
+            `uvm_fatal("VDEV_UNIT", "device accepted a feature it never offered")
+        v = std_negotiate(std.device_features & ~(64'h1 << VIRTIO_F_RING_PACKED));
+        if (!(v & DEV_STATUS_FEATURES_OK))
+            `uvm_fatal("VDEV_UNIT", "device rejected a valid feature subset")
+        std_log.select(VDEV_STATUS, ev);
+        if ((ev.size() == 0) || (ev[ev.size() - 1].to_status != 8'h0b))
+            `uvm_fatal("VDEV_UNIT", "status transition event missing")
+        `uvm_info("VDEV_UNIT", "test_std_config_and_features PASSED", UVM_LOW)
+    endtask
+
+    // 规范 Review Focus 2：缺写 queue_driver 时 enable 被拒，补写后 enable 成功并发 queue_cfg。
+    task test_std_enable_requires_all_addresses();
+        split_virtqueue vq;
+        bit [63:0] iovas[$];
+        vdev_event ev[$];
+        vdev_expect_catcher catcher;
+
+        vq = std_kit.make_split("enable_rx", 0, 8, STD_BDF);
+        std_log.events.delete();
+        catcher = new("enable_catcher");
+        catcher.id = "VDEV_QUEUE";
+        catcher.text = "queue_driver not written";
+        uvm_report_cb::add(null, catcher);
+        std_program_queue(0, vq, 1, 1, iovas);
+        uvm_report_cb::delete(null, catcher);
+        std_log.select(VDEV_QUEUE_CFG, ev);
+        if ((catcher.caught != 1) || (std_rd(32'h1c, 2) != 0) || (ev.size() != 0))
+            `uvm_fatal("VDEV_UNIT", "enable without queue_driver was not rejected")
+        std_wr(32'h28, 4, iovas[1][31:0]);
+        std_wr(32'h2c, 4, iovas[1][63:32]);
+        std_wr(32'h1c, 2, 1);
+        std_log.select(VDEV_QUEUE_CFG, ev);
+        if ((std_rd(32'h1c, 2) != 1) || (ev.size() != 1) || (ev[0].q != 0) || (ev[0].size != 8) ||
+            (ev[0].vector != 1) || (ev[0].ring_fmt != "split"))
+            `uvm_fatal("VDEV_UNIT", "complete queue programming did not enable the queue")
+        std_wr(32'h1c, 2, 0);
+        std_release(vq, iovas);
+        `uvm_info("VDEV_UNIT", "test_std_enable_requires_all_addresses PASSED", UVM_LOW)
+    endtask
+
+    // split：TX 帧（含 12B header）回环到 RX；校验 RX buffer 字节、事件与 MSI-X。
+    task test_std_split_tx_loopback_rx();
+        split_virtqueue rxq, txq;
+        bit [63:0] rx_iovas[$], tx_iovas[$];
+        bit [63:0] rx_gpa, rx_iova, tx_gpa, tx_iova;
+        virtio_sg_list sgs[];
+        byte unsigned tx_bytes[$];
+        byte unsigned none[$];
+        byte got[];
+        uvm_object tok;
+        int unsigned len;
+        vdev_unit_token rx_tok, tx_tok;
+        vdev_event ev[$];
+
+        void'(std_negotiate(64'h0000_0001_0000_0000));
+        rxq = std_kit.make_split("split_rx", 0, 8, STD_BDF);
+        txq = std_kit.make_split("split_tx", 1, 8, STD_BDF);
+        std_program_queue(0, rxq, 1, 0, rx_iovas);
+        std_program_queue(1, txq, 1, 0, tx_iovas);
+        std_msix_on();
+        std_wr(32'h14, 1, 8'h0f);
+        tx_bytes = '{8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00,
+                     8'hde, 8'had, 8'hbe, 8'hef, 8'h01, 8'h02, 8'h03, 8'h04};
+        sgs = new[1];
+        std_buffer(none, 64, DMA_FROM_DEVICE, rx_gpa, rx_iova, sgs[0]);
+        rx_tok = new("rx_tok");
+        void'(rxq.add_buf(sgs, 0, 1, rx_tok, 0));
+        port.host_write(STD_BAR2 + 0, 2, 0);
+        std_buffer(tx_bytes, tx_bytes.size(), DMA_TO_DEVICE, tx_gpa, tx_iova, sgs[0]);
+        tx_tok = new("tx_tok");
+        std_log.events.delete();
+        void'(txq.add_buf(sgs, 1, 0, tx_tok, 0));
+        port.host_write(STD_BAR2 + 4, 2, 1);
+        wait_used(txq, tok, len);
+        if ((tok != tx_tok) || (len != 0))
+            `uvm_fatal("VDEV_UNIT", "TX used entry token/len mismatch")
+        wait_used(rxq, tok, len);
+        mem.read_mem(rx_gpa, 20, got);
+        if ((tok != rx_tok) || (len != 20) || (got[10] != 8'h01) || (got[12] != 8'hde) ||
+            (got[19] != 8'h04))
+            `uvm_fatal("VDEV_UNIT", "RX buffer does not hold header(num_buffers=1)+looped frame")
+        std_log.select(VDEV_PKT, ev);
+        if ((ev.size() != 2) || (ev[0].dir != "tx") || (ev[1].dir != "rx") ||
+            (ev[0].bytes != ev[1].bytes) || (ev[0].bytes.size() != 8))
+            `uvm_fatal("VDEV_UNIT", "pkt events do not show the same 8-byte frame on TX and RX")
+        std_log.select(VDEV_IRQ, ev);
+        if ((ev.size() != 2) || (port.msix_data[port.msix_data.size() - 1] != 1))
+            `uvm_fatal("VDEV_UNIT", "queue completions did not raise their MSI-X vectors")
+        iommu.unmap_for_host(0, STD_BDF, rx_iova);
+        iommu.unmap_for_host(0, STD_BDF, tx_iova);
+        mem.free(rx_gpa);
+        mem.free(tx_gpa);
+        std_wr(32'h14, 1, 0);
+        std_release(rxq, rx_iovas);
+        std_release(txq, tx_iovas);
+        `uvm_info("VDEV_UNIT", "test_std_split_tx_loopback_rx PASSED", UVM_LOW)
+    endtask
+
+    // packed：TX 完成写回 head 槽的 id/len/flags（AVAIL=USED=wrap），驱动 poll_used 认领。
+    task test_std_packed_tx();
+        packed_virtqueue txq;
+        bit [63:0] iovas[$];
+        bit [63:0] gpa, iova;
+        virtio_sg_list sgs[];
+        byte unsigned bytes[$];
+        uvm_object tok;
+        int unsigned len;
+        vdev_unit_token t;
+        vdev_event ev[$];
+
+        void'(std_negotiate(64'h0000_0001_0000_0000 | (64'h1 << VIRTIO_F_RING_PACKED)));
+        txq = std_kit.make_packed("packed_tx", 1, 8, STD_BDF);
+        std_program_queue(1, txq, 1, 0, iovas);
+        std_wr(32'h14, 1, 8'h0f);
+        for (int i = 0; i < 16; i++)
+            bytes.push_back(i);
+        sgs = new[1];
+        std_buffer(bytes, 16, DMA_TO_DEVICE, gpa, iova, sgs[0]);
+        t = new("packed_tok");
+        std_log.events.delete();
+        void'(txq.add_buf(sgs, 1, 0, t, 0));
+        port.host_write(STD_BAR2 + 4, 2, 1);
+        wait_used(txq, tok, len);
+        std_log.select(VDEV_QUEUE_CFG, ev);
+        if (ev.size() != 0)
+            `uvm_fatal("VDEV_UNIT", "packed TX datapath produced queue_cfg events")
+        if (tok != t)
+            `uvm_fatal("VDEV_UNIT", "packed used descriptor returned the wrong token")
+        std_log.select(VDEV_PKT, ev);
+        if ((ev.size() != 1) || (ev[0].bytes.size() != 4))
+            `uvm_fatal("VDEV_UNIT", "packed TX frame (16B minus 12B header) not observed")
+        iommu.unmap_for_host(0, STD_BDF, iova);
+        mem.free(gpa);
+        std_wr(32'h14, 1, 0);
+        std_release(txq, iovas);
+        `uvm_info("VDEV_UNIT", "test_std_packed_tx PASSED", UVM_LOW)
+    endtask
+
+    // ctrl VQ：MQ VQ_PAIRS_SET 2 → ACK_OK；5（超过 max_pairs）→ ACK_ERR；ctrl 事件记录 class/cmd/data/ack。
+    task test_std_ctrl_mq();
+        split_virtqueue cq;
+        bit [63:0] iovas[$];
+        bit [63:0] hdr_gpa, hdr_iova, data_gpa, data_iova, ack_gpa, ack_iova;
+        virtio_sg_list sgs[];
+        byte unsigned hdr_b[$], data_b[$], none[$];
+        byte got[];
+        uvm_object tok;
+        int unsigned len;
+        vdev_unit_token t;
+        vdev_event ev[$];
+        bit [63:0] drv;
+
+        drv = 64'h0000_0001_0000_0000;
+        drv[VIRTIO_NET_F_CTRL_VQ] = 1;
+        drv[VIRTIO_NET_F_MQ] = 1;
+        void'(std_negotiate(drv));
+        cq = std_kit.make_split("ctrl_q", 4, 8, STD_BDF);
+        std_program_queue(4, cq, 1, 0, iovas);
+        std_wr(32'h14, 1, 8'h0f);
+        std_log.events.delete();
+        for (int round = 0; round < 2; round++) begin
+            hdr_b = '{VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET};
+            data_b = '{(round == 0) ? 8'd2 : 8'd5, 8'd0};
+            sgs = new[3];
+            std_buffer(hdr_b, 2, DMA_TO_DEVICE, hdr_gpa, hdr_iova, sgs[0]);
+            std_buffer(data_b, 2, DMA_TO_DEVICE, data_gpa, data_iova, sgs[1]);
+            std_buffer(none, 1, DMA_FROM_DEVICE, ack_gpa, ack_iova, sgs[2]);
+            t = new("ctrl_tok");
+            void'(cq.add_buf(sgs, 2, 1, t, 0));
+            port.host_write(STD_BAR2 + 16, 2, 4);
+            wait_used(cq, tok, len);
+            mem.read_mem(ack_gpa, 1, got);
+            if ((tok != t) || (len != 1) || (got[0] != ((round == 0) ? 0 : 1)))
+                `uvm_fatal("VDEV_UNIT", $sformatf("MQ VQ_PAIRS_SET round %0d ack=%0d", round, got[0]))
+            iommu.unmap_for_host(0, STD_BDF, hdr_iova);
+            iommu.unmap_for_host(0, STD_BDF, data_iova);
+            iommu.unmap_for_host(0, STD_BDF, ack_iova);
+            mem.free(hdr_gpa);
+            mem.free(data_gpa);
+            mem.free(ack_gpa);
+        end
+        std_log.select(VDEV_CTRL, ev);
+        if ((ev.size() != 2) || (ev[0].ctrl_class != VIRTIO_NET_CTRL_MQ) || (ev[0].ack != 0) ||
+            (ev[0].ctrl_data.size() != 2) || (ev[0].ctrl_data[0] != 2) || (ev[1].ack != 1))
+            `uvm_fatal("VDEV_UNIT", "ctrl events do not record the MQ command sequence")
+        std_wr(32'h14, 1, 0);
+        std_release(cq, iovas);
+        `uvm_info("VDEV_UNIT", "test_std_ctrl_mq PASSED", UVM_LOW)
+    endtask
+
+    // 设备侧故障点：PRE_DEVICE_READ 把 TX 首描述符长度置零 → 设备拒绝链、置 DEVICE_NEEDS_RESET
+    // 并发配置中断；随后写 status=0 复位，status 与 queue_enable 读回 0。
+    task test_std_device_fault_and_reset();
+        split_virtqueue txq;
+        bit [63:0] iovas[$];
+        bit [63:0] gpa, iova;
+        virtio_sg_list sgs[];
+        byte unsigned bytes[$];
+        vdev_unit_token t;
+        vdev_expect_catcher catcher;
+        int unsigned irq_before;
+
+        void'(std_negotiate(64'h0000_0001_0000_0000));
+        txq = std_kit.make_split("fault_tx", 1, 8, STD_BDF);
+        std_program_queue(1, txq, 1, 0, iovas);
+        std_wr(32'h10, 2, 0);                       // config 向量 0
+        std_wr(32'h14, 1, 8'h0f);
+        std.err_inj = std_kit.err_inj;
+        std_kit.err_inj.configure(VQ_ERR_ZERO_LEN_BUF, 0, 1, 100, VQ_FAULT_PRE_DEVICE_READ);
+        for (int i = 0; i < 32; i++)
+            bytes.push_back(i);
+        sgs = new[1];
+        std_buffer(bytes, 32, DMA_TO_DEVICE, gpa, iova, sgs[0]);
+        t = new("fault_tok");
+        irq_before = port.msix_addr.size();
+        catcher = new("fault_catcher");
+        catcher.id = "VDEV_RING";
+        catcher.text = "zero length";
+        uvm_report_cb::add(null, catcher);
+        void'(txq.add_buf(sgs, 1, 0, t, 0));
+        port.host_write(STD_BAR2 + 4, 2, 1);
+        settle();
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught != 1) || !(std_rd(32'h14, 1) & DEV_STATUS_DEVICE_NEEDS_RESET) ||
+            (port.msix_addr.size() != irq_before + 1) || (port.msix_data[irq_before] != 0) ||
+            (std_kit.err_inj.injection_count() != 1))
+            `uvm_fatal("VDEV_UNIT", "device-side zero-length fault was not reported as DEVICE_NEEDS_RESET")
+        std_kit.err_inj.disable_injection();
+        std.err_inj = null;
+        std_wr(32'h14, 1, 0);
+        std_wr(32'h16, 2, 1);
+        if ((std_rd(32'h14, 1) != 0) || (std_rd(32'h1c, 2) != 0))
+            `uvm_fatal("VDEV_UNIT", "device reset did not clear status/queue_enable")
+        iommu.unmap_for_host(0, STD_BDF, iova);
+        mem.free(gpa);
+        std_release(txq, iovas);
+        `uvm_info("VDEV_UNIT", "test_std_device_fault_and_reset PASSED", UVM_LOW)
+    endtask
+
+    // EVENT_IDX：环取空后设备发布 avail_event=last_avail（驱动据此决定是否 kick）；
+    // RING_RESET：queue_reset 后读回 1、queue_enable 读回 0，须重写三个地址再使能，使能后读回 0。
+    task test_std_event_idx_and_queue_reset();
+        split_virtqueue txq;
+        bit [63:0] iovas[$];
+        bit [63:0] gpa, iova;
+        virtio_sg_list sgs[];
+        byte unsigned bytes[$];
+        byte got[];
+        uvm_object tok;
+        int unsigned len;
+        vdev_unit_token t;
+        bit [63:0] saved;
+        bit [63:0] drv;
+        vdev_expect_catcher catcher;
+
+        saved = std.device_features;
+        std.device_features[VIRTIO_F_RING_EVENT_IDX] = 1;
+        std.device_features[VIRTIO_F_RING_RESET] = 1;
+        drv = 64'h0000_0001_0000_0000;
+        drv[VIRTIO_F_RING_EVENT_IDX] = 1;
+        drv[VIRTIO_F_RING_RESET] = 1;
+        if (!(std_negotiate(drv) & DEV_STATUS_FEATURES_OK))
+            `uvm_fatal("VDEV_UNIT", "EVENT_IDX/RING_RESET negotiation rejected")
+        txq = std_kit.make_split("evidx_tx", 1, 8, STD_BDF);
+        std_program_queue(1, txq, 1, 0, iovas);
+        std_wr(32'h14, 1, 8'h0f);
+        for (int i = 0; i < 16; i++)
+            bytes.push_back(i);
+        sgs = new[1];
+        std_buffer(bytes, 16, DMA_TO_DEVICE, gpa, iova, sgs[0]);
+        t = new("evidx_tok");
+        void'(txq.add_buf(sgs, 1, 0, t, 0));
+        port.host_write(STD_BAR2 + 4, 2, 1);
+        wait_used(txq, tok, len);
+        settle();
+        mem.read_mem(txq.device_ring_addr + 4 + 8 * 8, 2, got);
+        if ((tok != t) || (got[0] != 1) || (got[1] != 0))
+            `uvm_fatal("VDEV_UNIT", "device did not publish avail_event after draining the ring")
+        std_wr(32'h16, 2, 1);
+        std_wr(32'h3a, 2, 1);
+        if ((std_rd(32'h3a, 2) != 1) || (std_rd(32'h1c, 2) != 0))
+            `uvm_fatal("VDEV_UNIT", "queue_reset did not read back 1 with queue_enable 0")
+        catcher = new("reset_catcher");
+        catcher.id = "VDEV_QUEUE";
+        catcher.text = "queue_desc not written";
+        uvm_report_cb::add(null, catcher);
+        std_wr(32'h1c, 2, 1);
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught != 1) || (std_rd(32'h1c, 2) != 0))
+            `uvm_fatal("VDEV_UNIT", "queue re-enabled after queue_reset without reprogrammed addresses")
+        std_release(txq, iovas);
+        txq = std_kit.make_split("evidx_tx2", 1, 8, STD_BDF);
+        std_program_queue(1, txq, 1, 0, iovas);
+        if ((std_rd(32'h1c, 2) != 1) || (std_rd(32'h3a, 2) != 0))
+            `uvm_fatal("VDEV_UNIT", "queue re-enable after queue_reset did not clear queue_reset")
+        iommu.unmap_for_host(0, STD_BDF, iova);
+        mem.free(gpa);
+        std_wr(32'h14, 1, 0);
+        std_release(txq, iovas);
+        std.device_features = saved;
+        `uvm_info("VDEV_UNIT", "test_std_event_idx_and_queue_reset PASSED", UVM_LOW)
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         echo.bdf = ECHO_BDF;
@@ -368,6 +843,13 @@ class virtio_vdev_unit_test extends uvm_test;
         test_base_msix_and_dma();
         test_base_msix_replay();
         test_base_command_gating();
+        test_std_config_and_features();
+        test_std_enable_requires_all_addresses();
+        test_std_split_tx_loopback_rx();
+        test_std_packed_tx();
+        test_std_ctrl_mq();
+        test_std_device_fault_and_reset();
+        test_std_event_idx_and_queue_reset();
         mem.leak_check();
         iommu.leak_check();
         `uvm_info("VDEV_UNIT", "virtio_vdev_unit_test PASSED", UVM_NONE)
