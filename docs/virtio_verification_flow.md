@@ -33,8 +33,8 @@
      ┌─────────────┴──┐  ┌──┴──────────────────────┐
      │ TLM 回环        │  │ SV 接口（pcie_tl_if ×2） │
      │ vdev_virtio_pci │  │ 真实 RTL DUT             │
-     │ + vdev_uvm_ep_  │  │ DUT DMA ← real_dut_host_ │
-     │ port（发真 EP TLP）│  │ mem_responder+iova_proxy │
+     │ +vdev_uvm_ep_   │  │ DUT DMA ← real_dut_host_ │
+     │ port 发真 EP TLP│  │ mem_responder+iova_proxy │
      └─────────────────┘  └─────────────────────────┘
 ```
 
