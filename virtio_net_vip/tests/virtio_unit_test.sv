@@ -1561,6 +1561,20 @@ class virtio_unit_test extends uvm_test;
         uvm_report_cb::delete(null, catcher);
         if (ok || (catcher.caught_count != 1) || (fsm.state != FSM_IDLE))
             `uvm_error("TEST", "private restore was not rejected by capability")
+
+        // 运行中的私有 Function 不得重初始化：ops 没有 transport/队列，任何越过拒绝的
+        // 发现/复位都会以空句柄失败；状态保持 FSM_RUNNING。
+        fsm.drv_cfg.num_queue_pairs = 1;
+        fsm.state = FSM_RUNNING;
+        catcher = new("gate_running_init_catcher", "AUTO_FSM",
+                      "full_init: dataplane is running; stop it before re-initialization");
+        uvm_report_cb::add(null, catcher);
+        fsm.full_init();
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught_count != 1) || (fsm.state != FSM_RUNNING) ||
+            (ops.config_backend != null))
+            `uvm_error("TEST", "private full_init ran while the dataplane was running")
+        fsm.state = FSM_IDLE;
         `uvm_info("UNIT_TEST", "test_private_capability_gates PASSED", UVM_LOW)
     endtask
 

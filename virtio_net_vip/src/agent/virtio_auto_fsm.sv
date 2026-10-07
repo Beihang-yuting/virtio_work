@@ -219,6 +219,14 @@ class virtio_auto_fsm extends uvm_report_object;
         bit        reset_ok;
         int unsigned total_queues;
 
+        // 要求确认停 DMA 的协议（私有环）不得在数据面运行时重初始化：复位会在后台
+        // worker 仍持有队列/DMA 时销毁队列。拒绝且不改变状态；标准协议保持原行为。
+        if ((state == FSM_RUNNING) && (ops.protocol != null) &&
+            ops.protocol.requires_verified_reset()) begin
+            `uvm_error("AUTO_FSM", "full_init: dataplane is running; stop it before re-initialization")
+            return;
+        end
+
         `uvm_info("AUTO_FSM", "full_init: starting initialization sequence", UVM_LOW)
 
         // ---- Step 1: BAR discovery ----
