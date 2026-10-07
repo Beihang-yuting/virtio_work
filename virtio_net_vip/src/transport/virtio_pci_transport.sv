@@ -532,8 +532,7 @@ class virtio_pci_transport extends uvm_object;
     // Select queue, write 1 to Q_RESET, then poll until Q_RESET reads back 0.
     // ========================================================================
 
-    // The verified form is required before a caller may release queue DMA.
-    // write_queue_reset() remains the backwards-compatible void wrapper.
+    // The verified result is required before a caller may release queue DMA.
     virtual task write_queue_reset_verified(int unsigned queue_id,
                                             ref bit reset_complete);
         bit [31:0] read_val;
@@ -578,11 +577,6 @@ class virtio_pci_transport extends uvm_object;
         else
             `uvm_info("TRANSPORT",
                 $sformatf("Queue %0d reset complete", queue_id), UVM_HIGH)
-    endtask
-
-    virtual task write_queue_reset(int unsigned queue_id);
-        bit reset_complete;
-        write_queue_reset_verified(queue_id, reset_complete);
     endtask
 
     // ========================================================================

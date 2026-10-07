@@ -385,6 +385,7 @@ class virtio_unit_test extends uvm_test;
         test_discovery_strategy_selection();
         test_injected_discovery_survives_fabric_config();
         test_config_backend_injection();
+        test_common_backend_queue_reset_result();
         test_driver_protocol_selection();
         test_fabric_bar_layout_roles();
         test_setup_queue_range_rollback();
@@ -1352,6 +1353,41 @@ class virtio_unit_test extends uvm_test;
             (vq_mgr.get_queue_count() != 0))
             `uvm_error("TEST", "queue program was not passed through the backend")
         `uvm_info("UNIT_TEST", "test_config_backend_injection PASSED", UVM_LOW)
+    endtask
+
+    // common-config 后端的 reset_queue 必须返回 Q_RESET 轮询的真实结果；超时时
+    // ops.reset_queue 进入错误分支（调用方据此保留 ring/DMA）。
+    task test_common_backend_queue_reset_result();
+        virtio_mock_transport transport;
+        virtio_common_cfg_backend backend;
+        virtio_atomic_ops ops;
+        virtio_unit_exact_error_catcher catcher;
+        bit ok;
+
+        transport = virtio_mock_transport::type_id::create("queue_reset_transport");
+        backend = virtio_common_cfg_backend::type_id::create("queue_reset_backend");
+        backend.bind_transport(transport);
+
+        transport.queue_reset_complete = 1;
+        backend.reset_queue(3, ok);
+        if (!ok || (transport.queue_reset_count != 1) || (transport.last_reset_queue_id != 3))
+            `uvm_error("TEST", "completed queue reset was not reported as ok")
+
+        transport.queue_reset_complete = 0;
+        backend.reset_queue(3, ok);
+        if (ok)
+            `uvm_error("TEST", "timed-out queue reset was reported as ok")
+
+        ops = virtio_atomic_ops::type_id::create("queue_reset_ops");
+        ops.transport = transport;
+        catcher = new("queue_reset_catcher", "ATOMIC_OPS",
+                      "reset_queue: config backend did not confirm queue_id=3 reset");
+        uvm_report_cb::add(null, catcher);
+        ops.reset_queue(3);
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught_count != 1)
+            `uvm_error("TEST", "ops.reset_queue did not report the unconfirmed queue reset")
+        `uvm_info("UNIT_TEST", "test_common_backend_queue_reset_result PASSED", UVM_LOW)
     endtask
 
     // 驱动协议决定 ops/FSM 的类型、status 访问权限与关机复位语义；私有协议拒绝

@@ -85,12 +85,7 @@ class virtio_mock_transport extends virtio_pci_transport;
         reset_complete = device_reset_complete;
     endtask
 
-    // 队列复位：计数、记录队列号，verified 形式返回可编程的完成结果。
-    virtual task write_queue_reset(int unsigned queue_id);
-        queue_reset_count++;
-        last_reset_queue_id = queue_id;
-    endtask
-
+    // 队列复位：计数、记录队列号，返回可编程的完成结果。
     virtual task write_queue_reset_verified(int unsigned queue_id,
                                             ref bit reset_complete);
         queue_reset_count++;

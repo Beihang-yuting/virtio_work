@@ -180,10 +180,12 @@ class virtio_common_cfg_backend extends virtio_config_backend;
         ok = 1;
     endtask
 
-    // 写 Q_RESET 并轮询完成；超时由 transport 报告（与 HEAD 的无返回包装一致）。
+    // 写 Q_RESET 并轮询完成；超时由 transport 报告并返回 ok=0。
     virtual task reset_queue(int unsigned queue_id, output bit ok);
-        transport.write_queue_reset(queue_id);
-        ok = 1;
+        bit reset_complete;
+
+        transport.write_queue_reset_verified(queue_id, reset_complete);
+        ok = reset_complete;
     endtask
 
     // 有 MSI-X capability 时建表、分配向量并绑定 config/队列向量；否则回退 INTx。
