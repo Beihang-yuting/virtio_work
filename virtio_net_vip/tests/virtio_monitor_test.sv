@@ -448,6 +448,7 @@ class virtio_monitor_test extends uvm_test;
         // the one verified submission and leaves the counter at zero.
         vq = mon.vq_mgr.create_queue(7, 8, VQ_SPLIT);
         vq.queue_enable = 1;
+        vq.total_add_buf_ops++;   // 驱动已使一个 buffer 可用（notify 的完成信用按 buffer 计）
         sva_errors_before = sva_catcher.caught_count;
         @(negedge protocol_vif.clk);
         mon.observe_queue_state(7, 1'b1, 1'b1);
@@ -468,6 +469,7 @@ class virtio_monitor_test extends uvm_test;
         // must not suppress consumption of this verified submission.
         vq = mon.vq_mgr.create_queue(6, 8, VQ_SPLIT);
         vq.queue_enable = 1;
+        vq.total_add_buf_ops++;   // 驱动已使一个 buffer 可用（notify 的完成信用按 buffer 计）
         mon.transport.notify_mgr.irq_mode = IRQ_INTX;
         mon.transport.notify_mgr.isr_status = 8'b0000_0011;
         sva_errors_before = sva_catcher.caught_count;
@@ -537,6 +539,7 @@ class virtio_monitor_test extends uvm_test;
 
         vq = mon.vq_mgr.create_queue(0, 8, VQ_SPLIT);
         vq.queue_enable = 1;
+        vq.total_add_buf_ops++;   // 驱动已使一个 buffer 可用（notify 的完成信用按 buffer 计）
         observer.write(make_notify_tlp(TLP_MEM_WR, 0));
         repeat (3) @(negedge protocol_vif.clk);
         assert(protocol_vif.outstanding_submission_count == 1)
@@ -564,6 +567,7 @@ class virtio_monitor_test extends uvm_test;
                 int'(non_irq_codes[index]);
             vq = mon.vq_mgr.create_queue(queue_ids[index], 8, VQ_SPLIT);
             vq.queue_enable = 1;
+            vq.total_add_buf_ops++;   // 驱动已使一个 buffer 可用（notify 的完成信用按 buffer 计）
             configure_adapter_queue(queue_ids[index]);
             observer.write(make_notify_tlp(TLP_MEM_WR, queue_ids[index]));
         end
@@ -583,6 +587,7 @@ class virtio_monitor_test extends uvm_test;
         mon.transport.notify_mgr.queue_vectors[9] = int'(MSG_ASSERT_INTA);
         vq = mon.vq_mgr.create_queue(9, 8, VQ_SPLIT);
         vq.queue_enable = 1;
+        vq.total_add_buf_ops++;   // 驱动已使一个 buffer 可用（notify 的完成信用按 buffer 计）
         configure_adapter_queue(9);
         observer.write(make_notify_tlp(TLP_MEM_WR, 9));
         repeat (3) @(negedge protocol_vif.clk);
@@ -597,6 +602,7 @@ class virtio_monitor_test extends uvm_test;
         mon.transport.notify_mgr.on_config_change_interrupt();
         vq = mon.vq_mgr.create_queue(3, 8, VQ_SPLIT);
         vq.queue_enable = 1;
+        vq.total_add_buf_ops++;   // 驱动已使一个 buffer 可用（notify 的完成信用按 buffer 计）
         configure_adapter_queue(3);
         observer.write(make_notify_tlp(TLP_MEM_WR, 3));
         repeat (3) @(negedge protocol_vif.clk);
@@ -614,6 +620,7 @@ class virtio_monitor_test extends uvm_test;
         // that stale line state into a second completion.
         vq = mon.vq_mgr.create_queue(2, 8, VQ_SPLIT);
         vq.queue_enable = 1;
+        vq.total_add_buf_ops++;   // 驱动已使一个 buffer 可用（notify 的完成信用按 buffer 计）
         configure_adapter_queue(2);
         observer.write(make_notify_tlp(TLP_MEM_WR, 2));
         repeat (3) @(negedge protocol_vif.clk);
@@ -654,6 +661,7 @@ class virtio_monitor_test extends uvm_test;
         mon.transport.notify_mgr.queue_vectors[6] = 18;
         vq = mon.vq_mgr.create_queue(5, 8, VQ_SPLIT);
         vq.queue_enable = 1;
+        vq.total_add_buf_ops++;   // 驱动已使一个 buffer 可用（notify 的完成信用按 buffer 计）
         configure_adapter_queue(5);
         configure_adapter_queue(6);
         observer.write(make_notify_tlp(TLP_MEM_WR, 5));
@@ -686,6 +694,7 @@ class virtio_monitor_test extends uvm_test;
         configure_adapter_trace(IRQ_MSIX_PER_QUEUE, 8);
         vq = mon.vq_mgr.create_queue(5, 8, VQ_SPLIT);
         vq.queue_enable = 1;
+        vq.total_add_buf_ops++;   // 驱动已使一个 buffer 可用（notify 的完成信用按 buffer 计）
         configure_adapter_queue(5);
         observer.write(make_notify_tlp(TLP_MEM_WR, 5));
         repeat (4) @(negedge protocol_vif.clk);

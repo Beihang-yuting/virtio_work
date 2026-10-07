@@ -27,6 +27,9 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
     logic        queue_enabled;
     logic        notify;
     logic        verified_submission;
+    // verified_submission 的伴随电平：本次 notify 新使可用的 buffer 数（virtio 1.2 §2.7.13：
+    // 一次 notify 可覆盖多个 buffer，设备可以每用一个 buffer 发一次通知）。
+    int unsigned submission_buffers;
     logic        completion;
     logic        queue_reset;
     logic        reset_all_queues;
@@ -43,9 +46,10 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
     logic        driver_seen;
     logic        assertions_enable;
     int unsigned protocol_error_count;
-    // A legal queue notify is the production submission boundary.  Retain
-    // credits by queue so a completion cannot consume a different queue's
-    // submission.  The aggregate remains available for debug/backcompat.
+    // Credits are buffers the driver made available, announced by a legal
+    // queue notify (one notify may cover many buffers).  Retain them by queue
+    // so a completion cannot consume a different queue's buffer.  The
+    // aggregate remains available for debug.
     int unsigned outstanding_submission_count;
     int unsigned outstanding_submission_count_by_queue[int unsigned];
     // Keep the associative lookup outside the concurrent assertion.  This is
@@ -70,6 +74,7 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         logic               queue_configured;
         logic               queue_enabled;
         logic               verified_submission;
+        int unsigned        buffers;
     } staged_pulse_t;
 
     // Status/notify/completion are protocol pulses and must retain their
@@ -98,6 +103,7 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         queue_enabled = 0;
         notify = 0;
         verified_submission = 0;
+        submission_buffers = 0;
         completion = 0;
         queue_reset = 0;
         reset_all_queues = 0;
@@ -169,6 +175,7 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
                         queue_enabled <= staged.queue_enabled;
                         notify <= 1;
                         verified_submission <= staged.verified_submission;
+                        submission_buffers <= staged.buffers;
                     end
                     STAGED_COMPLETION: begin
                         interrupt_vector <= staged.interrupt_vector;
@@ -191,7 +198,7 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
     // 中文：posedge 记账块——检查器采样之后更新生命周期历史与信用：
     // - 写 status=0 视为设备复位，清 features_ok_seen/driver_seen 及全部
     //   submission 信用（但保留 protocol_error_count 供负向用例统计）；
-    // - verified_submission/completion 按队列增减信用，2'b11 分支仅为
+    // - verified_submission 按 submission_buffers、completion 按 1 增减队列信用，2'b11 分支仅为
     //   direct VIF 兼容（production staging 每拍只发一个脉冲）；
     // - 末尾统一把所有单拍脉冲清零，保证脉冲宽度恰为一拍。
     always @(posedge clk or negedge rst_n) begin
@@ -253,11 +260,11 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
                         completion_has_pending_submission <= 0;
                 end
                 case ({verified_submission, completion})
-                    2'b10: begin
+                    2'b10: if (submission_buffers != 0) begin
                         outstanding_submission_count_by_queue[queue_id] <=
-                            outstanding_submission_count_by_queue.exists(queue_id) ?
-                            outstanding_submission_count_by_queue[queue_id] + 1 : 1;
-                        outstanding_submission_count <= outstanding_submission_count + 1;
+                            outstanding_submissions_for_queue(queue_id) + submission_buffers;
+                        outstanding_submission_count <=
+                            outstanding_submission_count + submission_buffers;
                         if (queue_id == completion_queue_id)
                             completion_has_pending_submission <= 1;
                     end
@@ -278,36 +285,32 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
                     // only a compatibility rule for direct VIF drivers.
                     2'b11: begin
                         if (queue_id == completion_queue_id) begin
+                            // 同队列：先记本次新 buffer，再由 completion 消耗一个。
                             outstanding_submission_count_by_queue[queue_id] <=
-                                outstanding_submission_count_by_queue.exists(queue_id) ?
-                                outstanding_submission_count_by_queue[queue_id] : 1;
-                            if (!outstanding_submission_count_by_queue.exists(queue_id) ||
-                                (outstanding_submission_count_by_queue[queue_id] == 0))
-                                outstanding_submission_count <=
-                                    outstanding_submission_count + 1;
-                            completion_has_pending_submission <= 1;
+                                (outstanding_submissions_for_queue(queue_id) +
+                                 submission_buffers != 0) ?
+                                outstanding_submissions_for_queue(queue_id) +
+                                submission_buffers - 1 : 0;
+                            outstanding_submission_count <=
+                                (outstanding_submission_count + submission_buffers != 0) ?
+                                outstanding_submission_count + submission_buffers - 1 : 0;
+                            completion_has_pending_submission <=
+                                (outstanding_submissions_for_queue(queue_id) +
+                                 submission_buffers > 1);
                         end
                         else begin
                             outstanding_submission_count_by_queue[queue_id] <=
-                                outstanding_submission_count_by_queue.exists(queue_id) ?
-                                outstanding_submission_count_by_queue[queue_id] + 1 : 1;
-                            if (outstanding_submission_count_by_queue.exists(
-                                    completion_queue_id) &&
-                                (outstanding_submission_count_by_queue[
-                                    completion_queue_id] != 0)) begin
-                                outstanding_submission_count_by_queue[
-                                    completion_queue_id] <=
-                                    outstanding_submission_count_by_queue[
-                                        completion_queue_id] - 1;
-                            end
-                            else begin
+                                outstanding_submissions_for_queue(queue_id) + submission_buffers;
+                            if (outstanding_submissions_for_queue(completion_queue_id) != 0) begin
+                                outstanding_submission_count_by_queue[completion_queue_id] <=
+                                    outstanding_submissions_for_queue(completion_queue_id) - 1;
                                 outstanding_submission_count <=
-                                    outstanding_submission_count + 1;
+                                    outstanding_submission_count + submission_buffers - 1;
                             end
-                            if (outstanding_submission_count_by_queue.exists(
-                                    completion_queue_id) &&
-                                (outstanding_submission_count_by_queue[
-                                    completion_queue_id] == 1))
+                            else
+                                outstanding_submission_count <=
+                                    outstanding_submission_count + submission_buffers;
+                            if (outstanding_submissions_for_queue(completion_queue_id) == 1)
                                 completion_has_pending_submission <= 0;
                         end
                     end
@@ -352,13 +355,14 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         staged_queue_state_pending = 1;
     endfunction
 
-    // 暂存一次 doorbell 脉冲：携带队列号、配置/使能快照以及 monitor 的
-    // verified 判定（只有 verified==1 的 notify 会在记账块产生 submission 信用）。
+    // 暂存一次 doorbell 脉冲：携带队列号、配置/使能快照、monitor 的 verified 判定
+    // 与本次新使可用的 buffer 数（只有 verified==1 的 notify 按 buffers 产生信用）。
     function void stage_notify(
         input logic [15:0] id,
         input logic configured,
         input logic enabled,
-        input logic verified
+        input logic verified,
+        input int unsigned buffers
     );
         staged_pulse_t staged;
         staged.kind = STAGED_NOTIFY;
@@ -366,6 +370,7 @@ interface virtio_protocol_event_if(input logic clk, input logic rst_n);
         staged.queue_configured = configured;
         staged.queue_enabled = enabled;
         staged.verified_submission = verified;
+        staged.buffers = verified ? buffers : 0;
         staged_pulses.push_back(staged);
     endfunction
 

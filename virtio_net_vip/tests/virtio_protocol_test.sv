@@ -366,25 +366,30 @@ class virtio_protocol_test extends uvm_test;
         protocol_vif.queue_enabled = enabled;
         protocol_vif.notify = 1;
         protocol_vif.verified_submission = 0;
+        protocol_vif.submission_buffers = 0;
         @(negedge protocol_vif.clk);
     endtask
 
-    // A valid queue notification is the actual submission boundary observed
-    // in production through the virtio PCI notify capability.
-    protected task drive_valid_submission();
+    // A valid queue notification is the submission boundary observed in
+    // production through the virtio PCI notify capability.  It announces the
+    // buffers made available since the previous notify (virtio 1.2 §2.7.13:
+    // one notify may cover many buffers).
+    protected task drive_valid_submission(input int unsigned buffers = 1);
         @(negedge protocol_vif.clk);
         protocol_vif.queue_configured = 1;
         protocol_vif.queue_enabled = 1;
         protocol_vif.notify = 1;
         protocol_vif.verified_submission = 1;
+        protocol_vif.submission_buffers = buffers;
         @(negedge protocol_vif.clk);
     endtask
 
     // Direct event-interface traces prove the checker rather than merely
-    // exercising utility code.  Seven illegal transitions must be reported:
+    // exercising utility code.  Eight illegal transitions must be reported:
     // one non-reset status clear, DRIVER_OK before FEATURES_OK, FEATURES_OK
     // before DRIVER, two raw invalid notifies, a completion without a
-    // submission, and an extra completion after one submission.
+    // submission, an extra completion after one available buffer, and a
+    // completion after a valid notify that made no buffer available.
     protected task test_protocol_sva_event_traces();
         virtio_protocol_expected_sva_catcher catcher;
 
@@ -419,17 +424,25 @@ class virtio_protocol_test extends uvm_test;
         drive_completion();
         drive_completion();
 
-        assert(catcher.caught_count == 7)
+        // Credit is per available buffer, not per notify: a valid notify that
+        // made no new buffer available leaves nothing for a completion.
+        drive_status_write(DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_FEATURES_OK,
+                           DEV_STATUS_RESET);
+        drive_valid_submission(0);
+        drive_completion();
+
+        assert(catcher.caught_count == 8)
             else `uvm_fatal("PROTO_TEST", $sformatf(
-                "expected seven scoped SVA reports, saw %0d", catcher.caught_count))
-        assert(protocol_vif.protocol_error_count == 7)
+                "expected eight scoped SVA reports, saw %0d", catcher.caught_count))
+        assert(protocol_vif.protocol_error_count == 8)
             else `uvm_fatal("PROTO_TEST", $sformatf(
-                "expected seven protocol SVA errors, saw %0d",
+                "expected eight protocol SVA errors, saw %0d",
                 protocol_vif.protocol_error_count))
         uvm_report_cb::delete(null, catcher);
 
-        // The standard lifecycle followed by one notify/completion pair is
-        // legal and must leave the checker entirely quiet.
+        // The standard lifecycle followed by one notify that makes four
+        // buffers available and four per-buffer completions is legal and
+        // must leave the checker entirely quiet.
         protocol_vif.protocol_error_count = 0;
         drive_status_write(DEV_STATUS_RESET, DEV_STATUS_RESET);
         drive_status_write(DEV_STATUS_RESET, DEV_STATUS_ACKNOWLEDGE);
@@ -442,8 +455,9 @@ class virtio_protocol_test extends uvm_test;
                            DEV_STATUS_FEATURES_OK,
                            DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER |
                            DEV_STATUS_FEATURES_OK | DEV_STATUS_DRIVER_OK);
-        drive_valid_submission();
-        drive_completion();
+        drive_valid_submission(4);
+        repeat (4)
+            drive_completion();
 
         assert(protocol_vif.protocol_error_count == 0)
             else `uvm_fatal("PROTO_TEST", $sformatf(

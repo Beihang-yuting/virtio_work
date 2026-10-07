@@ -7,7 +7,8 @@
 //   2) status 写只能增位，唯一例外是写 0 复位；
 //   3) FEATURES_OK 前必须已见 DRIVER（复位会清历史）；
 //   4) notify 只允许发给已配置且已使能的队列；
-//   5) completion 必须有同队列的未完成 submission 与之配对。
+//   5) completion 必须有同队列已使可用、尚未被完成消耗的 buffer（virtio 1.2 §2.7.13：
+//      一次 notify 可覆盖多个 buffer，设备可以每用一个 buffer 通知一次）。
 // 依赖：全部采样/辅助状态由 virtio_protocol_event_if 维护，本模块无状态；
 // 断言失败通过 events.report_protocol_error 走 UVM 报告（可被负向用例捕获）。
 // 总开关：events.assertions_enable == 0 时所有断言旁路。
@@ -61,9 +62,9 @@ module virtio_protocol_assertions(virtio_protocol_event_if events);
         else events.report_protocol_error(
             "notify observed for a disabled queue");
 
-    // One completion consumes one prior valid notification for that same
-    // queue.  Credits are updated after the sampled edge, preserving the
-    // required prior-event relationship.
+    // One completion consumes one buffer that a prior valid notification made
+    // available on that same queue.  Credits are updated after the sampled
+    // edge, preserving the required prior-event relationship.
     property p_completion_requires_pending_submission;
         @(posedge events.clk)
             events.assertions_enable && events.completion |->

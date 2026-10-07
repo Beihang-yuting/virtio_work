@@ -37,10 +37,14 @@ class virtio_monitor extends uvm_monitor;
     protected bit dma_range_configured;
     protected bit queue_configured[int unsigned];
     protected bit queue_enabled[int unsigned];
-    // A completion may only be emitted for an accepted notify.  Retain queue
-    // IDs independently of the SVA counter so the monitor can correlate an
-    // interrupt vector before it stages the completion pulse.
+    // A completion may only be emitted for a buffer an accepted notify made
+    // available.  Retain one queue ID per such buffer, independently of the
+    // SVA counter, so the monitor can correlate an interrupt vector before it
+    // stages the completion pulse.
     protected int unsigned verified_submission_queues[$];
+    // 每个队列在上一次已验证 notify 时的 add_buf 累计数：下一次 notify 的信用是两次之间
+    // 新使可用的 buffer 数（virtio 1.2 §2.7.13：一次 notify 可覆盖多个 buffer）。
+    protected int unsigned announced_buffers[int unsigned];
 
     // 构造函数：仅完成 UVM 注册；端口/FIFO 延迟到 build_phase 创建，
     // transport/vq_mgr/protocol_vif 由 env 在 connect 阶段注入。
@@ -92,6 +96,7 @@ class virtio_monitor extends uvm_monitor;
     virtual function void reset_queue_state(input int unsigned queue_id);
         queue_configured.delete(queue_id);
         queue_enabled.delete(queue_id);
+        announced_buffers.delete(queue_id);
         discard_queue_submissions(queue_id);
         if (protocol_vif != null) begin
             protocol_vif.stage_queue_state(queue_id, 0, 0);
@@ -104,6 +109,7 @@ class virtio_monitor extends uvm_monitor;
     virtual function void reset_all_queue_state();
         queue_configured.delete();
         queue_enabled.delete();
+        announced_buffers.delete();
         verified_submission_queues.delete();
         if (protocol_vif != null) begin
             protocol_vif.stage_queue_state('0, 0, 0);
@@ -250,6 +256,9 @@ class virtio_monitor extends uvm_monitor;
         if (enabled && !configured) begin
             mark_error(txn, $sformatf("Queue %0d enabled before configuration", queue_id));
         end
+        // 新使能的队列从零开始计 buffer（新建队列对象的 add_buf 计数从 0 起）。
+        if (enabled && !(queue_enabled.exists(queue_id) && queue_enabled[queue_id]))
+            announced_buffers.delete(queue_id);
         queue_configured[queue_id] = configured;
         queue_enabled[queue_id] = enabled;
         if (protocol_vif != null) begin
@@ -274,6 +283,7 @@ class virtio_monitor extends uvm_monitor;
         bit valid;
         bit configured;
         bit enabled;
+        int unsigned buffers;
 
         txn = new_monitor_txn(VIRTIO_MON_BAR_ACCESS, '0, 2, 1);
         txn.txn_type = VIO_TXN_ATOMIC_OP;
@@ -316,10 +326,14 @@ class virtio_monitor extends uvm_monitor;
             txn.vq_error_type = VQ_ERR_KICK_BEFORE_ENABLE;
             mark_error(txn, $sformatf("Notify for invalid or disabled queue: %0d", queue_id));
         end
-        if (valid)
-            verified_submission_queues.push_back(queue_id);
+        buffers = 0;
+        if (valid) begin
+            buffers = newly_available_buffers(queue_id, vq);
+            repeat (buffers)
+                verified_submission_queues.push_back(queue_id);
+        end
         if (protocol_vif != null) begin
-            protocol_vif.stage_notify(queue_id, configured, enabled, valid);
+            protocol_vif.stage_notify(queue_id, configured, enabled, valid, buffers);
         end
         publish_event(txn);
     endfunction
@@ -440,6 +454,23 @@ class virtio_monitor extends uvm_monitor;
             end
         end
         return 0;
+    endfunction
+
+    // 本次已验证 notify 新使可用的 buffer 数：驱动侧队列对象的 add_buf 累计数相对上次
+    // notify 的增量（计数回落说明队列对象已重建，按全部计）。没有驱动侧队列对象的被动
+    // 观察（vq_mgr 未接入）只能确定 notify 至少公告了一个 buffer。
+    protected function int unsigned newly_available_buffers(
+        input int unsigned queue_id,
+        input virtqueue_base vq
+    );
+        int unsigned prior;
+
+        if (vq == null)
+            return 1;
+        prior = announced_buffers.exists(queue_id) ? announced_buffers[queue_id] : 0;
+        announced_buffers[queue_id] = vq.total_add_buf_ops;
+        return (vq.total_add_buf_ops >= prior) ? (vq.total_add_buf_ops - prior) :
+                                                 vq.total_add_buf_ops;
     endfunction
 
     // 从待完成 notify 队列里剔除指定队列的所有条目（队列复位时防止
