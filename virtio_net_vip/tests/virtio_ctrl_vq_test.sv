@@ -126,7 +126,8 @@ class virtio_ctrl_vq_test_null_bar extends virtio_bar_accessor;
 endclass : virtio_ctrl_vq_test_null_bar
 
 // 迁移/MSI-X 用寄存器桩：status/复位/特性协商/队列编程/向量绑定在本地建模并记录（enable_vectors：
-// setup_single_queue 置 Q_ENABLE 时该队列的向量）；BAR 发现为空操作；
+// setup_single_queue 置 Q_ENABLE 时该队列的向量；remapped_after_enable：对已使能队列改写向量的
+// 队列号，复位清除使能）；BAR 发现为空操作；
 // max_virtqueue_pairs 可编程，使 control VQ 位于 2*max_virtqueue_pairs（与数据队列不连续）。
 class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
     `uvm_object_utils(virtio_ctrl_vq_migration_transport)
@@ -137,6 +138,8 @@ class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
     int unsigned msix_bound_qids[$];
     int unsigned msix_bound_vectors[int unsigned];
     int unsigned enable_vectors[int unsigned];
+    bit          queue_enabled[int unsigned];
+    int unsigned remapped_after_enable[$];
 
     function new(string name = "virtio_ctrl_vq_migration_transport");
         virtio_ctrl_vq_test_null_bar null_bar;
@@ -162,6 +165,7 @@ class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
 
     virtual task reset_device_verified(ref bit reset_complete);
         device_status = 0;
+        queue_enabled.delete();
         reset_complete = 1;
     endtask
 
@@ -193,6 +197,7 @@ class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
     );
         programmed_qids.push_back(queue_id);
         enable_vectors[queue_id] = msix_vector;
+        queue_enabled[queue_id] = 1;
     endtask
 
     virtual task write_queue_enable(bit enable);
@@ -204,6 +209,8 @@ class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
     virtual task write_queue_msix_vector(int unsigned queue_id, int unsigned vector);
         msix_bound_qids.push_back(queue_id);
         msix_bound_vectors[queue_id] = vector;
+        if (queue_enabled.exists(queue_id))
+            remapped_after_enable.push_back(queue_id);
     endtask
 
     virtual task kick(int unsigned queue_id, int unsigned next_avail_idx,
@@ -683,6 +690,8 @@ class virtio_ctrl_vq_test extends uvm_test;
         if (vq_mgr.get_queue_count() != 0)
             `uvm_fatal("CTRL_VQ_TEST", "verified reset did not release source queues")
         transport.msix_bound_qids.delete();
+        transport.enable_vectors.delete();
+        transport.remapped_after_enable.delete();
         fsm.restore_from_migration(snapshot, restore_ok);
         vq_mgr.get_queue_ids(restored_qids);
         if (!restore_ok || (fsm.state != FSM_RUNNING) ||
@@ -691,6 +700,20 @@ class virtio_ctrl_vq_test extends uvm_test;
             `uvm_error("CTRL_VQ_TEST", $sformatf(
                 "restore did not rebuild the control VQ outside 0..2N-1: ok=%0b state=%s queues=%p bound=%p",
                 restore_ok, fsm.state.name(), restored_qids, transport.msix_bound_qids))
+        // virtio 1.2 §4.1.4.3.2：恢复的队列同样须在 queue_enable 之前写入最终向量，使能后不再改写。
+        if (transport.remapped_after_enable.size() != 0)
+            `uvm_error("CTRL_VQ_TEST", $sformatf(
+                "restore remapped enabled queues %p after Q_ENABLE", transport.remapped_after_enable))
+        foreach (expected_qids[i])
+            if (!transport.enable_vectors.exists(expected_qids[i]) ||
+                (transport.enable_vectors[expected_qids[i]] !=
+                 transport.notify_mgr.queue_vectors[expected_qids[i]]) ||
+                (transport.enable_vectors[expected_qids[i]] == 32'hFFFF) ||
+                (transport.enable_vectors[expected_qids[i]] == transport.notify_mgr.config_vector))
+                `uvm_error("CTRL_VQ_TEST", $sformatf(
+                    "restore enabled queue %0d with vector %p instead of its final vector (vectors=%p config=%0d)",
+                    expected_qids[i], transport.enable_vectors, transport.notify_mgr.queue_vectors,
+                    transport.notify_mgr.config_vector))
 
         foreach (expected_qids[i])
             ops.teardown_queue(expected_qids[i]);

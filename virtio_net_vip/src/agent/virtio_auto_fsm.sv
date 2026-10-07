@@ -761,17 +761,18 @@ class virtio_auto_fsm extends uvm_report_object;
             return;
         end
 
-        // 4. 按快照拓扑重建队列并覆盖 ring 状态。
+        // 4. MSI-X：与 full_init 相同，先按将要恢复的队列分配并绑定向量，
+        // 恢复的队列在 queue_enable 之前写入最终向量（virtio 1.2 §4.1.4.3.2）。
         active_num_pairs = snap.num_queue_pairs;
         num_total_queues = snap.queue_count;
+        ops.setup_msix(num_total_queues);
+
+        // 5. 按快照拓扑重建队列并覆盖 ring 状态。
         migration.restore_queues(ops, snap, drv_cfg, step_ok);
         if (!step_ok) begin
             state = FSM_ERROR;
             return;
         end
-
-        // 5. Restore MSI-X
-        ops.setup_msix(num_total_queues);
 
         // 6. DRIVER_OK
         ops.set_driver_ok();
