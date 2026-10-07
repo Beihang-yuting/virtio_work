@@ -347,6 +347,7 @@ virtio_net_vip/
 |   +-- agent/
 |   |   +-- virtio_atomic_ops.sv            -- 原子操作库 (~30 个方法)
 |   |   +-- virtio_auto_fsm.sv             -- 自动生命周期状态机 (12 状态)
+|   |   +-- virtio_migration_engine.sv     -- 热迁移校验和/采集/恢复步骤
 |   |   +-- virtio_driver_protocol.sv      -- 驱动协议 (标准 / DPU 私有环)
 |   |   +-- virtio_driver.sv               -- UVM Driver (事务分发)
 |   |   +-- virtio_monitor.sv              -- 被动 TLP 观察 + 协议检查

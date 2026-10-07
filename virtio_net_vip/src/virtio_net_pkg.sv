@@ -85,6 +85,7 @@ package virtio_net_pkg;
   `include "dataplane/virtio_net_packet_adapter.sv"
   `include "agent/virtio_dma_buffer_set.sv"
   `include "agent/virtio_atomic_ops.sv"
+  `include "agent/virtio_migration_engine.sv"
   `include "agent/virtio_auto_fsm.sv"
   `include "dpu_priv/dpu_priv_atomic_ops.sv"
   `include "dpu_priv/dpu_priv_auto_fsm.sv"
