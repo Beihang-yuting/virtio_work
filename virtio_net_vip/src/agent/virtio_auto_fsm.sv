@@ -181,8 +181,8 @@ class virtio_auto_fsm extends uvm_report_object;
     // ========================================================================
     // Complete Initialization
     //
-    // FSM_IDLE -> FSM_DISCOVERING -> FSM_NEGOTIATING -> FSM_QUEUE_SETUP
-    //          -> FSM_MSIX_SETUP -> FSM_READY
+    // FSM_IDLE -> FSM_DISCOVERING -> FSM_NEGOTIATING -> FSM_MSIX_SETUP
+    //          -> FSM_QUEUE_SETUP -> FSM_READY
     // ========================================================================
 
     // 本 Function 的队列格式：驱动协议可改写配置值（私有协议固定 VQ_CUSTOM）。
@@ -208,8 +208,9 @@ class virtio_auto_fsm extends uvm_report_object;
 
     // full_init 的实现体（入参已由 full_init 校验）：按 virtio 1.x 顺序推进
     // DISCOVERING（BAR 发现，按 transport 的发现策略）→ NEGOTIATING（复位、
-    // ACK/DRIVER、特性协商、FEATURES_OK）→ QUEUE_SETUP（按队列对数建队，
-    // CTRL_VQ 协商成功时额外 +1 队列）→ MSIX_SETUP → FSM_READY。
+    // ACK/DRIVER、特性协商、FEATURES_OK）→ MSIX_SETUP（按将要建立的队列分配并绑定
+    // 向量）→ QUEUE_SETUP（按队列对数建队，CTRL_VQ 协商成功时额外 +1 队列；每条队列在
+    // queue_enable 前写入最终向量，virtio 1.2 §4.1.4.3.2）→ FSM_READY。
     // 任一步失败置 FSM_ERROR 并向设备写 FAILED 后返回。
     // protected virtual 以便派生 FSM 覆写初始化流程。
     protected virtual task do_full_init();
@@ -265,16 +266,24 @@ class virtio_auto_fsm extends uvm_report_object;
             return;
         end
 
-        // ---- Step 3: Queue setup ----
-        state = FSM_QUEUE_SETUP;
-        `uvm_info("AUTO_FSM",
-            $sformatf("full_init: state=%s -- setting up queues", state.name()), UVM_MEDIUM)
-
         active_num_pairs = drv_cfg.num_queue_pairs;
         total_queues = 2 * active_num_pairs;
         if (negotiated[VIRTIO_NET_F_CTRL_VQ])
             total_queues = total_queues + 1;
         num_total_queues = total_queues;
+
+        // ---- Step 3: MSI-X setup ----
+        // 先于建队：setup_queue 取 notify_mgr 中已分配的向量，在 queue_enable 前写入。
+        state = FSM_MSIX_SETUP;
+        `uvm_info("AUTO_FSM",
+            $sformatf("full_init: state=%s -- setting up MSI-X", state.name()), UVM_MEDIUM)
+
+        ops.setup_msix(num_total_queues);
+
+        // ---- Step 4: Queue setup ----
+        state = FSM_QUEUE_SETUP;
+        `uvm_info("AUTO_FSM",
+            $sformatf("full_init: state=%s -- setting up queues", state.name()), UVM_MEDIUM)
 
         ops.setup_all_queues(active_num_pairs, queue_format(),
                              drv_cfg.queue_size, setup_ok);
@@ -284,13 +293,6 @@ class virtio_auto_fsm extends uvm_report_object;
             ops.set_failed();
             return;
         end
-
-        // ---- Step 4: MSI-X setup ----
-        state = FSM_MSIX_SETUP;
-        `uvm_info("AUTO_FSM",
-            $sformatf("full_init: state=%s -- setting up MSI-X", state.name()), UVM_MEDIUM)
-
-        ops.setup_msix(num_total_queues);
 
         // ---- Step 5: DRIVER_OK ----
         ops.set_driver_ok();

@@ -125,7 +125,8 @@ class virtio_ctrl_vq_test_null_bar extends virtio_bar_accessor;
     endtask
 endclass : virtio_ctrl_vq_test_null_bar
 
-// 迁移/MSI-X 用寄存器桩：status/复位/特性协商/队列编程/向量绑定在本地建模并记录；
+// 迁移/MSI-X 用寄存器桩：status/复位/特性协商/队列编程/向量绑定在本地建模并记录（enable_vectors：
+// setup_single_queue 置 Q_ENABLE 时该队列的向量）；BAR 发现为空操作；
 // max_virtqueue_pairs 可编程，使 control VQ 位于 2*max_virtqueue_pairs（与数据队列不连续）。
 class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
     `uvm_object_utils(virtio_ctrl_vq_migration_transport)
@@ -135,6 +136,7 @@ class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
     int unsigned programmed_qids[$];
     int unsigned msix_bound_qids[$];
     int unsigned msix_bound_vectors[int unsigned];
+    int unsigned enable_vectors[int unsigned];
 
     function new(string name = "virtio_ctrl_vq_migration_transport");
         virtio_ctrl_vq_test_null_bar null_bar;
@@ -146,6 +148,9 @@ class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
         notify_mgr.bar = null_bar;
         cap_mgr.bar_ref = null_bar;
     endfunction
+
+    virtual task discover_and_init_bars();
+    endtask
 
     virtual task read_device_status(ref bit [7:0] status);
         status = device_status;
@@ -187,6 +192,7 @@ class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
         int unsigned msix_vector
     );
         programmed_qids.push_back(queue_id);
+        enable_vectors[queue_id] = msix_vector;
     endtask
 
     virtual task write_queue_enable(bit enable);
@@ -334,6 +340,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         test_ctrl_send_timeout_quarantines_without_ring_reset();
         test_ctrl_vq_outside_data_range_migration_and_msix();
         test_mq_expansion_rebinds_msix();
+        test_full_init_binds_msix_before_enable();
         `uvm_info("CTRL_VQ_TEST", "control VQ tests PASSED", UVM_NONE)
         phase.drop_objection(this);
     endtask
@@ -910,6 +917,80 @@ class virtio_ctrl_vq_test extends uvm_test;
             `uvm_error("CTRL_VQ_TEST", "MQ MSI-X test leaked queue resources")
         mem.leak_check();
         `uvm_info("CTRL_VQ_TEST", "MQ expansion MSI-X rebinding test PASSED", UVM_LOW)
+    endtask
+    // virtio 1.2 §4.1.4.3.2：驱动 MUST 在 queue_enable 之前配置好其余队列字段（含 queue_msix_vector）。
+    // FSM full_init 建 1 对 + CTRL_VQ（max_virtqueue_pairs=2，队列 {0,1,4}）：每条队列使能时写入的向量
+    // 必须就是最终绑定的有效向量（非 NO_VECTOR、非 config 向量），而不是先用占位向量使能、事后改绑。
+    task test_full_init_binds_msix_before_enable();
+        virtio_ctrl_vq_migration_transport transport =
+            virtio_ctrl_vq_migration_transport::type_id::create("init_msix_transport");
+        virtio_ctrl_vq_test_mq_ops ops =
+            virtio_ctrl_vq_test_mq_ops::type_id::create("init_msix_ops");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("init_msix_vq_mgr");
+        virtio_ctrl_vq_test_mem mem = virtio_ctrl_vq_test_mem::type_id::create("init_msix_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("init_msix_iommu");
+        virtio_auto_fsm fsm = virtio_auto_fsm::type_id::create("init_msix_fsm");
+        virtio_memory_barrier_model barrier =
+            virtio_memory_barrier_model::type_id::create("init_msix_barrier");
+        virtio_wait_policy init_wait_pol =
+            virtio_wait_policy::type_id::create("init_msix_wait_pol");
+        int unsigned qids[$];
+        bit [63:0] features;
+        string why;
+
+        mem.init_region(64'h7700_0000, 64'h7700_FFFF);
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.barrier = barrier;
+        vq_mgr.wait_pol = init_wait_pol;
+        vq_mgr.bdf = 16'h0907;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0907));
+        transport.max_virtqueue_pairs = 2;
+        transport.cap_mgr.msix_found = 1;
+        transport.cap_mgr.msix_table_size = 8;
+        transport.cap_mgr.msix_table_bir = 4;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = init_wait_pol;
+        virtio_vq_test_kit::bind_common_backend(ops);
+        fsm.ops = ops;
+        features = '0;
+        features[VIRTIO_F_VERSION_1] = 1'b1;
+        features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        features[VIRTIO_NET_F_MQ] = 1'b1;
+        fsm.drv_cfg.driver_features = features;
+        fsm.drv_cfg.num_queue_pairs = 1;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.full_init();
+
+        vq_mgr.get_queue_ids(qids);
+        if ((fsm.state != FSM_READY) || (qids.size() != 3) || (qids[2] != 4))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "full_init with control VQ failed: state=%s queues=%p", fsm.state.name(), qids))
+        foreach (qids[i]) begin
+            if (!transport.enable_vectors.exists(qids[i]) ||
+                (transport.enable_vectors[qids[i]] != transport.notify_mgr.queue_vectors[qids[i]]) ||
+                (transport.enable_vectors[qids[i]] == 32'hFFFF) ||
+                (transport.enable_vectors[qids[i]] == transport.notify_mgr.config_vector))
+                `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                    "full_init enabled queue %0d with vector %p instead of its final vector (vectors=%p config=%0d)",
+                    qids[i], transport.enable_vectors, transport.notify_mgr.queue_vectors,
+                    transport.notify_mgr.config_vector))
+        end
+
+        foreach (qids[i])
+            ops.teardown_queue(qids[i]);
+        if ((vq_mgr.get_queue_count() != 0) || (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("CTRL_VQ_TEST", "full_init MSI-X test leaked queue resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST", "full_init MSI-X before enable test PASSED", UVM_LOW)
     endtask
 endclass : virtio_ctrl_vq_test
 

@@ -307,15 +307,21 @@
     virtual task setup_msix(int unsigned num_queues);
         virtio_config_backend backend;
         int unsigned queue_ids[$];
+        int unsigned ctrl_qid;
         bit msix_ok;
 
-        // 绑定 vq_mgr 中实际存在的队列号（control VQ 可位于 2*max_virtqueue_pairs）；
-        // 数量与 num_queues 不符（尚未建队的手工调用）时沿用 0..num_queues-1。
+        // 绑定 vq_mgr 中实际存在的队列号（control VQ 可位于 2*max_virtqueue_pairs）。
+        // 数量与 num_queues 不符（尚未建队：初始化须在队列使能前绑定向量）时按将要建立的
+        // 队列号：协商 CTRL_VQ 且 num_queues 为奇数时末项是 control VQ，其余为 0..num_queues-1。
         if ((vq_mgr != null) && (vq_mgr.get_queue_count() == num_queues))
             vq_mgr.get_queue_ids(queue_ids);
         else begin
             for (int unsigned q = 0; q < num_queues; q++)
                 queue_ids.push_back(q);
+            if (negotiated_features[VIRTIO_NET_F_CTRL_VQ] && (num_queues % 2 == 1)) begin
+                control_queue_id(num_queues / 2, ctrl_qid);
+                queue_ids[num_queues - 1] = ctrl_qid;
+            end
         end
         backend = cfg_backend();
         backend.set_msix(queue_ids, msix_ok);

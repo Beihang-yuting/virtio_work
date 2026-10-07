@@ -296,6 +296,24 @@
     endtask
 
     // ------------------------------------------------------------------------
+    // control_queue_id -- num_pairs 对数据队列时 control VQ 的队列号
+    //
+    // virtio 1.2 §5.1.2：协商 MQ 时 controlq 编号为 2*max_virtqueue_pairs（设备 config 上限），
+    // 否则为 2（单对）。取 max(num_pairs, 设备上限)，设备上报值小于当前对数时也不与数据队列
+    // 重号；之后 MQ 扩容新建的 RX/TX 不会落到 control VQ 上。
+    // ------------------------------------------------------------------------
+    virtual task control_queue_id(int unsigned num_pairs, output int unsigned ctrl_qid);
+        virtio_net_device_config_t net_cfg;
+
+        ctrl_qid = num_pairs * 2;
+        if (negotiated_features[VIRTIO_NET_F_MQ]) begin
+            read_net_config(net_cfg);
+            if (net_cfg.max_virtqueue_pairs > num_pairs)
+                ctrl_qid = 2 * net_cfg.max_virtqueue_pairs;
+        end
+    endtask
+
+    // ------------------------------------------------------------------------
     // setup_all_queues -- Create all queue pairs + control queue
     // ------------------------------------------------------------------------
     virtual task setup_all_queues(
@@ -306,7 +324,6 @@
     );
         int unsigned ctrl_qid;
         bit queue_ok;
-        virtio_net_device_config_t net_cfg;
 
         ok = 0;
 
@@ -329,17 +346,9 @@
         if (!queue_ok)
             return;
 
-        // Setup control queue if CTRL_VQ negotiated.  virtio 1.2 §5.1.2：
-        // 协商 MQ 时 controlq 编号为 2*max_virtqueue_pairs（设备 config 上限），
-        // 否则为 2（单对，上面已保证 num_pairs == 1）。取 max(num_pairs, 设备上限)，设备上报值小于当前对数时
-        // 也不与数据队列重号；之后 MQ 扩容新建的 RX/TX 不会落到 control VQ 上。
+        // Setup control queue if CTRL_VQ negotiated.
         if (negotiated_features[VIRTIO_NET_F_CTRL_VQ]) begin
-            ctrl_qid = num_pairs * 2;
-            if (negotiated_features[VIRTIO_NET_F_MQ]) begin
-                read_net_config(net_cfg);
-                if (net_cfg.max_virtqueue_pairs > num_pairs)
-                    ctrl_qid = 2 * net_cfg.max_virtqueue_pairs;
-            end
+            control_queue_id(num_pairs, ctrl_qid);
             setup_queue(ctrl_qid, queue_size, vq_type, queue_ok);
             if (!queue_ok) begin
                 for (int unsigned qid = 0; qid < num_pairs * 2; qid++)
