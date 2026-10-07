@@ -259,8 +259,9 @@ class dpu_priv_config_backend extends virtio_config_backend;
         probed = 1;
     endtask
 
-    // Function 复位 = 驱动 dpu_down：先停全部 TX 再停全部 RX（#33）；任一未确认停止即 ok=0，调用方保留全部
-    // DMA。AF 声明与映射表保留（对应驱动未 rmmod）。成功后影子 status 清零。
+    // Function 复位 = 驱动 dpu_down（adapter_ops.c:16–35）：先停全部 TX 再停全部 RX（#33），任一未确认停止即
+    // ok=0，调用方保留全部 DMA；全部停完后按 dpu_clear_msix_irqs_conf（interrupt.c:257）依向量升序清各 RX
+    // 队列对的中断 info（gv=gq）。AF 声明与映射表保留（对应驱动未 rmmod）。成功后影子 status 清零。
     virtual task reset(output bit ok);
         virtio_queue_program_t order[$];
         bit done;
@@ -279,6 +280,9 @@ class dpu_priv_config_backend extends virtio_config_backend;
                 return;
             end
         end
+        foreach (order[i])
+            if (!order[i].tx_mode)
+                wr0(MSIX_INFO_BASE + 4 * (order[i].local_qid >> 1), 32'h0);
         status_shadow = 0;
     endtask
 
@@ -384,7 +388,7 @@ class dpu_priv_config_backend extends virtio_config_backend;
     endtask
 
     // #33：TX 置 queue_en=0 → 等 QSCH 空闲 → 队列复位 → 清 TX 统计（stat_clr）；RX 间接读回 3 DW 参数
-    // （af_mng.c:1564）→ 置 queue_en=0 → 复位，最后清该队列对的中断 info。任一轮询超时 ok=0（不报错），
+    // （af_mng.c:1564）→ 置 queue_en=0 → 复位。中断 info 不在这里清（见 reset）。任一轮询超时 ok=0（不报错），
     // 队列仍记为已配置以便重试。未配置的队列（如 teardown 的空编程参数）没有设备状态，直接 ok=1，不访问设备。
     virtual task disable_queue(virtio_queue_program_t q, output bit ok);
         bit [31:0] dw[4];
@@ -431,7 +435,6 @@ class dpu_priv_config_backend extends virtio_config_backend;
             poll0(VRX_RESET_DONE, 32'h1, 32'h1, ok);
             if (!ok)
                 return;
-            wr0(MSIX_INFO_BASE + 4 * gq, 32'h0);
         end
         active.delete(q.queue_id);
     endtask

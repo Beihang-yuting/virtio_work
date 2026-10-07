@@ -1628,6 +1628,15 @@ class virtio_vdev_unit_test extends uvm_test;
         if (!ok || priv.queue_enabled(0, 0) || priv.queue_enabled(0, 1) ||
             priv.queue_enabled(1, 0) || priv.queue_enabled(1, 1))
             `uvm_fatal("VDEV_UNIT", "private reset did not stop both queue pairs")
+        priv_log.reg_trace(trace);
+        want.delete();
+        push_tx_stop(0, tx_ring, 32'h93, want);
+        push_tx_stop(1, tx1_ring, 32'h8093, want);
+        push_rx_stop(0, rx_ring, 32'h13, want);
+        push_rx_stop(1, rx1_ring, 32'h8_0013, want);
+        want.push_back("W bar0 msix_info.0 0x0");
+        want.push_back("W bar0 msix_info.1 0x0");
+        expect_trace(trace, want, "stop 2 pairs");
         iommu.unmap_for_host(0, PRIV_BDF, rx_ring);
         iommu.unmap_for_host(0, PRIV_BDF, tx_ring);
         iommu.unmap_for_host(0, PRIV_BDF, rx1_ring);
