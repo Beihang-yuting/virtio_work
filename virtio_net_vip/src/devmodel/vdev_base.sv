@@ -5,6 +5,8 @@
 // 依赖 vdev_port、virtqueue_error_injector（可选）与 virtio 类型常量；不引用任何驱动侧对象。
 // 时序：配置/MMIO 处理是零时间函数（端口在请求入口直接调用，不得阻塞）；DMA 与中断只在
 // run_phase 的 worker 中发生。INTx 消息不建模：MSI-X 未使能时设备只置 ISR（子类）。
+// Command 门控：MSE（0x004 bit1）清零时不认领 MMIO；BME（bit2）清零时 DMA 失败（ok=0、不访问
+// Host memory、报 VDEV_BME 警告），MSI-X 不发而置 PBA 挂起，BME 置回后补发一次。
 `ifndef VDEV_BASE_SV
 `define VDEV_BASE_SV
 
@@ -34,7 +36,7 @@ virtual class vdev_base extends uvm_component;
     protected bit          msix_pending[];
     protected frame_t      rx_backlog[int unsigned][$];
     protected int unsigned work_q[$];
-    protected int unsigned irq_q[$];
+    protected int unsigned irq_q[$];      // 挂起向量补发请求（可重复；投递时按 PBA 去重）
     protected event        work_ev;
     protected int unsigned epoch;
     protected int unsigned busy_epoch;
@@ -230,7 +232,7 @@ virtual class vdev_base extends uvm_component;
             return;
         end
         reg_event(1, "cfg", $sformatf("0x%03h", a), -1, data);
-        if ((msix_cap != 0) && (a == {4'h0, msix_cap}))
+        if ((msix_cap != 0) && ((a == {4'h0, msix_cap}) || (a == 12'h004)))
             flush_pending();
     endfunction
 
@@ -242,11 +244,14 @@ virtual class vdev_base extends uvm_component;
         return {v[63:4], 4'h0};
     endfunction
 
+    // Command.MSE 清零时不认领任何 MMIO。
     function bit claims(bit [63:0] addr, output int unsigned bar, output bit [31:0] offset);
         bit [63:0] base;
 
         bar = 0;
         offset = 0;
+        if (!cfg[12'h004][1])
+            return 0;
         for (int unsigned b = 0; b < 6; b += 2) begin
             if (bar_size[b] == 0)
                 continue;
@@ -332,7 +337,7 @@ virtual class vdev_base extends uvm_component;
         bit [31:0] ctrl;
 
         ctrl = get_cfg({4'h0, msix_cap} + 2, 2);
-        if (!ctrl[15] || ctrl[14])
+        if (!ctrl[15] || ctrl[14] || !bus_master())
             return;
         foreach (msix_pending[v])
             if (msix_pending[v] && !msix_table[4*v + 3][0])
@@ -340,7 +345,12 @@ virtual class vdev_base extends uvm_component;
         -> work_ev;
     endfunction
 
-    // 发一个 MSI-X 向量：未使能不发；功能屏蔽或向量屏蔽时置 PBA；NO_VECTOR/越界忽略。
+    // Command.BME：设备可发起 DMA 与 MSI-X 消息写。
+    protected function bit bus_master();
+        return cfg[12'h004][2];
+    endfunction
+
+    // 发一个 MSI-X 向量：未使能不发；功能屏蔽、向量屏蔽或 BME 清零时置 PBA；NO_VECTOR/越界忽略。
     protected task raise_irq(int unsigned vector);
         bit [31:0] ctrl;
         vdev_event e;
@@ -350,7 +360,7 @@ virtual class vdev_base extends uvm_component;
         ctrl = get_cfg({4'h0, msix_cap} + 2, 2);
         if (!ctrl[15])
             return;
-        if (ctrl[14] || msix_table[4*vector + 3][0]) begin
+        if (ctrl[14] || msix_table[4*vector + 3][0] || !bus_master()) begin
             msix_pending[vector] = 1;
             return;
         end
@@ -365,14 +375,19 @@ virtual class vdev_base extends uvm_component;
 
     // ---------------- worker、DMA、复位 ----------------
     // 单 worker 串行处理：补发中断优先，再服务队列；busy_epoch 用于复位时判断在途工作。
+    // 补发只在向量仍挂起时投递：同一挂起向量的多次补发请求（重复解除屏蔽、随后的 Message
+    // Control 写）只产生一条 MSI-X，首次投递清 PBA 后其余请求跳过。
     virtual task run_phase(uvm_phase phase);
         int unsigned q;
+        int unsigned v;
 
         forever begin
             while ((work_q.size() == 0) && (irq_q.size() == 0))
                 @(work_ev);
             if (irq_q.size() != 0) begin
-                raise_irq(irq_q.pop_front());
+                v = irq_q.pop_front();
+                if (msix_pending[v])
+                    raise_irq(v);
                 continue;
             end
             q = work_q.pop_front();
@@ -408,15 +423,33 @@ virtual class vdev_base extends uvm_component;
         return rx_backlog.exists(pair) && (rx_backlog[pair].size() != 0);
     endfunction
 
+    // BME 清零时不发 DMA：ok=0，不计数。
     protected task dma_rd(bit [63:0] addr, int unsigned len, output bit [7:0] data[], output bit ok);
+        if (!dma_allowed("read", addr)) begin
+            data = new[0];
+            ok = 0;
+            return;
+        end
         port.dma_read(bdf, addr, len, data, ok);
         n_dma_rd++;
     endtask
 
     protected task dma_wr(bit [63:0] addr, bit [7:0] data[], output bit ok);
+        if (!dma_allowed("write", addr)) begin
+            ok = 0;
+            return;
+        end
         port.dma_write(bdf, addr, data, ok);
         n_dma_wr++;
     endtask
+
+    protected function bit dma_allowed(string what, bit [63:0] addr);
+        if (bus_master())
+            return 1;
+        `uvm_warning("VDEV_BME", $sformatf("BDF 0x%04h DMA %s IOVA=0x%016h dropped: Bus Master Enable is clear",
+                                           bdf, what, addr))
+        return 0;
+    endfunction
 
     // 设备侧故障点：只消费本模型能实现的错误类型（PRE_DEVICE_READ：零长、方向翻转；
     // BEFORE_USED：完成长度多报 1）。其它类型留给驱动侧时序点或专用接口。

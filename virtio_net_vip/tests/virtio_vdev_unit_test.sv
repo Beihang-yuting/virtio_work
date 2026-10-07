@@ -9,7 +9,7 @@ import uvm_pkg::*;
 import virtio_net_pkg::*;
 
 // 底座测试设备：BAR0+0 为 scratch 寄存器；BAR0+4 写入任意值触发一次服务：
-// 从 echo_iova 读 4 字节、加一写回 echo_iova+4，然后发向量 0。
+// 从 echo_iova 读 4 字节、加一写回 echo_iova+4，然后发向量 0；BAR0+8 写入任意值只发向量 0。
 class vdev_unit_echo_device extends vdev_base;
     `uvm_component_utils(vdev_unit_echo_device)
 
@@ -41,6 +41,8 @@ class vdev_unit_echo_device extends vdev_base;
             scratch = data;
         if ((bar == 0) && (off == 4))
             schedule(0);
+        if ((bar == 0) && (off == 8))
+            schedule(1);
     endfunction
 
     virtual task service_queue(int unsigned q);
@@ -48,6 +50,10 @@ class vdev_unit_echo_device extends vdev_base;
         bit [31:0] v;
         bit ok;
 
+        if (q == 1) begin
+            raise_irq(0);
+            return;
+        end
         dma_rd(echo_iova, 4, d, ok);
         if (!ok)
             return;
@@ -73,6 +79,7 @@ class virtio_vdev_unit_test extends uvm_test;
     vdev_loopback_port    port;
     vdev_unit_echo_device echo;
     vdev_event_log        echo_log;
+    int unsigned          irq_base;   // 本子测试开始时的 interrupt_count
 
     function new(string name = "virtio_vdev_unit_test", uvm_component parent = null);
         super.new(name, parent);
@@ -234,6 +241,123 @@ class virtio_vdev_unit_test extends uvm_test;
         `uvm_info("VDEV_UNIT", "test_base_msix_and_dma PASSED", UVM_LOW)
     endtask
 
+    // 新发一次向量 0 中断（不经 DMA），等 worker 处理。
+    protected task fire_irq();
+        port.host_write(ECHO_BAR0 + 8, 4, 1);
+        settle();
+    endtask
+
+    // 断言自 base 以来恰好新投递 n 条 MSI-X（端口记录、irq 事件与计数一致），且 PBA 已清。
+    protected function void expect_delivered(int unsigned base, int unsigned n, string what);
+        vdev_event ev[$];
+
+        echo_log.select(VDEV_IRQ, ev);
+        if ((port.msix_addr.size() != base + n) || (ev.size() != base + n) ||
+            (echo.interrupt_count() != irq_base + base + n) ||
+            (port.host_read(ECHO_BAR4 + 32'h8000, 4) != 0))
+            `uvm_fatal("VDEV_UNIT", $sformatf("%s: expected %0d new MSI-X, port=%0d events=%0d count=%0d",
+                                              what, n, port.msix_addr.size() - base, ev.size() - base,
+                                              echo.interrupt_count() - irq_base - base))
+    endfunction
+
+    // 挂起补发只投递一次：同一挂起向量的多次补发请求（重复解除屏蔽、解除屏蔽后再写
+    // Message Control、Function Mask 清除）合计只产生一条 MSI-X。前置：MSI-X 已使能、向量 0 已编程。
+    task test_base_msix_replay();
+        echo_log.events.delete();
+        port.msix_addr.delete();
+        port.msix_data.delete();
+        irq_base = echo.interrupt_count();
+        // (a) 挂起后连续两次写向量控制=0。
+        port.host_write(ECHO_BAR4 + 12, 4, 1);
+        fire_irq();
+        if ((port.msix_addr.size() != 0) || (port.host_read(ECHO_BAR4 + 32'h8000, 4) != 1))
+            `uvm_fatal("VDEV_UNIT", "masked vector did not become pending")
+        port.host_write(ECHO_BAR4 + 12, 4, 0);
+        port.host_write(ECHO_BAR4 + 12, 4, 0);
+        settle();
+        expect_delivered(0, 1, "double unmask");
+        // (b) 挂起后解除向量屏蔽，再写 Message Control（Enable 保持）。
+        port.host_write(ECHO_BAR4 + 12, 4, 1);
+        fire_irq();
+        port.host_write(ECHO_BAR4 + 12, 4, 0);
+        port.host_cfg_write(ECHO_BDF, 12'h07c, 32'h8000_0000, 4'hc);
+        settle();
+        expect_delivered(1, 1, "unmask then Message Control write");
+        // (c) Function Mask 置位时中断挂起，清除 Function Mask 经 flush_pending 补发一次。
+        port.host_cfg_write(ECHO_BDF, 12'h07c, 32'hc000_0000, 4'hc);
+        fire_irq();
+        if ((port.msix_addr.size() != 2) || (port.host_read(ECHO_BAR4 + 32'h8000, 4) != 1))
+            `uvm_fatal("VDEV_UNIT", "function-masked interrupt did not become pending")
+        port.host_cfg_write(ECHO_BDF, 12'h07c, 32'h8000_0000, 4'hc);
+        settle();
+        expect_delivered(2, 1, "function mask clear");
+        // 未挂起时的新中断照常投递。
+        fire_irq();
+        expect_delivered(3, 1, "new interrupt after replays");
+        `uvm_info("VDEV_UNIT", "test_base_msix_replay PASSED", UVM_LOW)
+    endtask
+
+    // Command 门控：MSE=0 时设备不认领 MMIO；BME=0 时 DMA 失败（不碰内存、报 VDEV_BME 警告）、
+    // 中断转挂起，置回 BME 后补发一次；恢复 0x6 后正向路径照常。前置：MSI-X 已使能、向量 0 未屏蔽。
+    task test_base_command_gating();
+        bit [63:0] gpa;
+        byte word[];
+        byte data[];
+        int unsigned rd0;
+        int unsigned wr0;
+        vdev_expect_catcher catcher;
+
+        echo_log.events.delete();
+        port.msix_addr.delete();
+        port.msix_data.delete();
+        irq_base = echo.interrupt_count();
+        // MSE=0：读返回全 1（未认领），写不落到寄存器。
+        port.host_cfg_write(ECHO_BDF, 12'h004, 32'h0000_0004, 4'h3);
+        if (port.host_read(ECHO_BAR0, 4) != 32'hffff_ffff)
+            `uvm_fatal("VDEV_UNIT", "MMIO claimed while Memory Space Enable is clear")
+        port.host_write(ECHO_BAR0, 4, 32'h1111_2222);
+        port.host_cfg_write(ECHO_BDF, 12'h004, 32'h0000_0006, 4'h3);
+        if (port.host_read(ECHO_BAR0, 4) != 32'hcafe_f00d)
+            `uvm_fatal("VDEV_UNIT", "MMIO write reached the device while Memory Space Enable is clear")
+        // BME=0：DMA 失败且不访问内存；中断挂起不投递。
+        echo.echo_iova = map_buffer(ECHO_BDF, 4096, DMA_BIDIRECTIONAL, gpa);
+        word = new[8];
+        foreach (word[i])
+            word[i] = i;
+        mem.write_mem(gpa, word);
+        rd0 = echo.dma_read_count();
+        wr0 = echo.dma_write_count();
+        port.host_cfg_write(ECHO_BDF, 12'h004, 32'h0000_0002, 4'h3);
+        catcher = new("vdev_bme_catcher");
+        catcher.id = "VDEV_BME";
+        catcher.text = "Bus Master Enable";
+        uvm_report_cb::add(null, catcher);
+        port.host_write(ECHO_BAR0 + 4, 4, 1);
+        settle();
+        uvm_report_cb::delete(null, catcher);
+        mem.read_mem(gpa + 4, 4, data);
+        if ((catcher.caught != 1) || (data[0] != 8'h04) || (data[3] != 8'h07) ||
+            (echo.dma_read_count() != rd0) || (echo.dma_write_count() != wr0))
+            `uvm_fatal("VDEV_UNIT", "DMA was not blocked while Bus Master Enable is clear")
+        fire_irq();
+        if ((port.msix_addr.size() != 0) || (port.host_read(ECHO_BAR4 + 32'h8000, 4) != 1))
+            `uvm_fatal("VDEV_UNIT", "interrupt with Bus Master Enable clear did not become pending")
+        // 置回 BME：挂起向量补发一次；随后 DMA 正向路径照常。
+        port.host_cfg_write(ECHO_BDF, 12'h004, 32'h0000_0006, 4'h3);
+        settle();
+        expect_delivered(0, 1, "BME set replay");
+        port.host_write(ECHO_BAR0 + 4, 4, 1);
+        settle();
+        mem.read_mem(gpa + 4, 4, data);
+        if ((data[0] != 8'h01) || (data[1] != 8'h01) || (data[2] != 8'h02) || (data[3] != 8'h03) ||
+            (echo.dma_read_count() != rd0 + 1) || (echo.dma_write_count() != wr0 + 1))
+            `uvm_fatal("VDEV_UNIT", "DMA did not resume after Bus Master Enable was set")
+        expect_delivered(0, 2, "DMA completion interrupt");
+        iommu.unmap_for_host(0, ECHO_BDF, echo.echo_iova);
+        mem.free(gpa);
+        `uvm_info("VDEV_UNIT", "test_base_command_gating PASSED", UVM_LOW)
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         echo.bdf = ECHO_BDF;
@@ -242,6 +366,8 @@ class virtio_vdev_unit_test extends uvm_test;
         test_base_config_space();
         test_base_marker();
         test_base_msix_and_dma();
+        test_base_msix_replay();
+        test_base_command_gating();
         mem.leak_check();
         iommu.leak_check();
         `uvm_info("VDEV_UNIT", "virtio_vdev_unit_test PASSED", UVM_NONE)
