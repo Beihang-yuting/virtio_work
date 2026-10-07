@@ -7,8 +7,9 @@
 // completion adapter, then exchange packets simultaneously.
 //
 // Architecture:
-//   VIP A (BDF=0x0100) <---> Virtual Network Bridge <---> VIP B (BDF=0x0200)
-//   Both share a single pcie_tl_env with TLM loopback.
+//   VIP A / VIP B 的 PCIe 身份（BDF、BAR lease）来自 fixture 冻结 snapshot 中
+//   的两个 host0 PF，共享同一个 pcie_tl_env/EP 模型，经 Fabric 预配置流程完成
+//   初始化；数据面互打使用各自独立的 Host memory/IOMMU（队列 BDF 0x0100/0x0200）。
 //
 // Tests:
 //   1. Bidirectional large traffic (2000 packets total)
@@ -23,7 +24,6 @@
 
 import uvm_pkg::*;
 `include "uvm_macros.svh"
-import pcie_tl_pkg::*;
 import host_mem_pkg::*;
 import virtio_net_pkg::*;
 
@@ -35,27 +35,22 @@ class virtio_dual_test extends uvm_test;
 
     localparam int unsigned DUAL_BW_MAX_PKTS_PER_DIR = 10_000;
 
-    // PCIe environment (shared)
-    pcie_tl_env pcie_env;
+    // Snapshot-derived shared PCIe/virtio flow (two host0 VIO PFs)
+    virtio_real_driver_flow_fixture flow;
 
+    // Borrowed from the fixture
     virtio_tlm_completion_adapter tlm_adapter;
 
     // ---- VIP A components ----
     virtio_pci_transport  transport_a;
     host_mem_manager      mem_a;
     virtio_iommu_model    iommu_a;
-    virtqueue_manager     vq_mgr_a;
-    virtio_atomic_ops     ops_a;
-    virtio_function_instance binding_function_a;
     virtio_vq_test_kit    kit_a;
 
     // ---- VIP B components ----
     virtio_pci_transport  transport_b;
     host_mem_manager      mem_b;
     virtio_iommu_model    iommu_b;
-    virtqueue_manager     vq_mgr_b;
-    virtio_atomic_ops     ops_b;
-    virtio_function_instance binding_function_b;
     virtio_vq_test_kit    kit_b;
 
     // Perf monitors
@@ -126,54 +121,24 @@ class virtio_dual_test extends uvm_test;
     // Build Phase
     // ========================================================================
     virtual function void build_phase(uvm_phase phase);
-        pcie_tl_env_config pcie_cfg;
         super.build_phase(phase);
 
-        // Install one reusable adapter before PCIe creates its RC driver.
-        tlm_adapter = virtio_tlm_completion_adapter::type_id::create(
-            "tlm_adapter");
-        tlm_adapter.install_factory_overrides();
+        // Two snapshot PFs share one PCIe EP model; the fixture owns the TLM
+        // completion adapter, the endpoint images and the BAR leases.
+        flow = virtio_real_driver_flow_fixture::type_id::create("flow", this);
+        flow.vio_pf_count = 2;
+        // 500ms: accommodate bandwidth test time advances
+        flow.pcie_cpl_timeout_ns = 500_000_000;
 
-        // 4. Create PCIe environment
-        pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
-        pcie_cfg.if_mode = TLM_MODE;
-        pcie_cfg.rc_agent_enable = 1;
-        pcie_cfg.ep_agent_enable = 1;
-        pcie_cfg.rc_is_active = UVM_ACTIVE;
-        pcie_cfg.ep_is_active = UVM_ACTIVE;
-        pcie_cfg.ep_auto_response = 1;
-        pcie_cfg.scb_enable = 0;
-        pcie_cfg.fc_enable = 0;
-        pcie_cfg.infinite_credit = 1;
-        pcie_cfg.extended_tag_enable = 1;
-        pcie_cfg.cpl_timeout_ns = 500_000_000;  // 500ms: accommodate bandwidth test time advances
-        pcie_cfg.link_delay_enable = 0;
-        uvm_config_db #(pcie_tl_env_config)::set(this, "pcie_env", "cfg", pcie_cfg);
-        pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
-
-        // 5. Create VIP A components
-        transport_a = virtio_pci_transport::type_id::create("transport_a");
+        // 5. Create VIP A data-plane components
         mem_a       = host_mem_manager::type_id::create("mem_a");
         iommu_a     = virtio_iommu_model::type_id::create("iommu_a");
         kit_a       = virtio_vq_test_kit::create_kit("dual_a", mem_a, iommu_a, 16'h0100);
-        vq_mgr_a    = virtqueue_manager::type_id::create("vq_mgr_a");
-        ops_a       = virtio_atomic_ops::type_id::create("ops_a");
-        uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "binding_function_a.driver_agent", "is_active", UVM_PASSIVE);
-        binding_function_a = virtio_function_instance::type_id::create(
-            "binding_function_a", this);
 
-        // 6. Create VIP B components
-        transport_b = virtio_pci_transport::type_id::create("transport_b");
+        // 6. Create VIP B data-plane components
         mem_b       = host_mem_manager::type_id::create("mem_b");
         iommu_b     = virtio_iommu_model::type_id::create("iommu_b");
         kit_b       = virtio_vq_test_kit::create_kit("dual_b", mem_b, iommu_b, 16'h0200);
-        vq_mgr_b    = virtqueue_manager::type_id::create("vq_mgr_b");
-        ops_b       = virtio_atomic_ops::type_id::create("ops_b");
-        uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "binding_function_b.driver_agent", "is_active", UVM_PASSIVE);
-        binding_function_b = virtio_function_instance::type_id::create(
-            "binding_function_b", this);
 
         // 7. Perf monitors
         perf_a = virtio_perf_monitor::type_id::create("perf_a", this);
@@ -190,39 +155,13 @@ class virtio_dual_test extends uvm_test;
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
 
-        // ---- Wire VIP A ----
-        transport_a.bdf = 16'h0100;
-        binding_function_a.transport = transport_a;
-        binding_function_a.vq_mgr = vq_mgr_a;
-        binding_function_a.driver_agent.ops = ops_a;
-        if (!binding_function_a.wire_shared(
-            mem_a, iommu_a, kit_a.barrier, kit_a.err_inj, kit_a.wait_pol,
-            pcie_env.rc_agent.sequencer)) begin
-            `uvm_fatal("DUAL_TEST", "failed to bind function A to PCIe")
-            return;
-        end
+        tlm_adapter = flow.tlm_adapter;
 
-        kit_a.wait_pol.default_poll_interval_ns = 100;
-        kit_a.wait_pol.reset_timeout_ns = 10000;
-        kit_a.wait_pol.queue_reset_timeout_ns = 10000;
-        kit_a.wait_pol.max_poll_attempts = 100;
+        // ---- VIP A wait policy ----
+        apply_fast_wait_policy(kit_a.wait_pol);
 
-        // ---- Wire VIP B ----
-        transport_b.bdf = 16'h0200;
-        binding_function_b.transport = transport_b;
-        binding_function_b.vq_mgr = vq_mgr_b;
-        binding_function_b.driver_agent.ops = ops_b;
-        if (!binding_function_b.wire_shared(
-            mem_b, iommu_b, kit_b.barrier, kit_b.err_inj, kit_b.wait_pol,
-            pcie_env.rc_agent.sequencer)) begin
-            `uvm_fatal("DUAL_TEST", "failed to bind function B to PCIe")
-            return;
-        end
-
-        kit_b.wait_pol.default_poll_interval_ns = 100;
-        kit_b.wait_pol.reset_timeout_ns = 10000;
-        kit_b.wait_pol.queue_reset_timeout_ns = 10000;
-        kit_b.wait_pol.max_poll_attempts = 100;
+        // ---- VIP B wait policy ----
+        apply_fast_wait_policy(kit_b.wait_pol);
     endfunction
 
     // ========================================================================
@@ -237,8 +176,7 @@ class virtio_dual_test extends uvm_test;
 
         #200ns;
 
-        // Setup EP and run full init for both VIPs
-        setup_ep_virtio_config();
+        // Run full init for both VIPs on the snapshot-derived endpoint
         init_both_vips();
 
         // Drain bridge between phases
@@ -280,290 +218,46 @@ class virtio_dual_test extends uvm_test;
     endtask
 
     // ========================================================================
-    // Setup EP Config Space
-    // ========================================================================
-    virtual function void setup_ep_virtio_config();
-        pcie_tl_cfg_space_manager cfg;
-        pcie_tl_ep_driver ep_drv;
-        pcie_capability vs_cap;
-        bit [7:0] cap_data[];
-
-        cfg = pcie_env.cfg_mgr;
-        ep_drv = pcie_env.ep_agent.ep_driver;
-
-        cfg.cap_list.delete();
-        cfg.ext_cap_list.delete();
-
-        cfg.init_type0_header(
-            .vendor_id(16'h1AF4),
-            .device_id(16'h1041),
-            .revision_id(8'h01),
-            .class_code(24'h020000),
-            .header_type(8'h00)
-        );
-
-        cfg.cfg_space[6] = cfg.cfg_space[6] | (1 << PCI_STATUS_CAP_LIST);
-        cfg.field_attrs[6] = CFG_FIELD_RO;
-
-        cfg.cfg_space[16] = 8'h00;
-        cfg.cfg_space[17] = 8'h00;
-        cfg.cfg_space[18] = 8'h00;
-        cfg.cfg_space[19] = 8'h00;
-        for (int i = 16; i < 18; i++)
-            cfg.field_attrs[i] = CFG_FIELD_RO;
-
-        cfg.init_pcie_capability(8'h40, MPS_256, MRRS_512, RCB_64);
-
-        // Common Config capability (cfg_type=1) at offset 0x50
-        vs_cap = pcie_capability::type_id::create("virtio_common_cap");
-        vs_cap.cap_id = CAP_ID_VENDOR;
-        vs_cap.offset = 8'h50;
-        cap_data = new[14];
-        cap_data[0]  = 8'h14;
-        cap_data[1]  = VIRTIO_PCI_CAP_COMMON_CFG;
-        cap_data[2]  = 8'h00;
-        cap_data[3]  = 8'h00;
-        cap_data[4]  = 8'h00;
-        cap_data[5]  = 8'h00;
-        cap_data[6]  = 8'h00;
-        cap_data[7]  = 8'h00;
-        cap_data[8]  = 8'h00;
-        cap_data[9]  = 8'h00;
-        cap_data[10] = 8'h40;
-        cap_data[11] = 8'h00;
-        cap_data[12] = 8'h00;
-        cap_data[13] = 8'h00;
-        vs_cap.data = cap_data;
-        cfg.register_capability(vs_cap);
-
-        // Notify capability (cfg_type=2) at offset 0x70
-        vs_cap = pcie_capability::type_id::create("virtio_notify_cap");
-        vs_cap.cap_id = CAP_ID_VENDOR;
-        vs_cap.offset = 8'h70;
-        cap_data = new[18];
-        cap_data[0]  = 8'h18;
-        cap_data[1]  = VIRTIO_PCI_CAP_NOTIFY_CFG;
-        cap_data[2]  = 8'h00;
-        cap_data[3]  = 8'h00;
-        cap_data[4]  = 8'h00;
-        cap_data[5]  = 8'h00;
-        cap_data[6]  = 8'h00;
-        cap_data[7]  = 8'h10;
-        cap_data[8]  = 8'h00;
-        cap_data[9]  = 8'h00;
-        cap_data[10] = 8'h00;
-        cap_data[11] = 8'h10;
-        cap_data[12] = 8'h00;
-        cap_data[13] = 8'h00;
-        cap_data[14] = 8'h02;
-        cap_data[15] = 8'h00;
-        cap_data[16] = 8'h00;
-        cap_data[17] = 8'h00;
-        vs_cap.data = cap_data;
-        cfg.register_capability(vs_cap);
-
-        // ISR capability (cfg_type=3) at offset 0x90
-        vs_cap = pcie_capability::type_id::create("virtio_isr_cap");
-        vs_cap.cap_id = CAP_ID_VENDOR;
-        vs_cap.offset = 8'h90;
-        cap_data = new[14];
-        cap_data[0]  = 8'h14;
-        cap_data[1]  = VIRTIO_PCI_CAP_ISR_CFG;
-        cap_data[2]  = 8'h00;
-        cap_data[3]  = 8'h00;
-        cap_data[4]  = 8'h00;
-        cap_data[5]  = 8'h00;
-        cap_data[6]  = 8'h00;
-        cap_data[7]  = 8'h20;
-        cap_data[8]  = 8'h00;
-        cap_data[9]  = 8'h00;
-        cap_data[10] = 8'h04;
-        cap_data[11] = 8'h00;
-        cap_data[12] = 8'h00;
-        cap_data[13] = 8'h00;
-        vs_cap.data = cap_data;
-        cfg.register_capability(vs_cap);
-
-        // Device Config capability (cfg_type=4) at offset 0xA8
-        vs_cap = pcie_capability::type_id::create("virtio_devcfg_cap");
-        vs_cap.cap_id = CAP_ID_VENDOR;
-        vs_cap.offset = 8'hA8;
-        cap_data = new[14];
-        cap_data[0]  = 8'h14;
-        cap_data[1]  = VIRTIO_PCI_CAP_DEVICE_CFG;
-        cap_data[2]  = 8'h00;
-        cap_data[3]  = 8'h00;
-        cap_data[4]  = 8'h00;
-        cap_data[5]  = 8'h00;
-        cap_data[6]  = 8'h00;
-        cap_data[7]  = 8'h30;
-        cap_data[8]  = 8'h00;
-        cap_data[9]  = 8'h00;
-        cap_data[10] = 8'h40;
-        cap_data[11] = 8'h00;
-        cap_data[12] = 8'h00;
-        cap_data[13] = 8'h00;
-        vs_cap.data = cap_data;
-        cfg.register_capability(vs_cap);
-
-        // MSI-X capability at offset 0xC0
-        begin
-            pcie_capability msix_cap;
-            msix_cap = pcie_capability::type_id::create("msix_cap");
-            msix_cap.cap_id = CAP_ID_MSIX;
-            msix_cap.offset = 8'hC0;
-            cap_data = new[10];
-            cap_data[0] = 8'h07;
-            cap_data[1] = 8'h00;
-            cap_data[2] = 8'h00;
-            cap_data[3] = 8'h40;
-            cap_data[4] = 8'h00;
-            cap_data[5] = 8'h00;
-            cap_data[6] = 8'h00;
-            cap_data[7] = 8'h50;
-            cap_data[8] = 8'h00;
-            cap_data[9] = 8'h00;
-            msix_cap.data = cap_data;
-            cfg.register_capability(msix_cap);
-        end
-
-        `uvm_info("DUAL_TEST", "EP config space setup complete", UVM_LOW)
-    endfunction
-
-    // ========================================================================
-    // Init EP MMIO registers
-    // ========================================================================
-    virtual function void init_ep_mmio_regs(bit [63:0] bar0_base);
-        pcie_tl_ep_driver ep_drv;
-        bit [63:0] cc_base, dc_base;
-        bit [63:0] device_features;
-
-        ep_drv  = pcie_env.ep_agent.ep_driver;
-        cc_base = bar0_base;
-        dc_base = bar0_base + 64'h3000;
-
-        device_features = 0;
-        device_features[VIRTIO_NET_F_MAC]     = 1;
-        device_features[VIRTIO_NET_F_STATUS]  = 1;
-        device_features[VIRTIO_NET_F_MRG_RXBUF] = 1;
-        device_features[VIRTIO_NET_F_CTRL_VQ] = 1;
-        device_features[VIRTIO_NET_F_MQ]      = 1;
-        device_features[VIRTIO_F_VERSION_1]   = 1;
-        device_features[VIRTIO_NET_F_MTU]     = 1;
-        device_features[VIRTIO_NET_F_CSUM]    = 1;
-        device_features[VIRTIO_NET_F_HOST_TSO4] = 1;
-
-        write_ep_mem32(ep_drv, cc_base + 64'h00, 32'h0);
-        write_ep_mem32(ep_drv, cc_base + 64'h04, device_features[31:0]);
-        write_ep_mem32(ep_drv, cc_base + 64'h08, 32'h0);
-        write_ep_mem32(ep_drv, cc_base + 64'h0C, 32'h0);
-        write_ep_mem16(ep_drv, cc_base + 64'h10, 16'h0);
-        write_ep_mem16(ep_drv, cc_base + 64'h12, 16'h0006);
-        write_ep_mem8(ep_drv,  cc_base + 64'h14, 8'h0);
-        write_ep_mem8(ep_drv,  cc_base + 64'h15, 8'h0);
-        write_ep_mem16(ep_drv, cc_base + 64'h16, 16'h0);
-        write_ep_mem16(ep_drv, cc_base + 64'h18, 16'h0100);
-        write_ep_mem16(ep_drv, cc_base + 64'h1A, 16'h0);
-        write_ep_mem16(ep_drv, cc_base + 64'h1C, 16'h0);
-        write_ep_mem16(ep_drv, cc_base + 64'h1E, 16'h0);
-        for (int i = 0; i < 24; i++)
-            ep_drv.mem_space[cc_base + 64'h20 + i] = 8'h00;
-
-        // Device Config: MAC, status, etc.
-        write_ep_mem8(ep_drv, dc_base + 64'h00, 8'h52);
-        write_ep_mem8(ep_drv, dc_base + 64'h01, 8'h54);
-        write_ep_mem8(ep_drv, dc_base + 64'h02, 8'h00);
-        write_ep_mem8(ep_drv, dc_base + 64'h03, 8'h12);
-        write_ep_mem8(ep_drv, dc_base + 64'h04, 8'h34);
-        write_ep_mem8(ep_drv, dc_base + 64'h05, 8'h56);
-        write_ep_mem16(ep_drv, dc_base + 64'h06, 16'h0001);
-        write_ep_mem16(ep_drv, dc_base + 64'h08, 16'h0002);
-        write_ep_mem16(ep_drv, dc_base + 64'h0A, 16'h05DC);
-        write_ep_mem32(ep_drv, dc_base + 64'h0C, 32'h00002710);
-        write_ep_mem8(ep_drv,  dc_base + 64'h10, 8'h01);
-    endfunction
-
-    // ========================================================================
-    // EP Device Behavior
-    // ========================================================================
-    virtual task ep_device_behavior(bit [63:0] bar0_base);
-        pcie_tl_ep_driver ep_drv;
-        bit [63:0] cc_base;
-        bit [63:0] device_features;
-        bit [7:0] last_status;
-        int unsigned last_qselect;
-
-        ep_drv  = pcie_env.ep_agent.ep_driver;
-        cc_base = bar0_base;
-
-        device_features = 0;
-        device_features[VIRTIO_NET_F_MAC]     = 1;
-        device_features[VIRTIO_NET_F_STATUS]  = 1;
-        device_features[VIRTIO_NET_F_MRG_RXBUF] = 1;
-        device_features[VIRTIO_NET_F_CTRL_VQ] = 1;
-        device_features[VIRTIO_NET_F_MQ]      = 1;
-        device_features[VIRTIO_F_VERSION_1]   = 1;
-        device_features[VIRTIO_NET_F_MTU]     = 1;
-        device_features[VIRTIO_NET_F_CSUM]    = 1;
-        device_features[VIRTIO_NET_F_HOST_TSO4] = 1;
-
-        last_status  = 0;
-        last_qselect = 0;
-
-        forever begin
-            bit [31:0] dfselect_val;
-            bit [7:0] status_val;
-            int unsigned qselect_val;
-
-            #10ns;
-
-            dfselect_val = read_ep_mem32(ep_drv, cc_base + 64'h00);
-            if (dfselect_val == 0)
-                write_ep_mem32(ep_drv, cc_base + 64'h04, device_features[31:0]);
-            else if (dfselect_val == 1)
-                write_ep_mem32(ep_drv, cc_base + 64'h04, device_features[63:32]);
-
-            status_val = read_ep_mem8(ep_drv, cc_base + 64'h14);
-            if (status_val != last_status) begin
-                last_status = status_val;
-                if (last_status & DEV_STATUS_FEATURES_OK)
-                    write_ep_mem8(ep_drv, cc_base + 64'h14, last_status);
-            end
-
-            qselect_val = read_ep_mem16(ep_drv, cc_base + 64'h16);
-            if (qselect_val != last_qselect) begin
-                last_qselect = qselect_val;
-                write_ep_mem16(ep_drv, cc_base + 64'h18, 16'h0100);
-                write_ep_mem16(ep_drv, cc_base + 64'h1E, last_qselect[15:0]);
-            end
-        end
-    endtask
-
-    // ========================================================================
-    // Init Both VIPs (sequentially through shared PCIe)
+    // Init Both VIPs (sequentially through the shared snapshot-derived EP)
     // ========================================================================
     virtual task init_both_vips();
-        bit [63:0] bar0_base;
+        virtio_net_env           env;
+        virtio_function_instance function_a;
+        virtio_function_instance function_b;
+        string                   why;
+
+        if (!flow.build_flow(why))
+            `uvm_fatal("DUAL_TEST", {"fixture flow is not ready: ", why})
+        if (!flow.execution_profile().has_model_device())
+            `uvm_fatal("DUAL_TEST", "dual VIP test requires MODEL execution mode")
+        if (tlm_adapter == null)
+            `uvm_fatal("DUAL_TEST", "fixture did not expose its completion adapter")
+        env = flow.virtio_env();
+        function_a = flow.function_by_bdf(flow.function_bdf());
+        function_b = null;
+        foreach (env.function_instances[index]) begin
+            if ((env.function_instances[index] != null) &&
+                (env.function_instances[index] != function_a)) begin
+                function_b = env.function_instances[index];
+                break;
+            end
+        end
+        if ((function_a == null) || (function_b == null) ||
+            (function_a.transport == null) || (function_b.transport == null) ||
+            (function_a.transport.wait_pol == null) ||
+            (function_b.transport.wait_pol == null))
+            `uvm_fatal("DUAL_TEST", "fixture did not provide two snapshot VIO functions")
+        transport_a = function_a.transport;
+        transport_b = function_b.transport;
+        apply_fast_wait_policy(transport_a.wait_pol);
+        apply_fast_wait_policy(transport_b.wait_pol);
 
         `uvm_info("DUAL_TEST", "--- Initializing VIP A ---", UVM_LOW)
 
-        // BAR enumeration (VIP A)
-        transport_a.bar.requester_id = transport_a.bdf;
-        transport_a.bar.enumerate_bars();
-        bar0_base = transport_a.bar.bar_base[0];
-        `uvm_info("DUAL_TEST", $sformatf("VIP A: BAR0=0x%016h", bar0_base), UVM_LOW)
-
-        // Init EP MMIO
-        init_ep_mmio_regs(bar0_base);
-
-        // Start EP device behavior
-        fork
-            ep_device_behavior(bar0_base);
-        join_none
-
-        // Capability discovery
-        transport_a.cap_mgr.bar_ref = transport_a.bar;
-        transport_a.cap_mgr.discover_capabilities();
+        // Fabric BAR programming + capability discovery (VIP A)
+        transport_a.discover_and_init_bars();
+        `uvm_info("DUAL_TEST", $sformatf("VIP A: BDF=0x%04h BAR0=0x%016h",
+            transport_a.bdf, transport_a.bar.bar_base[0]), UVM_LOW)
 
         if (!transport_a.cap_mgr.common_cfg_found) begin
             `uvm_fatal("DUAL_TEST", "VIP A: Common Config capability not found")
@@ -575,21 +269,19 @@ class virtio_dual_test extends uvm_test;
         #100ns;
         tlm_adapter.drain();
 
-        // VIP B uses same EP config space and BAR (shared device)
+        // VIP B is the second snapshot PF on the same PCIe EP model
         `uvm_info("DUAL_TEST", "--- Initializing VIP B ---", UVM_LOW)
 
-        transport_b.bar.requester_id = transport_b.bdf;
-        // Copy BAR assignment from VIP A (same device)
-        transport_b.bar.bar_base[0] = bar0_base;
-        transport_b.bar.bar_size[0] = transport_a.bar.bar_size[0];
-        transport_b.bar.bar_type[0] = transport_a.bar.bar_type[0];
-
-        transport_b.cap_mgr.bar_ref = transport_b.bar;
-        transport_b.cap_mgr.discover_capabilities();
+        transport_b.discover_and_init_bars();
+        `uvm_info("DUAL_TEST", $sformatf("VIP B: BDF=0x%04h BAR0=0x%016h",
+            transport_b.bdf, transport_b.bar.bar_base[0]), UVM_LOW)
 
         if (!transport_b.cap_mgr.common_cfg_found) begin
             `uvm_fatal("DUAL_TEST", "VIP B: Common Config capability not found")
         end
+
+        // VIP B must reach its own endpoint image, not VIP A's (already DRIVER_OK)
+        check_vip_b_endpoint_image(function_b);
 
         // Full virtio init for VIP B
         run_virtio_init(transport_b, "VIP_B");
@@ -604,6 +296,65 @@ class virtio_dual_test extends uvm_test;
         iommu_b.strict_permission_check = 0;
 
         `uvm_info("DUAL_TEST", "Both VIPs initialized successfully", UVM_LOW)
+    endtask
+
+    // Fast simulation wait policy (same values the test used before migration).
+    function void apply_fast_wait_policy(virtio_wait_policy wait_pol);
+        wait_pol.default_poll_interval_ns = 100;
+        wait_pol.reset_timeout_ns = 10000;
+        wait_pol.queue_reset_timeout_ns = 10000;
+        wait_pol.max_poll_attempts = 100;
+    endfunction
+
+    // ========================================================================
+    // 中文说明：两个 PF 共享同一 EP 配置空间（BAR 寄存器后写者覆盖），但各自的
+    // common-config/ISR 镜像位于各自 snapshot BAR0 lease。这里在 VIP B 初始化前
+    // 确认：B 的 common-config 区落在 B 自己的 lease（且不同于 A），经 PCIe 读回的
+    // 是 fixture 为 B 安装的初值，而不是 A 已推进到 DRIVER_OK 的镜像。
+    // ========================================================================
+    virtual task check_vip_b_endpoint_image(virtio_function_instance function_b);
+        dpu_bar_pair_lease_t b_common_bar;
+        int unsigned         common_bar_id;
+        int unsigned         num_queues;
+        int unsigned         queue_size;
+        int unsigned         expected_queues;
+        bit [7:0]            status;
+        bit [31:0]           msix_config;
+        bit [31:0]           isr;
+        string               why;
+
+        if (!flow.device_snapshot().get_bar(function_b.function_key,
+                DPU_BAR_DEVICE_MEMORY, b_common_bar, why))
+            `uvm_fatal("DUAL_TEST", {"VIP B: no snapshot BAR0 lease: ", why})
+        common_bar_id = transport_b.cap_mgr.get_common_cfg_bar();
+        if ((transport_b.bar.bar_base[common_bar_id] != b_common_bar.base) ||
+            (transport_b.bar.bar_base[common_bar_id] ==
+             transport_a.bar.bar_base[transport_a.cap_mgr.get_common_cfg_bar()]))
+            `uvm_fatal("DUAL_TEST", $sformatf(
+                "VIP B: common-config BAR base 0x%016h is not its own lease 0x%016h",
+                transport_b.bar.bar_base[common_bar_id], b_common_bar.base))
+
+        expected_queues = flow.virtio_cfg.default_num_pairs * 2;
+        transport_b.read_device_status(status);
+        transport_b.read_num_queues(num_queues);
+        transport_b.read_queue_num_max(queue_size);
+        transport_b.bar.read_reg(common_bar_id,
+            transport_b.cap_mgr.get_common_cfg_bar_offset() + VIRTIO_PCI_COMMON_MSIX,
+            2, msix_config);
+        transport_b.bar.read_reg(transport_b.cap_mgr.isr_cap.bar,
+            transport_b.cap_mgr.isr_cap.offset, 1, isr);
+        if ((status != 8'h00) || (num_queues != expected_queues) ||
+            (queue_size != 256) || (msix_config[15:0] != 16'hffff) ||
+            (isr[7:0] != 8'h00))
+            `uvm_error("DUAL_TEST", $sformatf({
+                "VIP B: endpoint image mismatch: status=0x%02h num_queues=%0d/%0d ",
+                "queue_size=%0d msix_config=0x%04h isr=0x%02h"},
+                status, num_queues, expected_queues, queue_size,
+                msix_config[15:0], isr[7:0]))
+        else
+            `uvm_info("DUAL_TEST", $sformatf(
+                "VIP B: own endpoint image confirmed at 0x%016h (num_queues=%0d)",
+                b_common_bar.base, num_queues), UVM_LOW)
     endtask
 
     // ========================================================================
@@ -1822,45 +1573,6 @@ class virtio_dual_test extends uvm_test;
             `uvm_error("DUAL_TEST", $sformatf("OVERALL: FAIL (%0d tests failed)", tests_failed))
         else
             `uvm_info("DUAL_TEST", "OVERALL: PASS -- All dual VIP tests passed", UVM_LOW)
-    endfunction
-
-    // ========================================================================
-    // EP Memory Helpers
-    // ========================================================================
-    function void write_ep_mem8(pcie_tl_ep_driver drv, bit [63:0] addr, bit [7:0] data);
-        drv.mem_space[addr] = data;
-    endfunction
-
-    function void write_ep_mem16(pcie_tl_ep_driver drv, bit [63:0] addr, bit [15:0] data);
-        drv.mem_space[addr]     = data[7:0];
-        drv.mem_space[addr + 1] = data[15:8];
-    endfunction
-
-    function void write_ep_mem32(pcie_tl_ep_driver drv, bit [63:0] addr, bit [31:0] data);
-        drv.mem_space[addr]     = data[7:0];
-        drv.mem_space[addr + 1] = data[15:8];
-        drv.mem_space[addr + 2] = data[23:16];
-        drv.mem_space[addr + 3] = data[31:24];
-    endfunction
-
-    function bit [7:0] read_ep_mem8(pcie_tl_ep_driver drv, bit [63:0] addr);
-        return drv.mem_space.exists(addr) ? drv.mem_space[addr] : 8'h00;
-    endfunction
-
-    function bit [15:0] read_ep_mem16(pcie_tl_ep_driver drv, bit [63:0] addr);
-        bit [15:0] val;
-        val[7:0]  = drv.mem_space.exists(addr)     ? drv.mem_space[addr]     : 8'h00;
-        val[15:8] = drv.mem_space.exists(addr + 1) ? drv.mem_space[addr + 1] : 8'h00;
-        return val;
-    endfunction
-
-    function bit [31:0] read_ep_mem32(pcie_tl_ep_driver drv, bit [63:0] addr);
-        bit [31:0] val;
-        val[7:0]   = drv.mem_space.exists(addr)     ? drv.mem_space[addr]     : 8'h00;
-        val[15:8]  = drv.mem_space.exists(addr + 1) ? drv.mem_space[addr + 1] : 8'h00;
-        val[23:16] = drv.mem_space.exists(addr + 2) ? drv.mem_space[addr + 2] : 8'h00;
-        val[31:24] = drv.mem_space.exists(addr + 3) ? drv.mem_space[addr + 3] : 8'h00;
-        return val;
     endfunction
 
 endclass : virtio_dual_test
