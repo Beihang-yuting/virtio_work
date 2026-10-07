@@ -2599,7 +2599,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
 **Interfaces:**
 - Produces（`virtio_driver_protocol`，基类纯虚，标准与私有实现）：`function bit has_ctrl_vq()`、
   `function bit supports_mq()`、`function bit supports_migration()`、
-  `function virtqueue_type_e queue_format(virtqueue_type_e requested)`。标准：1/1/1/requested；私有：0/0/0/`VQ_DPU_PRIV`。
+  `function virtqueue_type_e queue_format(virtqueue_type_e requested)`。标准：1/1/1/requested；私有：0/0/0/`VQ_CUSTOM`。
 - Produces：`virtio_atomic_ops::protocol`（`virtio_driver_protocol`，由协议 `bind_ops` 注入；为空按标准处理）。
 - Produces 错误契约：`ATOMIC_OPS` `ctrl_send: driver protocol has no control VQ`（ack=ERR，不碰队列）；
   `AUTO_FSM` `configure_mq: driver protocol does not support dynamic MQ`、
@@ -2641,8 +2641,8 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
               `uvm_error("TEST", "standard protocol capabilities differ from virtio-net")
           if (private_protocol.has_ctrl_vq() || private_protocol.supports_mq() ||
               private_protocol.supports_migration() ||
-              (private_protocol.queue_format(VQ_SPLIT) != VQ_DPU_PRIV) ||
-              (private_protocol.queue_format(VQ_PACKED) != VQ_DPU_PRIV))
+              (private_protocol.queue_format(VQ_SPLIT) != VQ_CUSTOM) ||
+              (private_protocol.queue_format(VQ_PACKED) != VQ_CUSTOM))
               `uvm_error("TEST", "private protocol capabilities differ from the DPU private ring")
 
           ops = virtio_atomic_ops::type_id::create("cap_ops");
@@ -2749,7 +2749,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
 
           maps_before = iommu.total_maps;
           unmaps_before = iommu.total_unmaps;
-          ops.setup_queue(1, 8, VQ_DPU_PRIV, ok);
+          ops.setup_queue(1, 8, VQ_CUSTOM, ok);
           q = backend.configured_program;
           if (!ok || (iommu.total_maps != maps_before + 1) || (q.ring_bytes != 4096) ||
               (q.desc_iova == 0) || (q.driver_iova != 0) ||
@@ -2766,13 +2766,13 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
       endtask
 
   ```
-  （`virtio_unit_recording_backend.query_queue_max` 固定返回 8；新建的 `dpu_priv_virtqueue` 默认 TX 方向，
+  （`virtio_unit_recording_backend.query_queue_max` 固定返回 8；新建的 `custom_virtqueue` 默认 TX 方向，
   8×16+2 字节页对齐为 4096。B 若改了单元测试 fixture 的后端接线方式，按 B 的写法接 `backend`。）
 
 - [ ] **Step 2: 运行，确认失败**
 
   SYNC 后单测（`TEST=virtio_unit_test`）。期望编译失败：`Error-` 指出 `has_ctrl_vq`、`protocol` 不是成员。
-  （旧 `setup_queue` 对 `VQ_DPU_PRIV` 走 `default:` 三区映射，区域测试会报
+  （旧 `setup_queue` 对 `VQ_CUSTOM` 走 `default:` 三区映射，区域测试会报
   `private ring regions mapped wrongly (ok=1 maps=3 ...)`。）
 
 - [ ] **Step 3: 协议能力**
@@ -2864,7 +2864,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
 
       // 私有 Function 只使用私有环，与配置值无关。
       virtual function virtqueue_type_e queue_format(virtqueue_type_e requested);
-          return VQ_DPU_PRIV;
+          return VQ_CUSTOM;
       endfunction
   ```
   私有 `bind_ops` old（B2 改写后的两行调用）：
@@ -2990,7 +2990,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
   ```
   在 `    task full_init();` 之前插入（C3 使用）：
   ```systemverilog
-      // 本 Function 的队列格式：驱动协议可改写配置值（私有协议固定 VQ_DPU_PRIV）。
+      // 本 Function 的队列格式：驱动协议可改写配置值（私有协议固定 VQ_CUSTOM）。
       protected function virtqueue_type_e queue_format();
           if ((ops == null) || (ops.protocol == null))
               return drv_cfg.vq_type;
@@ -3120,7 +3120,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
   `virtio_pf_lifecycle_reset_test`、`virtio_ctrl_vq_test`、`virtio_full_test`
 
 **Interfaces:**
-- Consumes: C1 `dpu_priv_virtqueue` 与 vq 钩子；C2 能力、`ops.protocol`、`ring_iova_of`、FSM `queue_format()`；
+- Consumes: C1 `custom_virtqueue` 与 vq 钩子；C2 能力、`ops.protocol`、`ring_iova_of`、FSM `queue_format()`；
   B 的 `ops.config_backend`（commit 时由协议 `bind_ops(ops, backend, behavior, why)` 设置）与后端
   `read_net_config`；A3 的 `ops.kick_queue`。
 - Produces（`virtio_config_backend` 非纯虚钩子，基类默认即标准行为）：
@@ -3373,7 +3373,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
   ```systemverilog
   // 目录层次：src/dpu_priv；DPU 私有环的配置后端：通用 ops/FSM 对私有 Function 的全部
   // 设备副作用都经这里。依赖 dpu_priv_device_control（借用，D 阶段由寄存器级实现替换）
-  // 与 dpu_priv_virtqueue。保存本 Function 冻结的队列参数表，不持有 Host 内存或映射。
+  // 与 custom_virtqueue。保存本 Function 冻结的队列参数表，不持有 Host 内存或映射。
   // 私有设备没有 virtio status/feature/MSI-X/device-config 寄存器：status 是驱动侧影子
   // 值（复位清零），特性恒为 0，device config 全零，队列上限为私有默认环大小，当前固定
   // polling，MSI-X 编程为空操作。
@@ -3454,7 +3454,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
       // 把参数表应用到新建的私有队列（方向、本地号、TX 首描述符控制）与编程参数
       // （本地号、RX 容量、doorbell 位置）；非私有格式或表外队列拒绝。
       virtual function bit prepare_queue(virtqueue_base vq, ref virtio_queue_program_t q);
-          dpu_priv_virtqueue pvq;
+          custom_virtqueue pvq;
           dpu_priv_queue_config c;
 
           if (!$cast(pvq, vq) || (pvq == null) || !queue_cfg.exists(q.queue_id)) begin
@@ -3518,7 +3518,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
       // 私有 doorbell：驱动 writel({wrap, tail, local_qid}, notify_addr)。
       virtual task notify_queue(virtio_queue_program_t q, int unsigned next_idx, bit wrap);
           control.notify_queue(transport, to_context(q),
-              dpu_priv_virtqueue::notify_word(wrap, next_idx, q.local_qid));
+              custom_virtqueue::notify_word(wrap, next_idx, q.local_qid));
       endtask
 
       // 私有 Function 没有 virtio-net device config：全零，不报错、不访问设备。
@@ -4089,7 +4089,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
   ```bash
   grep -rn 'dpu_priv' virtio_net_vip/src/agent
   ```
-  期望无输出（通用 ops/FSM/driver/protocol 基类中没有按私有类型或名字的分支；`VQ_DPU_PRIV` 只出现在
+  期望无输出（通用 ops/FSM/driver/protocol 基类中没有按私有类型或名字的分支；`VQ_CUSTOM` 只出现在
   `virtqueue_base::descriptor_format`、`virtqueue_manager`、`virtio_net_types` 与私有文件中）。
 
 - [ ] **Step 11: 运行，确认通过**
@@ -4125,40 +4125,40 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
 
 - [ ] **Step 1: README.md**
   - 第 160 行 `| **Custom Virtqueue** | 用户自定义格式 | 通过回调接口扩展，支持厂商私有描述符格式 |` →
-    `| **DPU Private Ring** | 16B 私有描述符 + CQ | 与 split/packed 平级的 dpu_priv_virtqueue，对应 icpu-kernel-driver DPU_RING_T_PRIV |`。
-  - 目录树删除 `│   │   ├── custom_virtqueue.sv             ← 自定义扩展`；`dpu_priv/` 下
+    `| **DPU Private Ring** | 16B 私有描述符 + CQ | 与 split/packed 平级的 custom_virtqueue，对应 icpu-kernel-driver DPU_RING_T_PRIV |`。
+  - 目录树中 `custom_virtqueue.sv` 的说明改为 `← DPU 私有环格式（16B 描述符 + CQ）`；`dpu_priv/` 下
     `dpu_priv_ring_callback.sv`、`dpu_priv_atomic_ops.sv`、`dpu_priv_auto_fsm.sv` 三行替换为一行
-    `│   │   ├── dpu_priv_virtqueue.sv           ← 私有 TX/RX 描述符/CQ 队列格式`；
+    `│   │   ├── custom_virtqueue.sv           ← 私有 TX/RX 描述符/CQ 队列格式`；
     `dpu_priv_config_backend.sv` 注释改为 `← 私有配置后端（队列参数表、status/feature 语义、doorbell）`；
     `dpu_priv_driver_protocol.sv` 注释改为 `← 私有协议（能力声明、MANUAL kick/poll、复位语义）`。
   - 第 765–780 行附近 “继承回调基类，实现厂商私有描述符格式” 的 `virtqueue_custom_callback` 示例整段删除，
-    换成两句：新队列格式按 `dpu_priv_virtqueue` 的方式直接继承 `virtqueue_base`（实现 ring 方法与
+    换成两句：新队列格式按 `custom_virtqueue` 的方式直接继承 `virtqueue_base`（实现 ring 方法与
     `get_ring_regions`），设备侧差异放进 `virtio_config_backend` 子类，能力差异放进 `virtio_driver_protocol` 子类。
 - [ ] **Step 2: `docs/virtio_net_vip_manual.md`**
-  - 第 148 行 `split_virtqueue / packed_virtqueue / custom_virtqueue` → `split_virtqueue / packed_virtqueue / dpu_priv_virtqueue`。
-  - 第 337 行 `custom_virtqueue.sv -- Custom Virtqueue (回调委托)` 删除；第 374–379 行目录同 README 处理。
+  - 第 148 行 `split_virtqueue / packed_virtqueue / custom_virtqueue` → `split_virtqueue / packed_virtqueue / custom_virtqueue`。
+  - 第 337 行 `custom_virtqueue.sv -- Custom Virtqueue (回调委托)` 改为 `custom_virtqueue.sv -- DPU 私有环格式（16B 描述符 + CQ）`；第 374–379 行目录同 README 处理。
   - 第 430 行 `私有 ops/FSM、配置后端、ring 回调` → `私有队列格式、配置后端与驱动协议（ops/FSM 为通用实现）`。
-  - 第 500 行 `VQ_CUSTOM` → `VQ_DPU_PRIV`；第 793 行 “14 个纯虚方法（由 split/packed/custom 实现）” →
+  - 第 500 行 `VQ_CUSTOM` → `VQ_CUSTOM`；第 793 行 “14 个纯虚方法（由 split/packed/custom 实现）” →
     “15 个纯虚方法（由 split/packed/dpu_priv 实现，含 get_ring_regions）”。
-  - 第 885–904 行 custom_virtqueue 章节改写为 “DPU 私有环队列” 小节：`VQ_DPU_PRIV` 由 `virtqueue_manager` 创建
-    `dpu_priv_virtqueue`；方向/本地号/TX 控制由 `dpu_priv_config_backend.prepare_queue` 写入；desc+CQ 一次映射；
+  - 第 885–904 行 custom_virtqueue 章节改写为 “DPU 私有环队列” 小节：`VQ_CUSTOM` 由 `virtqueue_manager` 创建
+    `custom_virtqueue`；方向/本地号/TX 控制由 `dpu_priv_config_backend.prepare_queue` 写入；desc+CQ 一次映射；
     通知字 `{wrap, tail, local_qid}` 经后端写 doorbell。并附能力表：标准 `has_ctrl_vq/supports_mq/supports_migration`
-    = 1/1/1、`queue_format` = 配置值；私有 0/0/0、`VQ_DPU_PRIV`。
+    = 1/1/1、`queue_format` = 配置值；私有 0/0/0、`VQ_CUSTOM`。
 - [ ] **Step 3: `docs/virtio_verification_flow.md`**：第 19 行 `atomic_ops(~55)` 按方法数变化更新为 `~60`
   （新增 `kick_queue`、`get_queue_program`、`has_active_queues`、`discover_device`、`ring_iova_of`，删 `uses_private_ring`）；
   若文中有私有 ops/FSM 的流程框，改为 “通用 ops/FSM + 私有后端/队列/协议”。
 - [ ] **Step 4: `examples/dpu_priv_ring/README.md`**：文件表三行（ring_callback/atomic_ops/auto_fsm）替换为
-  `src/dpu_priv/dpu_priv_virtqueue.sv`（16B 描述符、CQ、wrap、64KiB TX 分片）、`src/dpu_priv/dpu_priv_config_backend.sv`
+  `src/virtqueue/custom_virtqueue.sv`（16B 描述符、CQ、wrap、64KiB TX 分片）、`src/dpu_priv/dpu_priv_config_backend.sv`
   （队列参数表、doorbell、status/feature 语义）、`src/dpu_priv/dpu_priv_driver_protocol.sv`（能力与复位语义）；
-  第 70 行 `VQ_CUSTOM` → `VQ_DPU_PRIV`；第 83–85 行改为 “Function 选择 `dpu_priv_driver_protocol`，创建通用 ops/FSM，
-  提交时冻结私有配置进 `dpu_priv_config_backend`”；第 108 行建队顺序改为 “创建 `VQ_DPU_PRIV` → 后端写方向/本地号 →
+  第 70 行 `VQ_CUSTOM` → `VQ_CUSTOM`；第 83–85 行改为 “Function 选择 `dpu_priv_driver_protocol`，创建通用 ops/FSM，
+  提交时冻结私有配置进 `dpu_priv_config_backend`”；第 108 行建队顺序改为 “创建 `VQ_CUSTOM` → 后端写方向/本地号 →
   分配连续 desc+CQ → 一次映射 → 控制后端配置启动”；若有 `get_queue_context` 用法，改为
   `get_queue_program` + `dpu_priv_config_backend::to_context`。
-  `STANDARD_MODE_AUDIT.md` 第 115 行 `dpu_priv_*` 若指已删除类，改为 `dpu_priv_virtqueue`。
+  `STANDARD_MODE_AUDIT.md` 第 115 行 `dpu_priv_*` 若指已删除类，改为 `custom_virtqueue`。
 - [ ] **Step 5: 最终 grep 证据**
   ```bash
   cd /home/ubuntu/ryan/virtio_sdd
-  grep -rn 'custom_virtqueue\|virtqueue_custom_callback\|dpu_priv_ring_callback\|dpu_priv_atomic_ops\|dpu_priv_auto_fsm\|uses_private_ring\|VQ_CUSTOM\|get_queue_context\|configure_private\|custom_cb' \
+  grep -rn 'virtqueue_custom_callback\|dpu_priv_ring_callback\|dpu_priv_atomic_ops\|dpu_priv_auto_fsm\|uses_private_ring\|get_queue_context\|configure_private\|custom_cb' \
       README.md docs/virtio_net_vip_manual.md docs/virtio_verification_flow.md examples virtio_net_vip scripts
   ```
   期望无输出（`docs/superpowers/` 下的历史计划/规范不在范围）。
@@ -4179,9 +4179,9 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
 ## Notes for integrator (C)
 
 **阶段 C 产出的名字（D 依赖）：**
-- 私有队列类：`dpu_priv_virtqueue extends virtqueue_base`（`src/dpu_priv/dpu_priv_virtqueue.sv`）；
+- 私有队列类：`custom_virtqueue extends virtqueue_base`（`src/virtqueue/custom_virtqueue.sv`）；
   `static notify_word(wrap, tail, qid)` 是 doorbell 编码的唯一定义。`vdev_dpu_priv` 按同一 16B/CQ 布局解析。
-- 枚举：`virtqueue_type_e = { VQ_SPLIT, VQ_PACKED, VQ_DPU_PRIV }`。
+- 枚举：`virtqueue_type_e = { VQ_SPLIT, VQ_PACKED, VQ_CUSTOM }`。
 - `virtqueue_base` 新钩子：`get_ring_regions`（纯虚）、`net_hdr_bytes`、`prepare_notify`。
 - 协议能力：`has_ctrl_vq()`、`supports_mq()`、`supports_migration()`、`queue_format(requested)`；保留
   `allows_status_access()`、`requires_verified_reset()`。`prepare_candidates` 改为基类具体实现（私有协议先校验再 `super`）。
@@ -4217,7 +4217,7 @@ C3 后端钩子 + 通用数据路径/FSM 吸收私有行为 + 删除私有 ops/F
   原实现允许到 4096。当前私有 Function 用 256/512，不受影响；需要更大环时调大 `default_queue_size`。
 - `queue_size=0` 的私有 Function 不再回写解析后的深度（启动预填 0 个 RX buffer，由后台补充），与标准一致。
 - 私有 RX 帧无法解析为 packet_item 时由报错改为静默丢弃（与标准 `rx_receive` 一致）。
-- 私有 TX 在 ring 满时由静默返回改为 `dpu_priv_virtqueue.add_buf` 报错（`DPU_PRIV_RING`）；现有测试不触发。
+- 私有 TX 在 ring 满时由静默返回改为 `custom_virtqueue.add_buf` 报错（`DPU_PRIV_RING`）；现有测试不触发。
 - 通用 `reset_single_queue` 现在先停再起数据面、teardown 未确认即 FSM_ERROR（标准 Function 同样生效，属正确性修复；
   当前无测试经 `VIO_TXN_RESET_QUEUE` 调用）。
 - 通用 `kick_with_fault` 经 `cfg_backend()` 发通知：未设后端却走 TX/RX kick 的单元测试会因 B 的“后端为空即报错”失败，
@@ -4237,7 +4237,7 @@ C 阶段各任务中"直接构造"示例与 C3 Step 3 的核对改为传入 back
 与 MSI-X，不引用任何驱动侧对象（transport、ops、virtqueue、notify_mgr）。它替换 `virtio_pcie_dut_responder`（标准）
 与 `dpu_priv_device_control`（私有）；`dpu_priv_config_backend` 改为按真实驱动寄存器序列访问私有设备。
 
-**前置：** A、B、C 已合入。C 之后：`dpu_priv_virtqueue`（16B 描述符、TX CQ 2B、RX CQ 16B、
+**前置：** A、B、C 已合入。C 之后：`custom_virtqueue`（16B 描述符、TX CQ 2B、RX CQ 16B、
 `static notify_word(wrap, tail, qid)`）、`virtio_config_backend` 的 `discover/prepare_queue/notify_queue` 钩子、
 `bind_ops(ops, backend, behavior, why)`（控制者裁决）、`virtio_function_instance::select_config_backend`、
 B 的 `read_net_config`。本阶段 old 锚点按 C 完成后的树写；若 A–C 改动了同一段，按语义套用。
@@ -7890,7 +7890,7 @@ dpu_common `4d73996` reg plan（`dpu_device_bootstrap_plan_builder.sv`、`dpu_vi
 | 33 | stop | dpu_down：control_tx(en=0)、reset_tx txrx.c:382–524、control_rx(en=0) af_mng.c:1570–1589、reset_rx txrx.c:543–550、clear_msix_irq_conf interrupt.c:234 | BAR0 | TX：#28 置 en=0；轮询 0xB22000+q*4 [11:9]=0；0x880100 写 `q`、`q\|1<<31`；轮询 0x880104 bit0；0x880154 写 `q\|1<<16`、`\|1<<31`；轮询 0x880158 bit0。RX：0x900210 写 `i<<14\|q`、`\|0x10000` 后读 0x900214（i=0..3）；写回 en=0；0x900200 `q`、`0x10000\|q`；0x90010C 写 0；0x900108 `q`、`q\|1<<31`；轮询 0x90010C bit0；0x54000+gv*4 写 0 | 见左 | 停队/复位完成位；`stall_queue_stop` 旋钮使完成位永不置位、QSCH 报在途 | disable_queue / reset（先全部 TX 再全部 RX） |
 | 34–38 | remove | qid map 失效重写 + 0x20044、QSCH 删除、mailbox 中断关闭、清 0x56000/0xC0000、BAR2 0x2C/0x1C 拆除、0x60040=0、0x20040=0 | BAR0/BAR2 | — | W | rmmod | 存储（0x20040 写 0 即解除声明） | 不做（VIP 无 rmmod 对应，F 阶段 S4 判定） |
 
-**描述符/CQ/doorbell（与 C1 `dpu_priv_virtqueue` 一致）：** 16B 描述符 `addr[63:0]`；W1 `len[17:0]、dport_info[29:18]、
+**描述符/CQ/doorbell（与 C1 `custom_virtqueue` 一致）：** 16B 描述符 `addr[63:0]`；W1 `len[17:0]、dport_info[29:18]、
 dport_id_l[31:30]`；W2 `dport_id_h[7:0]、dport_type[10:8]、rss_lag[11]、cpu_tx_cos[14:12]、dtype[15]、next[16]、l3_cs[17]、
 l4_cs[18]、fwd[20:19]、avail[23]、used[31]`（驱动写 avail=wrap、used=!wrap）。TX ring：N×16B 描述符 + CQ（u16 `head_index[14:0]、
 wrap[15]`，初值 0x8000）；RX ring：N×16B 描述符 + N×16B CQ（DW0 `desc_num[31:28]`；DW1 `head_idx[15:0]、pkt_len[29:16]、
@@ -8921,7 +8921,7 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
 
 **Interfaces:**
 - Consumes: D4 设备；D3 `vdev_loopback_bar_accessor`；C 的 `bind_private(cfg, pairs)`、`prepare_queue` 钩子、
-  `dpu_priv_virtqueue::notify_word`；B 的 `read_net_config`；`transport.wait_pol.queue_reset_timeout_ns`（停队轮询上限）。
+  `custom_virtqueue::notify_word`；B 的 `read_net_config`；`transport.wait_pol.queue_reset_timeout_ns`（停队轮询上限）。
 - Produces: `dpu_priv_config_backend`（寄存器级，无 `control`）；失败约定：`disable_queue/reset` 轮询超时返回 `ok=0`
   且**不报错**（由通用 ops 报 `ATOMIC_OPS` 错误，私有流程测试的 catcher 只认这一条）；`discover()` 发现 `pfvf_id!=0`、
   AF 已被声明、声明读回不符或 qid map 读回不符时报 `DPU_PRIV_BACKEND` 错误。
@@ -9369,12 +9369,12 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
           dev_port.host_write(64'h0000_0044_0000_0000 + off, 4, data);
       endfunction
 
-      // 设备往返：生产 dpu_priv_virtqueue 发布 TX/RX，vdev_dpu_priv 按 qid map 与 VTX/VRX 参数表（驱动
+      // 设备往返：生产 custom_virtqueue 发布 TX/RX，vdev_dpu_priv 按 qid map 与 VTX/VRX 参数表（驱动
       // #21/#24/#25/#28 的最小子集，q_depth=3、queue_en=1）读描述符、写 CQ；TX CQ 必须等于黄金 01 80，
       // RX CQ 按驱动布局解码出单 buffer、原长度，且两边都被 poll_used 认领。
       protected task test_device_round_trip();
-          dpu_priv_virtqueue tx;
-          dpu_priv_virtqueue rx;
+          custom_virtqueue tx;
+          custom_virtqueue rx;
           bit [63:0] tx_iova, rx_iova, f_gpa, f_iova, b_gpa, b_iova;
           virtio_sg_list sgs[];
           virtio_sg_entry entry;
@@ -9518,7 +9518,7 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
   删除从 `// 设备控制接收明确的 Host/BDF/local_qid 与 IOVA，不能用全局资源编号代替本地号。` 到
   `dpu_priv_device_control` 的 `endclass`（含 `dpu_priv_queue_context_t` typedef 与整个虚类）。
   old：`// 每队列覆盖配置只保存通知和 TX 控制，不持有 ring 索引；运行态仍由独立回调持有。`
-  new：`// 每队列覆盖配置只保存通知和 TX 控制，不持有 ring 索引；运行态由 dpu_priv_virtqueue 持有。`
+  new：`// 每队列覆盖配置只保存通知和 TX 控制，不持有 ring 索引；运行态由 custom_virtqueue 持有。`
   old：
   ```systemverilog
       dpu_priv_device_control control;
@@ -9556,7 +9556,7 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
   // 目录层次：src/dpu_priv；DPU 私有设备的寄存器级配置后端：通用 ops/FSM 对私有 Function 的全部设备副作用
   // 都经这里，按真实驱动 icpu-kernel-driver（lance_net_mailbox@f2c9cd6）AF 路径的寄存器序列访问设备；
   // 序列表与疑点见 devmodel/vdev_dpu_priv.sv 文件头（本后端实现其中“VIP 后端”列）。依赖 transport 的 BAR
-  // accessor 与 dpu_priv_virtqueue；保存冻结的队列参数表与已配置队列，不持有 Host 内存或映射。
+  // accessor 与 custom_virtqueue；保存冻结的队列参数表与已配置队列，不持有 Host 内存或映射。
   // 私有设备没有 virtio status/feature/device-config：status 是驱动侧影子值（复位清零），特性恒 0，device
   // config 全零；队列上限为私有默认环大小。VIP 私有数据面固定 polling：不编程 PCI MSI-X 表，但按驱动建立
   // 设备侧 MSI-X 映射。只实现 pfvf_id=0 的 AF 路径（PF/VF mailbox 未建模）。
@@ -9974,7 +9974,7 @@ FSM 每次 full_init 先 discover 后 reset，reset 若撤销声明会让随后�
       // #29/#31：BAR0+0 共享 doorbell，驱动 writel({wrap, tail, local_qid})。
       virtual task notify_queue(virtio_queue_program_t q, int unsigned next_idx, bit wrap);
           transport.bar.write_reg(q.notify_bar, q.notify_offset, 4,
-                                  dpu_priv_virtqueue::notify_word(wrap, next_idx, q.local_qid));
+                                  custom_virtqueue::notify_word(wrap, next_idx, q.local_qid));
       endtask
 
       // 私有设备没有 virtio-net device config。

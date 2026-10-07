@@ -56,10 +56,10 @@ tests 25,811 行，`strict_regression` 40/40 PASS（53 主机 VCS W-2024.09-SP1�
 | 差异点 | 承担内容 |
 |---|---|
 | `dpu_priv_config_backend` | AF 声明、BAR2 qinfo、队列参数表、MSI-X 映射；features/status 在私有设备上的语义 |
-| `dpu_priv_virtqueue`（直接继承 `virtqueue_base`，与 split/packed 平级） | 16B 描述符、CQ、kick 游标、状态保存与恢复 |
+| `custom_virtqueue`（重写为直接继承 `virtqueue_base`，与 split/packed 平级，实现 DPU 私有环格式） | 16B 描述符、CQ、kick 游标、状态保存与恢复 |
 | `dpu_priv_driver_protocol` | kick、完成轮询、复位语义；能力声明（是否有 ctrl VQ、是否支持迁移、是否支持 MQ） |
 
-删除：`dpu_priv_atomic_ops`、`dpu_priv_auto_fsm`、`custom_virtqueue`、`dpu_priv_ring_callback`，
+删除：`dpu_priv_atomic_ops`、`dpu_priv_auto_fsm`、callback 层（`virtqueue_custom_callback` 与 `dpu_priv_ring_callback`），
 以及只为它们存在的通用代码分支（例如 `uses_private_ring()` 判断）。
 通用 ops/fsm 中凡按“私有”分支的地方，改为询问 protocol 能力或交给 backend。
 
