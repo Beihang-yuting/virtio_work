@@ -49,6 +49,9 @@ class virtio_function_instance extends uvm_component;
     local virtio_auto_fsm  pending_pcie_fsm;
     local virtio_atomic_ops pending_pcie_ops;
     local bit              pcie_bind_prepared;
+    // 提交后的驱动协议（标准/私有）；预检阶段的候选保存在 pending_protocol。
+    virtio_driver_protocol protocol;
+    local virtio_driver_protocol pending_protocol;
 
     // 创建一个尚未绑定拓扑的 Function 组件；资源、BDF、BAR 和 Host 所有权
     // 由后续 configure_from_service 从冻结 snapshot 注入。
@@ -59,43 +62,36 @@ class virtio_function_instance extends uvm_component;
         pending_pcie_fsm = null;
         pending_pcie_ops = null;
         pcie_bind_prepared = 0;
+        protocol = null;
+        pending_protocol = null;
     endfunction
 
-    // 根据本 Function 的配置选择并创建匹配的 ops/FSM 候选；这是 driver 工厂
-    // 选择的唯一位置，不访问设备。已提供对象与私有配置类型冲突时拒绝，防止标准
-    // FSM 驱动私有 ring；factory 返回空对象时 UVM_FATAL。配置仅在提交时冻结。
+    // 选择本 Function 的驱动协议并由协议创建/校验 ops/FSM 候选；这是 driver 工厂
+    // 选择的唯一位置，预检不访问设备。private_cfg 是否为空只在这里判断一次，其余
+    // 标准/私有差异都经协议对象分派；factory 返回空对象时 UVM_FATAL。配置仅在提交时冻结。
     protected function bit prepare_driver_candidates(
         string label, virtio_driver_config_t behavior,
         ref virtio_atomic_ops candidate_ops, ref virtio_auto_fsm candidate_fsm
     );
-        dpu_priv_atomic_ops private_ops;
-        dpu_priv_auto_fsm private_fsm;
-        string why;
+        dpu_priv_driver_protocol private_protocol;
+
         if (private_cfg != null) begin
-            if (!private_cfg.validate(behavior.num_queue_pairs, why) ||
-                behavior.vq_type != VQ_CUSTOM || behavior.irq_mode != IRQ_POLLING) begin
-                `uvm_error("FUNCTION_BIND", {"私有驱动配置非法: ", why})
-                return 0;
-            end
-            if (candidate_ops == null)
-                candidate_ops = dpu_priv_atomic_ops::type_id::create({label, "_ops"});
-            if (candidate_fsm == null)
-                candidate_fsm = dpu_priv_auto_fsm::type_id::create({label, "_fsm"});
-            if (!$cast(private_ops, candidate_ops) || !$cast(private_fsm, candidate_fsm)) begin
-                `uvm_error("FUNCTION_BIND", "私有配置与已绑定 ops/FSM 类型冲突")
-                return 0;
-            end
-            return 1;
+            private_protocol = dpu_priv_driver_protocol::type_id::create(
+                {label, "_protocol"});
+            private_protocol.private_cfg = private_cfg;
+            pending_protocol = private_protocol;
+        end else begin
+            pending_protocol = virtio_standard_driver_protocol::type_id::create(
+                {label, "_protocol"});
         end
-        if (candidate_fsm == null)
-            candidate_fsm = virtio_auto_fsm::type_id::create({label, "_fsm"}, this);
+        if (!pending_protocol.prepare_candidates(
+            label, this, behavior, candidate_ops, candidate_fsm))
+            return 0;
         if (candidate_fsm == null) begin
             `uvm_fatal("FUNCTION_BIND", $sformatf(
                 "%s factory returned a null PCIe FSM", label))
             return 0;
         end
-        if (candidate_ops == null)
-            candidate_ops = virtio_atomic_ops::type_id::create({label, "_ops"}, this);
         if (candidate_ops == null) begin
             `uvm_fatal("FUNCTION_BIND", $sformatf(
                 "%s factory returned null PCIe atomic ops", label))
@@ -316,6 +312,7 @@ class virtio_function_instance extends uvm_component;
     function void cancel_bind_pcie();
         pending_pcie_fsm = null;
         pending_pcie_ops = null;
+        pending_protocol = null;
         pcie_bind_prepared = 0;
     endfunction
 
@@ -352,6 +349,7 @@ class virtio_function_instance extends uvm_component;
         barrier = bar_mdl;
         err_inj = einj;
         wait_pol = wpol;
+        protocol = pending_protocol;
         cancel_bind_pcie();
         return 1;
     endfunction
@@ -374,14 +372,15 @@ class virtio_function_instance extends uvm_component;
         input virtio_auto_fsm fsm
     );
         string why;
-        dpu_priv_atomic_ops private_ops;
 
-        if (private_cfg != null) begin
-            if (!$cast(private_ops, ops) ||
-                !private_ops.configure_private(private_cfg, driver_cfg.num_queue_pairs, why)) begin
-                `uvm_error("FUNCTION_BIND", {"无法冻结私有驱动配置: ", why})
-                return 0;
-            end
+        if (pending_protocol == null) begin
+            `uvm_fatal("FUNCTION_BIND", $sformatf(
+                "%s PCIe bind commit has no driver protocol", function_name))
+            return 0;
+        end
+        if (!pending_protocol.bind_ops(ops, driver_cfg, why)) begin
+            `uvm_error("FUNCTION_BIND", {"无法冻结私有驱动配置: ", why})
+            return 0;
         end
 
         if (!fsm.bind_mq_pair_limit(
@@ -413,11 +412,8 @@ class virtio_function_instance extends uvm_component;
         // 标准与私有 Function 使用同一引擎类，只是注入的 ops 不同；收发、DMA
         // 所有权与通知都在 ops 内，engine 与 FSM/sequence 共用同一张所有权表。
         if (dataplane != null) begin
-            if (private_cfg != null) begin
-                // 私有 buffer 容量不含 Virtio header；补充由调用方/FSM 控制。
-                dataplane.rx_engine.buf_size = private_cfg.rx_buf_size;
-                dataplane.rx_engine.refill_threshold = 0;
-            end
+            // 引擎参数由驱动协议决定（私有协议改写 RX buffer 容量与补充阈值）。
+            pending_protocol.install_dataplane(dataplane, ops, function_name);
             // Function 不调用 configure()：借用 dataplane 自带的 offload，特性为 0 时
             // build_tx_hdr 产出全零 header（私有 ops 要求如此）。
             dataplane.tx_engine.offload = dataplane.offload;
@@ -440,6 +436,7 @@ class virtio_function_instance extends uvm_component;
             if (driver_agent_ref.driver != null) begin
                 driver_agent_ref.driver.ops = ops;
                 driver_agent_ref.driver.fsm = fsm;
+                driver_agent_ref.driver.protocol = pending_protocol;
             end
             if (driver_agent_ref.monitor != null) begin
                 driver_agent_ref.monitor.transport = transport_ref;
@@ -523,11 +520,11 @@ class virtio_function_instance extends uvm_component;
     endtask
 
     // 停止活动数据面，复位成功后释放运行时资源并把 Function 标记为 DISABLED；
-    // 不释放 snapshot 所有的静态 BDF/BAR lease。私有后端未确认停 DMA 时保留
+    // 不释放 snapshot 所有的静态 BDF/BAR lease。要求确认停 DMA 的协议（私有环）在后端未确认时保留
     // 全部资源，进入 RESET_FAILED/FSM_ERROR，供调用方诊断或重试；成功时 FSM
     // 标记 REINIT_REQUIRED，禁止在已经释放的队列上直接重启数据面。
     virtual task shutdown();
-        if (private_cfg != null) begin
+        if ((protocol != null) && protocol.requires_verified_reset()) begin
             bit reset_ok;
             if ((driver_agent.fsm != null) && (driver_agent.fsm.state == FSM_RUNNING))
                 driver_agent.fsm.stop_dataplane();

@@ -87,6 +87,7 @@ package virtio_net_pkg;
   `include "agent/virtio_auto_fsm.sv"
   `include "dpu_priv/dpu_priv_atomic_ops.sv"
   `include "dpu_priv/dpu_priv_auto_fsm.sv"
+  `include "agent/virtio_driver_protocol.sv"
   `include "agent/virtio_driver.sv"
   `include "agent/virtio_monitor.sv"
   `include "pcie/virtio_pcie_model_dma_adapter.sv"
@@ -109,6 +110,8 @@ package virtio_net_pkg;
   `include "dataplane/virtio_tx_engine.sv"
   `include "dataplane/virtio_rx_engine.sv"
   `include "dataplane/virtio_net_dataplane.sv"
+  // 私有驱动协议安装 dataplane 引擎参数，须在 dataplane 之后编译。
+  `include "dpu_priv/dpu_priv_driver_protocol.sv"
 
   // ---------------------------------------------------------------------------
   // 第 7 层 – SR-IOV PF/VF 编排（sriov/）

@@ -229,6 +229,48 @@ class virtio_unit_recording_backend extends virtio_config_backend;
     endtask
 endclass : virtio_unit_recording_backend
 
+// 私有控制后端桩：所有操作立即成功，只用于驱动协议的配置冻结检查，不产生 DMA。
+class virtio_unit_priv_control_stub extends dpu_priv_device_control;
+    `uvm_object_utils(virtio_unit_priv_control_stub)
+
+    function new(string name = "virtio_unit_priv_control_stub");
+        super.new(name);
+    endfunction
+
+    virtual task reset_device(int unsigned host_id, bit [15:0] bdf, output bit ok);
+        ok = 1;
+    endtask
+    virtual task configure_queue(dpu_priv_queue_context_t ctx, output bit ok);
+        ok = 1;
+    endtask
+    virtual task disable_queue(dpu_priv_queue_context_t ctx, output bit ok);
+        ok = 1;
+    endtask
+endclass : virtio_unit_priv_control_stub
+
+// 按 ID 与完整消息匹配一条预期 UVM_ERROR；其他报告照常抛出。
+class virtio_unit_exact_error_catcher extends uvm_report_catcher;
+    string expected_id;
+    string expected_message;
+    int unsigned caught_count;
+
+    function new(string name, string configured_id, string configured_message);
+        super.new(name);
+        expected_id = configured_id;
+        expected_message = configured_message;
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_ERROR) && (get_id() == expected_id) &&
+            (get_message() == expected_message)) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_unit_exact_error_catcher
+
 // ============================================================================
 // virtio_unit_test
 //
@@ -296,6 +338,7 @@ class virtio_unit_test extends uvm_test;
         test_late_driver_agent_binding();
         test_discovery_strategy_selection();
         test_config_backend_injection();
+        test_driver_protocol_selection();
         test_dma_buffer_set();
 
         `uvm_info("UNIT_TEST", "All unit tests PASSED", UVM_NONE)
@@ -1214,6 +1257,62 @@ class virtio_unit_test extends uvm_test;
             (vq_mgr.get_queue_count() != 0))
             `uvm_error("TEST", "queue program was not passed through the backend")
         `uvm_info("UNIT_TEST", "test_config_backend_injection PASSED", UVM_LOW)
+    endtask
+
+    // 驱动协议决定 ops/FSM 的类型、status 访问权限与关机复位语义；私有协议拒绝
+    // 接管已绑定的标准 ops。
+    task test_driver_protocol_selection();
+        virtio_standard_driver_protocol standard;
+        dpu_priv_driver_protocol private_protocol;
+        dpu_priv_driver_config private_cfg;
+        virtio_atomic_ops ops;
+        virtio_auto_fsm fsm;
+        dpu_priv_atomic_ops typed_ops;
+        dpu_priv_auto_fsm typed_fsm;
+        virtio_driver_config_t behavior;
+        virtio_unit_exact_error_catcher catcher;
+        string why;
+
+        behavior.num_queue_pairs = 1;
+        standard = virtio_standard_driver_protocol::type_id::create(
+            "unit_standard_protocol");
+        ops = null;
+        fsm = null;
+        if (!standard.allows_status_access() || standard.requires_verified_reset() ||
+            !standard.prepare_candidates("unit_standard", null, behavior, ops, fsm) ||
+            (ops == null) || (fsm == null) || ops.uses_private_ring() ||
+            !standard.bind_ops(ops, behavior, why))
+            `uvm_error("TEST", "standard driver protocol did not select standard ops/FSM")
+
+        private_cfg = dpu_priv_driver_config::type_id::create("unit_private_cfg");
+        private_cfg.control = virtio_unit_priv_control_stub::type_id::create(
+            "unit_private_control");
+        private_protocol = dpu_priv_driver_protocol::type_id::create(
+            "unit_private_protocol");
+        private_protocol.private_cfg = private_cfg;
+        behavior.vq_type = VQ_CUSTOM;
+        behavior.irq_mode = IRQ_POLLING;
+        ops = null;
+        fsm = null;
+        if (private_protocol.allows_status_access() ||
+            !private_protocol.requires_verified_reset() ||
+            !private_protocol.prepare_candidates("unit_private", null, behavior, ops, fsm) ||
+            !$cast(typed_ops, ops) || !$cast(typed_fsm, fsm) ||
+            (typed_ops == null) || (typed_fsm == null) || !ops.uses_private_ring() ||
+            !private_protocol.bind_ops(ops, behavior, why))
+            `uvm_error("TEST", {"private driver protocol did not select private ops/FSM: ", why})
+
+        ops = virtio_atomic_ops::type_id::create("unit_conflicting_ops");
+        fsm = null;
+        catcher = new("protocol_conflict_catcher", "FUNCTION_BIND",
+                      "私有配置与已绑定 ops/FSM 类型冲突");
+        uvm_report_cb::add(null, catcher);
+        if (private_protocol.prepare_candidates("unit_conflict", null, behavior, ops, fsm))
+            `uvm_error("TEST", "private protocol accepted a standard ops candidate")
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught_count != 1)
+            `uvm_error("TEST", "private protocol did not report the ops/FSM type conflict")
+        `uvm_info("UNIT_TEST", "test_driver_protocol_selection PASSED", UVM_LOW)
     endtask
 
 endclass

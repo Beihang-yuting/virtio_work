@@ -123,6 +123,11 @@ class virtio_atomic_ops extends uvm_object;
         return config_backend;
     endfunction
 
+    // 是否为 DPU 私有环 ops；私有 FSM 用它确认 ops/FSM 配对，无需类型转换。
+    virtual function bit uses_private_ring();
+        return 0;
+    endfunction
+
     // 生产路径的通知边界：PRE_NOTIFY 故障钩子 → transport 通知（携带 ring 游标
     // next_idx/wrap）→ POST_NOTIFY 故障钩子。不调用 virtqueue::kick()，那只计数；
     // 调用方自己决定是否需要通知（needs_notification 等）。via 为空时用本 ops 的
@@ -558,6 +563,22 @@ class virtio_atomic_ops extends uvm_object;
         bit reset_complete;
 
         device_reset_verified(reset_complete);
+    endtask
+
+    // MANUAL 原始 status 读写：经配置后端访问，与生命周期 helper 走同一路径；
+    // 私有后端拒绝该访问（driver 已按协议在此之前拒绝）。
+    virtual task write_device_status(bit [7:0] status);
+        virtio_config_backend backend;
+
+        backend = cfg_backend();
+        backend.write_status(status);
+    endtask
+
+    virtual task read_device_status(output bit [7:0] status);
+        virtio_config_backend backend;
+
+        backend = cfg_backend();
+        backend.read_status(status);
     endtask
 
     // ------------------------------------------------------------------------

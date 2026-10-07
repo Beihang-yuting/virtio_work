@@ -17,10 +17,9 @@ class dpu_priv_auto_fsm extends virtio_auto_fsm;
     // 私有初始化：确认复位停 DMA、创建 RX/TX 队列后进入 READY；失败进入 ERROR。
     // 不调用 BAR 枚举/标准 feature handshake；平台须在控制后端执行前准备好 PCIe 路径。
     protected virtual task do_full_init();
-        dpu_priv_atomic_ops private_ops;
-        dpu_priv_queue_context_t ctx;
+        virtqueue_base first_vq;
         bit ok;
-        if ((state == FSM_RUNNING) || !$cast(private_ops, ops) ||
+        if ((state == FSM_RUNNING) || (ops == null) || !ops.uses_private_ring() ||
             (drv_cfg.vq_type != VQ_CUSTOM) || (drv_cfg.irq_mode != IRQ_POLLING)) begin
             `uvm_error("DPU_PRIV_FSM", "初始化要求私有 ops、VQ_CUSTOM、polling 和已停止的数据面")
             return;
@@ -34,7 +33,8 @@ class dpu_priv_auto_fsm extends virtio_auto_fsm;
         ops.setup_all_queues(active_num_pairs, VQ_CUSTOM, drv_cfg.queue_size, ok);
         if (!ok) begin state = FSM_ERROR; return; end
         // queue_size=0 表示使用私有默认 512；背景补 RX 需要解析后的实际数量。
-        if (private_ops.get_queue_context(0, ctx)) drv_cfg.queue_size = ctx.queue_size;
+        first_vq = ops.vq_mgr.get_queue(0);
+        if (first_vq != null) drv_cfg.queue_size = first_vq.queue_size;
         state = FSM_READY;
     endtask
 

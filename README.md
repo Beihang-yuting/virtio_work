@@ -240,6 +240,7 @@ virtio_net_vip/
 │   ├── agent/                              ← UVM 驱动代理
 │   │   ├── virtio_atomic_ops.sv            ← 原子操作库（约 30 个方法）
 │   │   ├── virtio_auto_fsm.sv             ← 自动状态机（12 状态 + 5 后台任务）
+│   │   ├── virtio_driver_protocol.sv       ← 驱动协议（标准 / DPU 私有环）分派
 │   │   ├── virtio_driver.sv               ← UVM Driver（事务分发）
 │   │   ├── virtio_monitor.sv              ← UVM Monitor（被动观测 + 协议检查）
 │   │   ├── virtio_sequencer.sv            ← UVM Sequencer

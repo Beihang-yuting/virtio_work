@@ -5,8 +5,8 @@
 // virtio_driver
 //
 // 目录层次：src/agent；统一事务分派器，依赖 transaction、ops 和 FSM。
-// 借用 Function 注入的 ops/FSM，不持有 ring/DMA；私有模式的通知、完成和复位
-// 仍交给私有 ops，禁止绕过其资源所有权或访问标准 status 寄存器。
+// 借用 Function 注入的 ops/FSM/协议，不持有 ring/DMA；标准与私有协议在 status
+// 访问、通知、完成和复位上的差异由 virtio_driver_protocol 分派。
 // UVM driver that receives virtio_transaction items from the sequencer and
 // dispatches to virtio_atomic_ops (MANUAL mode) or virtio_auto_fsm (AUTO mode)
 // based on the transaction type.
@@ -23,6 +23,8 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // ===== References (injected by agent in connect_phase) =====
     virtio_atomic_ops   ops;
     virtio_auto_fsm     fsm;
+    // Function 提交绑定时注入；为空时（standalone/测试）按标准 virtio 处理。
+    virtio_driver_protocol protocol;
 
     // ========================================================================
     // Constructor
@@ -31,6 +33,13 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // 建立 UVM driver 组件；ops/FSM 在 Function 提交绑定时注入。
     function new(string name, uvm_component parent);
         super.new(name, parent);
+    endfunction
+
+    // 当前驱动协议；未注入时惰性创建标准协议。
+    protected function virtio_driver_protocol active_protocol();
+        if (protocol == null)
+            protocol = virtio_standard_driver_protocol::type_id::create("standard_protocol");
+        return protocol;
     endfunction
 
     // ========================================================================
@@ -54,23 +63,16 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // Routes each transaction type to the appropriate ops/fsm method.
     // ========================================================================
 
-    // 按事务类型调用统一 API；私有复位须先停止后台 worker，再确认设备停止 DMA。
+    // 按事务类型调用统一 API；复位语义（是否先停 worker 并确认停 DMA）由驱动协议决定。
     protected virtual task process_transaction(virtio_transaction req);
         bit setup_ok;
-        dpu_priv_atomic_ops private_ops;
-        bit is_private;
-        is_private = $cast(private_ops, ops);
+        virtio_driver_protocol proto;
+        proto = active_protocol();
 
         case (req.txn_type)
             // ----- Lifecycle -----
             VIO_TXN_INIT:       fsm.full_init();
-            VIO_TXN_RESET: begin
-                if (is_private) begin
-                    if (fsm.state == FSM_RUNNING) fsm.stop_dataplane();
-                    ops.device_reset_verified(req.success);
-                    fsm.state = req.success ? FSM_REINIT_REQUIRED : FSM_ERROR;
-                end else ops.device_reset();
-            end
+            VIO_TXN_RESET:      proto.reset(ops, fsm, req);
             VIO_TXN_SHUTDOWN:   fsm.stop_dataplane();
 
             // ----- Data plane (AUTO mode) -----
@@ -116,15 +118,14 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // MANUAL 操作仍受所选协议约束；私有 kick/poll 经 ops 保留通知与回收语义。
     protected virtual task dispatch_atomic_op(virtio_transaction req);
         bit setup_ok;
-        dpu_priv_atomic_ops private_ops;
-        bit is_private;
-        int unsigned private_poll_budget = 1;
+        virtio_driver_protocol proto;
 
-        // 私有协议的状态控制由 AF/mailbox 后端负责；显式拒绝标准状态访问，
+        // 协议不允许标准状态访问时（私有环由 AF/mailbox 后端控制状态）显式拒绝，
         // 其余请求继续分派到同一 Function 的 ops，保持 DMA 所有权一致。
-        is_private = $cast(private_ops, ops);
-        if (is_private && ((req.atomic_op == ATOMIC_SET_STATUS) ||
-                           (req.atomic_op == ATOMIC_READ_STATUS))) begin
+        proto = active_protocol();
+        if (!proto.allows_status_access() &&
+            ((req.atomic_op == ATOMIC_SET_STATUS) ||
+             (req.atomic_op == ATOMIC_READ_STATUS))) begin
             req.success = 0;
             `uvm_error("VIRTIO_DRV", "私有驱动不能访问标准 Virtio status 寄存器")
             return;
@@ -132,10 +133,10 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
 
         case (req.atomic_op)
             ATOMIC_SET_STATUS:
-                ops.transport.write_device_status(req.status_val);
+                ops.write_device_status(req.status_val);
 
             ATOMIC_READ_STATUS:
-                ops.transport.read_device_status(req.status_val);
+                ops.read_device_status(req.status_val);
 
             ATOMIC_SETUP_QUEUE: begin
                 ops.setup_queue(req.queue_id, req.queue_size, req.vq_type, setup_ok);
@@ -155,39 +156,11 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
             ATOMIC_RX_RECEIVE:
                 ops.rx_receive(req.queue_id, req.received_pkts, req.budget);
 
-            ATOMIC_KICK: begin
-                virtqueue_base vq;
-                if (is_private)
-                    private_ops.kick_queue(req.queue_id);
-                else begin
-                    vq = ops.vq_mgr.get_queue(req.queue_id);
-                    if (vq != null)
-                        vq.kick();
-                    else
-                        `uvm_error("VIRTIO_DRV",
-                            $sformatf("ATOMIC_KICK: queue %0d not found", req.queue_id))
-                end
-            end
+            ATOMIC_KICK:
+                proto.kick(ops, req.queue_id);
 
-            ATOMIC_POLL_USED: begin
-                uvm_object token;
-                int unsigned len;
-                virtqueue_base vq;
-                // 私有完成必须经过 ops 回收数据 DMA，不能裸 poll 丢弃 token。
-                if (is_private) begin
-                    if (req.queue_id % 2)
-                        ops.tx_complete(req.queue_id, req.completed_pkts, private_poll_budget);
-                    else
-                        ops.rx_receive(req.queue_id, req.received_pkts, private_poll_budget);
-                end else begin
-                    vq = ops.vq_mgr.get_queue(req.queue_id);
-                    if (vq != null)
-                        void'(vq.poll_used(token, len));
-                    else
-                        `uvm_error("VIRTIO_DRV",
-                            $sformatf("ATOMIC_POLL_USED: queue %0d not found", req.queue_id))
-                end
-            end
+            ATOMIC_POLL_USED:
+                proto.poll_used(ops, req);
 
             ATOMIC_CTRL_SEND:
                 ops.ctrl_send(req.ctrl_class, req.ctrl_cmd,

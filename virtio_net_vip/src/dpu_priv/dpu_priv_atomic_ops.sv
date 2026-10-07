@@ -53,6 +53,11 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
         return 1;
     endfunction
 
+    // 私有环 ops 标识，供私有 FSM 校验配对。
+    virtual function bit uses_private_ring();
+        return 1;
+    endfunction
+
     // 统一检查配置和 Host/BDF 所有权；不允许一个 Function 的 ops 错接另一 Host 内存。
     protected function bit context_ready();
         if ((private_backend == null) || (private_backend.control == null) || (transport == null) || (mem == null) ||
