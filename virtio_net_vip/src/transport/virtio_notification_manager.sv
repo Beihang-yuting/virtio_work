@@ -126,6 +126,10 @@ class virtio_notification_manager extends uvm_object;
             msix_table[i].masked   = 1;                          // Start masked
             msix_mask[i]           = 1;
 
+            // Vector Control：先读改写置屏蔽位（保留其余位）再改消息地址/数据——PCIe Base Spec：
+            // 表项未屏蔽时改写地址/数据结果未定义（重复初始化、迁移恢复时表项可能处于未屏蔽状态）。
+            write_vector_control(i);
+
             // Write Message Address (lower 32)
             bar.write_msix_reg(msix_table_bar, entry_offset + 32'h00, 4,
                                msix_table[i].msg_addr[31:0]);
@@ -137,9 +141,6 @@ class virtio_notification_manager extends uvm_object;
             // Write Message Data
             bar.write_msix_reg(msix_table_bar, entry_offset + 32'h08, 4,
                                msix_table[i].msg_data);
-
-            // Vector Control：读改写置屏蔽位，保留其余位
-            write_vector_control(i);
 
             `uvm_info("NOTIFY_MGR",
                 $sformatf("MSI-X vector %0d: addr=0x%016h data=0x%08h masked=%0b",

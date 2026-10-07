@@ -1194,6 +1194,61 @@ class virtio_vdev_unit_test extends uvm_test;
         `uvm_info("VDEV_UNIT", "test_vip_msix_enables_device PASSED", UVM_LOW)
     endtask
 
+    // PCIe Base Spec（MSI-X Table）：表项未屏蔽时改写消息地址/数据，结果未定义。set_msix 面对未屏蔽的
+    // 表项（重复初始化、迁移恢复）必须先置 Vector Control 屏蔽位，再写 dw0–dw2，最后才解屏蔽。
+    task test_vip_msix_masks_before_programming();
+        virtio_pci_transport t;
+        vdev_loopback_bar_accessor acc;
+        virtio_common_cfg_backend be;
+        int unsigned qids[$];
+        bit ok;
+        vdev_event ev[$];
+        int first_mask[int unsigned];
+        int first_addr[int unsigned];
+
+        t = virtio_pci_transport::type_id::create("mask_first_transport");
+        t.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(STD_BDF));
+        acc = vdev_loopback_bar_accessor::type_id::create("mask_first_bar");
+        acc.port = port;
+        acc.target_bdf = STD_BDF;
+        acc.bar_base[0] = STD_BAR0;
+        acc.bar_base[2] = STD_BAR2;
+        acc.bar_base[4] = STD_BAR4;
+        t.bar = acc;
+        t.cap_mgr.bar_ref = acc;
+        t.notify_mgr.bar = acc;
+        t.cap_mgr.discover_capabilities();
+        for (int unsigned i = 0; i < 6; i++)
+            port.host_write(STD_BAR4 + 16*i + 12, 4, 32'h0000_0000);   // 全部未屏蔽
+        std_log.events.delete();
+        be = virtio_common_cfg_backend::type_id::create("mask_first_backend");
+        be.bind_transport(t);
+        qids.push_back(0);
+        qids.push_back(1);
+        be.set_msix(qids, ok);
+        std_log.select(VDEV_REG_WR, ev);
+        foreach (ev[k]) begin
+            if (ev[k].region != "msix")
+                continue;
+            for (int unsigned i = 0; i < 3; i++) begin
+                if ((ev[k].field == $sformatf("vec%0d.dw3", i)) && ev[k].val[0] &&
+                    !first_mask.exists(i))
+                    first_mask[i] = k;
+                if ((ev[k].field == $sformatf("vec%0d.dw0", i)) && !first_addr.exists(i))
+                    first_addr[i] = k;
+            end
+        end
+        for (int unsigned i = 0; i < 3; i++)
+            if (!ok || !first_mask.exists(i) || !first_addr.exists(i) ||
+                (first_mask[i] > first_addr[i]))
+                `uvm_fatal("VDEV_UNIT", $sformatf(
+                    "set_msix programmed vector %0d address before masking it (mask@%0d addr@%0d)",
+                    i, first_mask.exists(i) ? first_mask[i] : -1,
+                    first_addr.exists(i) ? first_addr[i] : -1))
+        be.clear_msix(ok);
+        `uvm_info("VDEV_UNIT", "test_vip_msix_masks_before_programming PASSED", UVM_LOW)
+    endtask
+
     // virtio 1.2 §4.1.5.1.2.2：驱动把事件映射到向量后 MUST 回读 vector 字段核对，失败时读回 NO_VECTOR。
     // 设备拒绝向量 2：config/queue 映射接口与建队路径（setup_single_queue）都必须报告失败并在 notify_mgr
     // 中记为 NO_VECTOR，接受的映射不报且按回读值记录。
@@ -1800,6 +1855,7 @@ class virtio_vdev_unit_test extends uvm_test;
         test_std_split_indirect();
         test_std_packed_indirect_loopback();
         test_vip_msix_enables_device();
+        test_vip_msix_masks_before_programming();
         test_vip_msix_mapping_readback();
         test_priv_driver_sequence();
         test_priv_backend_sequence();
