@@ -105,6 +105,23 @@ virtual class virtio_config_backend extends uvm_object;
     pure virtual task clear_msix(output bit ok);
     // 读取 virtio-net 设备配置空间（MAC、link status、max_virtqueue_pairs 等）。
     pure virtual task read_net_config(output virtio_net_device_config_t cfg);
+
+    // 以下钩子的默认实现即标准 virtio-pci 行为；私有后端覆写。
+    // 设备发现：BAR/capability 枚举，委托 transport 的发现策略。
+    virtual task discover();
+        transport.discover_and_init_bars();
+    endtask
+
+    // 建队钩子：ops 已创建队列对象、尚未分配 ring；后端可按自己的队列参数表配置
+    // 队列对象并补全编程参数。返回 0 时 ops 销毁队列，设备未被访问。
+    virtual function bit prepare_queue(virtqueue_base vq, ref virtio_queue_program_t q);
+        return 1;
+    endfunction
+
+    // 通知设备队列有新缓冲；标准设备经 notify capability 写 next_idx/wrap。
+    virtual task notify_queue(virtio_queue_program_t q, int unsigned next_idx, bit wrap);
+        transport.kick(q.queue_id, next_idx, wrap);
+    endtask
 endclass
 
 // 标准 virtio-pci common-config 后端：逐字保留 atomic ops 在 HEAD 中的寄存器序列。

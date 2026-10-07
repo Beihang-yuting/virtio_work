@@ -86,8 +86,6 @@ package virtio_net_pkg;
   `include "agent/virtio_atomic_ops.sv"
   `include "agent/virtio_migration_engine.sv"
   `include "agent/virtio_auto_fsm.sv"
-  `include "dpu_priv/dpu_priv_atomic_ops.sv"
-  `include "dpu_priv/dpu_priv_auto_fsm.sv"
   `include "agent/virtio_driver_protocol.sv"
   `include "agent/virtio_driver.sv"
   `include "agent/virtio_monitor.sv"

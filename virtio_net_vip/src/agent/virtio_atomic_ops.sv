@@ -147,9 +147,19 @@ class virtio_atomic_ops extends uvm_object;
         return config_backend;
     endfunction
 
-    // 是否为 DPU 私有环 ops；私有 FSM 用它确认 ops/FSM 配对，无需类型转换。
-    virtual function bit uses_private_ring();
-        return 0;
+    // 只读导出已编程队列的设备视角参数（诊断/测试）；未建队返回 0 且输出空程序。
+    function bit get_queue_program(int unsigned queue_id,
+                                   output virtio_queue_program_t q);
+        q = virtio_empty_queue_program();
+        if (!queue_programs.exists(queue_id))
+            return 0;
+        q = queue_programs[queue_id];
+        return 1;
+    endfunction
+
+    // 是否仍有已编程队列；驱动协议据此拒绝对活动 ops 重新冻结配置。
+    function bit has_active_queues();
+        return queue_programs.num() != 0;
     endfunction
 
     // ring 内地址 → 设备视角 IOVA：落在第 i 个已映射 ring 区内时按区内偏移换算；
@@ -165,17 +175,30 @@ class virtio_atomic_ops extends uvm_object;
         return 0;
     endfunction
 
-    // 生产路径的通知边界：PRE_NOTIFY 故障钩子 → transport 通知（携带 ring 游标
-    // next_idx/wrap）→ POST_NOTIFY 故障钩子。不调用 virtqueue::kick()，那只计数；
-    // 调用方自己决定是否需要通知（needs_notification 等）。via 为空时用本 ops 的
-    // transport，Admin VQ 传入其上下文 transport。
+    // 生产路径的通知边界：PRE_NOTIFY 故障钩子 → 队列格式发布（prepare_notify）→
+    // 通知（携带 ring 游标 next_idx/wrap）→ POST_NOTIFY 故障钩子。不调用
+    // virtqueue::kick()，那只计数；调用方自己决定是否需要通知。via 为空时经配置
+    // 后端通知（标准：notify capability；私有：私有 doorbell），Admin VQ 传入其上下文 transport。
     protected task kick_with_fault(virtqueue_base vq, int unsigned qid,
                                    virtio_pci_transport via = null);
-        virtio_pci_transport notify_transport;
+        virtio_config_backend backend;
+        virtio_queue_program_t qprog;
 
-        notify_transport = (via != null) ? via : transport;
         void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
-        notify_transport.kick(qid, vq.get_notify_next_idx(), vq.get_notify_wrap());
+        if (vq.prepare_notify()) begin
+            if (via != null)
+                via.kick(qid, vq.get_notify_next_idx(), vq.get_notify_wrap());
+            else begin
+                if (queue_programs.exists(qid))
+                    qprog = queue_programs[qid];
+                else begin
+                    qprog = virtio_empty_queue_program();
+                    qprog.queue_id = qid;
+                end
+                backend = cfg_backend();
+                backend.notify_queue(qprog, vq.get_notify_next_idx(), vq.get_notify_wrap());
+            end
+        end
         void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));
     endtask
 

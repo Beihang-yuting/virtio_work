@@ -35,11 +35,19 @@ virtual class virtio_driver_protocol extends uvm_object;
     pure virtual function bit supports_migration();
     // 本协议实际使用的队列格式；requested 为 Function 配置值。
     pure virtual function virtqueue_type_e queue_format(virtqueue_type_e requested);
-    // 预检：校验行为配置，按需创建 ops/FSM 候选；已提供的对象类型不符时返回 0。
-    // 不访问设备，不冻结配置。
-    pure virtual function bit prepare_candidates(
+    // 预检：按需用 factory 创建通用 ops/FSM 候选；协议可先校验自己的配置。
+    // 不访问设备，不冻结配置；创建失败留给调用方的空句柄检查报告。
+    virtual function bit prepare_candidates(
         string label, uvm_component parent, virtio_driver_config_t behavior,
         ref virtio_atomic_ops candidate_ops, ref virtio_auto_fsm candidate_fsm);
+        if (candidate_fsm == null)
+            candidate_fsm = virtio_auto_fsm::type_id::create(
+                {label, "_fsm"}, parent);
+        if (candidate_ops == null)
+            candidate_ops = virtio_atomic_ops::type_id::create(
+                {label, "_ops"}, parent);
+        return 1;
+    endfunction
     // 提交：把 Function 选定的配置后端与协议专属配置一起冻结进 ops；失败时 why 说明
     // 原因且 ops 不被修改。
     pure virtual function bit bind_ops(virtio_atomic_ops ops,
@@ -95,27 +103,21 @@ class virtio_standard_driver_protocol extends virtio_driver_protocol;
         return requested;
     endfunction
 
-    // 未提供时用 factory 创建标准 FSM 与 ops；创建失败留给调用方的空句柄检查报告。
-    virtual function bit prepare_candidates(
-        string label, uvm_component parent, virtio_driver_config_t behavior,
-        ref virtio_atomic_ops candidate_ops, ref virtio_auto_fsm candidate_fsm);
-        if (candidate_fsm == null)
-            candidate_fsm = virtio_auto_fsm::type_id::create(
-                {label, "_fsm"}, parent);
-        if (candidate_ops == null)
-            candidate_ops = virtio_atomic_ops::type_id::create(
-                {label, "_ops"}, parent);
-        return 1;
-    endfunction
-
-    // 标准驱动只下发配置后端，没有其他需要冻结的协议专属配置。
+    // 标准驱动只下发 common-config 后端，没有其他需要冻结的协议专属配置；其他后端
+    // （如私有后端）拒绝且不改动 ops。
     virtual function bit bind_ops(virtio_atomic_ops ops,
                                   virtio_config_backend backend,
                                   virtio_driver_config_t behavior,
                                   output string why);
+        virtio_common_cfg_backend common_be;
+
         why = "";
         if (backend == null) begin
             why = "标准协议缺少配置后端";
+            return 0;
+        end
+        if (!$cast(common_be, backend)) begin
+            why = "标准协议要求 virtio_common_cfg_backend";
             return 0;
         end
         ops.config_backend = backend;

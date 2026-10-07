@@ -92,7 +92,7 @@ class dpu_priv_expected_error extends uvm_report_catcher;
     endfunction
     // 按 ID/严重度/完整消息匹配；命中一次后清空期望，不吞第二条或无关错误。
     virtual function action_e catch();
-        if ((get_severity() == UVM_ERROR) && (get_id() == "DPU_PRIV_OPS") &&
+        if ((get_severity() == UVM_ERROR) && (get_id() == "ATOMIC_OPS") &&
             (expected != "") && (get_message() == expected)) begin
             expected = "";
             matched++;
@@ -108,7 +108,7 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
     `uvm_component_utils(dpu_priv_driver_flow_test)
     dpu_priv_example_control controls[2];
     virtio_function_instance private_functions[2];
-    dpu_priv_atomic_ops private_ops[2];
+    virtio_atomic_ops private_ops[2];
     uvm_sequencer #(pcie_tl_tlp) unused_rc;
 
     // 创建测试组件；所有配置仍在 build 阶段交给父示例生成。
@@ -151,17 +151,25 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
             controls[h].iommu = env.iommu;
             foreach (env.function_instances[i]) begin
                 virtio_function_instance f;
-                dpu_priv_atomic_ops check_private;
+                dpu_priv_config_backend check_private;
                 f = env.function_instances[i];
                 if (!(f.preflight_bind_pcie(unused_rc) &&
                       f.commit_bind_pcie(env.host_mem, env.iommu,
                           env.barrier, env.err_inj, env.wait_pol, unused_rc)))
                     `uvm_fatal("DPU_FLOW", "Function binding failed")
+                // 私有与标准 VF 共用通用 ops/FSM；选择结果体现在配置后端与协议上。
                 if (f.function_key.vf_id == 0) begin
-                    if (f.private_cfg == null || !$cast(private_ops[h], f.driver_agent.ops))
+                    private_ops[h] = f.driver_agent.ops;
+                    if (f.private_cfg == null || private_ops[h] == null ||
+                        !$cast(check_private, private_ops[h].config_backend) ||
+                        check_private == null || f.protocol == null ||
+                        private_ops[h].protocol != f.protocol ||
+                        f.protocol.protocol_name() != "dpu_priv")
                         `uvm_fatal("DPU_FLOW", "env private configuration did not reach ops")
                     private_functions[h] = f;
-                end else if ($cast(check_private, f.driver_agent.ops))
+                end else if (($cast(check_private, f.driver_agent.ops.config_backend) &&
+                              check_private != null) ||
+                             f.protocol.protocol_name() != "standard")
                     `uvm_fatal("DPU_FLOW", "private selection changed a standard VF")
             end
             if (private_functions[h] == null)
@@ -193,6 +201,7 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
     // 验证原始字节、token、完成长度、通知本地号及单帧 DMA 回收数量。
     task check_traffic(int unsigned h);
         dpu_priv_queue_context_t tx_ctx, rx_ctx;
+        virtio_queue_program_t tx_prog, rx_prog;
         packet_item frame;
         virtio_net_hdr_t hdr;
         uvm_object completed[$], received[$];
@@ -203,9 +212,12 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
         int unsigned budget = 8;
         frame = make_frame($sformatf("host%0d_frame", h), 128+64*h);
         hdr = '{default:0};
-        if (!private_ops[h].get_queue_context(1, tx_ctx) ||
-            !private_ops[h].get_queue_context(0, rx_ctx) ||
-            tx_ctx.host_id != h || tx_ctx.local_qid != h*8+1)
+        if (!private_ops[h].get_queue_program(1, tx_prog) ||
+            !private_ops[h].get_queue_program(0, rx_prog))
+            `uvm_fatal("DPU_FLOW", "private queue context/host routing mismatch")
+        tx_ctx = dpu_priv_config_backend::to_context(tx_prog);
+        rx_ctx = dpu_priv_config_backend::to_context(rx_prog);
+        if (tx_ctx.host_id != h || tx_ctx.local_qid != h*8+1)
             `uvm_fatal("DPU_FLOW", "private queue context/host routing mismatch")
         if (h == 0) private_ops[h].tx_submit(1, hdr, frame, 0, id);
         else private_functions[h].dataplane.tx_engine.submit_packet(1, frame, 0, id);
@@ -252,27 +264,27 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
     // 必须重新初始化的状态，确保既不会进入标准寄存器路径，也不留下可误启动的 FSM。
     task check_lifecycle(int unsigned h);
         dpu_priv_expected_error catcher;
-        dpu_priv_queue_context_t ctx;
+        virtio_queue_program_t prog;
         int unsigned maps_before;
         bit ok;
         catcher = new();
         uvm_report_cb::add(null, catcher);
         maps_before = controls[h].iommu.total_unmaps;
         controls[h].fail_disable = 1;
-        catcher.expected = "teardown: 未确认 DMA 停止，保留队列资源";
+        catcher.expected = "teardown_queue: config backend did not confirm queue_id=0 stopped; retaining queue DMA";
         private_ops[h].teardown_queue(0);
         if (catcher.matched != 1 || controls[h].iommu.total_unmaps != maps_before ||
-            !private_ops[h].get_queue_context(0, ctx))
+            !private_ops[h].get_queue_program(0, prog))
             `uvm_fatal("DPU_FLOW", "failed stop released live DMA")
         controls[h].fail_disable = 0;
         controls[h].fail_reset = 1;
-        catcher.expected = "reset: 未确认 Function 停止 DMA，保留资源";
+        catcher.expected = "device_reset: transport reset did not complete; retaining PF DMA";
         private_ops[h].device_reset_verified(ok);
         if (ok || catcher.matched != 2 || controls[h].iommu.total_unmaps != maps_before)
             `uvm_fatal("DPU_FLOW", "failed reset released live DMA")
         controls[h].fail_reset = 0;
         private_ops[h].teardown_queue(0);
-        if (private_ops[h].get_queue_context(0, ctx) ||
+        if (private_ops[h].get_queue_program(0, prog) ||
             private_functions[h].vq_mgr.has_queue(0) ||
             controls[h].configured.exists(0) || controls[h].iommu.total_unmaps <= maps_before)
             `uvm_fatal("DPU_FLOW", "successful stop did not retire RX queue ownership")
@@ -284,12 +296,12 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
         #100ns;
         maps_before = controls[h].iommu.total_unmaps;
         controls[h].fail_reset = 1;
-        catcher.expected = "reset: 未确认 Function 停止 DMA，保留资源";
+        catcher.expected = "device_reset: transport reset did not complete; retaining PF DMA";
         private_functions[h].shutdown();
         if (catcher.matched != 3 || controls[h].iommu.total_unmaps != maps_before ||
             private_functions[h].state != VF_RESET_FAILED ||
             private_functions[h].driver_agent.fsm.state != FSM_ERROR ||
-            !private_ops[h].get_queue_context(0, ctx))
+            !private_ops[h].get_queue_program(0, prog))
             `uvm_fatal("DPU_FLOW", "failed Function shutdown lost resources or failure state")
         controls[h].fail_reset = 0;
         private_functions[h].shutdown();

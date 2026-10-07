@@ -178,7 +178,7 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // Injects descriptor/barrier/IOMMU errors via the virtqueue interface.
     // ========================================================================
 
-    // 将故障注入委托给目标队列；私有回调对不支持的错误类型显式报错，不猜位布局。
+    // 将故障注入委托给目标队列；私有队列对不支持的错误类型显式报错，不猜位布局。
     protected virtual task dispatch_error_injection(virtio_transaction req);
         virtqueue_base vq;
         vq = ops.vq_mgr.get_queue(req.queue_id);

@@ -1,6 +1,7 @@
-// 目录层次：src/dpu_priv；DPU 私有环驱动协议。依赖私有 ops/FSM 与
-// dpu_priv_driver_config（借用，env_cfg 按 service key 注入）。不访问标准 status/MSI-X；
-// 复位与关机必须由控制后端确认停 DMA，失败保留资源并进入错误态。
+// 目录层次：src/dpu_priv；DPU 私有环驱动协议：只声明私有 Function 与标准 virtio 的差异
+// （能力、队列格式、MANUAL kick/poll、复位语义），ops/FSM 均为通用实现。依赖
+// dpu_priv_driver_config（借用，env_cfg 按 service key 注入）与 Function 提交时选定的
+// dpu_priv_config_backend。复位与关机必须由控制后端确认停 DMA，失败保留资源。
 `ifndef DPU_PRIV_DRIVER_PROTOCOL_SV
 `define DPU_PRIV_DRIVER_PROTOCOL_SV
 
@@ -20,7 +21,7 @@ class dpu_priv_driver_protocol extends virtio_driver_protocol;
         return "dpu_priv";
     endfunction
 
-    // 私有协议的状态控制由 AF/mailbox 后端负责。
+    // 私有设备没有标准 status 寄存器，MANUAL 原始 status 访问被 driver 拒绝。
     virtual function bit allows_status_access();
         return 0;
     endfunction
@@ -47,52 +48,45 @@ class dpu_priv_driver_protocol extends virtio_driver_protocol;
         return VQ_CUSTOM;
     endfunction
 
-    // 校验私有配置与 VQ_CUSTOM/polling 行为，创建私有 ops/FSM；已提供的对象类型冲突时拒绝。
+    // 校验私有配置与 polling 行为，再创建通用 ops/FSM 候选。
     virtual function bit prepare_candidates(
         string label, uvm_component parent, virtio_driver_config_t behavior,
         ref virtio_atomic_ops candidate_ops, ref virtio_auto_fsm candidate_fsm);
-        dpu_priv_atomic_ops private_ops;
-        dpu_priv_auto_fsm private_fsm;
         string why;
 
         why = "private_cfg 未注入";
         if ((private_cfg == null) ||
             !private_cfg.validate(behavior.num_queue_pairs, why) ||
-            behavior.vq_type != VQ_CUSTOM || behavior.irq_mode != IRQ_POLLING) begin
+            (behavior.irq_mode != IRQ_POLLING)) begin
             `uvm_error("FUNCTION_BIND", {"私有驱动配置非法: ", why})
             return 0;
         end
-        if (candidate_ops == null)
-            candidate_ops = dpu_priv_atomic_ops::type_id::create({label, "_ops"});
-        if (candidate_fsm == null)
-            candidate_fsm = dpu_priv_auto_fsm::type_id::create({label, "_fsm"});
-        if (!$cast(private_ops, candidate_ops) || !$cast(private_fsm, candidate_fsm)) begin
-            `uvm_error("FUNCTION_BIND", "私有配置与已绑定 ops/FSM 类型冲突")
-            return 0;
-        end
-        return (candidate_ops != null) && (candidate_fsm != null);
+        return super.prepare_candidates(label, parent, behavior,
+                                        candidate_ops, candidate_fsm);
     endfunction
 
-    // 冻结一份私有配置与私有配置后端进 ops（有活动队列时 ops 拒绝重配）。
+    // 把私有配置冻结进 Function 选定的私有配置后端，再把后端与协议绑定进 ops。ops 仍有
+    // 活动队列或后端不是私有后端时拒绝，不改动 ops 与后端。
     virtual function bit bind_ops(virtio_atomic_ops ops,
                                   virtio_config_backend backend,
                                   virtio_driver_config_t behavior,
                                   output string why);
-        dpu_priv_atomic_ops private_ops;
-        dpu_priv_config_backend private_backend;
+        dpu_priv_config_backend priv_be;
 
         why = "";
-        if (!$cast(private_ops, ops) || (private_ops == null)) begin
-            why = "私有协议要求 dpu_priv_atomic_ops";
+        if ((private_cfg == null) || (ops == null) || ops.has_active_queues()) begin
+            why = "private 配置为空或仍有活动队列";
             return 0;
         end
-        if (!$cast(private_backend, backend) || (private_backend == null)) begin
+        if (!private_cfg.validate(behavior.num_queue_pairs, why))
+            return 0;
+        if (!$cast(priv_be, backend) || (priv_be == null)) begin
             why = "私有协议要求 dpu_priv_config_backend";
             return 0;
         end
-        if (!private_ops.configure_private(private_cfg, behavior.num_queue_pairs,
-                                           private_backend, why))
-            return 0;
+        priv_be.bind_private(private_cfg, behavior.num_queue_pairs);
+        ops.config_backend = backend;
+        ops.negotiated_features = 0;
         ops.protocol = this;
         return 1;
     endfunction
@@ -107,15 +101,9 @@ class dpu_priv_driver_protocol extends virtio_driver_protocol;
         dataplane.rx_engine.refill_threshold = 0;
     endfunction
 
-    // 发布内存屏障后发送私有 32-bit doorbell。
+    // MANUAL ATOMIC_KICK：发布屏障后经私有后端写 32-bit doorbell。
     virtual task kick(virtio_atomic_ops ops, int unsigned queue_id);
-        dpu_priv_atomic_ops private_ops;
-
-        if (!$cast(private_ops, ops) || (private_ops == null)) begin
-            `uvm_error("VIRTIO_DRV", "私有协议未绑定私有 ops")
-            return;
-        end
-        private_ops.kick_queue(queue_id);
+        ops.kick_queue(queue_id);
     endtask
 
     // 私有完成必须经过 ops 回收数据 DMA，不能裸 poll 丢弃 token。

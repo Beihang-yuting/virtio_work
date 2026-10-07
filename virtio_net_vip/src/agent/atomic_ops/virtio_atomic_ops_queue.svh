@@ -80,6 +80,23 @@
             return;
         end
 
+        // 4b. 编程参数基本字段；后端可按其队列参数表配置队列对象并补全参数
+        // （私有：方向、本地号、RX 容量、doorbell）。拒绝时设备未被访问。
+        qprog = virtio_empty_queue_program();
+        qprog.host_id    = get_iommu_host_id(transport);
+        qprog.bdf        = transport.bdf;
+        qprog.queue_id   = queue_id;
+        qprog.queue_size = eff_size;
+        qprog.vq_type    = vq_type;
+        qprog.local_qid  = queue_id;
+        qprog.tx_mode    = queue_id[0];
+        if (!backend.prepare_queue(vq, qprog)) begin
+            vq_mgr.destroy_queue(queue_id);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: config backend rejected queue_id=%0d", queue_id))
+            return;
+        end
+
         // 5. Allocate ring memory
         vq.alloc_rings();
 
@@ -122,19 +139,11 @@
 
         // 9. 经配置后端编程并启用队列（common-config：写大小/地址/向量并置
         // Q_ENABLE）。后端拒绝时设备不得访问该队列，因此可以立即回收 ring 映射。
-        qprog = virtio_empty_queue_program();
-        qprog.host_id     = get_iommu_host_id(transport);
-        qprog.bdf         = transport.bdf;
-        qprog.queue_id    = queue_id;
-        qprog.queue_size  = eff_size;
-        qprog.vq_type     = vq_type;
         qprog.desc_iova   = desc_iova;
         qprog.driver_iova = avail_iova;
         qprog.device_iova = used_iova;
         qprog.ring_bytes  = ring_bytes;
         qprog.msix_vector = msix_vector;
-        qprog.local_qid   = queue_id;
-        qprog.tx_mode     = queue_id[0];
         backend.configure_queue(qprog, configured);
         if (configured)
             backend.enable_queue(qprog, configured);
@@ -254,7 +263,7 @@
     //
     // 队列号按 virtio-net 约定：pair i 的 receiveq 为 2i、transmitq 为 2i+1。
     // 任一队列失败时按创建顺序拆除本次已建队列并返回 ok=0，不触碰范围外队列；
-    // setup_queue/teardown_queue 为虚方法，私有 ops 的停 DMA 确认语义照常生效。
+    // teardown_queue 在后端未确认停 DMA 时保留队列资源（私有后端同样适用）。
     // ------------------------------------------------------------------------
     virtual task setup_queue_range(
         int unsigned     first_pair,

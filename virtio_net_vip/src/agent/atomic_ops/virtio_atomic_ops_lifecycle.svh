@@ -75,6 +75,14 @@
         `uvm_info("ATOMIC_OPS", "device_reset: complete", UVM_MEDIUM)
     endtask
 
+    // 设备发现经配置后端：标准设备枚举 BAR/capability，私有设备由其后端决定。
+    virtual task discover_device();
+        virtio_config_backend backend;
+
+        backend = cfg_backend();
+        backend.discover();
+    endtask
+
     // 便捷入口：执行验证式设备复位但忽略完成标志（结果由日志体现）；
     // 需要判定复位是否成功的调用方应使用 device_reset_verified。
     virtual task device_reset();

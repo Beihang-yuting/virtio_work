@@ -12,7 +12,7 @@ typedef byte unsigned virtio_byte_queue_t[$];
 //   2. DMA、描述符发布与 PCIe notify 委托 virtio_atomic_ops.tx_submit
 //      （经 virtio_net_dataplane.bind_ops 绑定）；
 //   3. 完成与 DMA 回收委托 virtio_atomic_ops.tx_complete。
-// 引擎不持有 DMA 缓冲，只维护统计。私有 Function 注入私有 ops，同一引擎类即可。
+// 引擎不持有 DMA 缓冲，只维护统计。私有 Function 同样注入通用 ops，同一引擎类即可。
 // host_id/bdf 记录 Function 的 DMA 身份，供 fabric 测试断言，收发不读取。
 // ============================================================================
 

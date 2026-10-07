@@ -216,6 +216,7 @@ class virtio_auto_fsm extends uvm_report_object;
         bit [63:0] negotiated;
         bit        feat_ok;
         bit        setup_ok;
+        bit        reset_ok;
         int unsigned total_queues;
 
         `uvm_info("AUTO_FSM", "full_init: starting initialization sequence", UVM_LOW)
@@ -224,14 +225,24 @@ class virtio_auto_fsm extends uvm_report_object;
         state = FSM_DISCOVERING;
         `uvm_info("AUTO_FSM",
             $sformatf("full_init: state=%s -- discovering BARs", state.name()), UVM_MEDIUM)
-        ops.transport.discover_and_init_bars();
+        ops.discover_device();
 
         // ---- Step 2: Feature negotiation ----
         state = FSM_NEGOTIATING;
         `uvm_info("AUTO_FSM",
             $sformatf("full_init: state=%s -- negotiating features", state.name()), UVM_MEDIUM)
 
-        ops.device_reset();
+        // 要求确认停 DMA 的协议（私有环）复位未确认即失败，保留全部资源；标准协议
+        // 保持原 device_reset 调用（测试子类会覆写它）。
+        if ((ops.protocol != null) && ops.protocol.requires_verified_reset()) begin
+            ops.device_reset_verified(reset_ok);
+            if (!reset_ok) begin
+                state = FSM_ERROR;
+                `uvm_error("AUTO_FSM", "full_init: device reset not confirmed; retaining DMA")
+                return;
+            end
+        end else
+            ops.device_reset();
 
         ops.set_acknowledge();
         ops.set_driver();
@@ -257,7 +268,7 @@ class virtio_auto_fsm extends uvm_report_object;
             total_queues = total_queues + 1;
         num_total_queues = total_queues;
 
-        ops.setup_all_queues(active_num_pairs, drv_cfg.vq_type,
+        ops.setup_all_queues(active_num_pairs, queue_format(),
                              drv_cfg.queue_size, setup_ok);
         if (!setup_ok) begin
             state = FSM_ERROR;
@@ -831,22 +842,31 @@ class virtio_auto_fsm extends uvm_report_object;
     // ------------------------------------------------------------------------
     // reset_single_queue -- Reset and re-setup a single queue
     //
-    // Does not change overall FSM state. If the queue is a receive queue,
-    // refills RX buffers after re-setup.
+    // 先停后台 worker（它们会轮询被拆除的队列），teardown 未确认停 DMA 时保留队列并
+    // 进入 FSM_ERROR；重建成功后 RX 队列补 buffer，原先运行的数据面重新启动。
     // ------------------------------------------------------------------------
     virtual task reset_single_queue(int unsigned queue_id);
         bit setup_ok;
+        bit was_running;
         `uvm_info("AUTO_FSM",
             $sformatf("reset_single_queue: queue_id=%0d", queue_id), UVM_MEDIUM)
 
-        // Teardown the queue
-        ops.teardown_queue(queue_id);
+        was_running = (state == FSM_RUNNING);
+        if (was_running)
+            stop_dataplane();
 
-        // Reset via transport (writes Q_RESET, polls until complete)
+        ops.teardown_queue(queue_id);
+        if (ops.vq_mgr.has_queue(queue_id)) begin
+            state = FSM_ERROR;
+            `uvm_error("AUTO_FSM", $sformatf(
+                "reset_single_queue: queue %0d was not stopped; retaining it", queue_id))
+            return;
+        end
+
+        // 经配置后端复位（标准：Q_RESET；私有：teardown 已完成停队）
         ops.reset_queue(queue_id);
 
-        // Re-setup the queue
-        ops.setup_queue(queue_id, drv_cfg.queue_size, drv_cfg.vq_type, setup_ok);
+        ops.setup_queue(queue_id, drv_cfg.queue_size, queue_format(), setup_ok);
         if (!setup_ok) begin
             state = FSM_ERROR;
             `uvm_error("AUTO_FSM", $sformatf(
@@ -858,6 +878,9 @@ class virtio_auto_fsm extends uvm_report_object;
         if (queue_id % 2 == 0 && queue_id < active_num_pairs * 2) begin
             ops.rx_refill(queue_id, drv_cfg.queue_size);
         end
+
+        if (was_running)
+            start_dataplane();
 
         `uvm_info("AUTO_FSM",
             $sformatf("reset_single_queue: queue_id=%0d complete", queue_id), UVM_MEDIUM)

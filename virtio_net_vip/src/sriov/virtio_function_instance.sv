@@ -2,7 +2,7 @@
 `define VIRTIO_FUNCTION_INSTANCE_SV
 
 // 目录层次：src/sriov；每个 PF/VF 拥有 driver、queue manager、transport 和运行态。
-// 依赖冻结 DPU snapshot、共享 Host memory 和标准/私有 ops/FSM；组件生命周期由
+// 依赖冻结 DPU snapshot、共享 Host memory 和通用 ops/FSM；组件生命周期由
 // UVM 管理，private_cfg/control 借用自 env_cfg，DMA 由所选 ops 在停机确认后释放。
 // One independently addressable virtio function.  A PF and every VF own the
 // same driver, transport, queue-manager, dataplane, Fabric identity, and BAR
@@ -67,7 +67,7 @@ class virtio_function_instance extends uvm_component;
     endfunction
 
     // 选择本 Function 的驱动协议并由协议创建/校验 ops/FSM 候选；这是 driver 工厂
-    // 选择的唯一位置，预检不访问设备。配置后端在提交时按同一 private_cfg 选择
+    // 选择的唯一位置，预检不访问设备。配置后端在提交时按这里选定的协议创建
     // （select_config_backend），其余标准/私有差异都经协议对象分派；factory 返回空对象时
     // UVM_FATAL。配置仅在提交时冻结。
     protected function bit prepare_driver_candidates(
@@ -357,10 +357,13 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
-    // 按冻结的 Function 配置选择配置后端：私有环（private_cfg 非空）用私有后端，否则
-    // common-config 后端。后端的唯一创建点；只创建对象，不访问设备。
+    // 按预检已选定的驱动协议选择配置后端：私有协议用私有后端，否则 common-config
+    // 后端；不再单独读取 private_cfg，后端与协议不会因两次读取而错配。后端的唯一
+    // 创建点；只创建对象，不访问设备。
     local function virtio_config_backend select_config_backend(string label);
-        if (private_cfg != null)
+        dpu_priv_driver_protocol private_protocol;
+
+        if ($cast(private_protocol, pending_protocol) && (private_protocol != null))
             return dpu_priv_config_backend::type_id::create({label, "_cfg_backend"});
         return virtio_common_cfg_backend::type_id::create({label, "_cfg_backend"});
     endfunction
@@ -430,7 +433,7 @@ class virtio_function_instance extends uvm_component;
             // 引擎参数由驱动协议决定（私有协议改写 RX buffer 容量与补充阈值）。
             pending_protocol.install_dataplane(dataplane, ops, function_name);
             // Function 不调用 configure()：借用 dataplane 自带的 offload，特性为 0 时
-            // build_tx_hdr 产出全零 header（私有 ops 要求如此）。
+            // build_tx_hdr 产出全零 header（无 header 的私有环要求如此）。
             dataplane.tx_engine.offload = dataplane.offload;
             dataplane.rx_engine.offload = dataplane.offload;
             dataplane.tx_engine.host_id =

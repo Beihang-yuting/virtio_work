@@ -65,7 +65,7 @@ class dpu_priv_queue_config extends uvm_object;
 endclass
 
 // 每 Function 独立配置：env_cfg 按完整 service key 注册它，再交给该 Function 的
-// 私有 ops/FSM。默认映射 local_qid_base+queue_id；单队列覆盖允许独立路由/通知。
+// 私有驱动协议与配置后端。默认映射 local_qid_base+queue_id；单队列覆盖允许独立路由/通知。
 class dpu_priv_driver_config extends uvm_object;
     `uvm_object_utils(dpu_priv_driver_config)
     dpu_priv_device_control control;

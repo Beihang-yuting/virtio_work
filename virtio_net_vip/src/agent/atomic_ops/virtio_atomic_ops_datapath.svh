@@ -42,6 +42,7 @@
         byte             pkt_data[];
         byte unsigned    wire_bytes[$];
         virtio_dma_buffer_set dma_set;
+        int unsigned     n_out;
 
         desc_id = '1;
         if (use_indirect &&
@@ -62,9 +63,20 @@
             return;
         end
 
-        // 1. Pack net_hdr to bytes
-        virtio_net_hdr_util::pack_hdr(net_hdr, negotiated_features, hdr_bytes);
-        hdr_size = hdr_bytes.size();
+        // 1. Pack net_hdr to bytes.  队列格式不带 virtio-net header（DPU 私有环）时只发
+        // 原始帧，header 中的 offload 请求无处承载，显式拒绝。
+        hdr_size = vq.net_hdr_bytes(negotiated_features);
+        if ((hdr_size == 0) && ((net_hdr.flags != 0) ||
+                                (net_hdr.gso_type != VIRTIO_NET_HDR_GSO_NONE))) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "tx_submit: queue %0d carries no virtio-net header; offload request rejected",
+                queue_id))
+            return;
+        end
+        if (hdr_size != 0) begin
+            virtio_net_hdr_util::pack_hdr(net_hdr, negotiated_features, hdr_bytes);
+            hdr_size = hdr_bytes.size();
+        end
         // PCIe Memory Read completions are DWORD based.  Keep the descriptor
         // length byte-accurate, but give the model/RC responder a DWORD-padded
         // backing allocation so a final partial DWORD never crosses an exact
@@ -97,8 +109,8 @@
         //    allocation rolls back the first; nothing is mapped yet.
         dma_set = new("tx_dma");
         dma_set.bind_domain(mem, iommu, get_iommu_host_id(transport), transport.bdf);
-        hdr_idx = dma_set.alloc(hdr_dma_size);
-        pkt_idx = (hdr_idx < 0) ? -1 : dma_set.alloc(pkt_dma_size);
+        hdr_idx = (hdr_size == 0) ? -1 : dma_set.alloc(hdr_dma_size);
+        pkt_idx = ((hdr_size != 0) && (hdr_idx < 0)) ? -1 : dma_set.alloc(pkt_dma_size);
         if (pkt_idx < 0) begin
             dma_set.release_all();
             `uvm_error("ATOMIC_OPS",
@@ -107,9 +119,11 @@
         end
 
         // 4. Write hdr and data to host_mem
-        hdr_data = new[hdr_size];
-        foreach (hdr_bytes[i]) hdr_data[i] = hdr_bytes[i];
-        dma_set.write(hdr_idx, hdr_data);
+        if (hdr_size != 0) begin
+            hdr_data = new[hdr_size];
+            foreach (hdr_bytes[i]) hdr_data[i] = hdr_bytes[i];
+            dma_set.write(hdr_idx, hdr_data);
+        end
 
         if (pkt_bytes.size() > 0) begin
             pkt_data = new[pkt_size];
@@ -118,7 +132,7 @@
         end
 
         // 5. Map through IOMMU (DMA_TO_DEVICE -- device reads these buffers)
-        if (!dma_set.map(hdr_idx, DMA_TO_DEVICE)) begin
+        if ((hdr_size != 0) && !dma_set.map(hdr_idx, DMA_TO_DEVICE)) begin
             dma_set.release_all();
             `uvm_error("ATOMIC_OPS", $sformatf(
                 "tx_submit: failed to map header for queue %0d", queue_id))
@@ -131,26 +145,31 @@
             return;
         end
 
-        // 6. Build scatter-gather lists: [hdr_sg(out)] [data_sg(out)]
-        hdr_entry.addr = dma_set.get_iova(hdr_idx);
-        hdr_entry.len  = hdr_size;
-        sgs[0].entries.push_back(hdr_entry);
+        // 6. Build scatter-gather lists: [hdr_sg(out)] [data_sg(out)]；无 header 时只有 data。
+        n_out = 0;
+        if (hdr_size != 0) begin
+            hdr_entry.addr = dma_set.get_iova(hdr_idx);
+            hdr_entry.len  = hdr_size;
+            sgs[n_out].entries.push_back(hdr_entry);
+            n_out++;
+        end
 
         pkt_entry.addr = dma_set.get_iova(pkt_idx);
         pkt_entry.len  = pkt_size;
-        sgs[1].entries.push_back(pkt_entry);
+        sgs[n_out].entries.push_back(pkt_entry);
+        n_out++;
 
         // 7. Add buffers to virtqueue (n_out=2, n_in=0).  The data buffers
         //    belong to this operation, not to add_buf(); a rejected chain
         //    rolls back and never reaches the completion map or notify path.
-        desc_id = vq.add_buf(sgs, 2, 0, pkt, use_indirect);
+        desc_id = vq.add_buf(sgs, n_out, 0, pkt, use_indirect);
         if (desc_id == '1) begin
             dma_set.release_all();
             return;
         end
 
-        // Hand both ownership records (hdr first, matching tx_complete's
-        // two-per-packet retirement) to completion/reset before notifying.
+        // Hand the ownership records (hdr first, matching tx_complete's
+        // per-packet retirement count) to completion/reset before notifying.
         if (!tx_dma_map.exists(queue_id))
             tx_dma_map[queue_id] = {};
         adopt_dma_set(dma_set, tx_dma_map[queue_id]);
@@ -189,10 +208,11 @@
             end
         end
 
-        // Clean up IOMMU mappings for completed TX buffers
-        // (Each TX uses 2 IOVAs: hdr + data)
+        // Clean up IOMMU mappings for completed TX buffers：每包 header+data 两条，
+        // 不带 header 的队列格式只有 data 一条。
         if (tx_dma_map.exists(queue_id)) begin
-            int unsigned iovas_to_free = count * 2;
+            int unsigned iovas_to_free =
+                count * ((vq.net_hdr_bytes(negotiated_features) == 0) ? 1 : 2);
             for (int unsigned i = 0; i < iovas_to_free && tx_dma_map[queue_id].size() > 0; i++) begin
                 normal_dma_record_t record = tx_dma_map[queue_id].pop_front();
                 retire_normal_dma_record(record);
@@ -230,9 +250,11 @@
         if (vq == null) return;
 
         // Determine buffer size based on header size + typical MTU
-        hdr_size = virtio_net_hdr_util::get_hdr_size(negotiated_features);
+        hdr_size = vq.net_hdr_bytes(negotiated_features);
 
-        // Use reasonable default: header + 1514 (standard Ethernet MTU)
+        // 默认容量：配置后端给出的队列 RX 容量（私有环），否则 header + 1514。
+        if ((buf_size == 0) && queue_programs.exists(queue_id))
+            buf_size = queue_programs[queue_id].rx_buf_size;
         if (buf_size == 0)
             buf_size = hdr_size + 1514;
         buf_dma_size = (buf_size + 3) & ~3;
@@ -314,7 +336,7 @@
         vq = vq_mgr.get_queue(queue_id);
         if (vq == null) return;
 
-        hdr_size = virtio_net_hdr_util::get_hdr_size(negotiated_features);
+        hdr_size = vq.net_hdr_bytes(negotiated_features);
 
         while (count < max_budget) begin
             if (vq.poll_used(token, len)) begin
@@ -340,8 +362,11 @@
                     retire_normal_dma_record(record);
                     break;
                 end
-                virtio_net_hdr_util::unpack_hdr(first_bytes,
-                                                negotiated_features, frame.net_hdr);
+                if (hdr_size != 0)
+                    virtio_net_hdr_util::unpack_hdr(first_bytes,
+                                                    negotiated_features, frame.net_hdr);
+                else
+                    frame.net_hdr = '{default:0};
                 for (int unsigned i = hdr_size; i < buf_data.size(); i++)
                     frame.payload.push_back(buf_data[i]);
                 // Only MRG_RXBUF gives num_buffers meaning; a VERSION_1

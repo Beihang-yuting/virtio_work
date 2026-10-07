@@ -1614,18 +1614,16 @@ class virtio_unit_test extends uvm_test;
         `uvm_info("UNIT_TEST", "test_setup_queue_maps_format_regions PASSED", UVM_LOW)
     endtask
 
-    // 驱动协议决定 ops/FSM 的类型、status 访问权限与关机复位语义；私有协议拒绝
-    // 接管已绑定的标准 ops。
+    // 驱动协议决定 status 访问权限、关机复位语义与私有配置冻结；两种协议都创建通用
+    // ops/FSM。私有协议只接受私有配置后端，并把协议绑定进 ops；标准协议只接受
+    // common-config 后端。
     task test_driver_protocol_selection();
         virtio_standard_driver_protocol standard;
         dpu_priv_driver_protocol private_protocol;
         dpu_priv_driver_config private_cfg;
         virtio_atomic_ops ops;
         virtio_auto_fsm fsm;
-        dpu_priv_atomic_ops typed_ops;
-        dpu_priv_auto_fsm typed_fsm;
         virtio_driver_config_t behavior;
-        virtio_unit_exact_error_catcher catcher;
         virtio_common_cfg_backend std_backend;
         dpu_priv_config_backend priv_backend;
         string why;
@@ -1639,9 +1637,17 @@ class virtio_unit_test extends uvm_test;
         fsm = null;
         if (!standard.allows_status_access() || standard.requires_verified_reset() ||
             !standard.prepare_candidates("unit_standard", null, behavior, ops, fsm) ||
-            (ops == null) || (fsm == null) || ops.uses_private_ring() ||
-            !standard.bind_ops(ops, std_backend, behavior, why) ||
-            (ops.config_backend != std_backend))
+            (ops == null) || (fsm == null))
+            `uvm_error("TEST", "standard driver protocol did not create generic ops/FSM")
+
+        // 下发私有后端：标准协议必须拒绝，且不改动 ops（不绑后端、不绑协议）。
+        if (standard.bind_ops(ops, priv_backend, behavior, why) ||
+            (why != "标准协议要求 virtio_common_cfg_backend") ||
+            (ops.config_backend != null) || (ops.protocol != null))
+            `uvm_error("TEST", {"standard protocol accepted a private config backend: ", why})
+
+        if (!standard.bind_ops(ops, std_backend, behavior, why) ||
+            (ops.config_backend != std_backend) || (ops.protocol != standard))
             `uvm_error("TEST", "standard driver protocol did not select standard ops/FSM")
 
         private_cfg = dpu_priv_driver_config::type_id::create("unit_private_cfg");
@@ -1650,34 +1656,26 @@ class virtio_unit_test extends uvm_test;
         private_protocol = dpu_priv_driver_protocol::type_id::create(
             "unit_private_protocol");
         private_protocol.private_cfg = private_cfg;
-        behavior.vq_type = VQ_CUSTOM;
         behavior.irq_mode = IRQ_POLLING;
         ops = null;
         fsm = null;
         if (private_protocol.allows_status_access() ||
             !private_protocol.requires_verified_reset() ||
             !private_protocol.prepare_candidates("unit_private", null, behavior, ops, fsm) ||
-            !$cast(typed_ops, ops) || !$cast(typed_fsm, fsm) ||
-            (typed_ops == null) || (typed_fsm == null) || !ops.uses_private_ring() ||
-            !private_protocol.bind_ops(ops, priv_backend, behavior, why) ||
-            (ops.config_backend != priv_backend) ||
-            (priv_backend.control != private_cfg.control))
-            `uvm_error("TEST", {"private driver protocol did not select private ops/FSM: ", why})
+            (ops == null) || (fsm == null))
+            `uvm_error("TEST", "private driver protocol did not create generic ops/FSM")
+
+        // 下发标准后端：私有协议必须拒绝冻结，且不改动 ops（不绑后端、不绑协议）。
         if (private_protocol.bind_ops(ops, std_backend, behavior, why) ||
             (why != "私有协议要求 dpu_priv_config_backend") ||
-            (ops.config_backend != priv_backend))
-            `uvm_error("TEST", {"private protocol accepted a common-config backend: ", why})
+            (ops.config_backend != null) || (ops.protocol != null))
+            `uvm_error("TEST", {"private protocol accepted a standard config backend: ", why})
 
-        ops = virtio_atomic_ops::type_id::create("unit_conflicting_ops");
-        fsm = null;
-        catcher = new("protocol_conflict_catcher", "FUNCTION_BIND",
-                      "私有配置与已绑定 ops/FSM 类型冲突");
-        uvm_report_cb::add(null, catcher);
-        if (private_protocol.prepare_candidates("unit_conflict", null, behavior, ops, fsm))
-            `uvm_error("TEST", "private protocol accepted a standard ops candidate")
-        uvm_report_cb::delete(null, catcher);
-        if (catcher.caught_count != 1)
-            `uvm_error("TEST", "private protocol did not report the ops/FSM type conflict")
+        if (!private_protocol.bind_ops(ops, priv_backend, behavior, why) ||
+            (ops.config_backend != priv_backend) ||
+            (ops.protocol != private_protocol) ||
+            (priv_backend.control != private_cfg.control))
+            `uvm_error("TEST", {"private protocol did not bind its backend: ", why})
         `uvm_info("UNIT_TEST", "test_driver_protocol_selection PASSED", UVM_LOW)
     endtask
 

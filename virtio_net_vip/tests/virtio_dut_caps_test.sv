@@ -498,19 +498,17 @@ class virtio_dut_caps_priv_control_stub extends dpu_priv_device_control;
     endtask
 endclass
 
-// 带一条活动队列上下文的私有 ops：预检通过，但提交时 configure_private 拒绝重配，
+// 带一条已编程队列的 ops：预检通过，但提交时私有协议 bind_ops 拒绝重新冻结配置，
 // 用于制造 commit_bind_pcie 的提交半段失败。
-class virtio_dut_caps_busy_priv_ops extends dpu_priv_atomic_ops;
-    `uvm_object_utils(virtio_dut_caps_busy_priv_ops)
+class virtio_dut_caps_busy_ops extends virtio_atomic_ops;
+    `uvm_object_utils(virtio_dut_caps_busy_ops)
 
-    function new(string name = "virtio_dut_caps_busy_priv_ops");
+    function new(string name = "virtio_dut_caps_busy_ops");
         super.new(name);
     endfunction
 
     function void mark_queue_active();
-        dpu_priv_queue_context_t ctx;
-        ctx = '{default:0};
-        contexts[0] = ctx;
+        queue_programs[0] = virtio_empty_queue_program();
     endfunction
 endclass
 
@@ -2246,7 +2244,7 @@ class virtio_dut_caps_test extends uvm_test;
         end
     endtask
 
-    // 提交半段失败（私有 ops 仍有活动队列）必须丢弃预检候选，且不改动已提交连接。
+    // 提交半段失败（ops 仍有活动队列）必须丢弃预检候选，且不改动已提交连接。
     task assert_function_commit_failure_discards_candidates();
         virtio_driver_config_t saved_cfg;
         virtio_driver_config_t private_behavior;
@@ -2257,8 +2255,8 @@ class virtio_dut_caps_test extends uvm_test;
         virtio_auto_fsm saved_fsm;
         virtio_driver_protocol saved_protocol;
         dpu_priv_driver_config private_cfg;
-        virtio_dut_caps_busy_priv_ops busy_ops;
-        dpu_priv_auto_fsm private_fsm;
+        virtio_dut_caps_busy_ops busy_ops;
+        virtio_auto_fsm private_fsm;
         virtio_dut_caps_expected_exact_error catcher;
         bit preflight_ok;
         bit bind_succeeded;
@@ -2275,10 +2273,10 @@ class virtio_dut_caps_test extends uvm_test;
             "commit_failure_private_cfg");
         private_cfg.control = virtio_dut_caps_priv_control_stub::type_id::create(
             "commit_failure_private_control");
-        busy_ops = virtio_dut_caps_busy_priv_ops::type_id::create(
+        busy_ops = virtio_dut_caps_busy_ops::type_id::create(
             "commit_failure_busy_ops");
         busy_ops.mark_queue_active();
-        private_fsm = dpu_priv_auto_fsm::type_id::create(
+        private_fsm = virtio_auto_fsm::type_id::create(
             "commit_failure_private_fsm");
         private_behavior = saved_cfg;
         private_behavior.num_queue_pairs = 1;

@@ -2,7 +2,7 @@
 // buffer 投递、取包、合包、DMA 所有权与 notify 全部由注入的 virtio_atomic_ops
 // （rx_refill / rx_receive_frames）执行；引擎只做可选的 RX checksum 校验、把帧
 // 转为 packet_item（或 wrapper）、维护统计与自动补充门限。私有 Function 注入
-// 私有 ops，并以 refill_threshold=0 关闭自动补充。host_id/bdf 记录 DMA 身份，
+// 通用 ops，并以 refill_threshold=0 关闭自动补充。host_id/bdf 记录 DMA 身份，
 // 供 fabric 测试断言，收发不读取。
 `ifndef VIRTIO_RX_ENGINE_SV
 `define VIRTIO_RX_ENGINE_SV
