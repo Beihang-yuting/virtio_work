@@ -970,27 +970,24 @@ class virtio_atomic_ops extends uvm_object;
     endtask
 
     // ------------------------------------------------------------------------
-    // setup_all_queues -- Create all queue pairs + control queue
+    // setup_queue_range -- 建立 [first_pair, first_pair+num_pairs) 的 RX/TX 队列对
+    //
+    // 队列号按 virtio-net 约定：pair i 的 receiveq 为 2i、transmitq 为 2i+1。
+    // 任一队列失败时按创建顺序拆除本次已建队列并返回 ok=0，不触碰范围外队列；
+    // setup_queue/teardown_queue 为虚方法，私有 ops 的停 DMA 确认语义照常生效。
     // ------------------------------------------------------------------------
-    virtual task setup_all_queues(
+    virtual task setup_queue_range(
+        int unsigned     first_pair,
         int unsigned     num_pairs,
         virtqueue_type_e vq_type,
         int unsigned     queue_size,
-        output bit        ok
+        output bit       ok
     );
-        int unsigned ctrl_qid;
         int unsigned created_qids[$];
         bit queue_ok;
-        virtio_net_device_config_t net_cfg;
 
         ok = 0;
-
-        `uvm_info("ATOMIC_OPS",
-            $sformatf("setup_all_queues: num_pairs=%0d type=%s size=%0d",
-                      num_pairs, vq_type.name(), queue_size), UVM_MEDIUM)
-
-        // Setup receive and transmit queue pairs
-        for (int unsigned i = 0; i < num_pairs; i++) begin
+        for (int unsigned i = first_pair; i < first_pair + num_pairs; i++) begin
             setup_queue(i * 2, queue_size, vq_type, queue_ok);  // receiveq_i
             if (!queue_ok) begin
                 foreach (created_qids[j])
@@ -1006,6 +1003,32 @@ class virtio_atomic_ops extends uvm_object;
             end
             created_qids.push_back(i * 2 + 1);
         end
+        ok = 1;
+    endtask
+
+    // ------------------------------------------------------------------------
+    // setup_all_queues -- Create all queue pairs + control queue
+    // ------------------------------------------------------------------------
+    virtual task setup_all_queues(
+        int unsigned     num_pairs,
+        virtqueue_type_e vq_type,
+        int unsigned     queue_size,
+        output bit        ok
+    );
+        int unsigned ctrl_qid;
+        bit queue_ok;
+        virtio_net_device_config_t net_cfg;
+
+        ok = 0;
+
+        `uvm_info("ATOMIC_OPS",
+            $sformatf("setup_all_queues: num_pairs=%0d type=%s size=%0d",
+                      num_pairs, vq_type.name(), queue_size), UVM_MEDIUM)
+
+        // Setup receive and transmit queue pairs
+        setup_queue_range(0, num_pairs, vq_type, queue_size, queue_ok);
+        if (!queue_ok)
+            return;
 
         // Setup control queue if CTRL_VQ negotiated.  virtio 1.2 §5.1.2：
         // 协商 MQ 时 controlq 编号为 2*max_virtqueue_pairs（设备 config 上限），
@@ -1020,8 +1043,8 @@ class virtio_atomic_ops extends uvm_object;
             end
             setup_queue(ctrl_qid, queue_size, vq_type, queue_ok);
             if (!queue_ok) begin
-                foreach (created_qids[j])
-                    teardown_queue(created_qids[j]);
+                for (int unsigned qid = 0; qid < num_pairs * 2; qid++)
+                    teardown_queue(qid);
                 return;
             end
         end

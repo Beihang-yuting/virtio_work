@@ -271,6 +271,31 @@ class virtio_unit_exact_error_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_unit_exact_error_catcher
 
+// 建队探针：setup_queue 只记录队列号并在 fail_qid 上失败，teardown 只记录；
+// 用于验证 setup_queue_range 的队列编号与失败回滚，不访问设备。
+class virtio_unit_range_ops extends virtio_atomic_ops;
+    `uvm_object_utils(virtio_unit_range_ops)
+
+    int unsigned fail_qid;
+    int unsigned setup_qids[$];
+    int unsigned teardown_qids[$];
+
+    function new(string name = "virtio_unit_range_ops");
+        super.new(name);
+        fail_qid = '1;
+    endfunction
+
+    virtual task setup_queue(int unsigned queue_id, int unsigned queue_size,
+                             virtqueue_type_e vq_type, output bit ok);
+        setup_qids.push_back(queue_id);
+        ok = (queue_id != fail_qid);
+    endtask
+
+    virtual task teardown_queue(int unsigned queue_id);
+        teardown_qids.push_back(queue_id);
+    endtask
+endclass : virtio_unit_range_ops
+
 // ============================================================================
 // virtio_unit_test
 //
@@ -340,6 +365,7 @@ class virtio_unit_test extends uvm_test;
         test_config_backend_injection();
         test_driver_protocol_selection();
         test_fabric_bar_layout_roles();
+        test_setup_queue_range_rollback();
         test_dma_buffer_set();
 
         `uvm_info("UNIT_TEST", "All unit tests PASSED", UVM_NONE)
@@ -1359,6 +1385,31 @@ class virtio_unit_test extends uvm_test;
             (why != "Fabric BAR lease set must contain exactly three unique pairs; got 0"))
             `uvm_error("TEST", {"empty Fabric BAR lease set was not rejected: ", why})
         `uvm_info("UNIT_TEST", "test_fabric_bar_layout_roles PASSED", UVM_LOW)
+    endtask
+
+    // 范围建队按 RX=2i/TX=2i+1 编号；失败时只拆除本次已建队列。
+    task test_setup_queue_range_rollback();
+        virtio_unit_range_ops ops;
+        bit ok;
+        int unsigned expected_setup[$];
+        int unsigned expected_teardown[$];
+
+        ops = virtio_unit_range_ops::type_id::create("range_ops");
+        ops.setup_queue_range(1, 2, VQ_SPLIT, 8, ok);
+        expected_setup = '{2, 3, 4, 5};
+        if (!ok || (ops.setup_qids != expected_setup) || (ops.teardown_qids.size() != 0))
+            `uvm_error("TEST", $sformatf("range setup created %p torn down %p",
+                                         ops.setup_qids, ops.teardown_qids))
+
+        ops.setup_qids.delete();
+        ops.fail_qid = 5;
+        ops.setup_queue_range(1, 2, VQ_SPLIT, 8, ok);
+        expected_teardown = '{2, 3, 4};
+        if (ok || (ops.setup_qids != expected_setup) ||
+            (ops.teardown_qids != expected_teardown))
+            `uvm_error("TEST", $sformatf("range rollback created %p torn down %p",
+                                         ops.setup_qids, ops.teardown_qids))
+        `uvm_info("UNIT_TEST", "test_setup_queue_range_rollback PASSED", UVM_LOW)
     endtask
 
 endclass

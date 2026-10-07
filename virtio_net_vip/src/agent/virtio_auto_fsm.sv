@@ -547,8 +547,8 @@ class virtio_auto_fsm extends uvm_report_object;
     endtask
 
     // configure_mq 的实现体：先经 ctrl VQ 向设备提交 MQ 变更，设备接受后
-    // 再收敛队列——缩容拆除多余的 RX/TX 队列，扩容按对新建（RX 建失败直接
-    // FSM_ERROR；TX 建失败回滚同对 RX 再报错），最后更新 active_num_pairs。
+    // 再收敛队列——缩容拆除多余的 RX/TX 队列，扩容经 ops.setup_queue_range 按对新建
+    // （任一失败拆除本次新建的全部队列并 FSM_ERROR），最后更新 active_num_pairs。
     // 设备拒绝时仅报错、不动现有队列。
     protected virtual task do_configure_mq(int unsigned num_pairs);
         bit success;
@@ -569,26 +569,17 @@ class virtio_auto_fsm extends uvm_report_object;
                 end
             end
 
-            // Setup new queues if expanding
+            // Setup new queues if expanding; a failure tears down every pair
+            // created by this expansion before reporting.
             if (num_pairs > active_num_pairs) begin
-                for (int unsigned i = active_num_pairs; i < num_pairs; i++) begin
-                    ops.setup_queue(i * 2, drv_cfg.queue_size, drv_cfg.vq_type,
-                                    setup_ok);
-                    if (!setup_ok) begin
-                        state = FSM_ERROR;
-                        `uvm_error("AUTO_FSM", $sformatf(
-                            "configure_mq: failed to setup RX queue %0d", i * 2))
-                        return;
-                    end
-                    ops.setup_queue(i * 2 + 1, drv_cfg.queue_size, drv_cfg.vq_type,
-                                    setup_ok);
-                    if (!setup_ok) begin
-                        ops.teardown_queue(i * 2);
-                        state = FSM_ERROR;
-                        `uvm_error("AUTO_FSM", $sformatf(
-                            "configure_mq: failed to setup TX queue %0d", i * 2 + 1))
-                        return;
-                    end
+                ops.setup_queue_range(active_num_pairs, num_pairs - active_num_pairs,
+                                      drv_cfg.vq_type, drv_cfg.queue_size, setup_ok);
+                if (!setup_ok) begin
+                    state = FSM_ERROR;
+                    `uvm_error("AUTO_FSM", $sformatf(
+                        "configure_mq: failed to setup queue pairs %0d..%0d",
+                        active_num_pairs, num_pairs - 1))
+                    return;
                 end
             end
 
