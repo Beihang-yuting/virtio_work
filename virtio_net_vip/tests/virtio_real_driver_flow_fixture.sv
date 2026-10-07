@@ -27,6 +27,13 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     // services EP-originated MemRd/MemWr against shared Host memory.
     virtio_pcie_real_dut_host_mem_responder host_mem_responder;
     bit                         real_dut_host_mem_responder_enable;
+    // 中文说明：snapshot 中声明的 host0 VIO PF 数量（默认 1，即 AF 本身）。
+    // 需要多个 Function 共享同一 PCIe EP 模型的测试，在 create 之后、本组件
+    // build_phase 之前设置；PF 0 始终是 AF。
+    int unsigned                vio_pf_count;
+    // PCIe completion 超时（ns）。默认值与原 fixture 相同；会长时间推进仿真
+    // 时间的测试可在 build_phase 之前放宽。
+    int                         pcie_cpl_timeout_ns;
 
     // 真实 DUT 模式的物理 PCIe 传输接口。该句柄由真实 DUT 顶层通过
     // config_db 发布，fixture 只负责把它显式交给外部 pcie_work adapter；
@@ -96,10 +103,13 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         m_selected_function = null;
         m_profile = null;
         real_dut_host_mem_responder_enable = 0;
+        vio_pf_count = 1;
+        pcie_cpl_timeout_ns = 100000;
     endfunction
 
     virtual function void build_phase(uvm_phase phase);
         dpu_function_cfg pf_cfg;
+        dpu_function_cfg af_cfg;
         dpu_function_key_t vio_devices[$];
         int responder_enable_arg;
 
@@ -107,16 +117,29 @@ class virtio_real_driver_flow_fixture extends uvm_component;
 
         device_builder = virtio_test_device_builder::type_id::create(
             "device_builder");
+        if ((vio_pf_count == 0) ||
+            (vio_pf_count > device_builder.device_cfg.dut_caps.max_pfs_per_host)) begin
+            `uvm_fatal("REAL_FLOW", $sformatf(
+                "vio_pf_count=%0d is outside 1..%0d", vio_pf_count,
+                device_builder.device_cfg.dut_caps.max_pfs_per_host))
+            return;
+        end
         void'(device_builder.add_host_domain(0, 0));
-        pf_cfg = device_builder.add_pf(0, 0, 0);
-        device_builder.add_real_dut_bars(pf_cfg);
-        void'(device_builder.allow_vio_service(pf_cfg));
-        vio_devices.push_back(pf_cfg.key);
-        // The shared real-flow fixture provisions two queue pairs so callers
-        // can exercise the normal RX0/TX1 and RX2/TX3 layout.  Individual
-        // tests may still set up only the queues they need.
-        void'(device_builder.add_fixed_vio_request(0, vio_devices, 2));
-        device_builder.select_af(pf_cfg);
+        af_cfg = null;
+        for (int unsigned pf_id = 0; pf_id < vio_pf_count; pf_id++) begin
+            pf_cfg = device_builder.add_pf(0, pf_id, 0);
+            device_builder.add_real_dut_bars(pf_cfg);
+            void'(device_builder.allow_vio_service(pf_cfg));
+            vio_devices.push_back(pf_cfg.key);
+            if (af_cfg == null)
+                af_cfg = pf_cfg;
+        end
+        // The shared real-flow fixture provisions two queue pairs per VIO
+        // PF so callers can exercise the normal RX0/TX1 and RX2/TX3 layout.
+        // Individual tests may still set up only the queues they need.
+        void'(device_builder.add_fixed_vio_request(0, vio_devices,
+                                                    2 * vio_pf_count));
+        device_builder.select_af(af_cfg);
 
         virtio_cfg = virtio_net_env_config::type_id::create("virtio_cfg");
         virtio_cfg.default_num_pairs = 2;
@@ -220,7 +243,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         pcie_cfg.cov_enable = 0;
         pcie_cfg.response_delay_min = 0;
         pcie_cfg.response_delay_max = 0;
-        pcie_cfg.cpl_timeout_ns = 100000;
+        pcie_cfg.cpl_timeout_ns = pcie_cpl_timeout_ns;
         pcie_cfg.use_unified_mem = 1;
         pcie_cfg.mem_access_mode = PCIE_TL_MEM_PER_BUFFER;
         begin
@@ -519,6 +542,19 @@ class virtio_real_driver_flow_fixture extends uvm_component;
 
     function pcie_tl_env pcie_env();
         return m_pcie_env;
+    endfunction
+
+    // 按冻结 snapshot 分配的 BDF 返回 env 中的 Function；未找到返回 null。
+    // 供需要直接驱动 transport 寄存器的测试使用，身份仍只来自 snapshot。
+    function virtio_function_instance function_by_bdf(input bit [15:0] bdf);
+        if (m_virtio_env == null)
+            return null;
+        foreach (m_virtio_env.function_instances[index]) begin
+            if ((m_virtio_env.function_instances[index] != null) &&
+                (m_virtio_env.function_instances[index].bdf == bdf))
+                return m_virtio_env.function_instances[index];
+        end
+        return null;
     endfunction
 
     function dpu_device_snapshot device_snapshot();
@@ -1155,6 +1191,33 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         write_common_defaults(ep_drv, common_bar.base,
                               virtio_cfg.default_num_pairs * 2);
         ep_drv.mem_space[common_bar.base + ISR_OFFSET] = 8'h00;
+        // Additional VIO PFs share this EP model's single configuration
+        // space; each function's Fabric discovery reprograms the BAR
+        // registers from its own lease before scanning capabilities.  Only
+        // the per-function common-config defaults live at distinct BAR0
+        // lease addresses and must be installed here.
+        foreach (m_virtio_env.function_instances[index]) begin
+            virtio_function_instance peer;
+            dpu_bar_pair_lease_t peer_common_bar;
+
+            peer = m_virtio_env.function_instances[index];
+            if ((peer == null) || !peer.pcie_id_valid ||
+                (peer.bdf == m_pcie_id.bdf))
+                continue;
+            if (!m_device_snapshot.get_bar(peer.function_key,
+                    DPU_BAR_DEVICE_MEMORY, peer_common_bar, why))
+                return 0;
+            if ((peer_common_bar.size < (DEVICE_OFFSET + DEVICE_LENGTH)) ||
+                (peer_common_bar.size <= ISR_OFFSET)) begin
+                why = $sformatf(
+                    "snapshot BAR0 lease of BDF 0x%04h is too small for the virtio image",
+                    peer.bdf);
+                return 0;
+            end
+            write_common_defaults(ep_drv, peer_common_bar.base,
+                                  virtio_cfg.default_num_pairs * 2);
+            ep_drv.mem_space[peer_common_bar.base + ISR_OFFSET] = 8'h00;
+        end
         return 1;
     endfunction
 
