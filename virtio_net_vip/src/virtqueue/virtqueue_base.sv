@@ -171,8 +171,8 @@ virtual class virtqueue_base extends uvm_object;
     );
 
     // 标准 split/packed 的 kick：计数并在通知边界前后消费 PRE/POST_NOTIFY 故障。
-    // 它不发 PCIe TLP；生产路径由 virtio_atomic_ops 经 transport 发通知。
-    // custom 队列覆盖为回调。
+    // 它不发 PCIe TLP；生产路径由 virtio_atomic_ops 经配置后端发通知。
+    // custom 队列（DPU 私有格式）覆盖为发布通知游标。
     virtual task kick();
         total_kick_ops++;
         void'(process_error_injection(VQ_FAULT_PRE_NOTIFY));
@@ -212,6 +212,22 @@ virtual class virtqueue_base extends uvm_object;
     endfunction
     virtual function bit get_notify_wrap();
         return 1'b0;
+    endfunction
+
+    // 设备可见 ring 内存区（GPA 与字节数，按映射顺序）；ops 逐区映射，并按区内
+    // 偏移推出 desc/driver/device 三个 IOVA。未分配 ring 时返回空列表。
+    pure virtual function void get_ring_regions(output bit [63:0] gpas[$],
+                                                output int unsigned sizes[$]);
+
+    // 本格式每个报文携带的 virtio-net header 字节数；标准格式由协商特性决定。
+    virtual function int unsigned net_hdr_bytes(bit [63:0] features);
+        return virtio_net_hdr_util::get_hdr_size(features);
+    endfunction
+
+    // 写 doorbell 前的格式钩子（发布屏障、通知游标）；返回 0 时 ops 不发通知。
+    // split/packed 在 add_buf 中已完成发布，无需额外动作。
+    virtual function bit prepare_notify();
+        return 1;
     endfunction
 
     // 队列托管 DMA 映射：dma_map_buf 用本队列的 {host_id, bdf} 域把调用方的
@@ -269,9 +285,9 @@ virtual class virtqueue_base extends uvm_object;
 
     // ----- Error injection -----
     // Return the serialized descriptor format used by this queue.  Standard
-    // split/packed implementations override it; a custom queue deliberately
-    // defaults to VQ_CUSTOM so the generic corruption helper cannot guess a
-    // field offset for a user-defined layout.
+    // split/packed implementations override it; any other layout defaults to
+    // VQ_CUSTOM so the generic corruption helper cannot guess a field
+    // offset.
     virtual function virtqueue_type_e descriptor_format();
         return VQ_CUSTOM;
     endfunction
@@ -423,7 +439,7 @@ virtual class virtqueue_base extends uvm_object;
     // 定向错误注入分派：三种 barrier-skip 错误直接交给 barrier 模型（属内存序
     // 语义，与描述符无关）；其余类型配置给 err_inj 并显式限定到本 queue_id，
     // 由后续 add_buf/kick 路径上的钩子按 phase 消费。err_inj 为空仅告警。
-    // custom 队列覆盖为回调，因为通用注入器不认识自定义布局。
+    // custom 队列（DPU 私有格式）覆盖为拒绝，因为通用注入器不认识私有布局。
     virtual function void inject_desc_error(virtqueue_error_e err_type);
         case (err_type)
             VQ_ERR_SKIP_WMB_BEFORE_AVAIL,
@@ -709,7 +725,7 @@ virtual class virtqueue_base extends uvm_object;
     endfunction
 
     // 摘除所有尚未被设备消费的缓冲：token 按 token_map 键序交还调用方，
-    // 随后释放队列所有权。custom 队列覆盖为回调。
+    // 随后释放队列所有权。custom 队列按发布顺序覆盖。
     virtual function void detach_all_unused(ref uvm_object tokens[$]);
         foreach (token_map[desc_id])
             tokens.push_back(token_map[desc_id]);

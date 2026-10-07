@@ -1,5 +1,5 @@
 // 目录层次：examples/dpu_priv_ring；由 filelists/tests.f 编入维护回归的 DPU 私有环合同测试。
-// 依赖预编译 host_mem_pkg、virtio_net_pkg 中的生产私有回调；字节黄金值来自 53 主机
+// 依赖预编译 host_mem_pkg、virtio_net_pkg 中的生产私有队列 `custom_virtqueue`；字节黄金值来自 53 主机
 // icpu-kernel-driver/txrx.h 在同平台 GCC 9.4 编译的 C 位字段探针。
 // 测试拥有 Host memory、queue manager、回调与模拟设备 CQ 写入；所有环在结束时
 // 释放。本文件不访问真实 DUT/MMIO，只验证驱动可见的描述符、通知值与回收语义。
@@ -67,26 +67,25 @@ class dpu_priv_ring_contract_test extends uvm_test;
         manager.bdf = 16'h0100;
     endfunction
 
-    // 从生产队列工厂创建 VQ_CUSTOM，然后在 alloc_rings 前注入方向专属回调。
+    // 从生产队列工厂创建 VQ_CUSTOM，在 alloc_rings 前写入方向与本地队列号。
     // qid 是 VIP 本地队列 ID，local_qid 则是驱动通知字中的 DPU 本地队列号。
-    // 若工厂类型不符或回调未分配环，fatal 阻止后续读写无效地址。
+    // 若工厂类型不符或未分配环，fatal 阻止后续读写无效地址。
     protected function void make_queue(
         input int unsigned qid,
         input int unsigned size,
         input bit tx_mode,
         input int unsigned local_qid,
-        output custom_virtqueue vq,
-        output dpu_priv_ring_callback cb
+        output custom_virtqueue vq
     );
         virtqueue_base base_vq;
 
         base_vq = manager.create_queue(qid, size, VQ_CUSTOM);
-        if (!$cast(vq, base_vq))
+        if (!$cast(vq, base_vq) || (vq == null))
             `uvm_fatal("DPU_PRIV", "queue manager did not create custom_virtqueue")
-        cb = new($sformatf("dpu_priv_cb_%0d", qid), tx_mode, local_qid);
-        vq.custom_cb = cb;
+        vq.tx_mode = tx_mode;
+        vq.local_qid = local_qid;
         vq.alloc_rings();
-        if (vq.desc_table_addr == 0 || cb.cq_addr == 0)
+        if (vq.desc_table_addr == 0 || vq.cq_addr == 0)
             `uvm_fatal("DPU_PRIV", "private ring allocation failed")
     endfunction
 
@@ -117,7 +116,6 @@ class dpu_priv_ring_contract_test extends uvm_test;
     // 与驱动分片上限一致。完成只看 CQ，不依赖描述符 used 位。
     protected task test_tx_layout_and_completion();
         custom_virtqueue tx;
-        dpu_priv_ring_callback cb;
         virtio_sg_list sgs[];
         virtio_sg_entry entry;
         uvm_object sent_token;
@@ -130,18 +128,18 @@ class dpu_priv_ring_contract_test extends uvm_test;
                             8'h5a, 8'h3d, 8'h92, 8'h00};
         byte cq_done[2] = '{8'h01, 8'h80};
 
-        make_queue(1, 8, 1, 1, tx, cb);
+        make_queue(1, 8, 1, 1, tx);
         if (tx.get_free_count() != 7)
             `uvm_fatal("DPU_PRIV", "TX queue did not reserve one empty slot")
 
-        cb.dport_info = 12'habc;
-        cb.dport_id = 10'h16a;
-        cb.dport_type = 3'd5;
-        cb.rss_lag = 1;
-        cb.cpu_tx_cos = 3'd3;
-        cb.l3_cs = 1;
-        cb.l4_cs = 0;
-        cb.fwd = 2'd2;
+        tx.dport_info = 12'habc;
+        tx.dport_id = 10'h16a;
+        tx.dport_type = 3'd5;
+        tx.rss_lag = 1;
+        tx.cpu_tx_cos = 3'd3;
+        tx.l3_cs = 1;
+        tx.l4_cs = 0;
+        tx.fwd = 2'd2;
 
         entry.addr = 64'h0123_4567_89ab_cdef;
         entry.len = 2048;
@@ -155,13 +153,13 @@ class dpu_priv_ring_contract_test extends uvm_test;
         expect_bytes(tx.desc_table_addr, golden, "private TX C ABI");
 
         tx.kick();
-        if (cb.last_notify_word != 32'h8001_0001 || cb.notify_count != 1)
+        if (tx.last_notify_word != 32'h8001_0001 || tx.notify_count != 1)
             `uvm_fatal("DPU_PRIV", "TX notify differs from driver 32-bit BAR value")
         if (barrier.wmb_count == 0)
             `uvm_fatal("DPU_PRIV", "TX descriptor publication lacks wmb")
 
         // 驱动私有 TX CQ 的 head_index=1、wrap=1，小端字节为 01 80。
-        mem.write_mem(cb.cq_addr, cq_done);
+        mem.write_mem(tx.cq_addr, cq_done);
         returned_token = null;
         completed_len = 0;
         if (!tx.poll_used(returned_token, completed_len) ||
@@ -179,7 +177,6 @@ class dpu_priv_ring_contract_test extends uvm_test;
     // 两条描述符算作同一包，CQ 越过链尾后只返回一个 token 和原始总长度。
     protected task test_tx_large_sg_split();
         custom_virtqueue tx;
-        dpu_priv_ring_callback cb;
         virtio_sg_list sgs[];
         virtio_sg_entry entry;
         uvm_object sent_token;
@@ -196,7 +193,7 @@ class dpu_priv_ring_contract_test extends uvm_test;
                                  8'h00, 8'h00, 8'h80, 8'h00};
         byte cq_done[2] = '{8'h02, 8'h80};
 
-        make_queue(7, 8, 1, 7, tx, cb);
+        make_queue(7, 8, 1, 7, tx);
         entry.addr = 64'h0000_0000_0002_0000;
         entry.len = 65537;
         entry.is_indirect = 0;
@@ -212,9 +209,9 @@ class dpu_priv_ring_contract_test extends uvm_test;
         expect_bytes(tx.desc_table_addr + 16, second_desc, "TX second segment");
 
         tx.kick();
-        if (cb.last_notify_word != 32'h8002_0007)
+        if (tx.last_notify_word != 32'h8002_0007)
             `uvm_fatal("DPU_PRIV", "TX split tail notification differs from driver")
-        mem.write_mem(cb.cq_addr, cq_done);
+        mem.write_mem(tx.cq_addr, cq_done);
         returned_token = null;
         completed_len = 0;
         if (!tx.poll_used(returned_token, completed_len) ||
@@ -230,7 +227,6 @@ class dpu_priv_ring_contract_test extends uvm_test;
     // 确认长度取自 CQ 的 pkt_len 而非 posted 描述符的 len。
     protected task test_rx_layout_and_completion();
         custom_virtqueue rx;
-        dpu_priv_ring_callback cb;
         virtio_sg_list sgs[];
         virtio_sg_entry entry;
         uvm_object sent_token;
@@ -254,7 +250,7 @@ class dpu_priv_ring_contract_test extends uvm_test;
                              8'h00, 8'h00, 8'h00, 8'h00,
                              8'h00, 8'h00, 8'h00, 8'h00};
 
-        make_queue(0, 8, 0, 0, rx, cb);
+        make_queue(0, 8, 0, 0, rx);
         entry.addr = 64'h0123_4567_89ab_cdef;
         entry.len = 2048;
         entry.is_indirect = 0;
@@ -267,18 +263,18 @@ class dpu_priv_ring_contract_test extends uvm_test;
         expect_bytes(rx.desc_table_addr, golden, "private RX C ABI");
 
         rx.kick();
-        if (cb.last_notify_word != 32'h8001_0000)
+        if (rx.last_notify_word != 32'h8001_0000)
             `uvm_fatal("DPU_PRIV", "RX notify differs from driver 32-bit BAR value")
 
-        mem.write_mem(cb.cq_addr, cq_golden);
-        expect_bytes(cb.cq_addr, cq_golden, "private RX CQ C ABI");
-        if (!cb.decode_rx_cq(0, desc_num, pkt_len, cq_wrap, head_idx) ||
+        mem.write_mem(rx.cq_addr, cq_golden);
+        expect_bytes(rx.cq_addr, cq_golden, "private RX CQ C ABI");
+        if (!rx.decode_rx_cq(0, desc_num, pkt_len, cq_wrap, head_idx) ||
             desc_num != 2 || pkt_len != 1514 || !cq_wrap ||
             head_idx != 16'h1234)
             `uvm_fatal("DPU_PRIV", "RX CQ bitfield decoder differs from C ABI")
 
         // 当前回调只回收单 buffer 帧；把同一个槽改成 desc_num=1 的合法完成。
-        mem.write_mem(cb.cq_addr, cq_done);
+        mem.write_mem(rx.cq_addr, cq_done);
         returned_token = null;
         completed_len = 0;
         if (!rx.poll_used(returned_token, completed_len) ||
@@ -296,17 +292,15 @@ class dpu_priv_ring_contract_test extends uvm_test;
     protected task test_default_geometry();
         custom_virtqueue tx;
         custom_virtqueue rx;
-        dpu_priv_ring_callback tx_cb;
-        dpu_priv_ring_callback rx_cb;
 
-        make_queue(3, 512, 1, 3, tx, tx_cb);
-        make_queue(2, 512, 0, 2, rx, rx_cb);
-        if (tx_cb.cq_addr != tx.desc_table_addr + 8192 ||
-            tx_cb.ring_alloc_bytes != 12288 ||
+        make_queue(3, 512, 1, 3, tx);
+        make_queue(2, 512, 0, 2, rx);
+        if (tx.cq_addr != tx.desc_table_addr + 8192 ||
+            tx.ring_alloc_bytes != 12288 ||
             (tx.desc_table_addr % 4096) != 0)
             `uvm_fatal("DPU_PRIV", "default TX ring/CQ geometry differs from driver")
-        if (rx_cb.cq_addr != rx.desc_table_addr + 8192 ||
-            rx_cb.ring_alloc_bytes != 16384 ||
+        if (rx.cq_addr != rx.desc_table_addr + 8192 ||
+            rx.ring_alloc_bytes != 16384 ||
             (rx.desc_table_addr % 4096) != 0)
             `uvm_fatal("DPU_PRIV", "default RX ring/CQ geometry differs from driver")
         manager.destroy_queue(3);
@@ -318,7 +312,6 @@ class dpu_priv_ring_contract_test extends uvm_test;
     // 实际默认 512 项的字节几何另由 test_default_geometry 验证。
     protected task test_tx_wrap();
         custom_virtqueue tx;
-        dpu_priv_ring_callback cb;
         virtio_sg_list sgs[];
         virtio_sg_entry entry;
         uvm_object sent[5];
@@ -329,7 +322,7 @@ class dpu_priv_ring_contract_test extends uvm_test;
         byte cq_wrapped[2] = '{8'h01, 8'h00};
         byte wrapped_desc[];
 
-        make_queue(5, 4, 1, 5, tx, cb);
+        make_queue(5, 4, 1, 5, tx);
         sgs = new[1];
         entry.len = 64;
         entry.is_indirect = 0;
@@ -347,9 +340,9 @@ class dpu_priv_ring_contract_test extends uvm_test;
         if (tx.get_free_count() != 0)
             `uvm_fatal("DPU_PRIV", "TX ring failed to preserve one empty slot")
         tx.kick();
-        if (cb.last_notify_word != 32'h8003_0005)
+        if (tx.last_notify_word != 32'h8003_0005)
             `uvm_fatal("DPU_PRIV", "TX pre-wrap tail notification differs from driver")
-        mem.write_mem(cb.cq_addr, cq_three);
+        mem.write_mem(tx.cq_addr, cq_three);
         for (int unsigned i = 0; i < 3; i++) begin
             returned_token = null;
             if (!tx.poll_used(returned_token, completed_len) ||
@@ -368,14 +361,14 @@ class dpu_priv_ring_contract_test extends uvm_test;
                 `uvm_fatal("DPU_PRIV", "TX ring slot after wrap is wrong")
         end
         tx.kick();
-        if (cb.last_notify_word != 32'h0001_0005 || cb.producer_wrap != 0)
+        if (tx.last_notify_word != 32'h0001_0005 || tx.producer_wrap != 0)
             `uvm_fatal("DPU_PRIV", "TX wrapped notify/index differs from driver")
         mem.read_mem(tx.desc_table_addr, 16, wrapped_desc);
         if ((wrapped_desc[14] & 8'h80) != 0 ||
             (wrapped_desc[15] & 8'h80) == 0)
             `uvm_fatal("DPU_PRIV", "wrapped descriptor avail/used bits not flipped")
 
-        mem.write_mem(cb.cq_addr, cq_wrapped);
+        mem.write_mem(tx.cq_addr, cq_wrapped);
         for (int unsigned i = 3; i < 5; i++) begin
             returned_token = null;
             if (!tx.poll_used(returned_token, completed_len) ||

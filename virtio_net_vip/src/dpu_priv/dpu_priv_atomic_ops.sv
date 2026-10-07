@@ -70,13 +70,12 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
         return 1;
     endfunction
 
-    // 注入独立回调后分配连续 desc+CQ，整块只映射一次，再交控制后端配置启动。
+    // 写入方向与 TX 控制后由 custom_virtqueue 分配连续 desc+CQ，整块只映射一次，再交控制后端配置启动。
     // 失败无半条队列；control.configure_queue 返回失败必须保证设备不再访问该队列。
     virtual task setup_queue(int unsigned queue_id, int unsigned queue_size,
                               virtqueue_type_e vq_type, output bit ok);
         custom_virtqueue vq;
         virtqueue_base base_vq;
-        dpu_priv_ring_callback cb;
         dpu_priv_queue_config q;
         dpu_priv_queue_context_t ctx;
         int unsigned size;
@@ -98,18 +97,18 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
             `uvm_error("DPU_PRIV_OPS", "setup_queue: 工厂未返回 custom_virtqueue")
             return;
         end
-        cb = new($sformatf("private_cb_%0d", queue_id), queue_id%2, q.local_qid);
-        cb.dport_info = q.dport_info;
-        cb.dport_id = q.dport_id;
-        cb.dport_type = q.dport_type;
-        cb.cpu_tx_cos = q.cpu_tx_cos;
-        cb.rss_lag = q.rss_lag;
-        cb.l3_cs = q.l3_cs;
-        cb.l4_cs = q.l4_cs;
-        cb.fwd = q.fwd;
-        vq.custom_cb = cb;
+        vq.tx_mode = queue_id%2;
+        vq.local_qid = q.local_qid;
+        vq.dport_info = q.dport_info;
+        vq.dport_id = q.dport_id;
+        vq.dport_type = q.dport_type;
+        vq.cpu_tx_cos = q.cpu_tx_cos;
+        vq.rss_lag = q.rss_lag;
+        vq.l3_cs = q.l3_cs;
+        vq.l4_cs = q.l4_cs;
+        vq.fwd = q.fwd;
         vq.alloc_rings();
-        if (cb.ring_alloc_bytes == 0) begin
+        if (vq.ring_alloc_bytes == 0) begin
             vq_mgr.destroy_queue(queue_id);
             return;
         end
@@ -121,7 +120,7 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
         ctx.queue_size = size;
         ctx.rx_buf_size = rx_size;
         ctx.tx_mode = queue_id%2;
-        ctx.ring_bytes = cb.ring_alloc_bytes;
+        ctx.ring_bytes = vq.ring_alloc_bytes;
         ctx.notify_bar = q.notify_bar;
         ctx.notify_offset = q.notify_offset;
         ctx.ring_iova = iommu.map_for_host(ctx.host_id, ctx.bdf,
@@ -223,19 +222,16 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
     // 发布内存屏障后发送实际私有 32-bit doorbell；手工序列也应使用此入口。
     virtual task kick_queue(int unsigned queue_id);
         custom_virtqueue vq;
-        dpu_priv_ring_callback cb;
-        if (!contexts.exists(queue_id) ||
-            !$cast(vq, vq_mgr.get_queue(queue_id)) ||
-            !$cast(cb, vq.custom_cb)) begin
+        if (!contexts.exists(queue_id) || !$cast(vq, vq_mgr.get_queue(queue_id))) begin
             `uvm_error("DPU_PRIV_OPS", "kick: 私有队列尚未创建")
             return;
         end
         vq.kick();
         private_backend.bind_transport(transport);
-        private_backend.notify_queue(contexts[queue_id], cb.last_notify_word);
+        private_backend.notify_queue(contexts[queue_id], vq.last_notify_word);
     endtask
 
-    // 将 packet_item 的原始 Ethernet 字节映射成一个 SG；回调负责 64KiB 分片。
+    // 将 packet_item 的原始 Ethernet 字节映射成一个 SG；custom_virtqueue 负责 64KiB 分片。
     // 不携带 Virtio-net header；TSO/间接与标准 header offload 请求显式拒绝。
     virtual task tx_submit(int unsigned queue_id, virtio_net_hdr_t net_hdr,
                              uvm_object pkt, bit use_indirect,

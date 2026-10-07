@@ -50,7 +50,6 @@ package virtio_net_pkg;
   `include "virtqueue/split_virtqueue.sv"
   `include "virtqueue/packed_virtqueue.sv"
   `include "virtqueue/custom_virtqueue.sv"
-  `include "dpu_priv/dpu_priv_ring_callback.sv"
   `include "virtqueue/virtqueue_manager.sv"
 
   // Resource clients are transport discovery callbacks and need to be

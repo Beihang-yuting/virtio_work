@@ -46,7 +46,7 @@ virtual class dpu_priv_device_control extends uvm_object;
     endtask
 endclass
 
-// 每队列覆盖配置只保存通知和 TX 控制，不持有 ring 索引；运行态仍由独立回调持有。
+// 每队列覆盖配置只保存通知和 TX 控制，不持有 ring 索引；运行态由 custom_virtqueue 持有。
 class dpu_priv_queue_config extends uvm_object;
     `uvm_object_utils(dpu_priv_queue_config)
     int unsigned local_qid;

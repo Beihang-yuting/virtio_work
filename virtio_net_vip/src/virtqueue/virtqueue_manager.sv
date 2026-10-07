@@ -5,7 +5,7 @@
 // virtqueue_manager
 //
 // Factory and container for virtqueue instances. Creates split, packed, or
-// custom virtqueues by type, injects shared references, and provides
+// custom (DPU private ring) virtqueues by type, injects shared references, and provides
 // lifecycle management (create, get, destroy, leak check).
 //
 // Usage:

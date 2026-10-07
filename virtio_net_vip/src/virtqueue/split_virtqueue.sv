@@ -488,6 +488,13 @@ class split_virtqueue extends virtqueue_base;
         return queue_size - num_free;
     endfunction
 
+    // desc 表、avail ring、used ring 三区，尺寸与 virtio 1.2 §2.7 一致。
+    virtual function void get_ring_regions(output bit [63:0] gpas[$],
+                                           output int unsigned sizes[$]);
+        gpas  = '{desc_table_addr, driver_ring_addr, device_ring_addr};
+        sizes = '{16 * queue_size, 6 + 2 * queue_size, 6 + 8 * queue_size};
+    endfunction
+
     // Split notification data carries the free-running avail->idx.
     virtual function int unsigned get_notify_next_idx();
         return avail_idx;

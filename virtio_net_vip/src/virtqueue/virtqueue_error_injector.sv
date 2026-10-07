@@ -320,7 +320,7 @@ class virtqueue_error_injector extends uvm_object;
             return 0;
         end
         if (ring_type == VQ_CUSTOM) begin
-            why = "custom virtqueue descriptor layout is not known";
+            why = "DPU private descriptor layout is not known";
             return 0;
         end
         if (queue_size == 0 || descriptor_index >= queue_size) begin

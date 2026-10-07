@@ -550,6 +550,13 @@ class packed_virtqueue extends virtqueue_base;
         return queue_size - free_id_list.size();
     endfunction
 
+    // 描述符环与两份 4B event suppression 结构，各在自己的 GPA 上映射。
+    virtual function void get_ring_regions(output bit [63:0] gpas[$],
+                                           output int unsigned sizes[$]);
+        gpas  = '{desc_table_addr, driver_ring_addr, device_ring_addr};
+        sizes = '{16 * queue_size, 4, 4};
+    endfunction
+
     // Packed notification data carries the next descriptor slot and the
     // driver wrap counter, not the number of published chains.
     virtual function int unsigned get_notify_next_idx();
