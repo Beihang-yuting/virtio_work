@@ -489,12 +489,12 @@ class virtio_traffic_test extends uvm_test;
                 if (batch_num > 0) begin
                     txq.reset_queue();
                     txq.setup(1, queue_size, mem, iommu, kit.barrier, kit.err_inj,
-                              kit.wait_pol, 16'h0100);
+                              kit.wait_pol, 16'h0100, kit.host_id);
                     txq.alloc_rings();
 
                     rxq.reset_queue();
                     rxq.setup(0, queue_size, mem, iommu, kit.barrier, kit.err_inj,
-                              kit.wait_pol, 16'h0100);
+                              kit.wait_pol, 16'h0100, kit.host_id);
                     rxq.alloc_rings();
 
                     tx_used_idx = 0;

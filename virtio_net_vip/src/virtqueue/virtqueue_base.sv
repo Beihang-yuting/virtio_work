@@ -115,7 +115,7 @@ virtual class virtqueue_base extends uvm_object;
     //   e          -- Error injector reference
     //   w          -- Wait/timeout policy reference
     //   device_bdf     -- PCI BDF for IOMMU operations
-    //   device_host_id -- PCIe host/IOMMU requester domain (legacy host0)
+    //   device_host_id -- PCIe host/IOMMU requester domain（必填，无默认 host）
     // ------------------------------------------------------------------
     virtual function void setup(
         int unsigned qid,
@@ -126,7 +126,7 @@ virtual class virtqueue_base extends uvm_object;
         virtqueue_error_injector e,
         virtio_wait_policy w,
         bit [15:0] device_bdf,
-        int unsigned device_host_id = 0
+        int unsigned device_host_id
     );
         queue_id        = qid;
         queue_size      = size;
