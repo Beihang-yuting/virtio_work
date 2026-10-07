@@ -1,13 +1,17 @@
 // ============================================================================
 // virtio_full_test.sv
 //
-// Full integration test using the reusable PCIe TLM completion adapter.
+// Full integration test on the snapshot-derived Fabric flow.  The endpoint
+// image, BDF and BAR leases come from virtio_real_driver_flow_fixture (frozen
+// dpu-common snapshot); discovery programs the leased BARs instead of running
+// PCI BAR enumeration.
+// 中文说明：端点镜像、BDF 与 BAR 租约全部来自 fixture 冻结 snapshot；测试保留
+// 原有四项检查（初始化、大流量、带宽整形、协议完整性）。
 // ============================================================================
 
 import uvm_pkg::*;
 `include "uvm_macros.svh"
 import pcie_tl_pkg::*;
-import host_mem_pkg::*;
 import virtio_net_pkg::*;
 
 // ============================================================================
@@ -16,21 +20,12 @@ import virtio_net_pkg::*;
 class virtio_full_integration_test extends uvm_test;
     `uvm_component_utils(virtio_full_integration_test)
 
-    // PCIe environment
+    // Snapshot-derived PCIe/virtio flow (one host0 VIO PF)
+    virtio_real_driver_flow_fixture flow;
+
+    // Handles borrowed from the fixture
     pcie_tl_env pcie_env;
-
-    // Virtio components
     virtio_pci_transport transport;
-    virtio_wait_policy wait_pol;
-    host_mem_manager host_mem;
-    virtio_iommu_model iommu;
-    virtqueue_manager vq_mgr;
-    virtio_memory_barrier_model barrier;
-    virtqueue_error_injector err_inj;
-    virtio_atomic_ops ops;
-    virtio_perf_monitor perf_mon;
-    virtio_function_instance binding_function;
-
     virtio_tlm_completion_adapter tlm_adapter;
 
     // Test counters
@@ -49,45 +44,8 @@ class virtio_full_integration_test extends uvm_test;
     // Build Phase
     // ========================================================================
     virtual function void build_phase(uvm_phase phase);
-        pcie_tl_env_config pcie_cfg;
         super.build_phase(phase);
-
-        // Install one reusable adapter before PCIe creates its RC driver.
-        tlm_adapter = virtio_tlm_completion_adapter::type_id::create(
-            "tlm_adapter");
-        tlm_adapter.install_factory_overrides();
-
-        // 4. Create and configure PCIe environment
-        pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
-        pcie_cfg.if_mode = TLM_MODE;
-        pcie_cfg.rc_agent_enable = 1;
-        pcie_cfg.ep_agent_enable = 1;
-        pcie_cfg.rc_is_active = UVM_ACTIVE;
-        pcie_cfg.ep_is_active = UVM_ACTIVE;
-        pcie_cfg.ep_auto_response = 1;
-        pcie_cfg.scb_enable = 0;  // Disable scoreboard for this test
-        pcie_cfg.fc_enable = 0;   // Simplify: infinite credit
-        pcie_cfg.infinite_credit = 1;
-        pcie_cfg.extended_tag_enable = 1;
-        pcie_cfg.cpl_timeout_ns = 100000;
-        pcie_cfg.link_delay_enable = 0;
-        uvm_config_db #(pcie_tl_env_config)::set(this, "pcie_env", "cfg", pcie_cfg);
-        pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
-
-        // 5. Create virtio components
-        transport = virtio_pci_transport::type_id::create("transport");
-        wait_pol = virtio_wait_policy::type_id::create("wait_pol");
-        host_mem = host_mem_manager::type_id::create("host_mem");
-        iommu = virtio_iommu_model::type_id::create("iommu");
-        vq_mgr = virtqueue_manager::type_id::create("vq_mgr");
-        barrier = virtio_memory_barrier_model::type_id::create("barrier");
-        err_inj = virtqueue_error_injector::type_id::create("err_inj");
-        ops = virtio_atomic_ops::type_id::create("ops");
-        perf_mon = virtio_perf_monitor::type_id::create("perf_mon", this);
-        uvm_config_db#(uvm_active_passive_enum)::set(
-            this, "binding_function.driver_agent", "is_active", UVM_PASSIVE);
-        binding_function = virtio_function_instance::type_id::create(
-            "binding_function", this);
+        flow = virtio_real_driver_flow_fixture::type_id::create("flow", this);
     endfunction
 
     // ========================================================================
@@ -95,25 +53,38 @@ class virtio_full_integration_test extends uvm_test;
     // ========================================================================
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
+        pcie_env = flow.pcie_env();
+        tlm_adapter = flow.tlm_adapter;
+    endfunction
 
-        transport.bdf = 16'h0100;  // Bus=1, Dev=0, Func=0
-        // 测试自建的 transport/vq_mgr/ops 交给 Function 的统一绑定入口接线。
-        binding_function.transport = transport;
-        binding_function.vq_mgr = vq_mgr;
-        binding_function.driver_agent.ops = ops;
-        if (!binding_function.wire_shared(
-            host_mem, iommu, barrier, err_inj, wait_pol,
-            pcie_env.rc_agent.sequencer)) begin
-            `uvm_fatal("FULL_TEST", "failed to bind function to PCIe")
-            return;
-        end
+    // ========================================================================
+    // Resolve the fixture's snapshot function (BDF/BAR leases are never test
+    // constants) and apply the original fast wait policy to its transport.
+    // ========================================================================
+    virtual task bind_snapshot_function();
+        virtio_function_instance function_instance;
+        string why;
+
+        if (!flow.build_flow(why))
+            `uvm_fatal("FULL_TEST", {"fixture flow is not ready: ", why})
+        if (!flow.execution_profile().has_model_device())
+            `uvm_fatal("FULL_TEST", "full integration test requires MODEL execution mode")
+        if ((pcie_env == null) || (tlm_adapter == null))
+            `uvm_fatal("FULL_TEST", "fixture did not expose its PCIe env and completion adapter")
+        function_instance = flow.function_by_bdf(flow.function_bdf());
+        if ((function_instance == null) || (function_instance.transport == null) ||
+            (function_instance.transport.wait_pol == null))
+            `uvm_fatal("FULL_TEST", "fixture did not expose the snapshot function transport")
+        transport = function_instance.transport;
 
         // 4. Configure wait policy for fast simulation
-        wait_pol.default_poll_interval_ns = 100;
-        wait_pol.reset_timeout_ns = 10000;
-        wait_pol.queue_reset_timeout_ns = 10000;
-        wait_pol.max_poll_attempts = 100;
-    endfunction
+        transport.wait_pol.default_poll_interval_ns = 100;
+        transport.wait_pol.reset_timeout_ns = 10000;
+        transport.wait_pol.queue_reset_timeout_ns = 10000;
+        transport.wait_pol.max_poll_attempts = 100;
+        `uvm_info("FULL_TEST", $sformatf(
+            "Snapshot function BDF=0x%04h bound", transport.bdf), UVM_LOW)
+    endtask
 
     // ========================================================================
     // Run Phase
@@ -128,8 +99,8 @@ class virtio_full_integration_test extends uvm_test;
         // Wait for reset to deassert
         #200ns;
 
-        // Setup EP with virtio config
-        setup_ep_virtio_config();
+        // Resolve the snapshot function and its endpoint image
+        bind_snapshot_function();
 
         // Test 1: Full virtio initialization
         test_full_init();
@@ -163,325 +134,18 @@ class virtio_full_integration_test extends uvm_test;
     endtask
 
     // ========================================================================
-    // Setup EP Config Space with Virtio Capabilities
-    //
-    // Programs the EP driver's cfg_mgr with:
-    //   - Type 0 header with virtio VID/DID
-    //   - BAR0 = 64KB MMIO (32-bit) for common/notify/ISR/device config
-    //   - Virtio vendor-specific capabilities (cap_id=0x09):
-    //       cfg_type=1 (Common Config) at BAR0+0x0000
-    //       cfg_type=2 (Notify)        at BAR0+0x1000
-    //       cfg_type=3 (ISR)           at BAR0+0x2000
-    //       cfg_type=4 (Device Config) at BAR0+0x3000
-    //   - MSI-X capability with 8 vectors
-    // ========================================================================
-    virtual function void setup_ep_virtio_config();
-        pcie_tl_cfg_space_manager cfg;
-        pcie_tl_ep_driver ep_drv;
-        pcie_capability vs_cap;
-        bit [7:0] cap_data[];
-
-        cfg = pcie_env.cfg_mgr;
-        ep_drv = pcie_env.ep_agent.ep_driver;
-
-        // Clear any pre-existing capabilities from env init
-        cfg.cap_list.delete();
-        cfg.ext_cap_list.delete();
-
-        // Re-initialize with virtio IDs
-        cfg.init_type0_header(
-            .vendor_id(16'h1AF4),    // Red Hat / virtio
-            .device_id(16'h1041),    // virtio-net (modern)
-            .revision_id(8'h01),
-            .class_code(24'h020000), // Ethernet controller
-            .header_type(8'h00)
-        );
-
-        // Set Status register: Capabilities List present
-        cfg.cfg_space[6] = cfg.cfg_space[6] | (1 << PCI_STATUS_CAP_LIST);
-        cfg.field_attrs[6] = CFG_FIELD_RO;
-
-        // Setup BAR0 as 64KB 32-bit MMIO
-        // Lower 16 bits RO (size mask for 64KB)
-        cfg.cfg_space[16] = 8'h00;
-        cfg.cfg_space[17] = 8'h00;
-        cfg.cfg_space[18] = 8'h00;
-        cfg.cfg_space[19] = 8'h00;
-        for (int i = 16; i < 18; i++)
-            cfg.field_attrs[i] = CFG_FIELD_RO;
-
-        // ---- Capabilities ----
-        // Re-register PCIe capability at 0x40 (cleared by init_type0_header)
-        cfg.init_pcie_capability(8'h40, MPS_256, MRRS_512, RCB_64);
-
-        // Virtio Common Config capability (cfg_type=1) at offset 0x50
-        vs_cap = pcie_capability::type_id::create("virtio_common_cap");
-        vs_cap.cap_id = CAP_ID_VENDOR;
-        vs_cap.offset = 8'h50;
-        cap_data = new[14];
-        cap_data[0] = 8'h14;  // cap_len
-        cap_data[1] = VIRTIO_PCI_CAP_COMMON_CFG;  // cfg_type = 1
-        cap_data[2] = 8'h00;  // bar = 0
-        cap_data[3] = 8'h00;  // id
-        cap_data[4] = 8'h00;  // padding
-        cap_data[5] = 8'h00;  // padding
-        cap_data[6] = 8'h00;  // offset = 0x0000
-        cap_data[7] = 8'h00;
-        cap_data[8] = 8'h00;
-        cap_data[9] = 8'h00;
-        cap_data[10] = 8'h40; // length = 64 bytes
-        cap_data[11] = 8'h00;
-        cap_data[12] = 8'h00;
-        cap_data[13] = 8'h00;
-        vs_cap.data = cap_data;
-        cfg.register_capability(vs_cap);
-
-        // Virtio Notify capability (cfg_type=2) at offset 0x70
-        vs_cap = pcie_capability::type_id::create("virtio_notify_cap");
-        vs_cap.cap_id = CAP_ID_VENDOR;
-        vs_cap.offset = 8'h70;
-        cap_data = new[18];
-        cap_data[0] = 8'h18;  // cap_len = 24
-        cap_data[1] = VIRTIO_PCI_CAP_NOTIFY_CFG;  // cfg_type = 2
-        cap_data[2] = 8'h00;  // bar = 0
-        cap_data[3] = 8'h00;
-        cap_data[4] = 8'h00;
-        cap_data[5] = 8'h00;
-        cap_data[6] = 8'h00;  // offset = 0x1000
-        cap_data[7] = 8'h10;
-        cap_data[8] = 8'h00;
-        cap_data[9] = 8'h00;
-        cap_data[10] = 8'h00; // length = 0x1000
-        cap_data[11] = 8'h10;
-        cap_data[12] = 8'h00;
-        cap_data[13] = 8'h00;
-        cap_data[14] = 8'h02; // notify_off_multiplier = 2
-        cap_data[15] = 8'h00;
-        cap_data[16] = 8'h00;
-        cap_data[17] = 8'h00;
-        vs_cap.data = cap_data;
-        cfg.register_capability(vs_cap);
-
-        // Virtio ISR capability (cfg_type=3) at offset 0x90
-        vs_cap = pcie_capability::type_id::create("virtio_isr_cap");
-        vs_cap.cap_id = CAP_ID_VENDOR;
-        vs_cap.offset = 8'h90;
-        cap_data = new[14];
-        cap_data[0] = 8'h14;
-        cap_data[1] = VIRTIO_PCI_CAP_ISR_CFG;
-        cap_data[2] = 8'h00;
-        cap_data[3] = 8'h00;
-        cap_data[4] = 8'h00;
-        cap_data[5] = 8'h00;
-        cap_data[6] = 8'h00;  // offset = 0x2000
-        cap_data[7] = 8'h20;
-        cap_data[8] = 8'h00;
-        cap_data[9] = 8'h00;
-        cap_data[10] = 8'h04; // length = 4
-        cap_data[11] = 8'h00;
-        cap_data[12] = 8'h00;
-        cap_data[13] = 8'h00;
-        vs_cap.data = cap_data;
-        cfg.register_capability(vs_cap);
-
-        // Virtio Device Config capability (cfg_type=4) at offset 0xA8
-        vs_cap = pcie_capability::type_id::create("virtio_devcfg_cap");
-        vs_cap.cap_id = CAP_ID_VENDOR;
-        vs_cap.offset = 8'hA8;
-        cap_data = new[14];
-        cap_data[0] = 8'h14;
-        cap_data[1] = VIRTIO_PCI_CAP_DEVICE_CFG;
-        cap_data[2] = 8'h00;
-        cap_data[3] = 8'h00;
-        cap_data[4] = 8'h00;
-        cap_data[5] = 8'h00;
-        cap_data[6] = 8'h00;  // offset = 0x3000
-        cap_data[7] = 8'h30;
-        cap_data[8] = 8'h00;
-        cap_data[9] = 8'h00;
-        cap_data[10] = 8'h40; // length = 64
-        cap_data[11] = 8'h00;
-        cap_data[12] = 8'h00;
-        cap_data[13] = 8'h00;
-        vs_cap.data = cap_data;
-        cfg.register_capability(vs_cap);
-
-        // MSI-X capability at offset 0xC0
-        begin
-            pcie_capability msix_cap;
-            msix_cap = pcie_capability::type_id::create("msix_cap");
-            msix_cap.cap_id = CAP_ID_MSIX;
-            msix_cap.offset = 8'hC0;
-            cap_data = new[10];
-            cap_data[0] = 8'h07; // table_size=7 (8 entries-1)
-            cap_data[1] = 8'h00; // enable=0, func_mask=0
-            cap_data[2] = 8'h00; // table BIR=0
-            cap_data[3] = 8'h40; // table offset = 0x4000
-            cap_data[4] = 8'h00;
-            cap_data[5] = 8'h00;
-            cap_data[6] = 8'h00; // PBA BIR=0
-            cap_data[7] = 8'h50; // PBA offset = 0x5000
-            cap_data[8] = 8'h00;
-            cap_data[9] = 8'h00;
-            msix_cap.data = cap_data;
-            cfg.register_capability(msix_cap);
-        end
-
-        `uvm_info("FULL_TEST", "EP config space setup complete with virtio capabilities", UVM_LOW)
-    endfunction
-
-    // ========================================================================
-    // Initialize EP MMIO registers after BAR enumeration
-    // ========================================================================
-    virtual function void init_ep_mmio_regs(bit [63:0] bar0_base);
-        pcie_tl_ep_driver ep_drv;
-        bit [63:0] cc_base;
-        bit [63:0] dc_base;
-        bit [63:0] device_features;
-
-        ep_drv = pcie_env.ep_agent.ep_driver;
-        cc_base = bar0_base;
-        dc_base = bar0_base + 64'h3000;
-
-        device_features = 0;
-        device_features[VIRTIO_NET_F_MAC] = 1;
-        device_features[VIRTIO_NET_F_STATUS] = 1;
-        device_features[VIRTIO_NET_F_MRG_RXBUF] = 1;
-        device_features[VIRTIO_NET_F_CTRL_VQ] = 1;
-        device_features[VIRTIO_NET_F_MQ] = 1;
-        device_features[VIRTIO_F_VERSION_1] = 1;
-        device_features[VIRTIO_NET_F_MTU] = 1;
-        device_features[VIRTIO_NET_F_CSUM] = 1;
-        device_features[VIRTIO_NET_F_HOST_TSO4] = 1;
-
-        // Common Config at BAR0+0x0000
-        write_ep_mem32(ep_drv, cc_base + 64'h00, 32'h0); // DFSELECT
-        write_ep_mem32(ep_drv, cc_base + 64'h04, device_features[31:0]); // DF
-        write_ep_mem32(ep_drv, cc_base + 64'h08, 32'h0); // GFSELECT
-        write_ep_mem32(ep_drv, cc_base + 64'h0C, 32'h0); // GF
-        write_ep_mem16(ep_drv, cc_base + 64'h10, 16'h0); // MSIX
-        write_ep_mem16(ep_drv, cc_base + 64'h12, 16'h0006); // NUMQ = 6
-        write_ep_mem8(ep_drv, cc_base + 64'h14, 8'h0);  // STATUS
-        write_ep_mem8(ep_drv, cc_base + 64'h15, 8'h0);  // CFGGENERATION
-        write_ep_mem16(ep_drv, cc_base + 64'h16, 16'h0); // Q_SELECT
-        write_ep_mem16(ep_drv, cc_base + 64'h18, 16'h0100); // Q_SIZE = 256
-        write_ep_mem16(ep_drv, cc_base + 64'h1A, 16'h0); // Q_MSIX
-        write_ep_mem16(ep_drv, cc_base + 64'h1C, 16'h0); // Q_ENABLE
-        write_ep_mem16(ep_drv, cc_base + 64'h1E, 16'h0); // Q_NOFF
-        // Desc/Avail/Used addresses
-        for (int i = 0; i < 24; i++)
-            ep_drv.mem_space[cc_base + 64'h20 + i] = 8'h00;
-
-        // Device Config at BAR0+0x3000
-        // MAC: 52:54:00:12:34:56
-        write_ep_mem8(ep_drv, dc_base + 64'h00, 8'h52);
-        write_ep_mem8(ep_drv, dc_base + 64'h01, 8'h54);
-        write_ep_mem8(ep_drv, dc_base + 64'h02, 8'h00);
-        write_ep_mem8(ep_drv, dc_base + 64'h03, 8'h12);
-        write_ep_mem8(ep_drv, dc_base + 64'h04, 8'h34);
-        write_ep_mem8(ep_drv, dc_base + 64'h05, 8'h56);
-        write_ep_mem16(ep_drv, dc_base + 64'h06, 16'h0001); // status: link up
-        write_ep_mem16(ep_drv, dc_base + 64'h08, 16'h0002); // max_virtqueue_pairs
-        write_ep_mem16(ep_drv, dc_base + 64'h0A, 16'h05DC); // MTU=1500
-        write_ep_mem32(ep_drv, dc_base + 64'h0C, 32'h00002710); // speed=10000
-        write_ep_mem8(ep_drv, dc_base + 64'h10, 8'h01); // duplex=full
-
-        `uvm_info("FULL_TEST", $sformatf(
-            "EP MMIO registers initialized at BAR0=0x%016h", bar0_base), UVM_LOW)
-    endfunction
-
-    // ========================================================================
-    // EP Device Behavior Task
-    //
-    // Simulates device behavior by monitoring EP mem_space writes and
-    // updating read-back values accordingly.
-    // ========================================================================
-    virtual task ep_device_behavior(bit [63:0] bar0_base);
-        pcie_tl_ep_driver ep_drv;
-        bit [63:0] cc_base;
-        bit [63:0] device_features;
-        bit [7:0] last_status;
-        int unsigned last_qselect;
-
-        ep_drv = pcie_env.ep_agent.ep_driver;
-        cc_base = bar0_base;
-
-        device_features = 0;
-        device_features[VIRTIO_NET_F_MAC] = 1;
-        device_features[VIRTIO_NET_F_STATUS] = 1;
-        device_features[VIRTIO_NET_F_MRG_RXBUF] = 1;
-        device_features[VIRTIO_NET_F_CTRL_VQ] = 1;
-        device_features[VIRTIO_NET_F_MQ] = 1;
-        device_features[VIRTIO_F_VERSION_1] = 1;
-        device_features[VIRTIO_NET_F_MTU] = 1;
-        device_features[VIRTIO_NET_F_CSUM] = 1;
-        device_features[VIRTIO_NET_F_HOST_TSO4] = 1;
-
-        last_status = 0;
-        last_qselect = 0;
-
-        forever begin
-            bit [31:0] dfselect_val;
-            bit [7:0] status_val;
-            int unsigned qselect_val;
-
-            #10ns;
-
-            // React to DFSELECT writes: update DF register
-            dfselect_val = read_ep_mem32(ep_drv, cc_base + 64'h00);
-            if (dfselect_val == 0)
-                write_ep_mem32(ep_drv, cc_base + 64'h04, device_features[31:0]);
-            else if (dfselect_val == 1)
-                write_ep_mem32(ep_drv, cc_base + 64'h04, device_features[63:32]);
-
-            // React to STATUS writes
-            status_val = read_ep_mem8(ep_drv, cc_base + 64'h14);
-            if (status_val != last_status) begin
-                last_status = status_val;
-                // Device accepts features -- keep FEATURES_OK if set
-                if (last_status & DEV_STATUS_FEATURES_OK)
-                    write_ep_mem8(ep_drv, cc_base + 64'h14, last_status);
-            end
-
-            // React to Q_SELECT writes: update per-queue registers
-            qselect_val = read_ep_mem16(ep_drv, cc_base + 64'h16);
-            if (qselect_val != last_qselect) begin
-                last_qselect = qselect_val;
-                write_ep_mem16(ep_drv, cc_base + 64'h18, 16'h0100); // Q_SIZE max
-                write_ep_mem16(ep_drv, cc_base + 64'h1E, last_qselect[15:0]); // Q_NOFF
-            end
-        end
-    endtask
-
-    // ========================================================================
     // Test 1: Full Virtio Initialization
     // ========================================================================
     virtual task test_full_init();
-        bit [63:0] bar0_base;
-
         tests_run++;
         `uvm_info("FULL_TEST", "--- Test 1: Full Virtio Init ---", UVM_LOW)
 
-        // Step 1: BAR enumeration
-        `uvm_info("FULL_TEST", "Step 1: BAR enumeration", UVM_LOW)
-        transport.bar.requester_id = transport.bdf;
-        transport.bar.enumerate_bars();
-
-        bar0_base = transport.bar.bar_base[0];
-        `uvm_info("FULL_TEST", $sformatf("BAR0 assigned at 0x%016h", bar0_base), UVM_LOW)
-
-        // Step 2: Initialize EP MMIO registers at assigned BAR address
-        init_ep_mmio_regs(bar0_base);
-
-        // Step 3: Start EP device behavior monitor
-        fork
-            ep_device_behavior(bar0_base);
-        join_none
-
-        // Step 4: Capability discovery
-        `uvm_info("FULL_TEST", "Step 2: Capability discovery", UVM_LOW)
-        transport.cap_mgr.bar_ref = transport.bar;
-        transport.cap_mgr.discover_capabilities();
+        // Step 1: Fabric BAR programming and capability discovery.  BAR
+        // placement comes from the frozen snapshot lease; no enumeration.
+        `uvm_info("FULL_TEST", "Step 1: Fabric BAR programming and capability discovery", UVM_LOW)
+        transport.discover_and_init_bars();
+        `uvm_info("FULL_TEST", $sformatf("BAR0 lease at 0x%016h",
+            transport.bar.bar_base[0]), UVM_LOW)
 
         if (!transport.cap_mgr.common_cfg_found) begin
             `uvm_error("FULL_TEST", "Common Config capability not found!")
@@ -803,45 +467,6 @@ class virtio_full_integration_test extends uvm_test;
             `uvm_error("FULL_TEST", $sformatf("OVERALL: FAIL (%0d tests failed)", tests_failed))
         else
             `uvm_info("FULL_TEST", "OVERALL: PASS -- All tests passed", UVM_LOW)
-    endfunction
-
-    // ========================================================================
-    // EP Memory Helpers
-    // ========================================================================
-    function void write_ep_mem8(pcie_tl_ep_driver drv, bit [63:0] addr, bit [7:0] data);
-        drv.mem_space[addr] = data;
-    endfunction
-
-    function void write_ep_mem16(pcie_tl_ep_driver drv, bit [63:0] addr, bit [15:0] data);
-        drv.mem_space[addr]     = data[7:0];
-        drv.mem_space[addr + 1] = data[15:8];
-    endfunction
-
-    function void write_ep_mem32(pcie_tl_ep_driver drv, bit [63:0] addr, bit [31:0] data);
-        drv.mem_space[addr]     = data[7:0];
-        drv.mem_space[addr + 1] = data[15:8];
-        drv.mem_space[addr + 2] = data[23:16];
-        drv.mem_space[addr + 3] = data[31:24];
-    endfunction
-
-    function bit [7:0] read_ep_mem8(pcie_tl_ep_driver drv, bit [63:0] addr);
-        return drv.mem_space.exists(addr) ? drv.mem_space[addr] : 8'h00;
-    endfunction
-
-    function bit [15:0] read_ep_mem16(pcie_tl_ep_driver drv, bit [63:0] addr);
-        bit [15:0] val;
-        val[7:0]  = drv.mem_space.exists(addr)     ? drv.mem_space[addr]     : 8'h00;
-        val[15:8] = drv.mem_space.exists(addr + 1) ? drv.mem_space[addr + 1] : 8'h00;
-        return val;
-    endfunction
-
-    function bit [31:0] read_ep_mem32(pcie_tl_ep_driver drv, bit [63:0] addr);
-        bit [31:0] val;
-        val[7:0]   = drv.mem_space.exists(addr)     ? drv.mem_space[addr]     : 8'h00;
-        val[15:8]  = drv.mem_space.exists(addr + 1) ? drv.mem_space[addr + 1] : 8'h00;
-        val[23:16] = drv.mem_space.exists(addr + 2) ? drv.mem_space[addr + 2] : 8'h00;
-        val[31:24] = drv.mem_space.exists(addr + 3) ? drv.mem_space[addr + 3] : 8'h00;
-        return val;
     endfunction
 
 endclass

@@ -20,6 +20,7 @@ $DPU_COMMON_ROOT/tests/dpu_device_bootstrap_plan_test.sv
 $DPU_COMMON_ROOT/tests/dpu_vio_reg_plan_test.sv
 virtio_net_vip/tests/virtio_unit_test.sv
 virtio_net_vip/tests/virtio_shared_mem_fixture.sv
+virtio_net_vip/tests/virtio_real_driver_flow_fixture.sv
 virtio_net_vip/tests/virtio_host_mem_reclaim_test.sv
 virtio_net_vip/tests/virtio_queue_semantics_test.sv
 virtio_net_vip/tests/virtio_fabric_resource_test.sv
@@ -45,7 +46,6 @@ virtio_net_vip/tests/virtio_real_dut_iova_dma_test.sv
 $HOST_MEM_ROOT/tb/host_mem_random_tb.sv
 virtio_net_vip/tests/virtio_pcie_host_mem_test.sv
 virtio_net_vip/tests/virtio_net_packet_multi_queue_test.sv
-virtio_net_vip/tests/virtio_real_driver_flow_fixture.sv
 virtio_net_vip/tests/virtio_real_driver_flow_test.sv
 virtio_net_vip/tests/virtio_real_driver_multiqueue_test.sv
 virtio_net_vip/tests/virtio_real_driver_rx_test.sv
