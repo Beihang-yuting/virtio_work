@@ -79,7 +79,7 @@ VIP 提供两种驱动模式，可在运行时切换：
 
 #### 三种 Virtqueue 实现
 
-通过抽象基类 `virtqueue_base` 定义 18 个纯虚方法，提供三种实现：
+通过抽象基类 `virtqueue_base` 定义 14 个纯虚方法，提供三种实现：
 - **Split Virtqueue**：标准三区域布局（描述符表 + Available Ring + Used Ring）
 - **Packed Virtqueue**：单环布局，AVAIL/USED 标志位嵌入描述符
 - **Custom Virtqueue**：用户通过回调接口自定义描述符格式
@@ -326,11 +326,12 @@ virtio_net_vip/
 |   +-- shared/
 |   |   +-- virtio_wait_policy.sv            -- 统一等待/超时/轮询框架
 |   |   +-- virtio_memory_barrier_model.sv   -- 内存屏障模型 (wmb/rmb/mb)
+|   |   +-- host_mem_bar_reservation_importer.sv -- DPU BAR 视图 -> Host memory reservation
 |   +-- iommu/
 |   |   +-- virtio_iommu_model.sv            -- IOMMU 地址翻译、fault 注入、脏页追踪
 |   +-- virtqueue/
 |   |   +-- virtqueue_error_injector.sv      -- 错误注入控制器
-|   |   +-- virtqueue_base.sv               -- 抽象基类 (18 个纯虚方法)
+|   |   +-- virtqueue_base.sv               -- 抽象基类 (14 个纯虚方法)
 |   |   +-- split_virtqueue.sv              -- Split Virtqueue 完整实现
 |   |   +-- packed_virtqueue.sv             -- Packed Virtqueue 完整实现
 |   |   +-- custom_virtqueue.sv             -- Custom Virtqueue (回调委托)
@@ -343,15 +344,21 @@ virtio_net_vip/
 |   |   +-- virtio_notification_manager.sv  -- MSI-X/INTx/polling 中断管理
 |   |   +-- virtio_discovery_strategy.sv    -- BAR/capability 发现策略
 |   |   +-- virtio_config_backend.sv        -- 设备配置后端接口 + common-config 实现
-|   |   +-- virtio_pci_transport.sv         -- PCI 传输封装 (完整初始化序列)
+|   |   +-- virtio_pcie_function_endpoint.sv -- 单 function 的 {host, segment, BDF} PCIe 通路
+|   |   +-- virtio_pcie_observer_adapter.sv -- PCIe monitor TLP -> virtio monitor 语义事件
+|   |   +-- virtio_tlm_completion_adapter.sv -- TLM PCIe 路径的 completion 回填
+|   |   +-- virtio_pci_transport.sv         -- PCI 传输封装 (寄存器访问器 + 发现入口; 初始化由 FSM/ops 编排)
 |   +-- agent/
-|   |   +-- virtio_atomic_ops.sv            -- 原子操作库 (~30 个方法)
-|   |   +-- atomic_ops/*.svh                -- 原子操作类体分片 (类内 include)
+|   |   +-- virtio_atomic_ops.sv            -- 原子操作库 (含分片共 55 个方法, 不计构造函数)
+|   |   +-- atomic_ops/*.svh                -- 原子操作类体分片 (类内 include, 5 个)
+|   |   +-- virtio_dma_buffer_set.sv       -- 一次提交的数据 DMA 缓冲集合 (alloc/map/回滚/退休)
 |   |   +-- virtio_auto_fsm.sv             -- 自动生命周期状态机 (12 状态)
 |   |   +-- virtio_migration_engine.sv     -- 热迁移校验和/采集/恢复步骤
 |   |   +-- virtio_driver_protocol.sv      -- 驱动协议 (标准 / DPU 私有环)
 |   |   +-- virtio_driver.sv               -- UVM Driver (事务分发)
 |   |   +-- virtio_monitor.sv              -- 被动 TLP 观察 + 协议检查
+|   |   +-- virtio_protocol_event_if.sv    -- monitor 与 SVA 共用的时钟化事件接口
+|   |   +-- virtio_protocol_assertions.sv  -- virtio 1.x 协议级 SVA 检查器
 |   |   +-- virtio_sequencer.sv            -- UVM Sequencer
 |   |   +-- virtio_driver_agent.sv         -- UVM Agent 封装
 |   +-- dataplane/
@@ -359,10 +366,28 @@ virtio_net_vip/
 |   |   +-- virtio_tso_engine.sv            -- TCP/UDP GSO 头长度判定 (不分段)
 |   |   +-- virtio_rss_engine.sv            -- RSS 分发引擎 (Toeplitz hash)
 |   |   +-- virtio_offload_engine.sv        -- Offload 统一封装
+|   |   +-- virtio_net_packet_adapter.sv    -- net_packet packet_item <-> 线速字节流
 |   |   +-- virtio_tx_engine.sv             -- TX 引擎 (报文组装 + SG 链)
 |   |   +-- virtio_rx_engine.sv             -- RX 引擎 (buffer merge + parse)
 |   |   +-- virtio_net_dataplane.sv         -- 数据面顶层封装
+|   +-- dpu_priv/
+|   |   +-- dpu_priv_driver_config.sv       -- 私有队列控制接口与分层配置
+|   |   +-- dpu_priv_ring_callback.sv       -- 私有 TX/RX 描述符/CQ 的 custom_virtqueue 回调
+|   |   +-- dpu_priv_atomic_ops.sv          -- 私有环 ops (建队/停 DMA/释放)
+|   |   +-- dpu_priv_auto_fsm.sv            -- 私有环生命周期 FSM
+|   |   +-- dpu_priv_config_backend.sv      -- 私有控制面接入 virtio_config_backend
+|   |   +-- dpu_priv_driver_protocol.sv     -- 私有环驱动协议
+|   +-- pcie/
+|   |   +-- pcie_tl_dpu_reg_backend.sv      -- dpu_common 寄存器计划 -> PCIe TLP
+|   |   +-- virtio_pcie_dut_responder.sv    -- MODEL 设备侧行为模型 (EP 发起 DMA)
+|   |   +-- virtio_pcie_model_dma_adapter.sv -- MODEL 设备 DMA -> EP MemRd/MemWr
+|   |   +-- virtio_pcie_iova_host_mem_proxy.sv -- REAL_DUT IOVA -> Host memory 适配
+|   |   +-- virtio_pcie_real_dut_host_mem_responder.sv -- REAL_DUT EP->RC Memory TLP 应答
 |   +-- sriov/
+|   |   +-- vio_snapshot_ctx.sv             -- 一次校验、此后只读的 VIO snapshot 上下文
+|   |   +-- virtio_resource_client.sv       -- 单 service qpair 绑定只读视图 + device-ready
+|   |   +-- virtio_function_instance.sv     -- 单个 PF/VF function (driver/transport/队列/运行态)
+|   |   +-- virtio_pf_instance.sv           -- PF 实例与 Admin VQ 全复位桥接
 |   |   +-- virtio_vf_resource_pool.sv      -- VF 队列资源池 (local_qid <-> global_qid)
 |   |   +-- virtio_vf_instance.sv           -- 单个 VF 实例封装
 |   |   +-- virtio_pf_manager.sv            -- PF 管理器 (委托 pcie_tl_func_manager)
@@ -389,7 +414,7 @@ virtio_net_vip/
 # 分别由 $DPU_COMMON_ROOT、$HOST_MEM_ROOT、$PCIE_WORK_ROOT、$NET_PACKET_ROOT 指定。
 ```
 
-**总计：`src/` 61 个 `.sv` 文件，`tests/` 34 个 `.sv` 文件。**
+**总计：`src/` 75 个文件（70 个 `.sv` + 5 个 `.svh`），`tests/` 36 个 `.sv` 文件。**
 
 ### 3.2 目录职责说明
 
@@ -402,7 +427,9 @@ virtio_net_vip/
 | `src/transport/` | PCI 传输层：寄存器定义、BAR 访问、capability 发现、通知管理 |
 | `src/agent/` | UVM Agent 组件：驱动、监控器、sequencer |
 | `src/dataplane/` | 数据面引擎：TX/RX、offload |
-| `src/sriov/` | SR-IOV 支持：PF/VF 管理、资源池 |
+| `src/dpu_priv/` | DPU 私有环驱动协议：私有 ops/FSM、配置后端、ring 回调 |
+| `src/pcie/` | PCIe 适配层：寄存器计划后端、MODEL 设备响应、REAL_DUT Host memory 应答 |
+| `src/sriov/` | SR-IOV 支持：Function 实例、snapshot 上下文、resource client、PF/VF 管理、资源池 |
 | `src/env/` | 顶层环境：配置、scoreboard、coverage、性能监控 |
 | `tests/` | 测试用例和 testbench 顶层 |
 
@@ -763,16 +790,14 @@ page number 而在不同 Host 之间合并。
 
 #### 4.5.1 抽象基类接口 (`virtqueue_base`)
 
-`virtqueue_base` 是一个虚类（`virtual class`），继承自 `uvm_object`。定义了 18 个纯虚方法：
+`virtqueue_base` 是一个虚类（`virtual class`），继承自 `uvm_object`。定义了 14 个纯虚方法（由 split/packed/custom 实现）：
 
 | 类别 | 方法 | 返回类型 | 说明 |
 |------|------|----------|------|
 | 生命周期 | `alloc_rings()` | void | 分配并初始化 ring 内存 |
 | | `free_rings()` | void | 释放 ring 内存 |
 | | `reset_queue()` | void | 重置队列状态 |
-| | `detach_all_unused(ref tokens[$])` | void | 回收所有未完成的 token |
 | 驱动操作 | `add_buf(sgs[], n_out, n_in, token, indirect)` | int unsigned | 添加 buffer 到描述符环 |
-| | `kick()` | task | 通知设备（PCIe TLP） |
 | | `poll_used(ref token, ref len)` | bit | 轮询 Used Ring |
 | 通知控制 | `disable_cb()` | void | 抑制设备中断 |
 | | `enable_cb()` | void | 使能设备中断 |
@@ -781,14 +806,15 @@ page number 而在不同 Host 之间合并。
 | 查询 | `get_free_count()` | int unsigned | 空闲描述符数量 |
 | | `get_pending_count()` | int unsigned | 待完成描述符数量 |
 | | `needs_notification()` | bit | 是否需要 kick |
-| DMA 辅助 | `dma_map_buf(gpa, size, dir)` | bit[63:0] | DMA 映射 |
-| | `dma_unmap_buf(iova)` | void | DMA 解映射 |
-| 错误注入 | `inject_desc_error(err_type)` | void | 注入描述符错误 |
 | 热迁移 | `save_state(ref snap)` | void | 保存队列快照 |
-| | `restore_state(snap)` | void | 恢复队列快照 |
+| | `restore_state(snap)` | bit | 恢复队列快照 |
 
-基类还提供公共实现：
+基类还提供公共实现（可被子类覆写的虚方法）：
 - `setup()` -- 初始化外部引用
+- `kick()` -- 通知设备（PCIe TLP）
+- `dma_map_buf(gpa, size, dir)` / `dma_unmap_buf(iova)` -- DMA 映射/解映射
+- `inject_desc_error(err_type)` -- 注入描述符错误
+- `detach_all_unused(ref tokens[$])` -- 回收所有未完成的 token
 - `detach()` -- 重置并禁用
 - `dump_ring()` -- 日志输出队列状态
 - `leak_check()` -- 检测未释放 token 和 DMA 映射
@@ -2182,7 +2208,7 @@ lease，RC 再按 lease 调用 `program_fabric_bar_pairs()` 编程 PCIe config-s
 | `write_queue_driver_addr` | task | 设置 avail ring 地址 (64-bit) |
 | `write_queue_device_addr` | task | 设置 used ring 地址 (64-bit) |
 | `write_queue_enable` | task | 使能队列 |
-| `write_queue_reset` | task | 队列重置 (1.2+) |
+| `write_queue_reset_verified` | task | 队列重置 (1.2+)，返回 Q_RESET 是否在超时内完成 |
 | `setup_single_queue` | task | 单队列完整配置 |
 | `kick` | task | 通知 (标准或 NOTIFICATION_DATA) |
 | `read_net_config_atomic` | task | 原子读取设备配置 (config generation check) |

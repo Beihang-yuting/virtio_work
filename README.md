@@ -12,8 +12,8 @@
 
 | 指标 | 数值 |
 |------|------|
-| 源文件数 | 61 个 `.sv` 文件（`virtio_net_vip/src`），另有 34 个测试文件 |
-| 代码行数 | 27,390 行 SystemVerilog（`virtio_net_vip/src`） |
+| 源文件数 | 75 个源文件（`virtio_net_vip/src`：70 个 `.sv` + 5 个 `.svh`），另有 36 个测试 `.sv` 文件 |
+| 代码行数 | 27,441 行 SystemVerilog（`virtio_net_vip/src`） |
 | 支持规范 | virtio 1.2 / 1.3 |
 | Virtqueue 类型 | Split / Packed / 自定义 |
 | 验证目标 | DPU/SmartNIC virtio-net 设备端 RTL |
@@ -211,7 +211,7 @@ BAR 配置/发现（program frozen Fabric lease）
 
 ```
 virtio_net_vip/
-├── src/                                    ← 源代码（61 个文件）
+├── src/                                    ← 源代码（75 个文件：70 个 .sv + 5 个 .svh）
 │   ├── virtio_net_pkg.sv                   ← 顶层 Package（包含所有源文件）
 │   ├── types/                              ← 类型定义
 │   │   ├── virtio_net_types.sv             ← 所有枚举、结构体、Feature 位定义
@@ -219,13 +219,14 @@ virtio_net_vip/
 │   │   └── virtio_transaction.sv           ← UVM Sequence Item
 │   ├── shared/                             ← 共享工具
 │   │   ├── virtio_wait_policy.sv           ← 等待策略框架（三种等待方法）
-│   │   └── virtio_memory_barrier_model.sv  ← 内存屏障建模
+│   │   ├── virtio_memory_barrier_model.sv  ← 内存屏障建模
+│   │   └── host_mem_bar_reservation_importer.sv ← DPU BAR 视图 → Host memory reservation
 │   ├── iommu/                              ← IOMMU 模型
 │   │   └── virtio_iommu_model.sv           ← 地址翻译 + 权限 + 故障注入
 │   ├── virtqueue/                          ← 虚拟队列
-│   │   ├── virtqueue_base.sv               ← 抽象基类（18 个纯虚方法）
-│   │   ├── split_virtqueue.sv              ← Split 实现（764 行）
-│   │   ├── packed_virtqueue.sv             ← Packed 实现（861 行）
+│   │   ├── virtqueue_base.sv               ← 抽象基类（14 个纯虚方法）
+│   │   ├── split_virtqueue.sv              ← Split 实现（629 行）
+│   │   ├── packed_virtqueue.sv             ← Packed 实现（725 行）
 │   │   ├── custom_virtqueue.sv             ← 自定义扩展
 │   │   ├── virtqueue_manager.sv            ← 队列工厂与生命周期管理
 │   │   └── virtqueue_error_injector.sv     ← 队列错误注入器
@@ -237,26 +238,50 @@ virtio_net_vip/
 │   │   ├── virtio_notification_manager.sv  ← MSI-X/INTx/轮询/自适应中断管理
 │   │   ├── virtio_discovery_strategy.sv    ← BAR/capability 发现策略（fabric_preconfigured）
 │   │   ├── virtio_config_backend.sv        ← 设备配置后端接口 + common-config 实现
-│   │   └── virtio_pci_transport.sv         ← 传输层顶层封装（完整初始化序列）
+│   │   ├── virtio_pcie_function_endpoint.sv ← 单 function 的 {host, segment, BDF} PCIe 通路
+│   │   ├── virtio_pcie_observer_adapter.sv ← PCIe monitor TLP → virtio monitor 语义事件
+│   │   ├── virtio_tlm_completion_adapter.sv ← TLM PCIe 路径的 completion 回填
+│   │   └── virtio_pci_transport.sv         ← 传输层顶层封装（寄存器访问器 + 发现入口；初始化由 FSM/ops 编排）
 │   ├── agent/                              ← UVM 驱动代理
-│   │   ├── virtio_atomic_ops.sv            ← 原子操作库（约 30 个方法）
+│   │   ├── virtio_atomic_ops.sv            ← 原子操作库（含 atomic_ops/ 分片共 55 个方法，不计构造函数）
 │   │   ├── atomic_ops/                     ← 原子操作类体分片（lifecycle/queue/datapath/ctrl_admin/migration_ownership）
+│   │   ├── virtio_dma_buffer_set.sv        ← 一次提交的数据 DMA 缓冲集合（alloc/map/回滚/退休）
 │   │   ├── virtio_auto_fsm.sv             ← 自动状态机（12 状态 + 5 后台任务）
 │   │   ├── virtio_migration_engine.sv      ← 热迁移校验和/采集/恢复步骤
 │   │   ├── virtio_driver_protocol.sv       ← 驱动协议（标准 / DPU 私有环）分派
 │   │   ├── virtio_driver.sv               ← UVM Driver（事务分发）
 │   │   ├── virtio_monitor.sv              ← UVM Monitor（被动观测 + 协议检查）
+│   │   ├── virtio_protocol_event_if.sv     ← monitor 与 SVA 共用的时钟化事件接口
+│   │   ├── virtio_protocol_assertions.sv   ← virtio 1.x 协议级 SVA 检查器
 │   │   ├── virtio_sequencer.sv            ← UVM Sequencer
 │   │   └── virtio_driver_agent.sv          ← UVM Agent 顶层封装
 │   ├── dataplane/                          ← 数据面
 │   │   ├── virtio_tx_engine.sv             ← 发送引擎（net_packet 集成）
 │   │   ├── virtio_rx_engine.sv             ← 接收引擎（mergeable buffer 模式）
+│   │   ├── virtio_net_packet_adapter.sv    ← net_packet packet_item ↔ 线速字节流
 │   │   ├── virtio_offload_engine.sv        ← 统一 Offload 引擎入口
 │   │   ├── virtio_csum_engine.sv           ← 校验和计算/验证
 │   │   ├── virtio_tso_engine.sv            ← TCP/UDP GSO 头长度判定（分段由设备完成）
 │   │   ├── virtio_rss_engine.sv            ← RSS Toeplitz 哈希 + 队列选择
 │   │   └── virtio_net_dataplane.sv         ← 数据面顶层封装
+│   ├── dpu_priv/                           ← DPU 私有环驱动协议
+│   │   ├── dpu_priv_driver_config.sv       ← 私有队列控制接口与分层配置
+│   │   ├── dpu_priv_ring_callback.sv       ← 私有 TX/RX 描述符/CQ 的 custom_virtqueue 回调
+│   │   ├── dpu_priv_atomic_ops.sv          ← 私有环 ops（建队/停 DMA/释放）
+│   │   ├── dpu_priv_auto_fsm.sv            ← 私有环生命周期 FSM
+│   │   ├── dpu_priv_config_backend.sv      ← 私有控制面接入 virtio_config_backend
+│   │   └── dpu_priv_driver_protocol.sv     ← 私有环驱动协议
+│   ├── pcie/                               ← PCIe 适配层
+│   │   ├── pcie_tl_dpu_reg_backend.sv      ← dpu_common 寄存器计划 → PCIe TLP
+│   │   ├── virtio_pcie_dut_responder.sv    ← MODEL 设备侧行为模型（EP 发起 DMA）
+│   │   ├── virtio_pcie_model_dma_adapter.sv ← MODEL 设备 DMA → EP MemRd/MemWr
+│   │   ├── virtio_pcie_iova_host_mem_proxy.sv ← REAL_DUT IOVA → Host memory 适配
+│   │   └── virtio_pcie_real_dut_host_mem_responder.sv ← REAL_DUT EP→RC Memory TLP 应答
 │   ├── sriov/                              ← SR-IOV 支持
+│   │   ├── vio_snapshot_ctx.sv             ← 一次校验、此后只读的 VIO snapshot 上下文
+│   │   ├── virtio_resource_client.sv       ← 单 service qpair 绑定的只读视图 + device-ready
+│   │   ├── virtio_function_instance.sv     ← 单个 PF/VF function（driver/transport/队列/运行态）
+│   │   ├── virtio_pf_instance.sv           ← PF 实例与 Admin VQ 全复位桥接
 │   │   ├── virtio_pf_manager.sv            ← PF 管理（委托 pcie_tl_func_manager）
 │   │   ├── virtio_vf_resource_pool.sv      ← VF 队列资源映射
 │   │   └── virtio_vf_instance.sv           ← 单个 VF 实例封装

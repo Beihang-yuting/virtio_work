@@ -101,9 +101,11 @@ uvm_test_top.system_env
 
 全部配置访问最终经 `virtio_bar_accessor` 变成 TLP 从 `pcie_rc_seqr` 发出。
 
-1. **BAR 枚举**：`virtio_bar_accessor::enumerate_bars`（bar_accessor.sv:825）
-   ——每 BAR：CfgRd 原值 → CfgWr 全 1 → CfgRd sizing → 回写分配基址；
-   64-bit BAR 对做上半段 sizing。TLP 类型 CfgRd0/CfgWr0。
+1. **BAR 配置（fabric_preconfigured 发现）**：`virtio_pci_transport::discover_and_init_bars`
+   委托当前 `virtio_discovery_strategy`（默认 `virtio_fabric_preconfigured_discovery`，
+   discovery_strategy.sv）——不做 BAR sizing/地址分配：按冻结 snapshot 的 BAR 租约经
+   `virtio_bar_accessor::program_fabric_bar_pairs` 用 CfgWr0 写入三对 64-bit BAR，
+   再扫描 capability 并核对 BAR 角色窗口，最后由 resource client 标记 device-ready。
 2. **Capability 链**：`virtio_pci_cap_manager::discover_capabilities`
    （cap_manager.sv:103）——从 cfg 0x34 起遍历，解析 5 种 virtio vendor
    cap（common/notify/ISR/device/pci）与 MSI-X cap；NOTIFY cap 额外读
@@ -116,7 +118,7 @@ uvm_test_top.system_env
      GFSELECT(0x08)/GF(0x0C) 写两轮（:225-249）；
    - FEATURES_OK(0x0B) + 回读校验，失败写 FAILED；
    - 读 num_queues(0x12)（仅 fixture 用于校验队列容量）。
-4. **逐队列配置**：`virtio_atomic_ops::setup_queue`（atomic_ops.sv:627）：
+4. **逐队列配置**：`virtio_atomic_ops::setup_queue`（atomic_ops/virtio_atomic_ops_queue.svh）：
    queue_select(0x16) → 读 size max(0x18) → `vq.alloc_rings()`（host_mem
    三块：desc 4K 对齐/avail/used）→ 三段 `iommu.map_for_host()`（失败
    回滚）→ **IOVA** 写入 desc/avail/used 地址寄存器（0x20–0x34）→
@@ -129,7 +131,7 @@ uvm_test_top.system_env
 
 ## 4. 阶段 B：发包（TX）
 
-7. `virtio_atomic_ops::tx_submit`（atomic_ops.sv:895）：packet_item 经
+7. `virtio_atomic_ops::tx_submit`（atomic_ops/virtio_atomic_ops_datapath.svh）：packet_item 经
    `virtio_net_packet_adapter::pack` 转字节流 → 填 `virtio_net_hdr`
    （csum/GSO 标志）→ host_mem 分配 hdr+payload（DWORD 对齐防
    Completion 跨块）并写入 → `iommu.map_for_host(DMA_TO_DEVICE)` 拿
@@ -142,7 +144,7 @@ uvm_test_top.system_env
 ## 5. 阶段 C：notify（kick）与完成回收
 
 9. `needs_notification()` 判定（event_idx 抑制）→
-   `virtio_pci_transport::kick`（pci_transport.sv:544）：
+   `virtio_pci_transport::kick`（virtio_pci_transport.sv）：
    - notify 地址 = notify BAR 基址 + `notify_cap.offset +
      queue_notify_off[qid] × notify_off_multiplier`（cap_manager.sv:387）；
    - notify 值 = `{queue_id}`（NOTIFICATION_DATA 开启时带 avail idx/wrap）；
@@ -161,7 +163,7 @@ uvm_test_top.system_env
 11. **驱动侧完成回收**：中断 → `virtio_monitor::observe_interrupt`
     （monitor.sv:190）→ auto_fsm 的 interrupt/tx_complete 循环唤醒
     （auto_fsm.sv:1955/1907）→ `virtio_atomic_ops::tx_complete`
-    （atomic_ops.sv:1081）→ `split_virtqueue::poll_used`
+    （atomic_ops/virtio_atomic_ops_datapath.svh）→ `split_virtqueue::poll_used`
     （split_virtqueue.sv:403：`rmb()` → 读 used.idx → 取 {id,len} →
     token 还原 → desc 链归还 free list）→ unmap IOVA + free host_mem。
 
