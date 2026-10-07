@@ -9,7 +9,7 @@
 // ring 所有权，后端只负责"把已经准备好的参数写进设备"。后端借用 transport，
 // 由 ops 在每次调用前重新绑定；后端不持有 DMA 资源。
 //   virtio_common_cfg_backend : 标准 virtio-pci common-config（现行行为）。
-//   dpu_priv_config_backend   : DPU 私有环控制面（dpu_priv_device_control）。
+//   dpu_priv_config_backend   : DPU 私有设备寄存器级后端（真实驱动 AF 路径的寄存器序列）。
 //   后续 virtio_af_direct_backend：VIP 扮演 AF 直接写 DPU 队列/特性/中断表。
 // 失败约定：configure/enable 返回 ok=0 时设备不得访问该队列；disable/reset 返回
 // ok=0 时调用方保留全部 ring 与数据 DMA，不得释放。

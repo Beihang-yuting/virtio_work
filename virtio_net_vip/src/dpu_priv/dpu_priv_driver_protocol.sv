@@ -1,7 +1,7 @@
 // 目录层次：src/dpu_priv；DPU 私有环驱动协议：只声明私有 Function 与标准 virtio 的差异
 // （能力、队列格式、MANUAL kick/poll、复位语义），ops/FSM 均为通用实现。依赖
 // dpu_priv_driver_config（借用，env_cfg 按 service key 注入）与 Function 提交时选定的
-// dpu_priv_config_backend。复位与关机必须由控制后端确认停 DMA，失败保留资源。
+// dpu_priv_config_backend。复位与关机必须由配置后端确认设备停 DMA，失败保留资源。
 `ifndef DPU_PRIV_DRIVER_PROTOCOL_SV
 `define DPU_PRIV_DRIVER_PROTOCOL_SV
 

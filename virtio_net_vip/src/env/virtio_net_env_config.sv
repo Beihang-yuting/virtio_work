@@ -34,7 +34,7 @@ class virtio_net_env_config extends uvm_object;
     protected service_config_entry_t m_service_configs[string];
 
     // 私有驱动按完整 service key 选择，避免全局 factory override 影响标准 PF/VF。
-    // 配置及控制后端由上层持有；Function 在 PCIe 绑定时冻结队列配置副本。
+    // 配置由上层持有；Function 在 PCIe 绑定时冻结队列配置副本。
     typedef struct {
         dpu_service_key_t key;
         dpu_priv_driver_config cfg;
@@ -402,9 +402,8 @@ class virtio_net_env_config extends uvm_object;
         if (!validate_driver_behavior(default_cfg, "default VIO behavior", why))
             return 0;
         foreach (m_private_configs[private_name]) begin
-            if ((m_private_configs[private_name].cfg == null) ||
-                (m_private_configs[private_name].cfg.control == null)) begin
-                why = {"private service 缺少配置或控制后端 ", private_name};
+            if (m_private_configs[private_name].cfg == null) begin
+                why = {"private service 缺少配置 ", private_name};
                 return 0;
             end
         end

@@ -1,86 +1,12 @@
 // 目录层次：examples/dpu_priv_ring；验证 src 私有驱动在双 Host 顶层环境中的使用流程。
-// 依赖 virtio_system_env 示例与生产 virtio_net_pkg；配置/后端由测试持有，数据/ring
-// 生命周期完全交给生产 ops。模拟后端仅处理设备控制和 IOVA DMA，不替代驱动实现。
+// 每个 Host 的私有 VF 面对独立设备模型 vdev_dpu_priv（回环端口：寄存器访问直达设备，设备 DMA 经该
+// Host 的 IOMMU）。数据/ring 生命周期完全交给生产 ops，测试只从设备事件观察描述符、帧字节与通知字。
 import uvm_pkg::*;
 `include "uvm_macros.svh"
 import virtio_net_pkg::*;
 import net_packet_pkg::*;
 import dpu_resource_pkg::*;
 import pcie_tl_pkg::*;
-
-// 测试设备后端保存真正传入的队列配置，通过 IOMMU 读写 ring/帧/CQ。
-// 故意不使用 vq 回调或 Host GPA，才能发现 ring 映射和 Host/BDF 路由错误。
-class dpu_priv_example_control extends dpu_priv_device_control;
-    `uvm_object_utils(dpu_priv_example_control)
-    host_mem_manager mem;
-    virtio_iommu_model iommu;
-    dpu_priv_queue_context_t configured[int unsigned];
-    bit [31:0] notifications[int unsigned];
-    bit fail_disable, fail_reset;
-    int unsigned reset_count;
-
-    // 创建空设备模型；Host 内存/IOMMU 在环境解析后注入，均为借用引用。
-    function new(string name = "dpu_priv_example_control");
-        super.new(name);
-    endfunction
-
-    // 成功复位清设备队列，失败保留设备状态；Host/DMA 资源仍由生产 ops 持有。
-    virtual task reset_device(int unsigned host_id, bit [15:0] bdf, output bit ok);
-        ok = !fail_reset;
-        if (ok) begin
-            configured.delete();
-            notifications.delete();
-            reset_count++;
-        end
-    endtask
-
-    // 核对私有 CQ 必须在同一 IOVA 连续区间；读最后一字节可发现映射长度不足。
-    virtual task configure_queue(dpu_priv_queue_context_t ctx, output bit ok);
-        byte check_data[];
-        ok = 0;
-        if (ctx.cq_iova != ctx.ring_iova + ctx.queue_size*16)
-            `uvm_fatal("DPU_FLOW", "CQ IOVA is not contiguous with descriptors")
-        read_dma(ctx, ctx.ring_iova + ctx.ring_bytes - 1, 1, check_data);
-        if (configured.exists(ctx.queue_id))
-            `uvm_fatal("DPU_FLOW", "device queue configured twice")
-        configured[ctx.queue_id] = ctx;
-        ok = 1;
-    endtask
-
-    // 支持停 DMA 失败注入；成功清设备队列，失败保持其可访问 DMA 的状态。
-    virtual task disable_queue(dpu_priv_queue_context_t ctx, output bit ok);
-        ok = !fail_disable;
-        if (ok) configured.delete(ctx.queue_id);
-    endtask
-
-    // 模型记录实际通知值，不产生 PCIe 流量；低 16 位须匹配本地号而非全局资源号。
-    virtual task notify_queue(virtio_pci_transport transport,
-                              dpu_priv_queue_context_t ctx, bit [31:0] value);
-        if (!configured.exists(ctx.queue_id) || value[15:0] != ctx.local_qid)
-            `uvm_fatal("DPU_FLOW", "private notify uses wrong queue identity")
-        notifications[ctx.queue_id] = value;
-    endtask
-
-    // 设备纯读经严格 IOMMU 翻译后读 Host 内存；非法地址/域立即中止测试。
-    function void read_dma(dpu_priv_queue_context_t ctx, bit [63:0] iova,
-                           int unsigned size, output byte data[]);
-        bit [63:0] gpa;
-        iommu_fault_e fault;
-        if (!iommu.translate_for_host(ctx.host_id, ctx.bdf, iova, size,
-                                       DMA_TO_DEVICE, gpa, fault))
-            `uvm_fatal("DPU_FLOW", "device DMA read failed")
-        mem.read_mem(gpa, size, data);
-    endfunction
-
-    // 设备写入必须经过生产完成写边界，覆盖方向权限与写后记录；不能直接改 GPA。
-    function void write_dma(dpu_priv_queue_context_t ctx, bit [63:0] iova,
-                            byte data[]);
-        iommu_fault_e fault;
-        if (!iommu.write_from_device_for_host(ctx.host_id, mem, ctx.bdf,
-                                               iova, data, fault))
-            `uvm_fatal("DPU_FLOW", "device DMA write failed")
-    endfunction
-endclass
 
 // 只捕获当前指定的一次预期错误，其他 ERROR 保持失败，防止负向测试掩盖真实问题。
 class dpu_priv_expected_error extends uvm_report_catcher;
@@ -106,7 +32,9 @@ endclass
 // 这样测试覆盖 env_cfg→Function→ops/FSM 的真实选择路径，并保留每 Host 一个内存域。
 class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
     `uvm_component_utils(dpu_priv_driver_flow_test)
-    dpu_priv_example_control controls[2];
+    vdev_dpu_priv      devices[2];
+    vdev_loopback_port ports[2];
+    vdev_event_log     logs[2];
     virtio_function_instance private_functions[2];
     virtio_atomic_ops private_ops[2];
     uvm_sequencer #(pcie_tl_tlp) unused_rc;
@@ -124,9 +52,10 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
             dpu_service_key_t key;
             dpu_priv_driver_config private_cfg;
             string why;
-            controls[host_id] = new($sformatf("host%0d_control", host_id));
+            devices[host_id] = vdev_dpu_priv::type_id::create($sformatf("host%0d_vdev", host_id), this);
+            logs[host_id] = vdev_event_log::type_id::create($sformatf("host%0d_vdev_log", host_id), this);
+            ports[host_id] = vdev_loopback_port::type_id::create($sformatf("host%0d_vdev_port", host_id));
             private_cfg = new($sformatf("host%0d_private", host_id));
-            private_cfg.control = controls[host_id];
             private_cfg.local_qid_base = 8*host_id;
             key.function_key.host_id = host_id;
             key.function_key.pf_id = 0;
@@ -140,19 +69,63 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
         end
     endfunction
 
-    // 通过生产 Function 接线方法选取 ops/FSM；设备控制模型不使用 RC sequencer，
+    virtual function void connect_phase(uvm_phase phase);
+        super.connect_phase(phase);
+        foreach (devices[h])
+            devices[h].event_ap.connect(logs[h].analysis_export);
+    endfunction
+
+    // 私有 VF 面对 vdev_dpu_priv：设备按该 VF 的 BDF 初始化（qinfo 报告 host=h、pfvf=0），挂到本 Host 的
+    // 回环端口；VF 的 BAR accessor 换成回环 accessor，必须在 Function 绑定（把 accessor 接进 notify_mgr/
+    // cap_mgr）之前完成。BAR 由测试按设备尺寸放置（VF 租约 BAR0 只有 16 KiB，私有设备寄存器窗 32 MiB），
+    // 写进设备配置空间并同步给 accessor；回环 accessor 无 Fabric 布局，不受租约约束。
+    function void attach_private_device(int unsigned h, virtio_function_instance f);
+        vdev_loopback_bar_accessor acc;
+        bit [63:0] bases[3];
+
+        devices[h].bdf = f.bdf;
+        devices[h].host_id = h;
+        devices[h].init();
+        ports[h].attach(devices[h]);
+        acc = vdev_loopback_bar_accessor::type_id::create($sformatf("host%0d_priv_bar", h));
+        acc.port = ports[h];
+        acc.target_bdf = f.bdf;
+        bases[0] = 64'h0000_0080_0000_0000 + h * 64'h0000_0000_1000_0000;
+        bases[1] = bases[0] + 64'h0000_0000_0400_0000;
+        bases[2] = bases[0] + 64'h0000_0000_0500_0000;
+        for (int unsigned i = 0; i < 3; i++) begin
+            acc.bar_base[2*i] = bases[i];
+            ports[h].host_cfg_write(f.bdf, 12'h010 + 8*i, bases[i][31:0]);
+            ports[h].host_cfg_write(f.bdf, 12'h014 + 8*i, bases[i][63:32]);
+        end
+        f.transport.bar = acc;
+    endfunction
+
+    function bit same_bytes(bit [7:0] a[$], byte unsigned b[$]);
+        if (a.size() != b.size())
+            return 0;
+        foreach (a[i])
+            if (a[i] != b[i])
+                return 0;
+        return 1;
+    endfunction
+
+    // 通过生产 Function 接线方法选取 ops/FSM；私有设备经回环端口访问，不使用 RC sequencer，
     // 标准和私有 Function 均检查类型，避免全局 factory override 污染其他 VF。
     virtual function void end_of_elaboration_phase(uvm_phase phase);
         super.end_of_elaboration_phase(phase);
         for (int unsigned h = 0; h < 2; h++) begin
             virtio_net_env env;
             env = system_env.get_virtio_env(h);
-            controls[h].mem = system_env.get_host_mem(h);
-            controls[h].iommu = env.iommu;
+            ports[h].mem = system_env.get_host_mem(h);
+            ports[h].iommu = env.iommu;
+            ports[h].host_id = h;
             foreach (env.function_instances[i]) begin
                 virtio_function_instance f;
                 dpu_priv_config_backend check_private;
                 f = env.function_instances[i];
+                if (f.function_key.vf_id == 0)
+                    attach_private_device(h, f);
                 if (!(f.preflight_bind_pcie(unused_rc) &&
                       f.commit_bind_pcie(env.host_mem, env.iommu,
                           env.barrier, env.err_inj, env.wait_pol, unused_rc)))
@@ -187,81 +160,75 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
         return pkt;
     endfunction
 
-    // 从设备视角读一个 16B 描述符，独立按 C ABI 解析地址与 18-bit 长度。
-    function void descriptor(dpu_priv_example_control c, dpu_priv_queue_context_t ctx,
-                             int unsigned slot, output bit [63:0] addr,
-                             output int unsigned len);
-        byte data[];
-        c.read_dma(ctx, ctx.ring_iova+16*slot, 16, data);
-        addr = {data[7], data[6], data[5], data[4], data[3], data[2], data[1], data[0]};
-        len = {data[10][1:0], data[9], data[8]};
-    endfunction
-
-    // 驱动原子 API 走一次 TX/RX；模拟设备只通过已配置 IOVA 读取帧和写 CQ。
-    // 验证原始字节、token、完成长度、通知本地号及单帧 DMA 回收数量。
+    // 生产 ops/引擎走一次 TX/RX：设备按 qid map 与 VTX/VRX 参数表经 IOMMU 读帧、写 CQ，TX 帧回环到
+    // 同队列对的 RX。从设备事件核对描述符长度（不含 header）、原始字节、通知字与 RX buffer 容量，
+    // 并核对 token、完成长度与单帧 DMA 回收数量。
     task check_traffic(int unsigned h);
-        dpu_priv_queue_context_t tx_ctx, rx_ctx;
         virtio_queue_program_t tx_prog, rx_prog;
         packet_item frame;
         virtio_net_hdr_t hdr;
         uvm_object completed[$], received[$];
         byte unsigned raw[$];
-        byte data[], cq_tx[2], cq_rx[16];
-        bit [63:0] addr;
-        int unsigned len, id, before_count;
+        vdev_event ev[$];
+        int unsigned id, before_count, tx_notifies;
+        bit [31:0] tx_word;
         int unsigned budget = 8;
         frame = make_frame($sformatf("host%0d_frame", h), 128+64*h);
         hdr = '{default:0};
         if (!private_ops[h].get_queue_program(1, tx_prog) ||
-            !private_ops[h].get_queue_program(0, rx_prog))
+            !private_ops[h].get_queue_program(0, rx_prog) ||
+            tx_prog.host_id != h || tx_prog.local_qid != h*8+1)
             `uvm_fatal("DPU_FLOW", "private queue context/host routing mismatch")
-        tx_ctx = dpu_priv_config_backend::to_context(tx_prog);
-        rx_ctx = dpu_priv_config_backend::to_context(rx_prog);
-        if (tx_ctx.host_id != h || tx_ctx.local_qid != h*8+1)
-            `uvm_fatal("DPU_FLOW", "private queue context/host routing mismatch")
+        if (!virtio_net_packet_adapter::pack(frame, raw))
+            `uvm_fatal("DPU_FLOW", "frame could not be packed")
+        logs[h].events.delete();
         if (h == 0) private_ops[h].tx_submit(1, hdr, frame, 0, id);
         else private_functions[h].dataplane.tx_engine.submit_packet(1, frame, 0, id);
         if (id != 0) `uvm_fatal("DPU_FLOW", "private TX submission failed")
-        descriptor(controls[h], tx_ctx, id, addr, len);
-        if (!virtio_net_packet_adapter::pack(frame, raw) || len != raw.size())
+        #1us;
+        logs[h].select(VDEV_DESC_CHAIN, ev);
+        if ((ev.size() != 1) || (ev[0].q != tx_prog.local_qid) || (ev[0].seg_len.size() != 1) ||
+            (ev[0].seg_len[0] != raw.size()))
             `uvm_fatal("DPU_FLOW", "TX descriptor contains a header or wrong length")
-        controls[h].read_dma(tx_ctx, addr, len, data);
-        foreach (raw[i]) if (data[i] != raw[i])
+        logs[h].select(VDEV_PKT, ev);
+        if ((ev.size() == 0) || (ev[0].dir != "tx") || !same_bytes(ev[0].bytes, raw))
             `uvm_fatal("DPU_FLOW", "TX DMA bytes differ from raw Ethernet frame")
-        if (controls[h].notifications[1] != (32'h8001_0000 | tx_ctx.local_qid))
+        logs[h].select(VDEV_NOTIFY, ev);
+        tx_notifies = 0;
+        foreach (ev[i])
+            if (ev[i].q == tx_prog.local_qid) begin
+                tx_notifies++;
+                tx_word = {ev[i].wrap, ev[i].next_idx[14:0], 16'(ev[i].q)};
+            end
+        if ((tx_notifies != 1) || (tx_word != (32'h8001_0000 | tx_prog.local_qid)))
             `uvm_fatal("DPU_FLOW", "TX notification did not carry tail/wrap/local_qid")
-        before_count = controls[h].iommu.total_unmaps;
-        cq_tx = '{8'h01, 8'h80};
-        controls[h].write_dma(tx_ctx, tx_ctx.cq_iova, cq_tx);
+        before_count = ports[h].iommu.total_unmaps;
         if (h == 0) private_ops[h].tx_complete(1, completed, budget);
         else private_functions[h].dataplane.tx_engine.complete_tx(1, 8, completed);
         if (completed.size() != 1 || completed[0] != frame ||
-            controls[h].iommu.total_unmaps != before_count+1)
+            ports[h].iommu.total_unmaps != before_count+1)
             `uvm_fatal("DPU_FLOW", "TX completion ownership did not retire exactly once")
 
+        logs[h].events.delete();
         if (h == 0) private_ops[h].rx_refill(0, 2);
         else begin
             if (private_functions[h].dataplane.rx_engine.get_rx_buf_size() != 2048)
                 `uvm_fatal("DPU_FLOW", "private engine buffer query includes a header")
             private_functions[h].dataplane.rx_engine.refill_buffers(0, 2);
         end
-        descriptor(controls[h], rx_ctx, 0, addr, len);
-        if (len != 2048) `uvm_fatal("DPU_FLOW", "RX buffer size not taken from config")
-        controls[h].write_dma(rx_ctx, addr, data);
-        cq_rx = '{default:0};
-        cq_rx[3] = 8'h10; // desc_num=1，head_idx=0。
-        cq_rx[6] = raw.size() & 8'hff;
-        cq_rx[7] = 8'h80 | ((raw.size() >> 8) & 8'h3f);
-        controls[h].write_dma(rx_ctx, rx_ctx.cq_iova, cq_rx);
+        #1us;
+        logs[h].select(VDEV_DESC_CHAIN, ev);
+        if ((ev.size() != 1) || (ev[0].q != rx_prog.local_qid) || (ev[0].seg_len[0] != 2048))
+            `uvm_fatal("DPU_FLOW", "RX buffer size not taken from config")
         if (h == 0) private_ops[h].rx_receive(0, received, budget);
         else private_functions[h].dataplane.rx_engine.receive_packets(0, 8, received);
         if (received.size() != 1 || !virtio_net_packet_adapter::compare(frame, received[0]))
             `uvm_fatal("DPU_FLOW", "RX did not return the exact Ethernet frame")
     endtask
 
-    // 注入停队/复位失败，确认 Host/DMA 资源原封保留，再恢复后重试释放。
-    // 随后跑公共 FSM 后台补 RX，再从 Function.shutdown 停机；检查失败保护和成功后
-    // 必须重新初始化的状态，确保既不会进入标准寄存器路径，也不留下可误启动的 FSM。
+    // 设备旋钮 stall_queue_stop 让停队/复位永不完成（DMA 不停）：确认 Host/DMA 资源原封保留，再恢复后
+    // 重试释放。随后跑公共 FSM 后台补 RX，再从 Function.shutdown 停机；检查失败保护和成功后必须重新初始化
+    // 的状态，确保不会进入标准寄存器路径，也不留下可误启动的 FSM。
     task check_lifecycle(int unsigned h);
         dpu_priv_expected_error catcher;
         virtio_queue_program_t prog;
@@ -269,24 +236,22 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
         bit ok;
         catcher = new();
         uvm_report_cb::add(null, catcher);
-        maps_before = controls[h].iommu.total_unmaps;
-        controls[h].fail_disable = 1;
+        maps_before = ports[h].iommu.total_unmaps;
+        devices[h].stall_queue_stop = 1;
         catcher.expected = "teardown_queue: config backend did not confirm queue_id=0 stopped; retaining queue DMA";
         private_ops[h].teardown_queue(0);
-        if (catcher.matched != 1 || controls[h].iommu.total_unmaps != maps_before ||
+        if (catcher.matched != 1 || ports[h].iommu.total_unmaps != maps_before ||
             !private_ops[h].get_queue_program(0, prog))
             `uvm_fatal("DPU_FLOW", "failed stop released live DMA")
-        controls[h].fail_disable = 0;
-        controls[h].fail_reset = 1;
         catcher.expected = "device_reset: transport reset did not complete; retaining PF DMA";
         private_ops[h].device_reset_verified(ok);
-        if (ok || catcher.matched != 2 || controls[h].iommu.total_unmaps != maps_before)
+        if (ok || catcher.matched != 2 || ports[h].iommu.total_unmaps != maps_before)
             `uvm_fatal("DPU_FLOW", "failed reset released live DMA")
-        controls[h].fail_reset = 0;
+        devices[h].stall_queue_stop = 0;
         private_ops[h].teardown_queue(0);
         if (private_ops[h].get_queue_program(0, prog) ||
             private_functions[h].vq_mgr.has_queue(0) ||
-            controls[h].configured.exists(0) || controls[h].iommu.total_unmaps <= maps_before)
+            devices[h].queue_enabled(0, 4*h) || ports[h].iommu.total_unmaps <= maps_before)
             `uvm_fatal("DPU_FLOW", "successful stop did not retire RX queue ownership")
         private_ops[h].device_reset_verified(ok);
         if (!ok || private_functions[h].vq_mgr.get_queue_count() != 0)
@@ -294,21 +259,21 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
         private_functions[h].driver_agent.fsm.full_init();
         private_functions[h].driver_agent.fsm.start_dataplane();
         #100ns;
-        maps_before = controls[h].iommu.total_unmaps;
-        controls[h].fail_reset = 1;
+        maps_before = ports[h].iommu.total_unmaps;
+        devices[h].stall_queue_stop = 1;
         catcher.expected = "device_reset: transport reset did not complete; retaining PF DMA";
         private_functions[h].shutdown();
-        if (catcher.matched != 3 || controls[h].iommu.total_unmaps != maps_before ||
+        if (catcher.matched != 3 || ports[h].iommu.total_unmaps != maps_before ||
             private_functions[h].state != VF_RESET_FAILED ||
             private_functions[h].driver_agent.fsm.state != FSM_ERROR ||
             !private_ops[h].get_queue_program(0, prog))
             `uvm_fatal("DPU_FLOW", "failed Function shutdown lost resources or failure state")
-        controls[h].fail_reset = 0;
+        devices[h].stall_queue_stop = 0;
         private_functions[h].shutdown();
         if (private_functions[h].state != VF_DISABLED ||
             private_functions[h].driver_agent.fsm.state != FSM_REINIT_REQUIRED ||
             private_functions[h].vq_mgr.get_queue_count() != 0 ||
-            controls[h].iommu.total_maps != controls[h].iommu.total_unmaps)
+            ports[h].iommu.total_maps != ports[h].iommu.total_unmaps)
             `uvm_fatal("DPU_FLOW", "successful shutdown leaked DMA or left a restartable FSM")
         uvm_report_cb::delete(null, catcher);
     endtask
@@ -318,7 +283,7 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
         phase.raise_objection(this);
         fork : bounded_flow
             begin
-                if (controls[0].mem == controls[1].mem)
+                if (ports[0].mem == ports[1].mem)
                     `uvm_fatal("DPU_FLOW", "Hosts share the same memory manager")
                 for (int unsigned h = 0; h < 2; h++) begin
                     private_functions[h].driver_agent.fsm.full_init();

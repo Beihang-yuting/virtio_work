@@ -255,25 +255,6 @@ class virtio_unit_recording_backend extends virtio_config_backend;
     endtask
 endclass : virtio_unit_recording_backend
 
-// 私有控制后端桩：所有操作立即成功，只用于驱动协议的配置冻结检查，不产生 DMA。
-class virtio_unit_priv_control_stub extends dpu_priv_device_control;
-    `uvm_object_utils(virtio_unit_priv_control_stub)
-
-    function new(string name = "virtio_unit_priv_control_stub");
-        super.new(name);
-    endfunction
-
-    virtual task reset_device(int unsigned host_id, bit [15:0] bdf, output bit ok);
-        ok = 1;
-    endtask
-    virtual task configure_queue(dpu_priv_queue_context_t ctx, output bit ok);
-        ok = 1;
-    endtask
-    virtual task disable_queue(dpu_priv_queue_context_t ctx, output bit ok);
-        ok = 1;
-    endtask
-endclass : virtio_unit_priv_control_stub
-
 // 按 ID 与完整消息匹配一条预期 UVM_ERROR；其他报告照常抛出。
 class virtio_unit_exact_error_catcher extends uvm_report_catcher;
     string expected_id;
@@ -1695,8 +1676,6 @@ class virtio_unit_test extends uvm_test;
             `uvm_error("TEST", "standard driver protocol did not select standard ops/FSM")
 
         private_cfg = dpu_priv_driver_config::type_id::create("unit_private_cfg");
-        private_cfg.control = virtio_unit_priv_control_stub::type_id::create(
-            "unit_private_control");
         private_protocol = dpu_priv_driver_protocol::type_id::create(
             "unit_private_protocol");
         private_protocol.private_cfg = private_cfg;
@@ -1717,8 +1696,7 @@ class virtio_unit_test extends uvm_test;
 
         if (!private_protocol.bind_ops(ops, priv_backend, behavior, why) ||
             (ops.config_backend != priv_backend) ||
-            (ops.protocol != private_protocol) ||
-            (priv_backend.control != private_cfg.control))
+            (ops.protocol != private_protocol))
             `uvm_error("TEST", {"private protocol did not bind its backend: ", why})
         `uvm_info("UNIT_TEST", "test_driver_protocol_selection PASSED", UVM_LOW)
     endtask

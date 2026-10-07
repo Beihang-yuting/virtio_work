@@ -479,25 +479,6 @@ class virtio_dut_caps_malicious_reconfig extends virtio_dynamic_reconfig;
     endtask
 endclass
 
-// 私有控制桩：只为满足 private_cfg.validate 的非空要求，不会被调用到设备操作。
-class virtio_dut_caps_priv_control_stub extends dpu_priv_device_control;
-    `uvm_object_utils(virtio_dut_caps_priv_control_stub)
-
-    function new(string name = "virtio_dut_caps_priv_control_stub");
-        super.new(name);
-    endfunction
-
-    virtual task reset_device(int unsigned host_id, bit [15:0] bdf, output bit ok);
-        ok = 1;
-    endtask
-    virtual task configure_queue(dpu_priv_queue_context_t ctx, output bit ok);
-        ok = 1;
-    endtask
-    virtual task disable_queue(dpu_priv_queue_context_t ctx, output bit ok);
-        ok = 1;
-    endtask
-endclass
-
 // 带一条已编程队列的 ops：预检通过，但提交时私有协议 bind_ops 拒绝重新冻结配置，
 // 用于制造 commit_bind_pcie 的提交半段失败。
 class virtio_dut_caps_busy_ops extends virtio_atomic_ops;
@@ -2271,8 +2252,6 @@ class virtio_dut_caps_test extends uvm_test;
 
         private_cfg = dpu_priv_driver_config::type_id::create(
             "commit_failure_private_cfg");
-        private_cfg.control = virtio_dut_caps_priv_control_stub::type_id::create(
-            "commit_failure_private_control");
         busy_ops = virtio_dut_caps_busy_ops::type_id::create(
             "commit_failure_busy_ops");
         busy_ops.mark_queue_active();

@@ -727,6 +727,17 @@ class virtio_pci_transport extends uvm_object;
             `uvm_fatal("TRANSPORT", {"BAR/capability discovery failed: ", why})
     endtask
 
+    // 驱动 probe 的 pci_enable_device + pci_set_master：Command 寄存器读改写置 Memory Space
+    // 与 Bus Master（bit1/bit2），其余位保持。平台只放置 BAR，不打开设备的 MMIO 应答与
+    // DMA/MSI-X 发起；不置位时设备不认领 BAR 访问、不发 DMA 与 MSI-X。标准发现策略与私有后端共用。
+    task enable_memory_and_bus_master();
+        bit [31:0] command;
+
+        command = '0;
+        bar.config_read(PCI_CFG_COMMAND, command);
+        bar.config_write(PCI_CFG_COMMAND, {16'h0, command[15:0] | 16'h0006}, 4'h3);
+    endtask
+
 endclass : virtio_pci_transport
 
 `endif // VIRTIO_PCI_TRANSPORT_SV

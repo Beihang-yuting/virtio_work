@@ -92,17 +92,6 @@ class virtio_fabric_preconfigured_discovery extends virtio_discovery_strategy;
         return 1;
     endfunction
 
-    // 驱动 probe 的 pci_enable_device + pci_set_master：Command 寄存器读改写置 Memory Space
-    // 与 Bus Master（bit1/bit2），其余位保持。Fabric 只放置 BAR，不打开设备的 MMIO 应答与
-    // DMA/MSI-X 发起；不置位时设备不认领 BAR 访问、不发 DMA 与 MSI-X。
-    protected task enable_memory_and_bus_master(virtio_pci_transport transport);
-        bit [31:0] command;
-
-        command = '0;
-        transport.bar.config_read(PCI_CFG_COMMAND, command);
-        transport.bar.config_write(PCI_CFG_COMMAND, {16'h0, command[15:0] | 16'h0006}, 4'h3);
-    endtask
-
     // 只对 Fabric 托管 function 生效：编程三对 BAR、打开 MSE/BME、扫描 capability、核对 BAR 角色窗口，
     // 最后由 resource client 标记 device-ready。配置错误直接 fatal（与原 transport 行为一致）。
     virtual task discover(virtio_pci_transport transport, output bit ok,
@@ -128,7 +117,7 @@ class virtio_fabric_preconfigured_discovery extends virtio_discovery_strategy;
         transport.cap_mgr.bar_ref = transport.bar;
         transport.notify_mgr.bar = transport.bar;
         transport.bar.program_fabric_bar_pairs();
-        enable_memory_and_bus_master(transport);
+        transport.enable_memory_and_bus_master();
         transport.cap_mgr.discover_capabilities();
         if (!capabilities_use_fabric_windows(transport, check_why)) begin
             `uvm_fatal("TRANSPORT", $sformatf(

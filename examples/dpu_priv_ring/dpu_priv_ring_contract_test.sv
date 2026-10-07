@@ -1,8 +1,9 @@
 // 目录层次：examples/dpu_priv_ring；由 filelists/tests.f 编入维护回归的 DPU 私有环合同测试。
 // 依赖预编译 host_mem_pkg、virtio_net_pkg 中的生产私有队列 `custom_virtqueue`；字节黄金值来自 53 主机
 // icpu-kernel-driver/txrx.h 在同平台 GCC 9.4 编译的 C 位字段探针。
-// 测试拥有 Host memory、queue manager、回调与模拟设备 CQ 写入；所有环在结束时
-// 释放。本文件不访问真实 DUT/MMIO，只验证驱动可见的描述符、通知值与回收语义。
+// 测试拥有 Host memory、queue manager 与模拟 CQ 写入；所有环在结束时释放。前五个子测试只验证驱动
+// 可见的描述符、通知值与回收语义；最后一个经回环端口驱动独立设备 vdev_dpu_priv，验证设备写出的
+// CQ 字节与同一组 C 黄金值一致并被生产 poll_used 认领。
 `ifndef DPU_PRIV_RING_CONTRACT_TEST_SV
 `define DPU_PRIV_RING_CONTRACT_TEST_SV
 
@@ -33,6 +34,8 @@ class dpu_priv_ring_contract_test extends uvm_test;
     virtqueue_error_injector err_inj;
     virtio_wait_policy wait_pol;
     virtqueue_manager manager;
+    vdev_dpu_priv device;
+    vdev_loopback_port dev_port;
 
     // 构造测试组件；资源直到 build_phase 才分配，仿真结束由 UVM 管理组件生命期。
     function new(string name = "dpu_priv_ring_contract_test",
@@ -65,6 +68,11 @@ class dpu_priv_ring_contract_test extends uvm_test;
         manager.wait_pol = wait_pol;
         manager.host_id = 0;
         manager.bdf = 16'h0100;
+        device = vdev_dpu_priv::type_id::create("dpu_priv_vdev", this);
+        dev_port = vdev_loopback_port::type_id::create("dpu_priv_vdev_port");
+        dev_port.mem = mem;
+        dev_port.iommu = iommu;
+        dev_port.host_id = 0;
     endfunction
 
     // 从生产队列工厂创建 VQ_CUSTOM，在 alloc_rings 前写入方向与本地队列号。
@@ -381,7 +389,99 @@ class dpu_priv_ring_contract_test extends uvm_test;
         manager.destroy_queue(5);
     endtask
 
-    // 依序执行位布局、通知、回收、默认几何及 wrap 检查；全部成功后归还
+    protected function void dev_wr(bit [31:0] off, bit [31:0] data);
+        dev_port.host_write(64'h0000_0044_0000_0000 + off, 4, data);
+    endfunction
+
+    // 设备往返：生产 custom_virtqueue 发布 TX/RX，vdev_dpu_priv 按 qid map 与 VTX/VRX 参数表（驱动
+    // #1/#21/#24/#25/#28 的最小子集，q_depth=3、queue_en=1）读描述符、写 CQ；TX CQ 必须等于黄金 01 80，
+    // RX CQ 按驱动布局解码出单 buffer、原长度，且两边都被 poll_used 认领。
+    protected task test_device_round_trip();
+        custom_virtqueue tx;
+        custom_virtqueue rx;
+        bit [63:0] tx_iova, rx_iova, f_gpa, f_iova, b_gpa, b_iova;
+        virtio_sg_list sgs[];
+        virtio_sg_entry entry;
+        byte frame[];
+        uvm_object tok;
+        int unsigned len, desc_num, pkt_len, head_idx;
+        bit wrap;
+        dpu_priv_test_token t_tx, t_rx;
+        byte cq_done[2] = '{8'h01, 8'h80};
+
+        device.bdf = 16'h0100;
+        device.init();
+        dev_port.attach(device);
+        dev_port.host_cfg_write(16'h0100, 12'h010, 32'h0000_0000);
+        dev_port.host_cfg_write(16'h0100, 12'h014, 32'h0000_0044);
+        dev_port.host_cfg_write(16'h0100, 12'h004, 32'h0000_0006, 4'h3);   // MSE + BME
+        make_queue(11, 8, 1, 1, tx);
+        make_queue(10, 8, 0, 0, rx);
+        tx_iova = iommu.map_for_host(0, 16'h0100, tx.desc_table_addr, tx.ring_alloc_bytes, DMA_BIDIRECTIONAL);
+        rx_iova = iommu.map_for_host(0, 16'h0100, rx.desc_table_addr, rx.ring_alloc_bytes, DMA_BIDIRECTIONAL);
+        dev_wr(32'h2_8000, 32'h0000_0001);
+        dev_wr(32'h2_8004, 32'h0000_0044);
+        dev_wr(32'h2_8008, 32'h0);
+        dev_wr(32'h2_0044, 32'h1);
+        dev_wr(32'h88_0134, tx_iova[31:0]);
+        dev_wr(32'h88_0138, tx_iova[63:32]);
+        dev_wr(32'h88_013c, 32'h93);
+        dev_wr(32'h88_0140, 32'h0);
+        dev_wr(32'h88_0130, 32'h0);
+        dev_wr(32'h88_0130, 32'h2000);
+        dev_wr(32'h90_0204, rx_iova[31:0]);
+        dev_wr(32'h90_0208, rx_iova[63:32]);
+        dev_wr(32'h90_020c, 32'h13);
+        dev_wr(32'h90_0200, 32'h0);
+        dev_wr(32'h90_0200, 32'h1_0000);
+        b_gpa = mem.alloc(2048, 64);
+        b_iova = iommu.map_for_host(0, 16'h0100, b_gpa, 2048, DMA_FROM_DEVICE);
+        entry.addr = b_iova;
+        entry.len = 2048;
+        entry.is_indirect = 0;
+        sgs = new[1];
+        sgs[0].entries.push_back(entry);
+        t_rx = dpu_priv_test_token::type_id::create("round_trip_rx");
+        void'(rx.add_buf(sgs, 0, 1, t_rx, 0));
+        rx.kick();
+        dev_wr(32'h0, rx.last_notify_word);
+        frame = new[60];
+        foreach (frame[i])
+            frame[i] = 8'h30 + i;
+        f_gpa = mem.alloc(64, 64);
+        mem.write_mem(f_gpa, frame);
+        f_iova = iommu.map_for_host(0, 16'h0100, f_gpa, 60, DMA_TO_DEVICE);
+        entry.addr = f_iova;
+        entry.len = 60;
+        sgs[0].entries.delete();
+        sgs[0].entries.push_back(entry);
+        t_tx = dpu_priv_test_token::type_id::create("round_trip_tx");
+        void'(tx.add_buf(sgs, 1, 0, t_tx, 0));
+        tx.kick();
+        dev_wr(32'h0, tx.last_notify_word);
+        #1us;
+        expect_bytes(tx.cq_addr, cq_done, "device-written TX CQ");
+        tok = null;
+        len = 0;
+        if (!tx.poll_used(tok, len) || (tok != t_tx) || (len != 60))
+            `uvm_fatal("DPU_PRIV", "device TX CQ was not reclaimed by the production queue")
+        if (!rx.decode_rx_cq(0, desc_num, pkt_len, wrap, head_idx) || (desc_num != 1) ||
+            (pkt_len != 60) || !wrap || (head_idx != 0))
+            `uvm_fatal("DPU_PRIV", "device RX CQ does not follow the driver layout")
+        tok = null;
+        if (!rx.poll_used(tok, len) || (tok != t_rx) || (len != 60))
+            `uvm_fatal("DPU_PRIV", "device RX CQ was not reclaimed by the production queue")
+        iommu.unmap_for_host(0, 16'h0100, f_iova);
+        iommu.unmap_for_host(0, 16'h0100, b_iova);
+        iommu.unmap_for_host(0, 16'h0100, tx_iova);
+        iommu.unmap_for_host(0, 16'h0100, rx_iova);
+        mem.free(f_gpa);
+        mem.free(b_gpa);
+        manager.destroy_queue(11);
+        manager.destroy_queue(10);
+    endtask
+
+    // 依序执行位布局、通知、回收、默认几何及 wrap 检查与设备往返；全部成功后归还
     // 环分配并运行 Host memory/IOMMU 泄漏检查，失败由各 task 抛 UVM_FATAL。
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
@@ -390,6 +490,7 @@ class dpu_priv_ring_contract_test extends uvm_test;
         test_rx_layout_and_completion();
         test_default_geometry();
         test_tx_wrap();
+        test_device_round_trip();
         manager.destroy_all();
         mem.leak_check();
         iommu.leak_check();
