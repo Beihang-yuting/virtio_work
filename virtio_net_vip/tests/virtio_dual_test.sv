@@ -129,6 +129,17 @@ class virtio_dual_test extends uvm_test;
         flow.vio_pf_count = 2;
         // 500ms: accommodate bandwidth test time advances
         flow.pcie_cpl_timeout_ns = 500_000_000;
+        // Offered device features of the pre-migration endpoint image
+        flow.device_features = 0;
+        flow.device_features[VIRTIO_NET_F_MAC]       = 1;
+        flow.device_features[VIRTIO_NET_F_STATUS]    = 1;
+        flow.device_features[VIRTIO_NET_F_MRG_RXBUF] = 1;
+        flow.device_features[VIRTIO_NET_F_CTRL_VQ]   = 1;
+        flow.device_features[VIRTIO_NET_F_MQ]        = 1;
+        flow.device_features[VIRTIO_F_VERSION_1]     = 1;
+        flow.device_features[VIRTIO_NET_F_MTU]       = 1;
+        flow.device_features[VIRTIO_NET_F_CSUM]      = 1;
+        flow.device_features[VIRTIO_NET_F_HOST_TSO4] = 1;
 
         // 5. Create VIP A data-plane components
         mem_a       = host_mem_manager::type_id::create("mem_a");
@@ -224,6 +235,8 @@ class virtio_dual_test extends uvm_test;
         virtio_net_env           env;
         virtio_function_instance function_a;
         virtio_function_instance function_b;
+        dpu_function_key_t       b_key;
+        dpu_pcie_function_id_t   b_pcie_id;
         string                   why;
 
         if (!flow.build_flow(why))
@@ -234,15 +247,16 @@ class virtio_dual_test extends uvm_test;
             `uvm_fatal("DUAL_TEST", "fixture did not expose its completion adapter")
         env = flow.virtio_env();
         function_a = flow.function_by_bdf(flow.function_bdf());
-        function_b = null;
-        foreach (env.function_instances[index]) begin
-            if ((env.function_instances[index] != null) &&
-                (env.function_instances[index] != function_a)) begin
-                function_b = env.function_instances[index];
-                break;
-            end
-        end
-        if ((function_a == null) || (function_b == null) ||
+        // VIP B is host0 PF1 of the frozen snapshot
+        b_key = '{host_id: 0, pf_id: 1, kind: DPU_FUNCTION_PF, vf_id: 0};
+        if (!flow.device_snapshot().get_pcie_id(b_key, b_pcie_id, why))
+            `uvm_fatal("DUAL_TEST", {"snapshot has no host0 PF1: ", why})
+        function_b = flow.function_by_bdf(b_pcie_id.bdf);
+        if (env.function_instances.size() != 2)
+            `uvm_fatal("DUAL_TEST", $sformatf(
+                "expected exactly 2 snapshot VIO functions, found %0d",
+                env.function_instances.size()))
+        if ((function_a == null) || (function_b == null) || (function_a == function_b) ||
             (function_a.transport == null) || (function_b.transport == null) ||
             (function_a.transport.wait_pol == null) ||
             (function_b.transport.wait_pol == null))
@@ -288,6 +302,15 @@ class virtio_dual_test extends uvm_test;
 
         #100ns;
         tlm_adapter.drain();
+
+        // VIP B's init must not have touched VIP A's endpoint image
+        begin
+            bit [7:0] a_status;
+            transport_a.read_device_status(a_status);
+            if (a_status != 8'h0f)
+                `uvm_error("DUAL_TEST", $sformatf(
+                    "VIP A: status changed to 0x%02h after VIP B init", a_status))
+        end
 
         // Initialize host memory regions (separate for A and B)
         mem_a.init_region(64'hA000_0000, 64'hAFFF_FFFF);  // 256MB for A
@@ -377,6 +400,10 @@ class virtio_dual_test extends uvm_test;
         driver_supported[VIRTIO_NET_F_CSUM]    = 1;
         transport.negotiate_features(driver_supported, negotiated);
         `uvm_info("DUAL_TEST", $sformatf("%s: Negotiated features: 0x%016h", label, negotiated), UVM_LOW)
+        if (negotiated != 64'h0000_0001_0001_8029)
+            `uvm_error("DUAL_TEST", $sformatf(
+                "%s: negotiated features 0x%016h != expected 0x0000000100018029",
+                label, negotiated))
 
         transport.write_device_status(
             DEV_STATUS_ACKNOWLEDGE | DEV_STATUS_DRIVER | DEV_STATUS_FEATURES_OK);

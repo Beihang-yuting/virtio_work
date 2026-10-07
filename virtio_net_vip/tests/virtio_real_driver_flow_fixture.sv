@@ -7,6 +7,48 @@ import dpu_resource_pkg::*;
 import pcie_tl_pkg::*;
 import virtio_net_pkg::*;
 
+// 中文说明：MODEL 端点驱动只增加 virtio common-config 的 DFSELECT 语义：
+// 驱动写 DFSELECT 后，同一 Function 的 DF 窗口改为对应的 32 位特性字
+// （0 -> 低 32 位，1 -> 高 32 位，其它 -> 0）。其余请求完全沿用基类。
+// 只有 fixture 登记过的 common-config 基址参与，其它 MemWr 不受影响。
+class virtio_feature_select_ep_driver extends pcie_tl_ep_driver;
+    `uvm_component_utils(virtio_feature_select_ep_driver)
+
+    // Keyed by the common-config base (= DFSELECT address) of each Function.
+    protected bit [63:0] m_features[bit [63:0]];
+
+    function new(string name = "virtio_feature_select_ep_driver",
+                 uvm_component parent = null);
+        super.new(name, parent);
+    endfunction
+
+    // Register one Function's offered features and present the low word.
+    function void add_feature_window(bit [63:0] common_base, bit [63:0] features);
+        m_features[common_base] = features;
+        serve_feature_word(common_base);
+    endfunction
+
+    virtual task handle_request(pcie_tl_tlp req);
+        pcie_tl_mem_tlp mem_req;
+        super.handle_request(req);
+        if ((req.kind == TLP_MEM_WR) && $cast(mem_req, req) &&
+            m_features.exists(mem_req.addr))
+            serve_feature_word(mem_req.addr);
+    endtask
+
+    protected function void serve_feature_word(bit [63:0] common_base);
+        bit [31:0] select;
+        bit [31:0] word;
+        for (int i = 0; i < 4; i++)
+            select[i*8 +: 8] = mem_space.exists(common_base + i) ?
+                               mem_space[common_base + i] : 8'h00;
+        word = (select == 0) ? m_features[common_base][31:0] :
+               (select == 1) ? m_features[common_base][63:32] : 32'h0;
+        for (int i = 0; i < 4; i++)
+            mem_space[common_base + VIRTIO_PCI_COMMON_DF + i] = word[i*8 +: 8];
+    endfunction
+endclass
+
 // Shared construction for tests which claim the real virtio-pci flow.  The
 // fixture deliberately has no BAR or BDF constants: those values are read
 // from the frozen dpu-common snapshot after the DPU environment resolves it.
@@ -34,6 +76,10 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     // PCIe completion 超时（ns）。默认值与原 fixture 相同；会长时间推进仿真
     // 时间的测试可在 build_phase 之前放宽。
     int                         pcie_cpl_timeout_ns;
+    // MODEL 端点镜像为每个 VIO PF 提供的 64 位 device features（按 DFSELECT
+    // 分低/高 32 位返回）。缺省值保持原镜像行为（两个半字都是 0x1）；需要
+    // 其它特性集合的测试在 build_phase 之前设置。
+    bit [63:0]                  device_features;
 
     // 真实 DUT 模式的物理 PCIe 传输接口。该句柄由真实 DUT 顶层通过
     // config_db 发布，fixture 只负责把它显式交给外部 pcie_work adapter；
@@ -105,6 +151,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         real_dut_host_mem_responder_enable = 0;
         vio_pf_count = 1;
         pcie_cpl_timeout_ns = 100000;
+        device_features = 64'h0000_0001_0000_0001;
     endfunction
 
     virtual function void build_phase(uvm_phase phase);
@@ -224,6 +271,8 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             tlm_adapter = virtio_tlm_completion_adapter::type_id::create(
                 "tlm_adapter");
             tlm_adapter.install_factory_overrides();
+            pcie_tl_ep_driver::type_id::set_inst_override(
+                virtio_feature_select_ep_driver::get_type(), "pcie_env.*", this);
         end else begin
             tlm_adapter = null;
             if (m_profile.supports_host_mem_responder())
@@ -1190,6 +1239,8 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         register_virtio_caps(cfg_mgr, common_bar, notify_bar, msix_bar);
         write_common_defaults(ep_drv, common_bar.base,
                               virtio_cfg.default_num_pairs * 2);
+        if (!add_feature_window(ep_drv, common_bar.base, why))
+            return 0;
         ep_drv.mem_space[common_bar.base + ISR_OFFSET] = 8'h00;
         // Additional VIO PFs share this EP model's single configuration
         // space; each function's Fabric discovery reprograms the BAR
@@ -1216,6 +1267,8 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             end
             write_common_defaults(ep_drv, peer_common_bar.base,
                                   virtio_cfg.default_num_pairs * 2);
+            if (!add_feature_window(ep_drv, peer_common_bar.base, why))
+                return 0;
             ep_drv.mem_space[peer_common_bar.base + ISR_OFFSET] = 8'h00;
         end
         return 1;
@@ -1301,12 +1354,26 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         cfg_mgr.register_capability(msix);
     endfunction
 
+    protected function bit add_feature_window(
+        input pcie_tl_ep_driver ep_drv,
+        input bit [63:0] base,
+        output string why
+    );
+        virtio_feature_select_ep_driver feature_drv;
+        why = "";
+        if (!$cast(feature_drv, ep_drv)) begin
+            why = "PCIe endpoint driver does not model virtio DFSELECT";
+            return 0;
+        end
+        feature_drv.add_feature_window(base + COMMON_OFFSET, device_features);
+        return 1;
+    endfunction
+
     protected function void write_common_defaults(
         input pcie_tl_ep_driver ep_drv,
         input bit [63:0] base,
         input int unsigned total_queues
     );
-        write_ep32(ep_drv, base + COMMON_OFFSET + 32'h04, 32'h0000_0001);
         write_ep16(ep_drv, base + COMMON_OFFSET + 32'h10, 16'hffff);
         write_ep16(ep_drv, base + COMMON_OFFSET + 32'h12,
                    total_queues[15:0]);

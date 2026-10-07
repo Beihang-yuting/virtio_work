@@ -46,6 +46,17 @@ class virtio_full_integration_test extends uvm_test;
     virtual function void build_phase(uvm_phase phase);
         super.build_phase(phase);
         flow = virtio_real_driver_flow_fixture::type_id::create("flow", this);
+        // Offered device features of the pre-migration endpoint image
+        flow.device_features = 0;
+        flow.device_features[VIRTIO_NET_F_MAC]       = 1;
+        flow.device_features[VIRTIO_NET_F_STATUS]    = 1;
+        flow.device_features[VIRTIO_NET_F_MRG_RXBUF] = 1;
+        flow.device_features[VIRTIO_NET_F_CTRL_VQ]   = 1;
+        flow.device_features[VIRTIO_NET_F_MQ]        = 1;
+        flow.device_features[VIRTIO_F_VERSION_1]     = 1;
+        flow.device_features[VIRTIO_NET_F_MTU]       = 1;
+        flow.device_features[VIRTIO_NET_F_CSUM]      = 1;
+        flow.device_features[VIRTIO_NET_F_HOST_TSO4] = 1;
     endfunction
 
     // ========================================================================
@@ -186,6 +197,13 @@ class virtio_full_integration_test extends uvm_test;
             driver_supported[VIRTIO_NET_F_CSUM] = 1;
             transport.negotiate_features(driver_supported, negotiated);
             `uvm_info("FULL_TEST", $sformatf("Negotiated features: 0x%016h", negotiated), UVM_LOW)
+            if (negotiated != 64'h0000_0001_0001_8029) begin
+                `uvm_error("FULL_TEST", $sformatf(
+                    "Negotiated features 0x%016h != expected 0x0000000100018029",
+                    negotiated))
+                tests_failed++;
+                return;
+            end
         end
 
         // Features OK
