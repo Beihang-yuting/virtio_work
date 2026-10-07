@@ -2083,11 +2083,11 @@ class virtio_dut_caps_test extends uvm_test;
         if (standalone_fsm_probe.observed_max_supported_qpairs() != 32)
             `uvm_fatal("DUT_CAPS",
                 "standalone FSM did not retain the compatibility limit 32")
-        if (!standalone_fsm_probe.bind_mq_pair_limit(0, why) ||
+        if (standalone_fsm_probe.bind_mq_pair_limit(0, why) ||
+            (why != "FSM MQ pair limit must be a nonzero per-function value") ||
             (standalone_fsm_probe.observed_max_supported_qpairs() != 32)) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
-                "legacy zero-valued qpair-limit bind was not compatible: %s",
-                why))
+                "zero-valued qpair-limit bind was not rejected: %s", why))
         end
 
         custom_cfg = virtio_net_env_config::type_id::create(
