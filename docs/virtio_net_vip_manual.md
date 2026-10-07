@@ -346,6 +346,7 @@ virtio_net_vip/
 |   |   +-- virtio_pci_transport.sv         -- PCI 传输封装 (完整初始化序列)
 |   +-- agent/
 |   |   +-- virtio_atomic_ops.sv            -- 原子操作库 (~30 个方法)
+|   |   +-- atomic_ops/*.svh                -- 原子操作类体分片 (类内 include)
 |   |   +-- virtio_auto_fsm.sv             -- 自动生命周期状态机 (12 状态)
 |   |   +-- virtio_migration_engine.sv     -- 热迁移校验和/采集/恢复步骤
 |   |   +-- virtio_driver_protocol.sv      -- 驱动协议 (标准 / DPU 私有环)

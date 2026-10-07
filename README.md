@@ -240,6 +240,7 @@ virtio_net_vip/
 │   │   └── virtio_pci_transport.sv         ← 传输层顶层封装（完整初始化序列）
 │   ├── agent/                              ← UVM 驱动代理
 │   │   ├── virtio_atomic_ops.sv            ← 原子操作库（约 30 个方法）
+│   │   ├── atomic_ops/                     ← 原子操作类体分片（lifecycle/queue/datapath/ctrl_admin/migration_ownership）
 │   │   ├── virtio_auto_fsm.sv             ← 自动状态机（12 状态 + 5 后台任务）
 │   │   ├── virtio_migration_engine.sv      ← 热迁移校验和/采集/恢复步骤
 │   │   ├── virtio_driver_protocol.sv       ← 驱动协议（标准 / DPU 私有环）分派
