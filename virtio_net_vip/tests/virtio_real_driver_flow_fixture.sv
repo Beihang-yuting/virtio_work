@@ -774,6 +774,11 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         end
 
         ops = function_instance.driver_agent.ops;
+        // 协议 SVA 接口在测试平台复位期间丢弃全部事件；驱动初始化必须在复位释放后开始，
+        // 否则 status 生命周期只有一部分被检查器看到。
+        if ((function_instance.driver_agent.monitor != null) &&
+            (function_instance.driver_agent.monitor.protocol_vif != null))
+            wait (function_instance.driver_agent.monitor.protocol_vif.rst_n === 1'b1);
         function_instance.transport.discover_and_init_bars();
         ops.device_reset_verified(step_ok);
         if (!step_ok) begin
