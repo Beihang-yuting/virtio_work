@@ -1274,6 +1274,17 @@ class virtio_vdev_unit_test extends uvm_test;
         if ((ev.size() != 2) || (ev[0].q != 0) || (ev[1].q != 1) || (ev[1].size != 8) ||
             (ev[1].vector != 0) || (ev[1].ring_fmt != "priv"))
             `uvm_fatal("VDEV_UNIT", "VRX/VTX enable did not emit queue_cfg for lqid 0 and 1")
+        // 驱动只用私有环（virtio_mode=0）；参数表写入 virtio_mode=1 时设备须告警
+        catcher = new("priv_virtio_mode_catcher");
+        catcher.id = "VDEV_DPU_PRIV";
+        catcher.text = "virtio_mode";
+        uvm_report_cb::add(null, catcher);
+        priv_wr(32'h88_013c, (32'h1 << 5) | 32'h3);
+        priv_wr(32'h88_0130, 32'h1);
+        priv_wr(32'h88_0130, 32'h2001);
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught != 1)
+            `uvm_fatal("VDEV_UNIT", "VTX parameter with virtio_mode=1 was accepted silently")
         // RX 补两个 2048B buffer，doorbell tail=2
         r0_iova = map_buffer(PRIV_BDF, 2048, DMA_FROM_DEVICE, r0_gpa);
         r1_iova = map_buffer(PRIV_BDF, 2048, DMA_FROM_DEVICE, r1_gpa);
@@ -1335,7 +1346,7 @@ class virtio_vdev_unit_test extends uvm_test;
         priv_wr(32'h88_0154, 32'h8001_0000);
         v = priv_rd(32'h88_0158);
         if (!v[0])
-            `uvm_fatal("VDEV_UNIT", "TX tail reset did not complete")
+            `uvm_fatal("VDEV_UNIT", "TX statistics clear did not complete")
         catcher = new("priv_doorbell_catcher");
         catcher.id = "VDEV_DPU_PRIV";
         catcher.text = "has no enabled TX queue";
@@ -1346,7 +1357,7 @@ class virtio_vdev_unit_test extends uvm_test;
             `uvm_fatal("VDEV_UNIT", "doorbell for a disabled TX queue was accepted")
         // stop：RX，先以旋钮制造“DMA 不停”，复位完成位必须保持 0
         priv.stall_queue_stop = 1;
-        for (int unsigned i = 0; i < 4; i++) begin
+        for (int unsigned i = 0; i < 3; i++) begin
             priv_wr(32'h90_0210, (i << 14));
             priv_wr(32'h90_0210, (i << 14) | 32'h1_0000);
             para[i] = priv_rd(32'h90_0214);

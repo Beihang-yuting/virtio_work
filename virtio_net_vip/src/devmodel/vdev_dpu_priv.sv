@@ -38,7 +38,7 @@
 // | 30 | open | up_complete | BAR0 | 0x4AA000+gfid*4 RMW | R/W | vport fwd | 存储 |
 // | 31 | TX | dpu_tx_map txrx.c:1492 | BAR0 | 0x0 | W | `wrap[31]\|tail[30:16]\|lqid[15:0]`，1 包=0x80010001 | TX doorbell |
 // | 32 | IRQ | dpu_enable_msix_irq interrupt.c:276 | BAR0 | 0x1004 | W | `gv<<1`（mask_en=0）解除自屏蔽 | 解除 gv 自屏蔽，挂起时补发一次 |
-// | 33 | stop | dpu_down：control_tx(en=0)、reset_tx txrx.c:382–524、control_rx(en=0) af_mng.c:1570–1589、reset_rx txrx.c:543–550、clear_msix_irq_conf interrupt.c:234 | BAR0 | TX：#28 置 en=0；轮询 0xB22000+q*4 [11:9]=0；0x880100 写 `q`、`q\|1<<31`；轮询 0x880104 bit0；0x880154 写 `q\|1<<16`、`\|1<<31`；轮询 0x880158 bit0。RX：0x900210 写 `i<<14\|q`、`\|0x10000` 后读 0x900214（i=0..3）；写回 en=0；0x900200 `q`、`0x10000\|q`；0x90010C 写 0；0x900108 `q`、`q\|1<<31`；轮询 0x90010C bit0；0x54000+gv*4 写 0 | 见左 | 停队/复位完成位；`stall_queue_stop` 旋钮使完成位永不置位、QSCH 报在途 |
+// | 33 | stop | dpu_down：control_tx(en=0)、reset_tx txrx.c:382–524、control_rx(en=0) af_mng.c:1570–1589、reset_rx txrx.c:543–550、clear_msix_irq_conf interrupt.c:234 | BAR0 | TX：#28 置 en=0；轮询 0xB22000+q*4 [11:9]=0；0x880100 写 `q`、`q\|1<<31`；轮询 0x880104 bit0；0x880154（stat_clr_cfg，清 TX 统计）写 `q\|1<<16`、`\|1<<31`；轮询 0x880158（stat_clr_done）bit0。RX：0x900210 写 `i<<14\|q`、`\|0x10000` 后读 0x900214（i=0..2，af_mng.c:1564 按 sizeof(vrx_queue_para_table_entry)/4 读 3 DW）；写回 en=0；0x900200 `q`、`0x10000\|q`；0x90010C 写 0；0x900108 `q`、`q\|1<<31`；轮询 0x90010C bit0；0x54000+gv*4 写 0 | 见左 | 停队/复位完成位；`stall_queue_stop` 旋钮使完成位永不置位、QSCH 报在途 |
 // | 34–38 | remove | qid map 失效重写 + 0x20044、QSCH 删除、mailbox 中断关闭、清 0x56000/0xC0000、BAR2 0x2C/0x1C 拆除、0x60040=0、0x20040=0 | BAR0/BAR2 | — | W | rmmod | 存储（0x20040 写 0 即解除声明） |
 //
 // **描述符/CQ/doorbell（与 C1 `custom_virtqueue` 一致）：** 16B 描述符 `addr[63:0]`；W1 `len[17:0]、dport_info[29:18]、
@@ -74,6 +74,11 @@
 // - M-7 RX 一帧跨多个描述符（desc_num≤15，`head_idx`=首描述符号）；驱动只用 pkt_len 与 cq_wrapper。
 // - M-8 PF/VF mailbox 路径未建模；qinfo 恒报 `pfvf_id=0`。
 // - M-9 全局资源分配：设备全新时驱动从 0 分配 gq/gfid/gv；VIP 后端取 gq=gv=队列对号（`local_qid>>1`）、gfid=0。
+// - M-10 doorbell 路由不比较 qid map DW1 的 host[31:29]：doorbell 写只带地址与 lqid，不带 host；单设备模型只有一个 host，
+//   notify 地址（=本 BAR0）已唯一确定 Function，驱动写入的 host 与 qinfo 报告值相同，比较它不增加区分度。
+// - M-11 全局屏蔽 0x48000+gv*16+0xC 未写时按 0（不屏蔽）处理：驱动只写 0（#27）、从不置 1 也不读，驱动与 reg plan 都未给出
+//   复位值；按 0 处理意味着漏写 #27 第二步不会被模型发现（若芯片复位值为 1，驱动的这一写是必需的）。
+// - M-12 VTX/VRX DW2 virtio_mode[5]=1（芯片 virtio 环模式）不建模：参数表照存并告警，数据面仍按私有环处理。
 `ifndef VDEV_DPU_PRIV_SV
 `define VDEV_DPU_PRIV_SV
 
@@ -96,8 +101,8 @@ class vdev_dpu_priv extends vdev_base;
     localparam bit [31:0] VTX_RESET_DONE   = 32'h088_0104;
     localparam bit [31:0] VTX_RAM_CFG      = 32'h088_0130;
     localparam bit [31:0] VTX_CONTENT      = 32'h088_0134;
-    localparam bit [31:0] VTX_TAIL_RESET   = 32'h088_0154;
-    localparam bit [31:0] VTX_TAIL_DONE    = 32'h088_0158;
+    localparam bit [31:0] VTX_STAT_CLR     = 32'h088_0154;   // vtx_stat_clr_cfg：{en[31], q_num[24:16], start_q[15:0]}
+    localparam bit [31:0] VTX_STAT_CLR_DONE = 32'h088_0158;
     localparam bit [31:0] VTX_PARA_RD      = 32'h089_0000;
     localparam bit [31:0] VRX_RESET        = 32'h090_0108;
     localparam bit [31:0] VRX_RESET_DONE   = 32'h090_010c;
@@ -137,7 +142,7 @@ class vdev_dpu_priv extends vdev_base;
     protected bit        gv_masked[int unsigned];
     protected bit        gv_pending[int unsigned];
     protected bit        vtx_reset_done;
-    protected bit        vtx_tail_done;
+    protected bit        vtx_stat_clr_done;
     protected bit        vrx_reset_done;
 
     function new(string name = "vdev_dpu_priv", uvm_component parent = null);
@@ -160,7 +165,7 @@ class vdev_dpu_priv extends vdev_base;
         qinfo[3] = {22'h0, host_id[2:0], 7'h0};
         vrx_rd_cfg = 0;
         vtx_reset_done = 0;
-        vtx_tail_done = 0;
+        vtx_stat_clr_done = 0;
         vrx_reset_done = 0;
         soft_reset();
     endfunction
@@ -250,8 +255,8 @@ class vdev_dpu_priv extends vdev_base;
             return 32'h8000_0000;
         if (off == VTX_RESET_DONE)
             return vtx_reset_done;
-        if (off == VTX_TAIL_DONE)
-            return vtx_tail_done;
+        if (off == VTX_STAT_CLR_DONE)
+            return vtx_stat_clr_done;
         if (off == VRX_RESET_DONE)
             return vrx_reset_done;
         if (off == VRX_RD_DATA)
@@ -299,14 +304,14 @@ class vdev_dpu_priv extends vdev_base;
         end else if (off == VRX_RD_CFG)
             vrx_rd_cfg = data;
         else if (off == VTX_RESET)
-            vtx_reset_done = data[31] ? stop_ring(1, data[10:0]) : 1'b0;
-        else if (off == VTX_TAIL_RESET)
-            vtx_tail_done = data[31] ? !stall_queue_stop : 1'b0;
+            vtx_reset_done = data[31] ? stop_ring(1, data[8:0]) : 1'b0;
+        else if (off == VTX_STAT_CLR)
+            vtx_stat_clr_done = data[31] ? !stall_queue_stop : 1'b0;
         else if (off == VRX_RESET_DONE)
             vrx_reset_done = 0;
         else if (off == VRX_RESET) begin
             if (data[31])
-                vrx_reset_done = stop_ring(0, data[10:0]);
+                vrx_reset_done = stop_ring(0, data[8:0]);
         end else if ((off >= VTX_CONTENT) && (off < VTX_CONTENT + 16))
             vtx_content[(off - VTX_CONTENT) / 4] = data;
         else if ((off >= VRX_CONTENT) && (off < VRX_CONTENT + 12))
@@ -327,6 +332,9 @@ class vdev_dpu_priv extends vdev_base;
         for (int unsigned i = 0; i < 3; i++)
             p.dw[i] = tx ? vtx_content[i] : vrx_content[i];
         p.dw[3] = tx ? vtx_content[3] : 32'h0;
+        if (p.dw[2][5])
+            `uvm_warning("VDEV_DPU_PRIV", $sformatf("BDF 0x%04h %s queue %0d sets virtio_mode=1; only the private ring is modelled",
+                         bdf, tx ? "VTX" : "VRX", gq))
         if (tx)
             vtx[gq] = p;
         else
@@ -687,8 +695,8 @@ class vdev_dpu_priv extends vdev_base;
             VTX_RESET:      return "vtx_reset";
             VTX_RESET_DONE: return "vtx_reset_done";
             VTX_RAM_CFG:    return "vtx_ram_cfg";
-            VTX_TAIL_RESET: return "vtx_tail_reset";
-            VTX_TAIL_DONE:  return "vtx_tail_reset_done";
+            VTX_STAT_CLR:      return "vtx_stat_clr_cfg";
+            VTX_STAT_CLR_DONE: return "vtx_stat_clr_done";
             VRX_RESET:      return "vrx_reset";
             VRX_RESET_DONE: return "vrx_reset_done";
             VRX_WR_CFG:     return "vrx_wr_cfg";
