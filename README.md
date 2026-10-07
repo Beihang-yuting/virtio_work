@@ -142,7 +142,7 @@ VIP 提供两种驱动模式，可在运行时切换：
 完成，MODEL 下由同一 transport API 经过 TLM 回环和 endpoint image 完成：
 
 ```
-BAR 配置/发现（Fabric: program frozen lease；legacy: enumerate）
+BAR 配置/发现（program frozen Fabric lease）
 → Capability 发现 → 设备复位（写 status=0，轮询确认）
 → 设置 ACKNOWLEDGE → 设置 DRIVER → Feature 协商（64 位读写）
 → 设置 FEATURES_OK（回读确认设备未拒绝）→ 队列配置
@@ -235,7 +235,7 @@ virtio_net_vip/
 │   │   ├── virtio_bar_accessor.sv          ← BAR 读写 → PCIe TLP 翻译
 │   │   ├── virtio_pci_cap_manager.sv       ← PCI Capability 链表发现
 │   │   ├── virtio_notification_manager.sv  ← MSI-X/INTx/轮询/自适应中断管理
-│   │   ├── virtio_discovery_strategy.sv    ← BAR/capability 发现策略（enumerate / fabric_preconfigured）
+│   │   ├── virtio_discovery_strategy.sv    ← BAR/capability 发现策略（fabric_preconfigured）
 │   │   ├── virtio_config_backend.sv        ← 设备配置后端接口 + common-config 实现
 │   │   └── virtio_pci_transport.sv         ← 传输层顶层封装（完整初始化序列）
 │   ├── agent/                              ← UVM 驱动代理

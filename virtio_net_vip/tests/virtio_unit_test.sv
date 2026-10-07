@@ -1193,15 +1193,15 @@ class virtio_unit_test extends uvm_test;
         `uvm_info("UNIT_TEST", "test_tlm_completion_factory_owner PASSED", UVM_LOW)
     endtask
 
-    // transport 的发现路径只由策略对象决定：默认 enumerate，Fabric 托管切换为
-    // fabric_preconfigured，外部可注入新策略（后续 verify_snapshot 的接入点）。
+    // transport 的发现路径只由策略对象决定：缺省即 fabric_preconfigured（非 Fabric
+    // 托管的 transport 发现时由该策略 fatal），外部可注入新策略（verify_snapshot）。
     task test_discovery_strategy_selection();
         virtio_pci_transport transport;
         virtio_unit_recording_discovery recorder;
         virtio_resource_client client;
 
         transport = virtio_pci_transport::type_id::create("discovery_transport");
-        if (transport.discovery_strategy_name() != "enumerate")
+        if (transport.discovery_strategy_name() != "fabric_preconfigured")
             `uvm_error("TEST", {"default discovery strategy is ",
                                 transport.discovery_strategy_name()})
         client = virtio_resource_client::type_id::create("discovery_client");

@@ -7,7 +7,6 @@
 // 目录层次：src/transport；BAR/capability 发现策略。transport 只持有当前策略并在
 // discover_and_init_bars() 中调用；策略借用 transport 的 bar/cap_mgr/notify_mgr，
 // 不拥有它们，也不保存跨调用状态。
-//   enumerate            : PCI BAR sizing + 本地地址分配，仅用于非 Fabric function。
 //   fabric_preconfigured : 按冻结 snapshot 的 BAR 租约写配置空间，只扫描 capability，
 //                          再经 resource client 进入 device-ready。
 // 后续 verify_snapshot 策略在 fabric_preconfigured 之前读硬件身份并与 snapshot 核对。
@@ -26,44 +25,6 @@ virtual class virtio_discovery_strategy extends uvm_object;
     // 调用方负责报告。实现可对不可恢复的配置错误直接 fatal。
     pure virtual task discover(virtio_pci_transport transport, output bit ok,
                                output string why);
-endclass
-
-// 传统 PCI 枚举：sizing 全部 BAR、按本地窗口分配地址，再扫描 virtio capability。
-class virtio_enumerate_discovery extends virtio_discovery_strategy;
-    `uvm_object_utils(virtio_enumerate_discovery)
-
-    // 无状态；构造不访问设备。
-    function new(string name = "virtio_enumerate_discovery");
-        super.new(name);
-    endfunction
-
-    virtual function string strategy_name();
-        return "enumerate";
-    endfunction
-
-    //   1. bar.enumerate_bars()
-    //   2. cap_mgr.bar_ref = bar
-    //   3. cap_mgr.discover_capabilities()
-    virtual task discover(virtio_pci_transport transport, output bit ok,
-                          output string why);
-        why = "";
-        `uvm_info("TRANSPORT", "Starting BAR discovery and capability enumeration", UVM_MEDIUM)
-
-        // Set BDF on bar accessor
-        transport.bar.requester_id = transport.bdf;
-
-        // Step 1: Enumerate BARs
-        transport.bar.enumerate_bars();
-
-        // Step 2: Wire bar reference into cap manager
-        transport.cap_mgr.bar_ref = transport.bar;
-
-        // Step 3: Discover virtio PCI capabilities
-        transport.cap_mgr.discover_capabilities();
-
-        `uvm_info("TRANSPORT", "BAR discovery and capability enumeration complete", UVM_MEDIUM)
-        ok = 1;
-    endtask
 endclass
 
 // Fabric owns BAR placement, but the root complex still must program all

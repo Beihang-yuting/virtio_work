@@ -275,13 +275,13 @@ VIP 与 DUT 的所有交互都通过 PCIe TLP 完成：
 ```
  VIP (RC Agent)                                     DUT (EP)
       |                                                |
-      |  Config Read TLP (BAR enumeration)             |
+      |  Config Read TLP (capability scan)             |
       |----------------------------------------------->|
       |                                                |
       |  Completion with Data                          |
       |<-----------------------------------------------|
       |                                                |
-      |  Config Write TLP (BAR address assignment)     |
+      |  Config Write TLP (BAR lease programming)      |
       |----------------------------------------------->|
       |                                                |
       |  Memory Write TLP (BAR: status/feature/queue)  |
@@ -1021,12 +1021,8 @@ BAR 访问器将 MMIO 寄存器访问翻译为 PCIe TLP：
 | `write_reg(bar_id, offset, size, data)` | Memory Write | BAR MMIO 写 |
 | `config_read(addr, data)` | Config Read Type 0 | 配置空间读 |
 | `config_write(addr, data, be)` | Config Write Type 0 | 配置空间写 |
-| `enumerate_bars()` | Config Read/Write | PCI BAR 枚举 |
 
-`enumerate_bars()` 的“保存原值 → 写全 1 → 读回 → 计算大小 → 分配地址 → 写入”
-流程仅适用于 legacy/TLM 模型路径，支持 32/64 位 BAR。Fabric-owned REAL_DUT
-禁止 sizing/enumeration；地址必须来自冻结 dpu_common lease，并由
-`program_fabric_bar_pairs()` 编程 config-space BAR 后再发现 capability。
+Fabric-owned function 禁止 BAR sizing/enumeration；地址必须来自冻结 dpu_common lease，并由 `program_fabric_bar_pairs()` 编程 config-space BAR 后再发现 capability。
 
 #### 4.6.3 Capability 发现 (`virtio_pci_cap_manager`)
 
@@ -2027,10 +2023,7 @@ MODEL；真实平台 wrapper 必须在 `run_test()` 前创建双向 `pcie_tl_if`
 
 Fabric-owned REAL_DUT 的 BAR 地址先由 dpu_common resolver/MMIO window 形成冻结
 lease，RC 再按 lease 调用 `program_fabric_bar_pairs()` 编程 PCIe config-space BAR，
-之后只做 capability discovery，不重新 sizing/分配，也不应在测试里写死地址。旧的
-`bar_accessor.enumerate_bars()` 顺序分配（默认从 `0xC000_0000` 开始）只适用于
-legacy/TLM 模型路径；Fabric-owned function 会明确报告 `BAR_FABRIC_OWNED`，不能
-再用 `bar.next_bar_alloc_addr` 覆盖它。
+之后只做 capability discovery，不重新 sizing/分配，也不应在测试里写死地址。
 
 ---
 
@@ -2175,7 +2168,7 @@ legacy/TLM 模型路径；Fabric-owned function 会明确报告 `BAR_FABRIC_OWNE
 
 | 方法 | 类型 | 说明 |
 |------|------|------|
-| `discover_and_init_bars` | task | 委托当前发现策略（enumerate / fabric_preconfigured） |
+| `discover_and_init_bars` | task | 委托当前发现策略（fabric_preconfigured） |
 | `reset_device` | task | 写 status=0, 轮询 |
 | `read_device_status` | task | 读取设备状态 |
 | `write_device_status` | task | 写入设备状态 |

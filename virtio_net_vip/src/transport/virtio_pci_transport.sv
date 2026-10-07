@@ -65,8 +65,9 @@ class virtio_pci_transport extends uvm_object;
     bit                     fabric_capability_discovered = 0;
     virtio_resource_client  fabric_resource_client;
 
-    // 当前 BAR/capability 发现策略：构造时为 enumerate，configure_fabric_managed()
-    // 切换为 fabric_preconfigured；后续设计经 set_discovery_strategy() 注入 verify_snapshot。
+    // 当前 BAR/capability 发现策略：构造时即为 fabric_preconfigured（未经
+    // configure_fabric_managed() 的 transport 发现时由该策略 fatal）；后续设计经
+    // set_discovery_strategy() 注入 verify_snapshot。
     virtio_discovery_strategy discovery_strategy;
 
     // ========================================================================
@@ -91,7 +92,8 @@ class virtio_pci_transport extends uvm_object;
         driver_features = '0;
         bdf             = 16'h0;
         pcie_id_valid   = 0;
-        discovery_strategy = virtio_enumerate_discovery::type_id::create("enumerate_discovery");
+        discovery_strategy = virtio_fabric_preconfigured_discovery::type_id::create(
+            "fabric_preconfigured_discovery");
     endfunction
 
     // 冻结本 function 的完整 PCIe identity({host, segment, BDF})，并同步
@@ -713,7 +715,7 @@ class virtio_pci_transport extends uvm_object;
     // ========================================================================
     // discover_and_init_bars
     //
-    // 唯一的发现入口：委托当前 discovery_strategy（enumerate / fabric_preconfigured /
+    // 唯一的发现入口：委托当前 discovery_strategy（fabric_preconfigured /
     // 后续 verify_snapshot）。策略失败时 fatal，因为后续所有寄存器访问都依赖它。
     // ========================================================================
 

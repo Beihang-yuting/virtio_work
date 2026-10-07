@@ -7,12 +7,11 @@
 // Provides:
 //   - read_reg / write_reg:   MMIO via Memory Read/Write TLPs
 //   - config_read / config_write: PCI config space via Config TLPs (Type 0)
-//   - enumerate_bars:         Standard PCI BAR enumeration
 //   - Error-injection variants for poisoned TLP testing
 //
 // 中文定位：transport 目录内 MMIO/配置空间访问的最底层执行者，virtio 侧所有
 // PCIe 请求(除 DMA)最终都经由本文件的四个 helper sequence 落到 RC sequencer。
-// 职责：字节使能计算与数据抽取、BAR 枚举与地址分配、Fabric 模式下的 BAR
+// 职责：字节使能计算与数据抽取、Fabric 模式下的 BAR
 // 角色租约校验/编程/访问守卫(功能 MMIO 限 BAR0/2、MSI-X 限 BAR4)、
 // 以及 zero-BE 错误注入变体。
 // 依赖：pcie_tl_vip 的 TLP/sequencer 类型、dpu BAR 租约与角色枚举、
@@ -301,7 +300,7 @@ class virtio_bar_accessor extends uvm_object;
 
     // ===== BAR configuration =====
     bit [63:0]  bar_base[6];        // BAR0-5 base addresses
-    bit [63:0]  bar_size[6];        // BAR0-5 sizes (for enumeration)
+    bit [63:0]  bar_size[6];        // BAR0-5 sizes (from Fabric leases)
     bit [2:0]   bar_type[6];        // PCI BAR bits [2:0]; 3'b100=64-bit MMIO
     // Fabric BAR 角色布局（由 snapshot 租约构造）；null 表示非 Fabric function。
     fabric_bar_layout fabric_layout;
@@ -313,12 +312,9 @@ class virtio_bar_accessor extends uvm_object;
     bit                    pcie_id_valid;
     virtio_tlm_completion_adapter endpoint_completion_adapter;
 
-    // ===== BAR enumeration base address allocator =====
-    bit [63:0]   next_bar_alloc_addr;
-
     // ========================================================================
-    // 构造：清空全部 BAR 表项与 Fabric 角色，MMIO 分配窗口从 0xC000_0000
-    // 起步；此时未注入 sequencer，所有访问入口都会 fatal。
+    // 构造：清空全部 BAR 表项与 Fabric 角色；此时未注入 sequencer，所有访问
+    // 入口都会 fatal。
     // ========================================================================
 
     function new(string name = "virtio_bar_accessor");
@@ -326,7 +322,6 @@ class virtio_bar_accessor extends uvm_object;
         requester_id        = 16'h0;
         pcie_id_valid       = 0;
         endpoint_completion_adapter = null;
-        next_bar_alloc_addr = 64'h0000_0000_C000_0000;  // Default MMIO window
         fabric_layout = null;
         for (int i = 0; i < 6; i++) begin
             bar_base[i] = '0;
@@ -817,144 +812,6 @@ class virtio_bar_accessor extends uvm_object;
         `uvm_info("BAR_ACCESSOR",
             $sformatf("config_write: addr=0x%03h reg_num=%0d data=0x%08h be=0x%01h",
                       addr, reg_num, data, be), UVM_HIGH)
-    endtask
-
-    // ========================================================================
-    // enumerate_bars
-    //
-    // Standard PCI BAR enumeration sequence:
-    //   1. Save original BAR value
-    //   2. Write all-1s to the BAR register
-    //   3. Read back to determine size (invert masked bits + 1)
-    //   4. Assign address from allocation window
-    //   5. Write the assigned address back to the BAR
-    //   6. Handle 64-bit BARs (consumes two BAR slots)
-    // ========================================================================
-
-    virtual task enumerate_bars();
-        bit [31:0] orig_val;
-        bit [31:0] sizing_val;
-        bit [63:0] size_mask;
-        bit [11:0] bar_cfg_addr;
-        int i;
-
-        if (fabric_layout != null) begin
-            `uvm_error("BAR_FABRIC_OWNED",
-                "BAR enumeration is forbidden for Fabric-owned BAR placements")
-            return;
-        end
-
-        `uvm_info("BAR_ACCESSOR", "Starting BAR enumeration", UVM_MEDIUM)
-
-        i = 0;
-        while (i < 6) begin
-            bar_cfg_addr = PCI_CFG_BAR0 + (i * 4);
-
-            // Step 1: Save original
-            config_read(bar_cfg_addr, orig_val);
-
-            // Step 2: Write all-1s
-            config_write(bar_cfg_addr, 32'hFFFF_FFFF, 4'hF);
-
-            // Step 3: Read back sizing value
-            config_read(bar_cfg_addr, sizing_val);
-
-            // Restore original
-            config_write(bar_cfg_addr, orig_val, 4'hF);
-
-            // Check if BAR is implemented (sizing_val == 0 means not implemented)
-            if (sizing_val == 0 || sizing_val == 32'hFFFF_FFFF) begin
-                bar_base[i] = '0;
-                bar_size[i] = '0;
-                bar_type[i] = '0;
-                `uvm_info("BAR_ACCESSOR",
-                    $sformatf("BAR%0d: not implemented (sizing=0x%08h)", i, sizing_val),
-                    UVM_MEDIUM)
-                i++;
-                continue;
-            end
-
-            // Determine BAR type from bits [2:1]
-            // 00 = 32-bit, 10 = 64-bit
-            bar_type[i] = sizing_val[2:0];
-
-            if (sizing_val[2:1] == 2'b10) begin
-                // 64-bit BAR: need to size the upper 32 bits too
-                bit [31:0] upper_sizing;
-                bit [31:0] upper_orig;
-                bit [11:0] upper_bar_addr;
-
-                if (i >= 5) begin
-                    `uvm_error("BAR_ACCESSOR",
-                        $sformatf("BAR%0d claims 64-bit but no room for upper BAR", i))
-                    i++;
-                    continue;
-                end
-
-                upper_bar_addr = PCI_CFG_BAR0 + ((i + 1) * 4);
-
-                config_read(upper_bar_addr, upper_orig);
-                config_write(upper_bar_addr, 32'hFFFF_FFFF, 4'hF);
-                config_read(upper_bar_addr, upper_sizing);
-                config_write(upper_bar_addr, upper_orig, 4'hF);
-
-                // Compute size from combined 64-bit sizing value
-                // Mask out lower 4 bits (type/prefetch) for lower 32
-                size_mask = {upper_sizing, sizing_val & 32'hFFFF_FFF0};
-                size_mask = (~size_mask) + 1;
-
-                bar_size[i] = size_mask;
-
-                // Align allocation address
-                if (next_bar_alloc_addr % size_mask != 0) begin
-                    next_bar_alloc_addr = ((next_bar_alloc_addr / size_mask) + 1) * size_mask;
-                end
-
-                bar_base[i] = next_bar_alloc_addr;
-
-                // Write assigned address
-                config_write(bar_cfg_addr,
-                    (bar_base[i][31:0] & 32'hFFFF_FFF0) | {29'h0, bar_type[i]}, 4'hF);
-                config_write(upper_bar_addr, bar_base[i][63:32], 4'hF);
-
-                next_bar_alloc_addr = next_bar_alloc_addr + size_mask;
-
-                // Upper BAR slot is consumed
-                bar_base[i+1] = '0;
-                bar_size[i+1] = '0;
-                bar_type[i+1] = '0;
-
-                `uvm_info("BAR_ACCESSOR",
-                    $sformatf("BAR%0d: 64-bit, base=0x%016h, size=0x%016h",
-                              i, bar_base[i], bar_size[i]), UVM_MEDIUM)
-                i += 2;  // Skip upper half
-            end else begin
-                // 32-bit BAR
-                size_mask = {32'h0, (~(sizing_val & 32'hFFFF_FFF0)) + 1};
-                bar_size[i] = size_mask;
-
-                // Align allocation address
-                if (next_bar_alloc_addr[31:0] % size_mask[31:0] != 0) begin
-                    next_bar_alloc_addr = (((next_bar_alloc_addr[31:0] / size_mask[31:0]) + 1)
-                                           * size_mask[31:0]);
-                end
-
-                bar_base[i] = next_bar_alloc_addr;
-
-                // Write assigned address
-                config_write(bar_cfg_addr,
-                    (bar_base[i][31:0] & 32'hFFFF_FFF0) | {29'h0, bar_type[i]}, 4'hF);
-
-                next_bar_alloc_addr = next_bar_alloc_addr + size_mask;
-
-                `uvm_info("BAR_ACCESSOR",
-                    $sformatf("BAR%0d: 32-bit, base=0x%016h, size=0x%016h",
-                              i, bar_base[i], bar_size[i]), UVM_MEDIUM)
-                i++;
-            end
-        end
-
-        `uvm_info("BAR_ACCESSOR", "BAR enumeration complete", UVM_MEDIUM)
     endtask
 
 endclass : virtio_bar_accessor
