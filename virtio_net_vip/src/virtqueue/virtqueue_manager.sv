@@ -193,6 +193,16 @@ class virtqueue_manager extends uvm_object;
     endfunction
 
     // ------------------------------------------------------------------
+    // get_queue_ids -- 按队列号升序返回全部受管队列号（control VQ 可不连续，
+    // 位于 2*max_virtqueue_pairs）；只读，不改变管理器状态。
+    // ------------------------------------------------------------------
+    function void get_queue_ids(output int unsigned queue_ids[$]);
+        queue_ids.delete();
+        foreach (queues[queue_id])
+            queue_ids.push_back(queue_id);
+    endfunction
+
+    // ------------------------------------------------------------------
     // leak_check -- Call leak_check() on all managed queues
     //
     // Should be called at test end to detect outstanding tokens or

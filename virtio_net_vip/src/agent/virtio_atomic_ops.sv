@@ -2159,9 +2159,14 @@ class virtio_atomic_ops extends uvm_object;
         int unsigned queue_ids[$];
         bit msix_ok;
 
-        // 队列号 0..num_queues-1（与 HEAD 相同）；P3-9 改为 vq_mgr 中的实际队列号。
-        for (int unsigned q = 0; q < num_queues; q++)
-            queue_ids.push_back(q);
+        // 绑定 vq_mgr 中实际存在的队列号（control VQ 可位于 2*max_virtqueue_pairs）；
+        // 数量与 num_queues 不符（尚未建队的手工调用）时沿用 0..num_queues-1。
+        if ((vq_mgr != null) && (vq_mgr.get_queue_count() == num_queues))
+            vq_mgr.get_queue_ids(queue_ids);
+        else begin
+            for (int unsigned q = 0; q < num_queues; q++)
+                queue_ids.push_back(q);
+        end
         backend = cfg_backend();
         backend.set_msix(queue_ids, msix_ok);
         if (!msix_ok)

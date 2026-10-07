@@ -197,11 +197,12 @@ class virtio_common_cfg_backend extends virtio_config_backend;
                 transport.cap_mgr.msix_table_offset
             );
             transport.notify_mgr.allocate_irq_vectors(queue_ids.size(), actual_mode);
+            transport.notify_mgr.remap_queue_vectors(queue_ids);
 
             // Bind config change vector
             transport.write_config_msix_vector(transport.notify_mgr.config_vector);
 
-            // Bind per-queue vectors（P3-3 中 queue_ids 恒为 0..n-1，与 HEAD 相同）
+            // Bind per-queue vectors：只写实际存在的队列号（control VQ 可不连续）
             foreach (queue_ids[i]) begin
                 transport.write_queue_msix_vector(
                     queue_ids[i], transport.notify_mgr.queue_vectors[queue_ids[i]]);

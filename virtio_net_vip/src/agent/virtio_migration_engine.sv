@@ -601,6 +601,7 @@ class virtio_migration_engine extends uvm_object;
         output bit ok,
         ref virtio_device_snapshot_t snap
     );
+        int unsigned queue_ids[$];
         ok = 0;
         // 3. Save negotiated features and device status
         snap.negotiated_features = ops.negotiated_features;
@@ -618,14 +619,16 @@ class virtio_migration_engine extends uvm_object;
         snap.queue_count = num_queues;
         snap.queue_snapshots = new[num_queues];
 
-        for (int unsigned q = 0; q < num_queues; q++) begin
+        // 槽位按实际队列号升序填充：数据队列 0..2N-1 连续，control VQ 可位于
+        // 2*max_virtqueue_pairs。队列少于 num_queues 时剩余槽位保持默认值（restore 拒绝）。
+        ops.vq_mgr.get_queue_ids(queue_ids);
+        for (int unsigned slot = 0;
+             (slot < num_queues) && (slot < queue_ids.size()); slot++) begin
             virtqueue_base vq;
-            vq = ops.vq_mgr.get_queue(q);
-            if (vq != null) begin
-                virtqueue_snapshot_t tmp_snap;
-                vq.save_state(tmp_snap);
-                snap.queue_snapshots[q] = tmp_snap;
-            end
+            virtqueue_snapshot_t tmp_snap;
+            vq = ops.vq_mgr.get_queue(queue_ids[slot]);
+            vq.save_state(tmp_snap);
+            snap.queue_snapshots[slot] = tmp_snap;
         end
         if (!ops.snapshot_normal_dma_ownership(snap.normal_dma_records)) begin
             `uvm_error("AUTO_FSM",
@@ -735,7 +738,18 @@ class virtio_migration_engine extends uvm_object;
             return 0;
         end
         foreach (snap.queue_snapshots[q]) begin
-            if ((snap.queue_snapshots[q].queue_id != q) ||
+            bit queue_id_valid;
+
+            // 数据队列槽位与队列号一致（普通 DMA 记录按 queue_id 索引槽位）；其后槽位
+            // 只能是 control VQ：队列号不小于 2*num_queue_pairs 且严格递增。
+            if (q < 2 * snap.num_queue_pairs)
+                queue_id_valid = (snap.queue_snapshots[q].queue_id == q);
+            else
+                queue_id_valid =
+                    (snap.queue_snapshots[q].queue_id >= 2 * snap.num_queue_pairs) &&
+                    ((q == 0) ||
+                     (snap.queue_snapshots[q].queue_id > snap.queue_snapshots[q - 1].queue_id));
+            if (!queue_id_valid ||
                 (snap.queue_snapshots[q].queue_size == 0) ||
                 ((configured_queue_size != 0) &&
                  (snap.queue_snapshots[q].queue_size != configured_queue_size))) begin
@@ -1095,20 +1109,22 @@ class virtio_migration_engine extends uvm_object;
         // Restore ring data and indices from snapshot
         for (int unsigned q = 0; q < snap.queue_count; q++) begin
             virtqueue_base vq;
-            vq = ops.vq_mgr.get_queue(q);
+            vq = ops.vq_mgr.get_queue(snap.queue_snapshots[q].queue_id);
             queue_restore_ok = (vq != null) &&
                                vq.restore_state(snap.queue_snapshots[q]);
             if (!queue_restore_ok) begin
                 rollback(ops);
                 `uvm_error("AUTO_FSM", $sformatf(
-                    "restore_from_migration: queue %0d state overlay failed", q))
+                    "restore_from_migration: queue %0d state overlay failed",
+                    snap.queue_snapshots[q].queue_id))
                 ops.set_failed();
                 return;
             end
             if (!ops.claim_restored_queue_ownership(snap.queue_snapshots[q])) begin
                 rollback(ops);
                 `uvm_error("AUTO_FSM", $sformatf(
-                    "restore_from_migration: queue %0d ownership commit failed", q))
+                    "restore_from_migration: queue %0d ownership commit failed",
+                    snap.queue_snapshots[q].queue_id))
                 ops.set_failed();
                 return;
             end

@@ -229,6 +229,38 @@ class virtio_notification_manager extends uvm_object;
     endtask
 
     // ========================================================================
+    // remap_queue_vectors
+    //
+    // allocate_irq_vectors 按槽位 0..n-1 分配向量；队列号不连续时（control VQ
+    // 位于 2*max_virtqueue_pairs）把槽位 i 的向量与回调使能移到 queue_ids[i]，
+    // 空洞队列号记为 VIRTIO_MSI_NO_VECTOR(0xFFFF)。queue_ids 须升序且数量等于
+    // 已分配槽位数，否则保持原样；queue_ids 为 0..n-1 时结果与原数组相同。
+    // ========================================================================
+
+    function void remap_queue_vectors(int unsigned queue_ids[$]);
+        int unsigned slot_vectors[];
+        bit          slot_cb[];
+        int unsigned span;
+
+        if ((queue_ids.size() == 0) || (queue_ids.size() != queue_vectors.size()) ||
+            (queue_ids.size() != cb_enabled.size()))
+            return;
+        slot_vectors = queue_vectors;
+        slot_cb = cb_enabled;
+        span = queue_ids[queue_ids.size() - 1] + 1;
+        queue_vectors = new[span];
+        cb_enabled = new[span];
+        foreach (queue_vectors[q]) begin
+            queue_vectors[q] = 32'hFFFF;
+            cb_enabled[q] = 1;
+        end
+        foreach (queue_ids[i]) begin
+            queue_vectors[queue_ids[i]] = slot_vectors[i];
+            cb_enabled[queue_ids[i]] = slot_cb[i];
+        end
+    endfunction
+
+    // ========================================================================
     // bind_queue_vector
     //
     // Records the MSI-X vector binding for a queue. The actual MMIO write to

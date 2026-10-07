@@ -99,6 +99,121 @@ class virtio_ctrl_vq_test_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_ctrl_vq_test_catcher
 
+// MSI-X 表写入桩：只吞掉表项 MMIO，不需要 PCIe 通路；向量分配仍走生产 notification manager。
+class virtio_ctrl_vq_test_null_bar extends virtio_bar_accessor;
+    `uvm_object_utils(virtio_ctrl_vq_test_null_bar)
+
+    function new(string name = "virtio_ctrl_vq_test_null_bar");
+        super.new(name);
+    endfunction
+
+    virtual task write_msix_reg(int unsigned bar_id, bit [31:0] offset,
+                                int unsigned size, bit [31:0] data);
+    endtask
+endclass : virtio_ctrl_vq_test_null_bar
+
+// 迁移/MSI-X 用寄存器桩：status/复位/特性协商/队列编程/向量绑定在本地建模并记录；
+// max_virtqueue_pairs 可编程，使 control VQ 位于 2*max_virtqueue_pairs（与数据队列不连续）。
+class virtio_ctrl_vq_migration_transport extends virtio_pci_transport;
+    `uvm_object_utils(virtio_ctrl_vq_migration_transport)
+
+    int unsigned max_virtqueue_pairs;
+    bit [7:0]    device_status;
+    int unsigned programmed_qids[$];
+    int unsigned msix_bound_qids[$];
+    int unsigned msix_bound_vectors[int unsigned];
+
+    function new(string name = "virtio_ctrl_vq_migration_transport");
+        virtio_ctrl_vq_test_null_bar null_bar;
+        super.new(name);
+        max_virtqueue_pairs = 1;
+        device_status = 0;
+        null_bar = virtio_ctrl_vq_test_null_bar::type_id::create("ctrl_vq_null_bar");
+        bar = null_bar;
+        notify_mgr.bar = null_bar;
+        cap_mgr.bar_ref = null_bar;
+    endfunction
+
+    virtual task read_device_status(ref bit [7:0] status);
+        status = device_status;
+    endtask
+
+    virtual task write_device_status(bit [7:0] status);
+        device_status = status;
+    endtask
+
+    virtual task reset_device_verified(ref bit reset_complete);
+        device_status = 0;
+        reset_complete = 1;
+    endtask
+
+    virtual task negotiate_features(bit [63:0] driver_supported,
+                                    ref bit [63:0] negotiated);
+        negotiated = driver_supported;
+        driver_features = negotiated;
+    endtask
+
+    virtual task read_net_config(ref virtio_net_device_config_t cfg);
+        cfg = '{default: 0};
+        cfg.max_virtqueue_pairs = max_virtqueue_pairs;
+    endtask
+
+    virtual task select_queue(int unsigned queue_id);
+    endtask
+
+    virtual task read_queue_num_max(ref int unsigned max_size);
+        max_size = 8;
+    endtask
+
+    virtual task setup_single_queue(
+        int unsigned queue_id,
+        int unsigned queue_size,
+        bit [63:0]   desc_addr,
+        bit [63:0]   driver_addr,
+        bit [63:0]   device_addr,
+        int unsigned msix_vector
+    );
+        programmed_qids.push_back(queue_id);
+    endtask
+
+    virtual task write_queue_enable(bit enable);
+    endtask
+
+    virtual task write_config_msix_vector(int unsigned vector);
+    endtask
+
+    virtual task write_queue_msix_vector(int unsigned queue_id, int unsigned vector);
+        msix_bound_qids.push_back(queue_id);
+        msix_bound_vectors[queue_id] = vector;
+    endtask
+
+    virtual task kick(int unsigned queue_id, int unsigned next_avail_idx,
+                      bit wrap_counter);
+    endtask
+endclass : virtio_ctrl_vq_migration_transport
+
+// 数据面启停只切换状态；迁移采集/恢复全部走生产 FSM 与迁移引擎。
+class virtio_ctrl_vq_test_migration_fsm extends virtio_auto_fsm;
+    `uvm_object_utils(virtio_ctrl_vq_test_migration_fsm)
+
+    function new(string name = "virtio_ctrl_vq_test_migration_fsm");
+        super.new(name);
+    endfunction
+
+    function void set_topology(int unsigned num_pairs, int unsigned num_queues);
+        active_num_pairs = num_pairs;
+        num_total_queues = num_queues;
+    endfunction
+
+    virtual task stop_dataplane();
+        state = FSM_READY;
+    endtask
+
+    virtual task start_dataplane();
+        state = FSM_RUNNING;
+    endtask
+endclass : virtio_ctrl_vq_test_migration_fsm
+
 class virtio_ctrl_vq_test extends uvm_test;
     `uvm_component_utils(virtio_ctrl_vq_test)
 
@@ -111,6 +226,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         test_ctrl_vq_at_twice_max_pairs();
         test_ctrl_send_alloc_failure_rolls_back();
         test_ctrl_send_map_failure_rolls_back();
+        test_ctrl_vq_outside_data_range_migration_and_msix();
         `uvm_info("CTRL_VQ_TEST", "control VQ tests PASSED", UVM_NONE)
         phase.drop_objection(this);
     endtask
@@ -320,6 +436,110 @@ class virtio_ctrl_vq_test extends uvm_test;
             else `uvm_fatal("CTRL_VQ_TEST", "map-failure test leaked control queue resources")
         mem.leak_check();
         `uvm_info("CTRL_VQ_TEST", "ctrl_send map-failure rollback test PASSED", UVM_LOW)
+    endtask
+
+    // 设备 max_virtqueue_pairs=4、当前 1 对 + CTRL_VQ：队列为 {0,1,8}。MSI-X 必须给
+    // control VQ 8 绑定向量（不得写不存在的队列 2）；freeze 必须保存队列 8，restore
+    // 必须按实际队列号重建并覆盖，全过程不泄漏 ring/DMA。
+    task test_ctrl_vq_outside_data_range_migration_and_msix();
+        virtio_ctrl_vq_migration_transport transport =
+            virtio_ctrl_vq_migration_transport::type_id::create("gap_transport");
+        virtio_atomic_ops ops = virtio_atomic_ops::type_id::create("gap_ops");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("gap_vq_mgr");
+        virtio_ctrl_vq_test_mem mem = virtio_ctrl_vq_test_mem::type_id::create("gap_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("gap_iommu");
+        virtio_ctrl_vq_test_migration_fsm fsm =
+            virtio_ctrl_vq_test_migration_fsm::type_id::create("gap_fsm");
+        virtio_memory_barrier_model barrier =
+            virtio_memory_barrier_model::type_id::create("gap_barrier");
+        virtio_wait_policy wait_pol = virtio_wait_policy::type_id::create("gap_wait_pol");
+        virtio_device_snapshot_t snapshot;
+        int unsigned expected_qids[$];
+        int unsigned snapshot_qids[$];
+        int unsigned restored_qids[$];
+        bit ok;
+        bit restore_ok;
+
+        mem.init_region(64'h7100_0000, 64'h7100_FFFF);
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.barrier = barrier;
+        vq_mgr.wait_pol = wait_pol;
+        vq_mgr.bdf = 16'h0902;
+        transport.bdf = 16'h0902;
+        transport.max_virtqueue_pairs = 4;
+        transport.cap_mgr.msix_found = 1;
+        transport.cap_mgr.msix_table_size = 8;
+        transport.cap_mgr.msix_table_bir = 4;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = wait_pol;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        expected_qids = '{0, 1, 8};
+
+        ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 3) || (vq_mgr.get_queue(8) == null))
+            `uvm_fatal("CTRL_VQ_TEST", "setup did not place the control VQ at 2*max_virtqueue_pairs=8")
+
+        // MSI-X：每条实际队列一个向量，control VQ 8 必须绑定，不得写队列 2。
+        ops.setup_msix(3);
+        if ((transport.msix_bound_qids != expected_qids) ||
+            (transport.notify_mgr.queue_vectors.size() <= 8) ||
+            (transport.notify_mgr.queue_vectors[8] != transport.msix_bound_vectors[8]) ||
+            (transport.msix_bound_vectors[8] == 0) ||
+            (transport.msix_bound_vectors[8] == transport.msix_bound_vectors[1]) ||
+            (transport.notify_mgr.queue_vectors[2] != 32'hFFFF))
+            `uvm_error("CTRL_VQ_TEST", $sformatf(
+                "MSI-X vectors were not bound to the actual queue set: bound=%p vectors=%p",
+                transport.msix_bound_qids, transport.notify_mgr.queue_vectors))
+
+        // freeze：快照按实际队列号保存 control VQ 8。
+        fsm.ops = ops;
+        fsm.drv_cfg.num_queue_pairs = 1;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        fsm.set_topology(1, 3);
+        fsm.state = FSM_RUNNING;
+        fsm.freeze_for_migration(snapshot);
+        foreach (snapshot.queue_snapshots[i])
+            snapshot_qids.push_back(snapshot.queue_snapshots[i].queue_id);
+        if ((fsm.state != FSM_FROZEN) || (snapshot.queue_count != 3) ||
+            (snapshot_qids != expected_qids) ||
+            (snapshot.queue_snapshots[2].queue_size != 8))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "freeze did not capture the control VQ outside 0..2N-1: state=%s ids=%p",
+                fsm.state.name(), snapshot_qids))
+
+        // restore：复位后按快照重建 {0,1,8}，覆盖状态并重新绑定向量。
+        ops.device_reset();
+        if (vq_mgr.get_queue_count() != 0)
+            `uvm_fatal("CTRL_VQ_TEST", "verified reset did not release source queues")
+        transport.msix_bound_qids.delete();
+        fsm.restore_from_migration(snapshot, restore_ok);
+        vq_mgr.get_queue_ids(restored_qids);
+        if (!restore_ok || (fsm.state != FSM_RUNNING) ||
+            (restored_qids != expected_qids) ||
+            (transport.msix_bound_qids != expected_qids))
+            `uvm_error("CTRL_VQ_TEST", $sformatf(
+                "restore did not rebuild the control VQ outside 0..2N-1: ok=%0b state=%s queues=%p bound=%p",
+                restore_ok, fsm.state.name(), restored_qids, transport.msix_bound_qids))
+
+        foreach (expected_qids[i])
+            ops.teardown_queue(expected_qids[i]);
+        if ((vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("CTRL_VQ_TEST", "control VQ migration/MSI-X test leaked queue resources")
+        mem.leak_check();
+
+        `uvm_info("CTRL_VQ_TEST",
+            "control VQ outside data range migration and MSI-X test PASSED", UVM_LOW)
     endtask
 endclass : virtio_ctrl_vq_test
 
