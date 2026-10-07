@@ -48,7 +48,7 @@ virtual class virtqueue_base extends uvm_object;
     bit               queue_enable = 0;
 
     // ===== Logging =====
-    // 各格式在构造函数里设置自己的报告 ID（SPLIT_VQ/PACKED_VQ/CUSTOM_VQ），
+    // 各格式在构造函数里设置自己的报告 ID（SPLIT_VQ/PACKED_VQ/DPU_PRIV_RING），
     // 基类公共实现用它打印，测试 report catcher 匹配的 ID 保持不变。
     protected string log_tag = "VQ_BASE";
 
@@ -205,8 +205,8 @@ virtual class virtqueue_base extends uvm_object;
     pure virtual function bit          needs_notification();
 
     // 通知数据游标（NOTIFICATION_DATA）：next_idx 为驱动下一个发布位置，
-    // wrap 为 packed 驱动侧 wrap counter。split/packed 各自覆盖；自定义队列
-    // 无标准游标，默认沿用已投递 chain 数且 wrap=0。
+    // wrap 为 packed 驱动侧 wrap counter。基类默认返回已投递 chain 数且 wrap=0；
+    // split/packed/custom 按需覆盖（custom 返回生产者游标与 wrap）。
     virtual function int unsigned get_notify_next_idx();
         return total_add_buf_ops;
     endfunction

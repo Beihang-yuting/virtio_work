@@ -1,7 +1,7 @@
 # DPU 私有环的 src 使用流程
 
 私有实现现在由 `virtio_net_vip/src/virtio_net_pkg.sv` 编译，使用者只需
-`import virtio_net_pkg::*;`。本目录保留测试和顶层环境用法，不再复制回调实现。
+`import virtio_net_pkg::*;`。本目录保留测试和顶层环境用法，不再复制私有实现。
 驱动依据为 53 主机 `/home/ubuntu/wn/icpu-kernel-driver` 的
 `lance_net_mailbox@f2c9cd6`，对应 `priv_ring=true`。
 
@@ -11,9 +11,9 @@
 | 源码 | 职责 |
 | --- | --- |
 | `src/dpu_priv/dpu_priv_driver_config.sv` | Function/queue 分层配置，AF/mailbox 控制接口 |
-| `src/dpu_priv/dpu_priv_ring_callback.sv` | 16B TX/RX 描述符、CQ、wrap、64KiB TX 分片 |
-| `src/dpu_priv/dpu_priv_atomic_ops.sv` | 自动建队、连续 ring DMA 映射、原始帧收发、资源回收 |
-| `src/dpu_priv/dpu_priv_auto_fsm.sv` | 私有初始化与公共 FSM 收发/停止流程 |
+| `src/virtqueue/custom_virtqueue.sv` | 16B 描述符、CQ、wrap、64KiB TX 分片 |
+| `src/dpu_priv/dpu_priv_config_backend.sv` | 队列参数表、doorbell、status/feature 语义 |
+| `src/dpu_priv/dpu_priv_driver_protocol.sv` | 能力与复位语义 |
 
 ## 1. 在顶层准备设备控制后端
 
@@ -71,7 +71,7 @@ service 使用 `default_queue_size`。注册私有模式会选择 `VQ_CUSTOM`、
 和原始 Ethernet 数据路径，不再协商标准 Virtio offload。
 
 顶层仍按 Host 绑定唯一的 `host_mem_manager`，该 Host 的 PF/VF 共用它；
-不同 Function 的 ops、队列管理器和回调独立。设备本地 `local_qid` 不等同于
+不同 Function 的 ops、队列管理器和配置后端独立。设备本地 `local_qid` 不等同于
 DPU 的全局队列资源编号。同一本地号可出现在不同 Host/Function 内。
 驱动的 `local_qid` 为 8 位，因此每 Function 最多 128 对 RX/TX 队列，并继续受
 冻结 snapshot 的实际配额限制；设备的 2048 条全局队列仍由顶层资源配置分配。
@@ -80,9 +80,9 @@ DPU 的全局队列资源编号。同一本地号可出现在不同 Host/Functio
 
 照常构建顶层环境，并使用现有 `bind_pcie_endpoints()`、`bind_pcie()` 或
 Function 的 `preflight_bind_pcie()` + `commit_bind_pcie()` 绑定资源。环境把私有配置交给对应 Function，
-后者自动创建 `dpu_priv_atomic_ops`、`dpu_priv_auto_fsm`，并把私有 ops 注入
-`function.dataplane` 的标准 TX/RX 引擎。
-不需要全局 factory override，也不需要手动给每条队列设置 `custom_cb`。
+Function 选择 `dpu_priv_driver_protocol`，创建通用 ops/FSM，提交时冻结私有配置进
+`dpu_priv_config_backend`；`function.dataplane` 的标准 TX/RX 引擎委托同一个 ops。
+不需要全局 factory override，也不需要逐队列配置私有格式。
 
 ```systemverilog
 function_instance.driver_agent.fsm.full_init();
@@ -105,12 +105,18 @@ if (function_instance.get_state() != VF_DISABLED)
 直接操作底层 `vq.add_buf/poll_used` 时则由调用方自行管理对应 SG/DMA 生命周期，
 不能与 ops 管理的投递混用。
 
-内部建队顺序为：创建 `VQ_CUSTOM` → 注入每队列独立回调 → 分配连续 desc+CQ →
-整块映射一次 IOVA → 配置设备 → 标记启用。CQ IOVA 必须等于 ring IOVA 加
+内部建队顺序为：创建 `VQ_CUSTOM` → 后端写方向/本地号 → 分配连续 desc+CQ →
+一次映射 → 控制后端配置启动。CQ IOVA 必须等于 ring IOVA 加
 `queue_size*16`，不能把 CQ 单独随机映射。停队或复位失败会保留资源；上层必须
 检查复位成功标志，并先停止后台数据面再做手工 teardown/reset。
 通过 `Function.shutdown()` 停机成功后，FSM 进入 `FSM_REINIT_REQUIRED`，下次启动
 须先 `full_init()`；停机失败则 Function/FSM 分别进入 `VF_RESET_FAILED/FSM_ERROR`。
+数据面处于 `FSM_RUNNING` 时 `full_init()` 报 `UVM_ERROR` 并拒绝执行，须先停止数据面。
+
+队列大小可为 2..4096，不要求 2 的幂（`default_queue_size` 本身仍须为 2 的幂）；
+显式请求大小超过 `default_queue_size` 时截到该值并给出 `UVM_WARNING`。
+TX 遇到 ring 满（剩余槽不足以容纳本包描述符）时报 `UVM_ERROR`（`DPU_PRIV_RING`，
+与 split 一致），不再静默返回；调用方应先回收完成再投递。
 
 ## 4. 运行验证
 

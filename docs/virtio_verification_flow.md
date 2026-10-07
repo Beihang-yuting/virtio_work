@@ -16,7 +16,7 @@
         │  每 Function（PF/VF 同构）─────────────┐   共享基础设施          │
         │  ┌──────────────────────────────────┐ │  ┌──────────────────┐  │
         │  │ driver_agent                     │ │  │ host_mem_manager │  │
-        │  │  ├ atomic_ops(~55)/auto_fsm(12态) │ │  │ iommu_model      │  │
+        │  │  ├ atomic_ops(~60)/auto_fsm(12态) │ │  │ iommu_model      │  │
         │  │  ├ monitor ──────────┐           │ │  │ barrier/wait_pol │  │
         │  │  └ observer_adapter ─┤(被动解码)  │ │  │ err_inj/perf_mon │  │
         │  │ vq_mgr (Split/Packed/Custom)     │ │  └──────────────────┘  │

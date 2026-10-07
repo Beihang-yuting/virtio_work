@@ -112,7 +112,7 @@ INFO=8、WARNING=0、ERROR=0、FATAL=0。测试明确输出上述差异；零 UV
 
 如果需要覆盖驱动 `priv_ring=false`，应增加单独的 DPU Virtio ring 模式：
 复用 Host/Function 隔离及 DPU 控制接口，实现原始帧数据路径和 DPU doorbell，
-并在确认完成协议后适配 packed 描述符。已有 `dpu_priv_*` 对应私有 W1/W2+CQ
+并在确认完成协议后适配 packed 描述符。已有 `custom_virtqueue` 对应私有 W1/W2+CQ
 格式，也不能直接用于这个分支。
 
 标准 Virtio 模式则应继续遵循标准定义，并分别修正上述 header 与通知游标问题。

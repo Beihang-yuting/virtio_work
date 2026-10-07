@@ -12,10 +12,10 @@
 
 | 指标 | 数值 |
 |------|------|
-| 源文件数 | 75 个源文件（`virtio_net_vip/src`：70 个 `.sv` + 5 个 `.svh`），另有 36 个测试 `.sv` 文件 |
-| 代码行数 | 27,441 行 SystemVerilog（`virtio_net_vip/src`） |
+| 源文件数 | 72 个源文件（`virtio_net_vip/src`：67 个 `.sv` + 5 个 `.svh`），另有 36 个测试 `.sv` 文件 |
+| 代码行数 | 26,901 行 SystemVerilog（`virtio_net_vip/src`） |
 | 支持规范 | virtio 1.2 / 1.3 |
-| Virtqueue 类型 | Split / Packed / 自定义 |
+| Virtqueue 类型 | Split / Packed / DPU 私有环（custom） |
 | 验证目标 | DPU/SmartNIC virtio-net 设备端 RTL |
 | EDA 工具 | Synopsys VCS（通过 `$VCS_HOME` 配置；外部依赖版本由 `scripts/check_deps.sh` 校验） |
 
@@ -30,7 +30,7 @@ virtio_net_env（顶层环境）
 │   ├── virtio_driver_agent                  ← UVM Agent（驱动 + 监控 + 序列器）
 │   │   ├── virtio_driver                    ← 双层模式：自动状态机 + 原子操作库
 │   │   └── virtio_monitor                   ← 被动 TLP 观测与协议检查
-│   ├── virtqueue_manager                    ← 队列管理（split/packed/自定义）
+│   ├── virtqueue_manager                    ← 队列管理（split/packed/DPU 私有环）
 │   ├── virtio_net_dataplane                 ← 数据面
 │   │   ├── tx_engine                        ← 发送引擎（集成 net_packet 报文产生器）
 │   │   ├── rx_engine                        ← 接收引擎（mergeable buffer 模式）
@@ -157,7 +157,7 @@ BAR 配置/发现（program frozen Fabric lease）
 |------|------|------|
 | **Split Virtqueue** | 标准分离式队列 | 描述符表 + Available Ring + Used Ring，三段独立内存 |
 | **Packed Virtqueue** | 紧凑型单 Ring 队列 | AVAIL/USED 标志位嵌入描述符，wrap counter 机制 |
-| **Custom Virtqueue** | 用户自定义格式 | 通过回调接口扩展，支持厂商私有描述符格式 |
+| **DPU Private Ring** | 16B 私有描述符 + CQ | 与 split/packed 平级的 custom_virtqueue，对应 icpu-kernel-driver DPU_RING_T_PRIV |
 
 ### 四、全量 Feature 支持
 
@@ -211,7 +211,7 @@ BAR 配置/发现（program frozen Fabric lease）
 
 ```
 virtio_net_vip/
-├── src/                                    ← 源代码（75 个文件：70 个 .sv + 5 个 .svh）
+├── src/                                    ← 源代码（72 个文件：67 个 .sv + 5 个 .svh）
 │   ├── virtio_net_pkg.sv                   ← 顶层 Package（包含所有源文件）
 │   ├── types/                              ← 类型定义
 │   │   ├── virtio_net_types.sv             ← 所有枚举、结构体、Feature 位定义
@@ -224,10 +224,10 @@ virtio_net_vip/
 │   ├── iommu/                              ← IOMMU 模型
 │   │   └── virtio_iommu_model.sv           ← 地址翻译 + 权限 + 故障注入
 │   ├── virtqueue/                          ← 虚拟队列
-│   │   ├── virtqueue_base.sv               ← 抽象基类（14 个纯虚方法）
+│   │   ├── virtqueue_base.sv               ← 抽象基类（15 个纯虚方法）
 │   │   ├── split_virtqueue.sv              ← Split 实现（629 行）
 │   │   ├── packed_virtqueue.sv             ← Packed 实现（725 行）
-│   │   ├── custom_virtqueue.sv             ← 自定义扩展
+│   │   ├── custom_virtqueue.sv             ← DPU 私有环格式（16B 描述符 + CQ）
 │   │   ├── virtqueue_manager.sv            ← 队列工厂与生命周期管理
 │   │   └── virtqueue_error_injector.sv     ← 队列错误注入器
 │   ├── transport/                          ← PCI 传输层
@@ -243,7 +243,7 @@ virtio_net_vip/
 │   │   ├── virtio_tlm_completion_adapter.sv ← TLM PCIe 路径的 completion 回填
 │   │   └── virtio_pci_transport.sv         ← 传输层顶层封装（寄存器访问器 + 发现入口；初始化由 FSM/ops 编排）
 │   ├── agent/                              ← UVM 驱动代理
-│   │   ├── virtio_atomic_ops.sv            ← 原子操作库（含 atomic_ops/ 分片共 55 个方法，不计构造函数）
+│   │   ├── virtio_atomic_ops.sv            ← 原子操作库（含 atomic_ops/ 分片共 61 个方法，不计构造函数）
 │   │   ├── atomic_ops/                     ← 原子操作类体分片（lifecycle/queue/datapath/ctrl_admin/migration_ownership）
 │   │   ├── virtio_dma_buffer_set.sv        ← 一次提交的数据 DMA 缓冲集合（alloc/map/回滚/退休）
 │   │   ├── virtio_auto_fsm.sv             ← 自动状态机（12 状态 + 5 后台任务）
@@ -266,11 +266,8 @@ virtio_net_vip/
 │   │   └── virtio_net_dataplane.sv         ← 数据面顶层封装
 │   ├── dpu_priv/                           ← DPU 私有环驱动协议
 │   │   ├── dpu_priv_driver_config.sv       ← 私有队列控制接口与分层配置
-│   │   ├── dpu_priv_ring_callback.sv       ← 私有 TX/RX 描述符/CQ 的 custom_virtqueue 回调
-│   │   ├── dpu_priv_atomic_ops.sv          ← 私有环 ops（建队/停 DMA/释放）
-│   │   ├── dpu_priv_auto_fsm.sv            ← 私有环生命周期 FSM
-│   │   ├── dpu_priv_config_backend.sv      ← 私有控制面接入 virtio_config_backend
-│   │   └── dpu_priv_driver_protocol.sv     ← 私有环驱动协议
+│   │   ├── dpu_priv_config_backend.sv      ← 私有配置后端（队列参数表、status/feature 语义、doorbell）
+│   │   └── dpu_priv_driver_protocol.sv     ← 私有协议（能力声明、MANUAL kick/poll、复位语义）
 │   ├── pcie/                               ← PCIe 适配层
 │   │   ├── pcie_tl_dpu_reg_backend.sv      ← dpu_common 寄存器计划 → PCIe TLP
 │   │   ├── virtio_pcie_dut_responder.sv    ← MODEL 设备侧行为模型（EP 发起 DMA）
@@ -765,18 +762,9 @@ start_item(req, , seqr); finish_item(req);
 
 ### 自定义 Virtqueue 格式扩展
 
-```systemverilog
-// 继承回调基类，实现厂商私有描述符格式
-class my_custom_cb extends virtqueue_custom_callback;
-    virtual function void custom_alloc_rings(custom_virtqueue vq);
-        // 自定义内存布局
-    endfunction
-
-    virtual function int unsigned custom_add_buf(custom_virtqueue vq, ...);
-        // 自定义描述符填充逻辑
-    endfunction
-endclass
-```
+新队列格式按 `custom_virtqueue` 的方式直接继承 `virtqueue_base`，实现 ring 方法与
+`get_ring_regions`。设备侧差异放进 `virtio_config_backend` 子类，能力差异放进
+`virtio_driver_protocol` 子类。
 
 ---
 

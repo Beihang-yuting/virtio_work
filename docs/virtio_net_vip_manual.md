@@ -5,7 +5,7 @@
 | **项目名称** | Virtio-Net Driver UVM Verification IP |
 | **版本** | 1.0 |
 | **日期** | 2026-04-24 |
-| **概述** | 面向 DPU/SmartNIC virtio 硬件加速引擎验证的 UVM virtio-net 驱动模拟组件，工作在 PCIe Transaction Layer，支持 Split/Packed/Custom virtqueue、完整 SR-IOV、双层驱动模型和丰富的错误注入能力。 |
+| **概述** | 面向 DPU/SmartNIC virtio 硬件加速引擎验证的 UVM virtio-net 驱动模拟组件，工作在 PCIe Transaction Layer，支持 Split/Packed/DPU 私有环 virtqueue、完整 SR-IOV、双层驱动模型和丰富的错误注入能力。 |
 
 ---
 
@@ -79,10 +79,10 @@ VIP 提供两种驱动模式，可在运行时切换：
 
 #### 三种 Virtqueue 实现
 
-通过抽象基类 `virtqueue_base` 定义 14 个纯虚方法，提供三种实现：
+通过抽象基类 `virtqueue_base` 定义 15 个纯虚方法，提供三种实现：
 - **Split Virtqueue**：标准三区域布局（描述符表 + Available Ring + Used Ring）
 - **Packed Virtqueue**：单环布局，AVAIL/USED 标志位嵌入描述符
-- **Custom Virtqueue**：用户通过回调接口自定义描述符格式
+- **DPU 私有环（`custom_virtqueue`，`VQ_CUSTOM`）**：16B 私有描述符 + CQ，对应 icpu-kernel-driver DPU_RING_T_PRIV
 
 #### wait_policy 统一等待框架
 
@@ -331,10 +331,10 @@ virtio_net_vip/
 |   |   +-- virtio_iommu_model.sv            -- IOMMU 地址翻译、fault 注入、脏页追踪
 |   +-- virtqueue/
 |   |   +-- virtqueue_error_injector.sv      -- 错误注入控制器
-|   |   +-- virtqueue_base.sv               -- 抽象基类 (14 个纯虚方法)
+|   |   +-- virtqueue_base.sv               -- 抽象基类 (15 个纯虚方法)
 |   |   +-- split_virtqueue.sv              -- Split Virtqueue 完整实现
 |   |   +-- packed_virtqueue.sv             -- Packed Virtqueue 完整实现
-|   |   +-- custom_virtqueue.sv             -- Custom Virtqueue (回调委托)
+|   |   +-- custom_virtqueue.sv             -- DPU 私有环格式（16B 描述符 + CQ）
 |   |   +-- virtqueue_manager.sv            -- 工厂 + 生命周期管理器
 |   +-- transport/
 |   |   +-- virtio_pci_regs.sv              -- PCI Common Config 寄存器偏移常量
@@ -349,7 +349,7 @@ virtio_net_vip/
 |   |   +-- virtio_tlm_completion_adapter.sv -- TLM PCIe 路径的 completion 回填
 |   |   +-- virtio_pci_transport.sv         -- PCI 传输封装 (寄存器访问器 + 发现入口; 初始化由 FSM/ops 编排)
 |   +-- agent/
-|   |   +-- virtio_atomic_ops.sv            -- 原子操作库 (含分片共 55 个方法, 不计构造函数)
+|   |   +-- virtio_atomic_ops.sv            -- 原子操作库 (含分片共 61 个方法, 不计构造函数)
 |   |   +-- atomic_ops/*.svh                -- 原子操作类体分片 (类内 include, 5 个)
 |   |   +-- virtio_dma_buffer_set.sv       -- 一次提交的数据 DMA 缓冲集合 (alloc/map/回滚/退休)
 |   |   +-- virtio_auto_fsm.sv             -- 自动生命周期状态机 (12 状态)
@@ -372,11 +372,8 @@ virtio_net_vip/
 |   |   +-- virtio_net_dataplane.sv         -- 数据面顶层封装
 |   +-- dpu_priv/
 |   |   +-- dpu_priv_driver_config.sv       -- 私有队列控制接口与分层配置
-|   |   +-- dpu_priv_ring_callback.sv       -- 私有 TX/RX 描述符/CQ 的 custom_virtqueue 回调
-|   |   +-- dpu_priv_atomic_ops.sv          -- 私有环 ops (建队/停 DMA/释放)
-|   |   +-- dpu_priv_auto_fsm.sv            -- 私有环生命周期 FSM
-|   |   +-- dpu_priv_config_backend.sv      -- 私有控制面接入 virtio_config_backend
-|   |   +-- dpu_priv_driver_protocol.sv     -- 私有环驱动协议
+|   |   +-- dpu_priv_config_backend.sv      -- 私有配置后端（队列参数表、status/feature 语义、doorbell）
+|   |   +-- dpu_priv_driver_protocol.sv     -- 私有协议（能力声明、MANUAL kick/poll、复位语义）
 |   +-- pcie/
 |   |   +-- pcie_tl_dpu_reg_backend.sv      -- dpu_common 寄存器计划 -> PCIe TLP
 |   |   +-- virtio_pcie_dut_responder.sv    -- MODEL 设备侧行为模型 (EP 发起 DMA)
@@ -414,7 +411,7 @@ virtio_net_vip/
 # 分别由 $DPU_COMMON_ROOT、$HOST_MEM_ROOT、$PCIE_WORK_ROOT、$NET_PACKET_ROOT 指定。
 ```
 
-**总计：`src/` 75 个文件（70 个 `.sv` + 5 个 `.svh`），`tests/` 36 个 `.sv` 文件。**
+**总计：`src/` 72 个文件（67 个 `.sv` + 5 个 `.svh`），`tests/` 36 个 `.sv` 文件。**
 
 ### 3.2 目录职责说明
 
@@ -427,7 +424,7 @@ virtio_net_vip/
 | `src/transport/` | PCI 传输层：寄存器定义、BAR 访问、capability 发现、通知管理 |
 | `src/agent/` | UVM Agent 组件：驱动、监控器、sequencer |
 | `src/dataplane/` | 数据面引擎：TX/RX、offload |
-| `src/dpu_priv/` | DPU 私有环驱动协议：私有 ops/FSM、配置后端、ring 回调 |
+| `src/dpu_priv/` | DPU 私有环驱动协议：私有队列格式、配置后端与驱动协议（ops/FSM 为通用实现） |
 | `src/pcie/` | PCIe 适配层：寄存器计划后端、MODEL 设备响应、REAL_DUT Host memory 应答 |
 | `src/sriov/` | SR-IOV 支持：Function 实例、snapshot 上下文、resource client、PF/VF 管理、资源池 |
 | `src/env/` | 顶层环境：配置、scoreboard、coverage、性能监控 |
@@ -790,7 +787,7 @@ page number 而在不同 Host 之间合并。
 
 #### 4.5.1 抽象基类接口 (`virtqueue_base`)
 
-`virtqueue_base` 是一个虚类（`virtual class`），继承自 `uvm_object`。定义了 14 个纯虚方法（由 split/packed/custom 实现）：
+`virtqueue_base` 是一个虚类（`virtual class`），继承自 `uvm_object`。定义了 15 个纯虚方法（由 split/packed/custom 实现，含 get_ring_regions）：
 
 | 类别 | 方法 | 返回类型 | 说明 |
 |------|------|----------|------|
@@ -806,6 +803,7 @@ page number 而在不同 Host 之间合并。
 | 查询 | `get_free_count()` | int unsigned | 空闲描述符数量 |
 | | `get_pending_count()` | int unsigned | 待完成描述符数量 |
 | | `needs_notification()` | bit | 是否需要 kick |
+| 映射 | `get_ring_regions(gpas, sizes)` | void | 设备可见 ring 内存区（ops 逐区映射） |
 | 热迁移 | `save_state(ref snap)` | void | 保存队列快照 |
 | | `restore_state(snap)` | bit | 恢复队列快照 |
 
@@ -880,29 +878,32 @@ else
     return (next_avail_idx < dev_desc_idx);
 ```
 
-#### 4.5.4 Custom Virtqueue
+#### 4.5.4 DPU 私有环队列（`custom_virtqueue`）
 
-`custom_virtqueue` 通过 `virtqueue_custom_callback` 回调接口将所有 ring 操作委托给用户实现。
+`custom_virtqueue` 实现 icpu-kernel-driver `DPU_RING_T_PRIV` 的 16B TX/RX 描述符与完成队列
+（CQ），是与 split/packed 平级的队列格式，报告 ID 为 `DPU_PRIV_RING`：
 
-**使用步骤：**
+- `VQ_CUSTOM` 由 `virtqueue_manager` 创建 `custom_virtqueue`；私有协议的 `queue_format()`
+  固定返回 `VQ_CUSTOM`，通用 `setup_queue` 按格式映射 ring。
+- 方向、本地号（`local_qid`）与 TX 首描述符控制由 `dpu_priv_config_backend.prepare_queue`
+  在 `alloc_rings` 前写入，分配后冻结。
+- desc 与 CQ 为一块连续分配，经 `get_ring_regions` 一次映射，CQ IOVA = ring IOVA + `queue_size*16`。
+- 通知字 `{wrap, tail, local_qid}` 由 ops 经配置后端写 doorbell。
+- 队列大小 2..4096，不要求 2 的幂；显式请求大小超过私有配置的 `default_queue_size`
+  时按通用 `setup_queue` 规则截到该值并给出 `UVM_WARNING`。
+- TX 在 ring 满时与 split 一致报 `UVM_ERROR`（`DPU_PRIV_RING`），不再静默返回。
+- 私有协议要求确认停 DMA 的复位，数据面处于 `FSM_RUNNING` 时 `full_init` 报错拒绝，
+  须先停止数据面。
 
-1. 继承 `virtqueue_custom_callback`，实现所有纯虚方法
-2. 创建 `custom_virtqueue` 实例
-3. 设置 `custom_cb` 引用
-4. 可选：配置 `desc_entry_size` 和 `desc_field_defs[]`
+驱动协议能力对照：
 
-**字段定义机制：**
+| 协议 | `has_ctrl_vq` | `supports_mq` | `supports_migration` | `queue_format` |
+|------|---------------|---------------|----------------------|----------------|
+| 标准 (`virtio_driver_protocol`) | 1 | 1 | 1 | 配置值 |
+| 私有 (`dpu_priv_driver_protocol`) | 0 | 0 | 0 | `VQ_CUSTOM` |
 
-```systemverilog
-custom_vq.desc_entry_size = 32;  // 每个描述符 32 字节
-custom_vq.desc_field_defs = '{"addr:64:0", "len:32:8", "flags:16:12",
-                               "next:16:14", "metadata:128:16"};
-// 格式: "name:width_bits:offset_bytes"
-
-// 在回调中使用:
-custom_vq.write_desc_field(idx, "metadata", 128'hDEADBEEF);
-bit [63:0] val = custom_vq.read_desc_field(idx, "addr");
-```
+新增队列格式按同样方式直接继承 `virtqueue_base`；设备侧差异放进 `virtio_config_backend`
+子类，能力差异放进 `virtio_driver_protocol` 子类。
 
 #### 4.5.5 Virtqueue Manager
 
@@ -988,8 +989,7 @@ bit ok = vq.corrupt_published_descriptor(
 `VQ_DESC_FIELD_ADDR`、`VQ_DESC_FIELD_LEN`、`VQ_DESC_FIELD_FLAGS`、
 `VQ_DESC_FIELD_NEXT`（仅 Split）和 `VQ_DESC_FIELD_ID`（仅 Packed）。辅助 API
 会检查 Host-memory handle、16 字节对齐、descriptor index/队列范围、地址算术
-溢出、ring 格式和字段宽度；Custom virtqueue 因布局由用户定义而被拒绝，不能
-猜测字段偏移。
+溢出、ring 格式和字段宽度；私有环（`custom_virtqueue`）的 W1/W2 布局不在通用字段表内，被拒绝。
 
 队列的通用 `process_error_injection(fault_phase)` 目前只把以下语义错误转换成
 真实的描述符字节变异：`VQ_ERR_ZERO_LEN_BUF`（LEN）、`VQ_ERR_DESC_UNALIGNED`
