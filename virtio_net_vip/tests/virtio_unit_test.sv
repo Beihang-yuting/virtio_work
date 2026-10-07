@@ -402,6 +402,7 @@ class virtio_unit_test extends uvm_test;
         test_ep_config_read_completion_metadata();
         test_tlm_completion_reject_filter();
         test_tlm_completion_matcher();
+        test_tlm_completion_same_timestep_wakeup();
         test_tlm_config_write_completion_lifecycle();
         test_tlm_completion_factory_owner();
         test_late_driver_agent_binding();
@@ -1194,6 +1195,35 @@ class virtio_unit_test extends uvm_test;
             else `uvm_error("TEST", "both matching completions were not consumed")
 
         `uvm_info("UNIT_TEST", "test_tlm_completion_matcher PASSED", UVM_LOW)
+    endtask
+
+    // completion 在等待者开始等待的同一时刻入队（等待者已扫描暂存队列、尚未进入等待）：
+    // 等待者必须在同一时刻认领返回，不能睡到超时。
+    task test_tlm_completion_same_timestep_wakeup();
+        virtio_tlm_completion_adapter adapter;
+        pcie_tl_cpl_tlp cpl;
+        pcie_tl_cpl_tlp observed_cpl;
+        time start;
+        bit ok;
+
+        adapter = virtio_tlm_completion_adapter::type_id::create("same_ts_adapter");
+        cpl = pcie_tl_cpl_tlp::type_id::create("same_ts_cpl");
+        cpl.kind = TLP_CPLD;
+        cpl.requester_id = 16'h0100;
+        cpl.tag = 10'h031;
+        cpl.cpl_status = CPL_STATUS_SC;
+        cpl.payload = new[4];
+        start = $time;
+        ok = 0;
+        fork
+            adapter.wait_matching_completion(50000, cpl.tag, cpl.requester_id, observed_cpl, ok);
+            adapter.put_completion(cpl);
+        join
+        assert(ok && (observed_cpl == cpl) && ($time == start))
+            else `uvm_error("TEST", $sformatf(
+                "same-timestep completion was not claimed immediately (ok=%0b waited=%0t)",
+                ok, $time - start))
+        `uvm_info("UNIT_TEST", "test_tlm_completion_same_timestep_wakeup PASSED", UVM_LOW)
     endtask
 
     // Configuration writes are non-posted requests, but their successful

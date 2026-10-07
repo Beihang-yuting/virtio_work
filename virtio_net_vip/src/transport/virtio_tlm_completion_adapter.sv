@@ -25,7 +25,6 @@ class virtio_tlm_completion_adapter extends uvm_object;
     // owner claims it; never let an unrelated waiter consume it from a FIFO.
     protected pcie_tl_cpl_tlp retained_cpls[$];
     protected pcie_tl_base_driver retained_cpl_sources[$];
-    protected uvm_event cpl_available;
     protected static virtio_tlm_completion_adapter factory_owner;
     protected pcie_tl_base_driver registered_rc_driver;
     protected pcie_tl_base_driver factory_rc_drivers[$];
@@ -35,11 +34,9 @@ class virtio_tlm_completion_adapter extends uvm_object;
     int unsigned completions_received;
     int unsigned completions_consumed;
 
-    // 构造只创建"有新 completion 到达"事件对象；此时未安装 factory override，
-    // 也未绑定任何 RC driver，需调用方后续显式安装/绑定。
+    // 构造时未安装 factory override，也未绑定任何 RC driver，需调用方后续显式安装/绑定。
     function new(string name = "virtio_tlm_completion_adapter");
         super.new(name);
-        cpl_available = new("tlm_completion_available");
         rc_driver_registration_failed = 0;
     endfunction
 
@@ -84,7 +81,9 @@ class virtio_tlm_completion_adapter extends uvm_object;
     endfunction
 
     // 按 {tag, requester_id} 认领一个暂存 completion；没有则阻塞等待新
-    // completion 事件或超时(timeout_ns)。命中即从暂存队列摘除并 ok=1；
+    // completion 到达或超时(timeout_ns)。等待按电平判断：扫描前记下
+    // completions_received，只要它变了就重扫，同一时刻在扫描后、进入等待前
+    // 入队的 completion 不会丢失唤醒。命中即从暂存队列摘除并 ok=1；
     // 超时返回 ok=0 且 cpl=null，是否告警由调用方决定。注意：本路径不区分
     // 来源 driver，多 domain 场景应改用 wait_matching_domain_completion，
     // 否则独立 domain 中等值 tag/BDF 可能被跨域误领。
@@ -97,11 +96,13 @@ class virtio_tlm_completion_adapter extends uvm_object;
     );
         time deadline;
         time remaining;
+        int unsigned seen;
 
         ok = 0;
         cpl = null;
         deadline = $time + (timeout_ns * 1ns);
         forever begin
+            seen = completions_received;
             foreach (retained_cpls[index]) begin
                 if (retained_cpls[index].tag == expected_tag &&
                     retained_cpls[index].requester_id == expected_requester_id) begin
@@ -119,7 +120,7 @@ class virtio_tlm_completion_adapter extends uvm_object;
 
             remaining = deadline - $time;
             fork : wait_matching_completion_blk
-                cpl_available.wait_trigger();
+                wait (completions_received != seen);
                 #(remaining);
             join_any
             disable wait_matching_completion_blk;
@@ -141,11 +142,13 @@ class virtio_tlm_completion_adapter extends uvm_object;
     );
         time deadline;
         time remaining;
+        int unsigned seen;
 
         ok = 0;
         cpl = null;
         deadline = $time + (timeout_ns * 1ns);
         forever begin
+            seen = completions_received;
             foreach (retained_cpls[index]) begin
                 bit source_matches_domain;
 
@@ -178,7 +181,7 @@ class virtio_tlm_completion_adapter extends uvm_object;
 
             remaining = deadline - $time;
             fork : wait_matching_domain_completion_blk
-                cpl_available.wait_trigger();
+                wait (completions_received != seen);
                 #(remaining);
             join_any
             disable wait_matching_domain_completion_blk;
@@ -191,7 +194,6 @@ class virtio_tlm_completion_adapter extends uvm_object;
         retained_cpls.push_back(cpl);
         retained_cpl_sources.push_back(null);
         completions_received++;
-        cpl_available.trigger();
     endfunction
 
     // shim 截获 completion 后的入队入口：连同来源 driver 一起暂存，使 domain
@@ -203,7 +205,6 @@ class virtio_tlm_completion_adapter extends uvm_object;
         retained_cpls.push_back(cpl);
         retained_cpl_sources.push_back(source_driver);
         completions_received++;
-        cpl_available.trigger();
     endfunction
 endclass : virtio_tlm_completion_adapter
 

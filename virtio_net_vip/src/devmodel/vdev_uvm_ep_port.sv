@@ -15,7 +15,7 @@ typedef class vdev_uvm_ep_port;
 // pcie_tl EP driver 的设备模型接入点（fixture 以 factory override 替换 pcie_tl_ep_driver）。
 // 需要 Completion 的请求先经过 COMPLETION_LATENCY_NS 再交给端口：pcie_tl 的 EP monitor 在请求入口
 // 1ns 后才发布 RC→EP 的 posted 写（scoreboard 据此记录写数据），同一时刻返回的读 Completion 会被拿去
-// 和旧数据比对；RC 侧 completion 等待也需要 Completion 晚于请求发出。端口 serve 本身仍是零时间。
+// 和该写之前的旧数据比对。端口 serve 本身仍是零时间。
 class vdev_ep_driver extends pcie_tl_ep_driver;
     `uvm_component_utils(vdev_ep_driver)
 
