@@ -482,32 +482,8 @@ endclass
 class virtio_dut_caps_malicious_function extends virtio_function_instance;
     `uvm_component_utils(virtio_dut_caps_malicious_function)
 
-    int unsigned public_wire_shared_count;
-    int unsigned public_function_bind_count;
-
     function new(string name, uvm_component parent);
         super.new(name, parent);
-        public_wire_shared_count = 0;
-        public_function_bind_count = 0;
-    endfunction
-
-    virtual function bit wire_shared(
-        host_mem_manager hmem,
-        virtio_iommu_model iommu_mdl,
-        virtio_memory_barrier_model bar_mdl,
-        virtqueue_error_injector einj,
-        virtio_wait_policy wpol,
-        uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
-    );
-        public_wire_shared_count++;
-        return 1;
-    endfunction
-
-    virtual function bit bind_pcie(
-        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
-    );
-        public_function_bind_count++;
-        return 1;
     endfunction
 endclass
 
@@ -1221,16 +1197,11 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS",
                 "phase-window environment failed its valid PCIe bind")
         end
-        if ((production_function.public_wire_shared_count != 0) ||
-            (production_function.public_function_bind_count != 0) ||
-            (production_function.driver_agent.fsm == null) ||
+        if ((production_function.driver_agent.fsm == null) ||
             (production_function.driver_agent.fsm.max_supported_mq_pairs() !=
              1)) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
-                {"production env bind bypassed mandatory function guard: ",
-                 "wire=%0d bind=%0d fsm=%0d"},
-                production_function.public_wire_shared_count,
-                production_function.public_function_bind_count,
+                "production env bind bypassed mandatory function guard: fsm=%0d",
                 (production_function.driver_agent.fsm == null) ? 0 :
                     production_function.driver_agent.fsm.
                         max_supported_mq_pairs()))
@@ -2103,8 +2074,9 @@ class virtio_dut_caps_test extends uvm_test;
         mq_binding_function.drv_cfg = driver_cfg;
         mq_binding_function.driver_agent.ops = ops;
         mq_binding_function.driver_agent.fsm = fsm;
-        if (!mq_binding_function.wire_shared(
-            null, null, null, null, null, mq_pcie_seqr)) begin
+        if (!(mq_binding_function.preflight_bind_pcie(mq_pcie_seqr) &&
+              mq_binding_function.commit_bind_pcie(
+                  null, null, null, null, null, mq_pcie_seqr))) begin
             `uvm_fatal("DUT_CAPS", "valid MQ function PCIe bind failed")
         end
         mq_driver.ops = ops;
@@ -2137,8 +2109,10 @@ class virtio_dut_caps_test extends uvm_test;
             {"function_0 could not bind its MQ pair limit: ",
              "FSM MQ pair limit is already bound to 1; cannot rebind to 2"});
         uvm_report_cb::add(null, rebind_catcher);
-        bind_succeeded = mq_binding_function.wire_shared(
-            null, null, null, null, null, mq_pcie_seqr);
+        bind_succeeded =
+            mq_binding_function.preflight_bind_pcie(mq_pcie_seqr) &&
+            mq_binding_function.commit_bind_pcie(
+                null, null, null, null, null, mq_pcie_seqr);
         uvm_report_cb::delete(null, rebind_catcher);
         mq_binding_function.transport = transport;
         mq_binding_function.vq_mgr = vq_mgr;
@@ -2466,7 +2440,7 @@ class virtio_dut_caps_test extends uvm_test;
         int unsigned saved_qpair_limit;
         bit bind_succeeded;
 
-        // 通过基类句柄调用非虚的 wire_shared：子类覆写不可达，MQ 守卫必须执行。
+        // 通过基类句柄调用非虚的 preflight_bind_pcie：MQ 守卫必须执行且不留候选。
         base_function = malicious_binding_function;
         saved_qpair_limit = base_function.drv_cfg.max_vio_net_qpairs_per_device;
         base_function.drv_cfg.max_vio_net_qpairs_per_device = 33;
@@ -2475,22 +2449,21 @@ class virtio_dut_caps_test extends uvm_test;
             {"function_0 could not bind its MQ pair limit: ",
              "FSM MQ pair limit 33 exceeds model ceiling 32"});
         uvm_report_cb::add(null, catcher);
-        bind_succeeded = base_function.wire_shared(
-            null, null, null, null, null, mq_pcie_seqr);
+        bind_succeeded =
+            base_function.preflight_bind_pcie(mq_pcie_seqr) &&
+            base_function.commit_bind_pcie(
+                null, null, null, null, null, mq_pcie_seqr);
         uvm_report_cb::delete(null, catcher);
         base_function.drv_cfg.max_vio_net_qpairs_per_device = saved_qpair_limit;
 
         if ((catcher.caught_count != 1) || bind_succeeded ||
-            (malicious_binding_function.public_wire_shared_count != 0) ||
             (base_function.driver_agent.ops != null) ||
             (base_function.driver_agent.fsm != null) ||
             (base_function.pending_pcie_fsm_candidate() != null) ||
             (base_function.pending_pcie_ops_candidate() != null)) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
-                {"base-typed function bind bypassed mandatory MQ guard: ",
-                 "reports=%0d public=%0d"},
-                catcher.caught_count,
-                malicious_binding_function.public_wire_shared_count))
+                "base-typed function bind bypassed mandatory MQ guard: reports=%0d",
+                catcher.caught_count))
         end
     endtask
 
@@ -2523,7 +2496,7 @@ class virtio_dut_caps_test extends uvm_test;
         catcher = new("public_bind_null_driver_catcher", base_function,
             "FUNCTION_BIND", "function_0 is missing driver agent");
         uvm_report_cb::add(null, catcher);
-        bind_succeeded = base_function.bind_pcie(mq_pcie_seqr);
+        bind_succeeded = base_function.preflight_bind_pcie(mq_pcie_seqr);
         uvm_report_cb::delete(null, catcher);
         base_function.driver_agent = saved_driver_agent;
 

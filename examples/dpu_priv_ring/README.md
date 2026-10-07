@@ -79,7 +79,7 @@ DPU 的全局队列资源编号。同一本地号可出现在不同 Host/Functio
 ## 3. 使用现有 env/agent 接口
 
 照常构建顶层环境，并使用现有 `bind_pcie_endpoints()`、`bind_pcie()` 或
-Function 的 `wire_shared()` 绑定资源。环境把私有配置交给对应 Function，
+Function 的 `preflight_bind_pcie()` + `commit_bind_pcie()` 绑定资源。环境把私有配置交给对应 Function，
 后者自动创建 `dpu_priv_atomic_ops`、`dpu_priv_auto_fsm`，并把私有 ops 注入
 `function.dataplane` 的标准 TX/RX 引擎。
 不需要全局 factory override，也不需要手动给每条队列设置 `custom_cb`。

@@ -423,9 +423,9 @@ class virtio_net_env extends uvm_env;
     // Wire shared components into VF instances and connect analysis ports to
     // scoreboard/coverage.
     //
-    // Note: wire_shared() for VF instances requires pcie_rc_seqr which
-    // comes from the PCIe TL env. That connection is deferred to the
-    // test's connect_phase.
+    // Note: binding VF instances (preflight/commit_bind_pcie) requires
+    // pcie_rc_seqr which comes from the PCIe TL env. That connection is
+    // deferred to the test's connect_phase.
     // 中文说明：按 service key 装载每个 Function 的 driver 行为，连接监控与
     // scoreboard/coverage，并发布虚拟 sequencer 引用；配置无效时不产生副作用。
     // ========================================================================

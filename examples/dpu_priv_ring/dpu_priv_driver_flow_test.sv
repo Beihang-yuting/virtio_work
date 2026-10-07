@@ -153,8 +153,9 @@ class dpu_priv_driver_flow_test extends virtio_system_env_example_test;
                 virtio_function_instance f;
                 dpu_priv_atomic_ops check_private;
                 f = env.function_instances[i];
-                if (!f.wire_shared(env.host_mem, env.iommu, env.barrier,
-                                     env.err_inj, env.wait_pol, unused_rc))
+                if (!(f.preflight_bind_pcie(unused_rc) &&
+                      f.commit_bind_pcie(env.host_mem, env.iommu,
+                          env.barrier, env.err_inj, env.wait_pol, unused_rc)))
                     `uvm_fatal("DPU_FLOW", "Function binding failed")
                 if (f.function_key.vf_id == 0) begin
                     if (f.private_cfg == null || !$cast(private_ops[h], f.driver_agent.ops))

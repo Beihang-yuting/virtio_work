@@ -1294,7 +1294,7 @@ typedef struct {
 
 #### 4.9.3 VF Instance
 
-`virtio_vf_instance` 封装单个 VF 的所有组件：`virtio_driver_agent`、`virtqueue_manager`、`virtio_pci_transport`、`virtio_net_dataplane`。底层 nonvirtual `wire_shared()` 返回 `bit`，只有 MQ capability guard 和全部组件接线成功才返回 1；环境集成应统一调用 `virtio_net_env::bind_pcie()`，不直接逐 VF 接线。
+`virtio_vf_instance` 封装单个 VF 的所有组件：`virtio_driver_agent`、`virtqueue_manager`、`virtio_pci_transport`、`virtio_net_dataplane`。底层 nonvirtual `preflight_bind_pcie()`/`commit_bind_pcie()` 返回 `bit`，只有 MQ capability guard 和全部组件接线成功才返回 1；环境集成应统一调用 `virtio_net_env::bind_pcie()`，不直接逐 VF 接线。
 
 #### 4.9.4 VF FLR 流程
 

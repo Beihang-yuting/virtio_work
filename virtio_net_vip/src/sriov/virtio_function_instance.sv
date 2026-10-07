@@ -407,8 +407,8 @@ class virtio_function_instance extends uvm_component;
         ops.iommu = iommu_mdl;
         ops.wait_pol = wpol;
 
-        // Keep the optional standalone dataplane wrapper in the same
-        // host-qualified DMA domain as the function-owned queue/atomic path.
+        // Keep the function-owned dataplane in the same host-qualified DMA
+        // domain as the queue/atomic path.
         // 标准与私有 Function 使用同一引擎类，只是注入的 ops 不同；收发、DMA
         // 所有权与通知都在 ops 内，engine 与 FSM/sequence 共用同一张所有权表。
         if (dataplane != null) begin
@@ -444,31 +444,6 @@ class virtio_function_instance extends uvm_component;
             end
         end
         return 1;
-    endfunction
-
-    // 单 Function 便捷入口：preflight + commit 的组合；任一半段失败都丢弃候选，
-    // 不保留部分接线。环境批量绑定直接使用两阶段接口以保证多 Function 原子性。
-    function bit wire_shared(
-        host_mem_manager hmem,
-        virtio_iommu_model iommu_mdl,
-        virtio_memory_barrier_model bar_mdl,
-        virtqueue_error_injector einj,
-        virtio_wait_policy wpol,
-        uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
-    );
-        if (preflight_bind_pcie(pcie_rc_seqr) &&
-            commit_bind_pcie(hmem, iommu_mdl, bar_mdl, einj, wpol, pcie_rc_seqr))
-            return 1;
-        cancel_bind_pcie();
-        return 0;
-    endfunction
-
-    // standalone 便捷入口：使用实例当前保存的共享对象绑定一个 RC sequencer。
-    function bit bind_pcie(
-        input uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr
-    );
-        return wire_shared(
-            mem, iommu, barrier, err_inj, wait_pol, pcie_rc_seqr);
     endfunction
 
     // 保存驱动行为并将 Function 置为 CONFIGURED；真正启动由 driver FSM 负责。
@@ -589,23 +564,16 @@ class virtio_function_instance extends uvm_component;
     endfunction
 
     // 把 snapshot 的 PCIe identity、BAR lease、Host-qualified DMA identity 和
-    // service resources 同步到 transport/queue/dataplane；未绑定 snapshot 时仅
-    // 保留 standalone 兼容路径，不创建新的资源所有权。
+    // service resources 同步到 transport/queue/dataplane；尚未绑定冻结
+    // snapshot 的实例不派生任何身份，transport 保持未配置。
     protected function void apply_function_configuration();
         string why;
 
         if ((transport == null) || (vq_mgr == null) || (resource_client == null))
             return;
-        if (pcie_id_valid)
-            transport.configure_pcie_identity(pcie_id);
-        else begin
-            // Compatibility for standalone instances authored before a
-            // frozen snapshot is attached.  Environment-owned functions
-            // always take the full-identity branch above.
-            transport.bdf = bdf;
-            transport.notify_mgr.set_function_bdf(bdf);
-            transport.bar.requester_id = bdf;
-        end
+        if (!pcie_id_valid)
+            return;
+        transport.configure_pcie_identity(pcie_id);
         transport.is_vf = (function_kind == DPU_FUNCTION_VF);
         transport.vf_index = vf_index;
         vq_mgr.host_id = transport.iommu_host_id();
