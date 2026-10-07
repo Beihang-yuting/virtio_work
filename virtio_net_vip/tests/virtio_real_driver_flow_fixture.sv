@@ -1039,6 +1039,36 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         ok = (received_count != 0);
     endtask
 
+    // 协议 SVA 接口每拍只释放一个暂存事件，零时间的数据面突发会积压；复位前等全部释放并被
+    // 采样，使本流程的 notify/完成都经过检查（复位会清空完成信用）。先等过端口 MSI-X 的发布延迟，
+    // 使仍在发布途中的中断也进入暂存队列；等待以 Function 的 wait_pol 超时为界，超时报错。
+    protected task drain_protocol_events(virtio_function_instance function_instance);
+        virtual virtio_protocol_event_if vif;
+        int unsigned timeout_ns;
+        int unsigned waited_ns;
+
+        if ((function_instance.driver_agent.monitor == null) ||
+            (function_instance.driver_agent.monitor.protocol_vif == null))
+            return;
+        vif = function_instance.driver_agent.monitor.protocol_vif;
+        timeout_ns = (function_instance.wait_pol != null) ?
+                     function_instance.wait_pol.effective_timeout(
+                         function_instance.wait_pol.default_timeout_ns) : 10000;
+        #((vdev_ep_driver::MSIX_PUBLISH_DELAY_NS + 1) * 1ns);
+        waited_ns = 0;
+        while ((vif.staged_pulses.size() != 0) && (waited_ns < timeout_ns)) begin
+            #1ns;
+            waited_ns++;
+        end
+        if (vif.staged_pulses.size() != 0) begin
+            `uvm_error("REAL_FLOW", $sformatf(
+                "protocol SVA still holds %0d staged events after %0dns; reset would discard unchecked events",
+                vif.staged_pulses.size(), timeout_ns))
+            return;
+        end
+        repeat (2) @(posedge vif.clk);
+    endtask
+
     // Quiesce FSM workers first (the device stops its own DMA when status is reset), then perform the verified normal
     // driver reset.  The atomic reset path detaches queues, unmaps ring IOVAs,
     // retires any normal DMA records, and destroys queue objects.
@@ -1066,13 +1096,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             `uvm_error("REAL_FLOW", "selected function reset ops are unavailable")
             return;
         end
-        // 协议 SVA 接口每拍只释放一个暂存事件，零时间的数据面突发会积压；复位前等全部释放
-        // 并被采样，使本流程的 notify/完成都经过检查（复位会清空完成信用）。
-        if ((function_instance.driver_agent.monitor != null) &&
-            (function_instance.driver_agent.monitor.protocol_vif != null)) begin
-            wait (function_instance.driver_agent.monitor.protocol_vif.staged_pulses.size() == 0);
-            repeat (2) @(posedge function_instance.driver_agent.monitor.protocol_vif.clk);
-        end
+        drain_protocol_events(function_instance);
         function_instance.driver_agent.ops.device_reset_verified(reset_complete);
         if (!reset_complete) begin
             `uvm_error("REAL_FLOW", "verified device reset did not complete")
