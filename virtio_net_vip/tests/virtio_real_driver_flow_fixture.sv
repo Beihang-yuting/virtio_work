@@ -1113,6 +1113,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
                 why = "snapshot has more VIO functions than device models";
                 return 0;
             end
+            bars.delete();
             if (!m_device_snapshot.list_bars(f.function_key, bars, why))
                 return 0;
             foreach (bars[i])
