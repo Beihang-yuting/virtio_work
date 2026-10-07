@@ -188,10 +188,12 @@ class virtio_unit_recording_backend extends virtio_config_backend;
     bit [7:0] status_reg;
     virtio_queue_program_t configured_program;
     virtio_queue_program_t disabled_program;
+    virtio_net_device_config_t net_config;
 
     function new(string name = "virtio_unit_recording_backend");
         super.new(name);
         status_reg = 0;
+        net_config = '{default: 0};
     endfunction
 
     virtual task reset(output bit ok);
@@ -246,6 +248,10 @@ class virtio_unit_recording_backend extends virtio_config_backend;
     virtual task clear_msix(output bit ok);
         calls.push_back("clear_msix");
         ok = 1;
+    endtask
+    virtual task read_net_config(output virtio_net_device_config_t cfg);
+        calls.push_back("read_net_config");
+        cfg = net_config;
     endtask
 endclass : virtio_unit_recording_backend
 
@@ -389,6 +395,7 @@ class virtio_unit_test extends uvm_test;
         test_discovery_strategy_selection();
         test_injected_discovery_survives_fabric_config();
         test_config_backend_injection();
+        test_config_reads_use_backend();
         test_common_backend_queue_reset_result();
         test_setup_queue_rejects_host_mismatch();
         test_driver_protocol_selection();
@@ -1608,6 +1615,60 @@ class virtio_unit_test extends uvm_test;
                 transport.kick_count, catcher.caught_count))
         kit.vq_mgr.destroy_all();
         `uvm_info("UNIT_TEST", "test_standard_manual_kick_notifies PASSED", UVM_LOW)
+    endtask
+
+    // 队列片段（control VQ 定位）与迁移采集读取的 net config / status 必须经注入的
+    // 后端，transport 的 net config 寄存器不得被直接读取。
+    task test_config_reads_use_backend();
+        virtio_mock_transport transport;
+        virtio_unit_recording_backend backend;
+        virtio_vq_test_kit kit;
+        virtio_atomic_ops ops;
+        virtio_migration_engine migration;
+        virtio_device_snapshot_t snap;
+        host_mem_manager mem;
+        virtio_iommu_model iommu;
+        int unsigned net_config_calls;
+        int unsigned status_calls;
+        bit ctrl_at_4;
+        bit reset_ok;
+        bit ok;
+
+        mem = host_mem_manager::type_id::create("cfg_read_mem");
+        mem.init_region(64'h7800_0000, 64'h7800_FFFF);
+        iommu = virtio_iommu_model::type_id::create("cfg_read_iommu");
+        transport = virtio_mock_transport::type_id::create("cfg_read_transport");
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0135));
+        kit = virtio_vq_test_kit::create_kit("cfg_read", mem, iommu, 16'h0135);
+        ops = kit.make_ops(transport, "cfg_read_ops");
+        backend = virtio_unit_recording_backend::type_id::create("cfg_read_backend");
+        backend.net_config.max_virtqueue_pairs = 2;
+        ops.config_backend = backend;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+
+        // 后端报告 max_virtqueue_pairs=2，control VQ 必须是 4（mock transport 报告 1）。
+        ops.setup_all_queues(1, VQ_SPLIT, 4, ok);
+        ctrl_at_4 = ok && kit.vq_mgr.has_queue(4);
+        ops.device_reset_verified(reset_ok);
+
+        migration = virtio_migration_engine::type_id::create("cfg_read_migration");
+        migration.capture_snapshot(ops, 0, 0, 0, ok, snap);
+        net_config_calls = 0;
+        status_calls = 0;
+        foreach (backend.calls[i]) begin
+            if (backend.calls[i] == "read_net_config")
+                net_config_calls++;
+            if (backend.calls[i] == "read_status")
+                status_calls++;
+        end
+        if (!ctrl_at_4 || !reset_ok || !ok || (net_config_calls != 2) ||
+            (status_calls != 1) || (transport.net_config_reads != 0) ||
+            (snap.net_config.max_virtqueue_pairs != 2))
+            `uvm_error("TEST", $sformatf(
+                "status/net config reads bypassed the config backend (ctrl_at_4=%0b ok=%0b net_cfg=%0d status=%0d direct_net_cfg=%0d)",
+                ctrl_at_4, ok, net_config_calls, status_calls, transport.net_config_reads))
+        `uvm_info("UNIT_TEST", "test_config_reads_use_backend PASSED", UVM_LOW)
     endtask
 
 endclass

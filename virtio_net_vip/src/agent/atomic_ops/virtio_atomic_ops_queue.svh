@@ -334,7 +334,7 @@
         if (negotiated_features[VIRTIO_NET_F_CTRL_VQ]) begin
             ctrl_qid = num_pairs * 2;
             if (negotiated_features[VIRTIO_NET_F_MQ]) begin
-                transport.read_net_config(net_cfg);
+                read_net_config(net_cfg);
                 if (net_cfg.max_virtqueue_pairs > num_pairs)
                     ctrl_qid = 2 * net_cfg.max_virtqueue_pairs;
             end

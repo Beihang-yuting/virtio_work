@@ -103,6 +103,8 @@ virtual class virtio_config_backend extends uvm_object;
     pure virtual task set_msix(int unsigned queue_ids[$], output bit ok);
     // 屏蔽全部 MSI-X 向量。
     pure virtual task clear_msix(output bit ok);
+    // 读取 virtio-net 设备配置空间（MAC、link status、max_virtqueue_pairs 等）。
+    pure virtual task read_net_config(output virtio_net_device_config_t cfg);
 endclass
 
 // 标准 virtio-pci common-config 后端：逐字保留 atomic ops 在 HEAD 中的寄存器序列。
@@ -222,6 +224,13 @@ class virtio_common_cfg_backend extends virtio_config_backend;
     virtual task clear_msix(output bit ok);
         transport.notify_mgr.mask_all();
         ok = 1;
+    endtask
+
+    virtual task read_net_config(output virtio_net_device_config_t cfg);
+        virtio_net_device_config_t value;
+
+        transport.read_net_config(value);
+        cfg = value;
     endtask
 endclass
 

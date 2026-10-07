@@ -1097,7 +1097,7 @@ class virtio_auto_fsm extends uvm_report_object;
             // Re-read device configuration and handle changes
             begin
                 virtio_net_device_config_t cfg;
-                ops.transport.read_net_config(cfg);
+                ops.read_net_config(cfg);
 
                 // Check link status if STATUS feature is negotiated
                 if (ops.negotiated_features[VIRTIO_NET_F_STATUS]) begin
@@ -1124,7 +1124,7 @@ class virtio_auto_fsm extends uvm_report_object;
                 // Check DEVICE_NEEDS_RESET
                 begin
                     bit [7:0] dev_status;
-                    ops.transport.read_device_status(dev_status);
+                    ops.read_device_status(dev_status);
                     if (dev_status & DEV_STATUS_DEVICE_NEEDS_RESET) begin
                         `uvm_warning("AUTO_FSM",
                             "config_change_handler: DEVICE_NEEDS_RESET detected")

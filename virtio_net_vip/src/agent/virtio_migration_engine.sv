@@ -607,12 +607,12 @@ class virtio_migration_engine extends uvm_object;
         snap.negotiated_features = ops.negotiated_features;
         begin
             bit [7:0] dev_status;
-            ops.transport.read_device_status(dev_status);
+            ops.read_device_status(dev_status);
             snap.device_status = dev_status;
         end
 
         // 4. Read device config
-        ops.transport.read_net_config(snap.net_config);
+        ops.read_net_config(snap.net_config);
 
         // 5. Save all queue states
         snap.num_queue_pairs = num_pairs;

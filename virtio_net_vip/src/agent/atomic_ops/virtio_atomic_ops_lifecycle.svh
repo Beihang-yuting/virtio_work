@@ -99,6 +99,14 @@
         backend.read_status(status);
     endtask
 
+    // 设备 net config 读取：FSM、迁移与建队片段的唯一入口，经配置后端。
+    virtual task read_net_config(output virtio_net_device_config_t cfg);
+        virtio_config_backend backend;
+
+        backend = cfg_backend();
+        backend.read_net_config(cfg);
+    endtask
+
     // ------------------------------------------------------------------------
     // set_acknowledge -- Set ACKNOWLEDGE bit in device status
     // ------------------------------------------------------------------------

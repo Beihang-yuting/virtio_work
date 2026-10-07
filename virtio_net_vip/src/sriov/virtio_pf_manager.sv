@@ -81,14 +81,17 @@ class virtio_pf_manager extends uvm_object;
 
     // Admin descriptors are owned by ctx.vq, while DMA and notification use
     // the context fields.  They must describe the same queue, requester, and
-    // memory/IOMMU domains before any lifecycle operation can touch them.
+    // memory/IOMMU domains, and status/queue-reset access must go through a
+    // config backend bound to the context transport, before any lifecycle
+    // operation can touch them.
     protected function bit admin_vq_bindings_are_consistent(
         virtio_admin_vq_context admin_context,
         string                  operation
     );
         if ((admin_context == null) || (admin_context.vq == null) ||
             (admin_context.transport == null) || (admin_context.mem == null) ||
-            (admin_context.iommu == null) ||
+            (admin_context.iommu == null) || (admin_context.config_backend == null) ||
+            (admin_context.config_backend.bound_transport() != admin_context.transport) ||
             (admin_context.queue_id != admin_context.vq.queue_id) ||
             (admin_context.vq.host_id !=
                 admin_context.transport.iommu_host_id()) ||
@@ -663,6 +666,7 @@ class virtio_pf_manager extends uvm_object;
             if (!admin_context.configured || (admin_context.vq == null) ||
                 (admin_context.transport == null) || (admin_context.mem == null) ||
                 (admin_context.iommu == null) || (admin_context.wait_pol == null) ||
+                (admin_context.config_backend == null) ||
                 (admin_context.response_capacity == 0)) begin
                     `uvm_error("PF_MGR", "admin_cmd: Admin VQ is not configured")
                 break;
@@ -685,9 +689,8 @@ class virtio_pf_manager extends uvm_object;
                 break;
             end
 
-            // Use the transport API rather than a cached status field, so the
-            // decision always follows the same device-visible status source.
-            admin_context.transport.read_device_status(device_status);
+            // 经 PF 配置后端读取设备可见 status，而不是缓存字段或直接寄存器访问。
+            admin_context.config_backend.read_status(device_status);
             if (device_status & (DEV_STATUS_FAILED | DEV_STATUS_DEVICE_NEEDS_RESET)) begin
                 `uvm_error("PF_MGR", "admin_cmd: device is FAILED or needs reset")
                 break;

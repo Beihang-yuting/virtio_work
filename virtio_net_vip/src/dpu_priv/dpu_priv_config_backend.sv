@@ -136,6 +136,11 @@ class dpu_priv_config_backend extends virtio_config_backend;
         reject("clear_msix");
     endtask
 
+    virtual task read_net_config(output virtio_net_device_config_t cfg);
+        cfg = '{default: 0};
+        reject("read_net_config");
+    endtask
+
     // 私有 doorbell：等价于驱动 writel(value, notify_addr)，经控制后端发出。
     task notify_queue(dpu_priv_queue_context_t ctx, bit [31:0] value);
         control.notify_queue(transport, ctx, value);

@@ -488,6 +488,8 @@ class virtio_admin_vq_test extends uvm_test;
         virtio_mock_transport transport;
         split_virtqueue                vq;
         virtio_admin_vq_expected_error_catcher catcher;
+        virtio_config_backend          backend;
+        virtio_mock_transport          other_transport;
 
         configure_admin_context(ctx, mem, iommu, transport, vq);
         pf_mgr.clear_admin_vq();
@@ -504,6 +506,32 @@ class virtio_admin_vq_test extends uvm_test;
             else `uvm_fatal("ADMIN_VQ",
                 "configure_admin_vq accepted inconsistent Admin VQ bindings")
         ctx.queue_id = vq.queue_id;
+
+        // 配置后端缺失或绑定到其他 transport 同样在配置时拒绝。
+        backend = ctx.config_backend;
+        other_transport = virtio_mock_transport::type_id::create("admin_other_transport");
+        ctx.config_backend = null;
+        catcher = new("configure_null_backend_catcher", '{"PF_MGR"},
+                      '{"configure_admin_vq: Admin VQ binding is inconsistent"});
+        uvm_report_cb::add(null, catcher);
+        pf_mgr.configure_admin_vq(ctx);
+        uvm_report_cb::delete(null, catcher);
+        assert(catcher.caught_count == 1 && pf_mgr.admin_vq != ctx)
+            else `uvm_fatal("ADMIN_VQ",
+                "configure_admin_vq accepted an Admin VQ without config backend")
+        ctx.config_backend = backend;
+        backend.bind_transport(other_transport);
+        catcher = new("configure_backend_mismatch_catcher", '{"PF_MGR"},
+                      '{"configure_admin_vq: Admin VQ binding is inconsistent"});
+        uvm_report_cb::add(null, catcher);
+        pf_mgr.configure_admin_vq(ctx);
+        uvm_report_cb::delete(null, catcher);
+        assert(catcher.caught_count == 1 && pf_mgr.admin_vq != ctx &&
+               transport.kick_count == 0 && vq.total_add_buf_ops == 0 &&
+               iommu.total_maps == 0)
+            else `uvm_fatal("ADMIN_VQ",
+                "configure_admin_vq accepted a config backend bound to another transport")
+        backend.bind_transport(transport);
         finish_context(vq);
     endtask
 
