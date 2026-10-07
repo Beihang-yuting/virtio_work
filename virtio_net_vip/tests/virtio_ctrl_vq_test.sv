@@ -346,7 +346,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         test_ctrl_send_timeout_resets_queue();
         test_ctrl_send_timeout_quarantines_without_ring_reset();
         test_ctrl_vq_outside_data_range_migration_and_msix();
-        test_mq_expansion_rebinds_msix();
+        test_mq_expansion_binds_new_queue_vectors();
         test_full_init_binds_msix_before_enable();
         `uvm_info("CTRL_VQ_TEST", "control VQ tests PASSED", UVM_NONE)
         phase.drop_objection(this);
@@ -865,7 +865,7 @@ class virtio_ctrl_vq_test extends uvm_test;
     // 的 RX1/TX1）都必须绑定有效、互不相同、非 config 的向量，并与 notification manager 一致。
     // virtio 1.2 §4.1.4.3.2：新建队列在 queue_enable 前写入最终向量；扩容不得改写已使能队列
     // 的向量（不再整体重建 MSI-X）。
-    task test_mq_expansion_rebinds_msix();
+    task test_mq_expansion_binds_new_queue_vectors();
         virtio_ctrl_vq_migration_transport transport =
             virtio_ctrl_vq_migration_transport::type_id::create("mq_msix_transport");
         virtio_ctrl_vq_test_mq_ops ops =
@@ -953,7 +953,7 @@ class virtio_ctrl_vq_test extends uvm_test;
             (mem.outstanding_allocations() != 0))
             `uvm_error("CTRL_VQ_TEST", "MQ MSI-X test leaked queue resources")
         mem.leak_check();
-        `uvm_info("CTRL_VQ_TEST", "MQ expansion MSI-X rebinding test PASSED", UVM_LOW)
+        `uvm_info("CTRL_VQ_TEST", "MQ expansion new-queue vector binding test PASSED", UVM_LOW)
     endtask
     // virtio 1.2 §4.1.4.3.2：驱动 MUST 在 queue_enable 之前配置好其余队列字段（含 queue_msix_vector）。
     // FSM full_init 建 1 对 + CTRL_VQ（max_virtqueue_pairs=2，队列 {0,1,4}）：每条队列使能时写入的向量
