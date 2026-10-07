@@ -69,6 +69,7 @@
 // - M-4 完成信号：先写 CQ，再按 VTX/VRX `dma_msix`→info 表（valid、self_mask）→线性表反查本地 MSI-X 向量；self_mask=1 时发出后
 //   自屏蔽，0x1004 写 `gv<<1` 解除（推断）。自屏蔽期间的完成置该 gv 挂起，解除时由 worker 补发一次：驱动 dpu_napi_poll
 //   （interrupt.c:279–335）在 napi_complete_done 后写 0x1004、不再轮询，窗口内的完成若丢弃则永远收不到中断。
+//   挂起在 info.valid=0 或使用该 gv 的使能队列全部复位后作废。
 // - M-5 TX CQ `head_index` 为最后完成描述符的下一槽、`wrap` 为该位置的圈号（驱动只比较 head_index，wrap 读而不用）。
 // - M-6 QSCH 状态 0xB22000+q*4 的 vld/fly/regi（bit11/10/9）：模型空闲为 0，`stall_queue_stop` 时报 bit10。
 // - M-7 RX 一帧跨多个描述符（desc_num≤15，`head_idx`=首描述符号）；驱动只用 pkt_len 与 cq_wrapper。
@@ -353,14 +354,31 @@ class vdev_dpu_priv extends vdev_base;
     endfunction
 
     // 驱动 dpu_af_reset_{tx,rx}_queue：清该队列运行态、停止其 DMA；旋钮打开时永不完成。
+    // 该队列的 gv 不再被任何使能队列使用时，作废其挂起中断（TX/RX 可共用 gv）。
     protected function bit stop_ring(bit tx, int unsigned gq);
+        int unsigned gv;
+        bit shared;
+
         if (stall_queue_stop)
             return 0;
         rings.delete(2 * gq + tx);
         broken.delete(2 * gq + tx);
         if (!tx)
             rx_backlog.delete(gq);
+        gv = queue_gv(tx, gq);
+        shared = 0;
+        foreach (vtx[q])
+            shared |= queue_enabled(1, q) && (queue_gv(1, q) == gv);
+        foreach (vrx[q])
+            shared |= queue_enabled(0, q) && (queue_gv(0, q) == gv);
+        if (!shared)
+            gv_pending.delete(gv);
         return 1;
+    endfunction
+
+    // 参数表 DW2 的 dma_msix（全局向量号）。
+    protected function int unsigned queue_gv(bit tx, int unsigned gq);
+        return tx ? (para_word(1, gq, 2) >> 15) & 32'h7ff : (para_word(0, gq, 2) >> 19) & 32'h7ff;
     endfunction
 
     // M-2：活动 bank 中 notify 地址等于本 BAR0、{blk,lq} 等于队列对号的有效项给出全局队列号。
@@ -430,7 +448,11 @@ class vdev_dpu_priv extends vdev_base;
 
         info = reg_val(MSIX_INFO_BASE + 4 * gv);
         ctrl = reg_val(MSIX_CTRL_BASE + 16 * gv + 32'hc);
-        if (!info[12] || ctrl[0])
+        if (!info[12]) begin
+            gv_pending.delete(gv);
+            return;
+        end
+        if (ctrl[0])
             return;
         if (gv_masked.exists(gv) && gv_masked[gv]) begin
             gv_pending[gv] = 1;
@@ -451,9 +473,10 @@ class vdev_dpu_priv extends vdev_base;
 
     // ---------------- 数据路径 ----------------
     virtual task service_queue(int unsigned q);
-        if (q >= IRQ_WORK)
-            cq_irq(q - IRQ_WORK);
-        else if (q % 2)
+        if (q >= IRQ_WORK) begin
+            if (gv_pending.exists(q - IRQ_WORK))     // 排队期间已投递或作废则不再处理
+                cq_irq(q - IRQ_WORK);
+        end else if (q % 2)
             service_tx(q / 2);
         else
             service_rx(q / 2);

@@ -1327,6 +1327,12 @@ class virtio_vdev_unit_test extends uvm_test;
         if ((ev.size() != 4) || (ev[0].dir != "tx") || (ev[0].q != 1) || (ev[1].dir != "rx") ||
             (ev[1].q != 0) || (ev[1].bytes.size() != 64))
             `uvm_fatal("VDEV_UNIT", "pkt events do not show TX loopback into RX")
+        // 停队前再发一包：gv0 已自屏蔽，TX 完成只挂起（RX 无 buffer，回环帧留在 backlog）
+        priv_desc(tx_gpa + 32, f_iova, 64, 1, 0);
+        priv_wr(32'h0, 32'h8003_0001);
+        settle();
+        if (port.msix_addr.size() != irq0 + 3)
+            `uvm_fatal("VDEV_UNIT", "TX completion while self-masked raised an MSI-X")
         // stop：TX
         for (int unsigned i = 0; i < 4; i++)
             para[i] = priv_rd(32'h89_0000 + 4*i);
@@ -1381,6 +1387,11 @@ class virtio_vdev_unit_test extends uvm_test;
         v = priv_rd(32'h90_010c);
         if (!v[0] || (priv_rd(32'h90_2000) != 32'h8000))
             `uvm_fatal("VDEV_UNIT", "RX reset did not complete or restore the VRX tail")
+        // 共用 gv0 的 TX/RX 都已停：挂起的完成随队列复位作废，解除自屏蔽不得再发
+        priv_wr(32'h1004, 32'h0);
+        settle();
+        if (port.msix_addr.size() != irq0 + 3)
+            `uvm_fatal("VDEV_UNIT", "re-arm after stopping every queue on gv0 raised a stale MSI-X")
         priv_wr(32'h5_4000, 32'h0);
         iommu.unmap_for_host(0, PRIV_BDF, tx_ring);
         iommu.unmap_for_host(0, PRIV_BDF, rx_ring);
