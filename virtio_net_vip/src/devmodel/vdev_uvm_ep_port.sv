@@ -1,7 +1,8 @@
 // 目录层次：virtio_net_vip/src/devmodel；VCS 回归用的设备端口：接在 pcie_tl EP driver 上。
 // RC→EP 的 CfgRd/CfgWr（按目标 BDF）与 MemRd/MemWr（按设备 BAR 窗口）交给设备并在请求入口直接回
-// Completion；无设备认领的请求走 EP driver 基类。请求入口与 EP 的 Completion 接收共用 TLM 线程，必须
-// 零时间；设备 DMA 只在设备 worker 中发起。设备 DMA：按 IOVA/GPA 两侧 4KiB 边界切块，经平台 IOMMU 翻译
+// Completion；无设备认领的请求走 EP driver 基类。请求入口与 EP 的 Completion 接收共用 TLM 线程：serve
+// 必须零时间、不得等待 DMA（vdev_ep_driver 只在 serve 前加固定的 Completion 延迟）；设备 DMA 只在设备
+// worker 中发起。设备 DMA：按 IOVA/GPA 两侧 4KiB 边界切块，经平台 IOMMU 翻译
 // 后由 virtio_pcie_model_dma_adapter 发 EP-originated MemRd/MemWr。MSI-X：pcie_tl 的 RC 会把 EP MemWr
 // 写进 Host memory，APIC 窗口没有后备内存，因此端口把 MSI-X MemWr 直接发布到 EP monitor 的 tlp_ap——
 // 与真实链路上被动观察到的 TLP 相同，VIP observer 照常解码。
@@ -12,8 +13,13 @@
 typedef class vdev_uvm_ep_port;
 
 // pcie_tl EP driver 的设备模型接入点（fixture 以 factory override 替换 pcie_tl_ep_driver）。
+// 需要 Completion 的请求先经过 COMPLETION_LATENCY_NS 再交给端口：pcie_tl 的 EP monitor 在请求入口
+// 1ns 后才发布 RC→EP 的 posted 写（scoreboard 据此记录写数据），同一时刻返回的读 Completion 会被拿去
+// 和旧数据比对；RC 侧 completion 等待也需要 Completion 晚于请求发出。端口 serve 本身仍是零时间。
 class vdev_ep_driver extends pcie_tl_ep_driver;
     `uvm_component_utils(vdev_ep_driver)
+
+    localparam int unsigned COMPLETION_LATENCY_NS = 2;
 
     vdev_uvm_ep_port port;
 
@@ -26,8 +32,11 @@ class vdev_ep_driver extends pcie_tl_ep_driver;
         bit handled;
 
         handled = 0;
-        if (port != null)
+        if (port != null) begin
+            if (req.requires_completion())
+                #(COMPLETION_LATENCY_NS * 1ns);
             port.serve(req, handled);
+        end
         if (!handled)
             super.handle_request(req);
     endtask
