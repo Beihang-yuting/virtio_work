@@ -319,6 +319,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         test_ctrl_send_timeout_resets_queue();
         test_ctrl_send_timeout_quarantines_without_ring_reset();
         test_ctrl_vq_outside_data_range_migration_and_msix();
+        test_mq_expansion_rebinds_msix();
         `uvm_info("CTRL_VQ_TEST", "control VQ tests PASSED", UVM_NONE)
         phase.drop_objection(this);
     endtask
@@ -766,6 +767,86 @@ class virtio_ctrl_vq_test extends uvm_test;
                 "verified device reset did not release quarantined control DMA")
         mem.leak_check();
         `uvm_info("CTRL_VQ_TEST", "ctrl_send timeout quarantine test PASSED", UVM_LOW)
+    endtask
+
+    // 1 对 + CTRL_VQ（max_virtqueue_pairs=2，队列 {0,1,4}）扩到 2 对：每条实际队列（含新建
+    // 的 RX1/TX1）都必须绑定有效、互不相同、非 config 的向量，并与 notification manager 一致。
+    task test_mq_expansion_rebinds_msix();
+        virtio_ctrl_vq_migration_transport transport =
+            virtio_ctrl_vq_migration_transport::type_id::create("mq_msix_transport");
+        virtio_ctrl_vq_test_mq_ops ops =
+            virtio_ctrl_vq_test_mq_ops::type_id::create("mq_msix_ops");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("mq_msix_vq_mgr");
+        virtio_ctrl_vq_test_mem mem = virtio_ctrl_vq_test_mem::type_id::create("mq_msix_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("mq_msix_iommu");
+        virtio_auto_fsm fsm = virtio_auto_fsm::type_id::create("mq_msix_fsm");
+        virtio_memory_barrier_model barrier =
+            virtio_memory_barrier_model::type_id::create("mq_msix_barrier");
+        virtio_wait_policy mq_wait_pol =
+            virtio_wait_policy::type_id::create("mq_msix_wait_pol");
+        int unsigned qids[$];
+        bit seen_vectors[int unsigned];
+        bit ok;
+        string why;
+
+        mem.init_region(64'h7600_0000, 64'h7600_FFFF);
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.barrier = barrier;
+        vq_mgr.wait_pol = mq_wait_pol;
+        vq_mgr.bdf = 16'h0906;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0906));
+        transport.max_virtqueue_pairs = 2;
+        transport.cap_mgr.msix_found = 1;
+        transport.cap_mgr.msix_table_size = 8;
+        transport.cap_mgr.msix_table_bir = 4;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = mq_wait_pol;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+
+        ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue(4) == null))
+            `uvm_fatal("CTRL_VQ_TEST", "MQ MSI-X test setup did not create queues {0,1,4}")
+        ops.setup_msix(3);
+        fsm.ops = ops;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.configure_mq(2);
+
+        vq_mgr.get_queue_ids(qids);
+        if ((fsm.state == FSM_ERROR) || (qids.size() != 5))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "MQ expansion 1->2 failed: state=%s queues=%p", fsm.state.name(), qids))
+        foreach (qids[i]) begin
+            if (!transport.msix_bound_vectors.exists(qids[i]) ||
+                (transport.msix_bound_vectors[qids[i]] !=
+                 transport.notify_mgr.queue_vectors[qids[i]]) ||
+                (transport.msix_bound_vectors[qids[i]] == 32'hFFFF) ||
+                (transport.msix_bound_vectors[qids[i]] ==
+                 transport.notify_mgr.config_vector) ||
+                seen_vectors.exists(transport.msix_bound_vectors[qids[i]]))
+                `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                    "MQ expansion left queue %0d without a valid MSI-X vector: bound=%p vectors=%p",
+                    qids[i], transport.msix_bound_vectors, transport.notify_mgr.queue_vectors))
+            seen_vectors[transport.msix_bound_vectors[qids[i]]] = 1;
+        end
+
+        foreach (qids[i])
+            ops.teardown_queue(qids[i]);
+        if ((vq_mgr.get_queue_count() != 0) || (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("CTRL_VQ_TEST", "MQ MSI-X test leaked queue resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST", "MQ expansion MSI-X rebinding test PASSED", UVM_LOW)
     endtask
 endclass : virtio_ctrl_vq_test
 
