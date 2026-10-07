@@ -24,6 +24,9 @@ class virtio_real_driver_multiqueue_test extends uvm_test;
   function void build_phase(uvm_phase phase);
     super.build_phase(phase);
     flow = virtio_real_driver_flow_fixture::type_id::create("flow", this);
+    // 第二对队列（2/3）只在协商 MQ 后存在（virtio 1.2 §5.1.2）；MQ 依赖 CTRL_VQ。
+    flow.device_features[VIRTIO_NET_F_CTRL_VQ] = 1;
+    flow.device_features[VIRTIO_NET_F_MQ] = 1;
   endfunction
 
   task run_phase(uvm_phase phase);
@@ -69,11 +72,8 @@ class virtio_real_driver_multiqueue_test extends uvm_test;
     end
 
     if (is_model) begin
-      if (flow.dut_responder() == null)
-        `uvm_fatal("REAL_MQ", "MODEL fixture did not expose DUT responder")
-      flow.dut_responder().start();
-      if (!flow.dut_responder().running())
-        `uvm_fatal("REAL_MQ", "MODEL DUT responder did not start")
+      if (flow.device() == null)
+        `uvm_fatal("REAL_MQ", "MODEL fixture did not expose its device model")
     end else begin
       if (!flow.real_dut_link_ready())
         `uvm_fatal("REAL_DUT_UNAVAILABLE",
@@ -120,13 +120,11 @@ class virtio_real_driver_multiqueue_test extends uvm_test;
     end
 
     if (is_model) begin
-      if (flow.dut_responder().notify_count() < packets_per_queue * 2 ||
-          flow.dut_responder().dma_read_count() == 0 ||
-          flow.dut_responder().dma_write_count() == 0 ||
-          flow.dut_responder().interrupt_count() < packets_per_queue * 2)
+      if (flow.device().notify_count() < packets_per_queue * 2 ||
+          flow.device().dma_read_count() == 0 ||
+          flow.device().dma_write_count() == 0 ||
+          flow.device().interrupt_count() < packets_per_queue * 2)
         `uvm_fatal("REAL_MQ", "multi-queue MODEL flow missed notify/DMA/interrupt")
-      flow.dut_responder().stop();
-      flow.dut_responder().wait_stopped();
     end else begin
       if (monitor.bar_event_fifo.used() <= notify_before ||
           monitor.dma_event_fifo.used() <= dma_before ||

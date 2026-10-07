@@ -194,7 +194,7 @@ typedef enum {
 
 // Descriptor/virtqueue fault timing.  The first two points are owned by the
 // driver-side queue object; PRE_DEVICE_READ and BEFORE_USED are exposed for a
-// model responder or a REAL_DUT Host-memory fault provider.  ANY preserves a
+// device model (vdev_base::take_fault) or a REAL_DUT fault provider.  ANY preserves a
 // convenient opt-in mode for users that do not care which boundary consumes
 // the configured fault.
 typedef enum {

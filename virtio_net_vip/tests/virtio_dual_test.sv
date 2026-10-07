@@ -357,7 +357,8 @@ class virtio_dual_test extends uvm_test;
                 "VIP B: common-config BAR base 0x%016h is not its own lease 0x%016h",
                 transport_b.bar.bar_base[common_bar_id], b_common_bar.base))
 
-        expected_queues = flow.virtio_cfg.default_num_pairs * 2;
+        expected_queues = flow.virtio_cfg.default_num_pairs * 2 +
+                          (flow.device_features[VIRTIO_NET_F_CTRL_VQ] ? 1 : 0);
         transport_b.read_device_status(status);
         transport_b.read_num_queues(num_queues);
         transport_b.read_queue_num_max(queue_size);

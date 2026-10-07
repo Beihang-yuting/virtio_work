@@ -1,4 +1,4 @@
-// tests/：经 DUT responder 边界验证真实 driver RX；依赖 net_packet_pkg 的
+// tests/：经设备模型边界验证真实 driver RX；依赖 net_packet_pkg 的
 // packet_item 和报文模板，以及 virtio_net_pkg 的共享 fixture。测试持有期望
 // 报文句柄，fixture 持有内存与队列资源；UVM 在仿真结束回收测试组件。
 `ifndef VIRTIO_REAL_DRIVER_RX_TEST_SV
@@ -9,8 +9,8 @@ import net_packet_pkg::*;
 import virtio_net_pkg::*;
 `include "uvm_macros.svh"
 
-// Real-driver RX contract.  The test injects packets only through the DUT
-// responder boundary; it never writes an RX buffer or used ring directly.
+// Real-driver RX contract.  The test injects packets only through the device
+// model's network side; it never writes an RX buffer or used ring directly.
 class virtio_real_driver_rx_test extends uvm_test;
   `uvm_component_utils(virtio_real_driver_rx_test)
 
@@ -28,7 +28,6 @@ class virtio_real_driver_rx_test extends uvm_test;
   task run_phase(uvm_phase phase);
     bit ok;
     string why;
-    virtio_net_hdr_t hdr;
     packet_item expected[$];
     uvm_object received[$];
     int unsigned received_count;
@@ -52,8 +51,8 @@ class virtio_real_driver_rx_test extends uvm_test;
     // RX ingress is not synthesized by the REAL_DUT Host-memory responder:
     // that component only answers EP-originated DMA.  A platform-specific
     // net_packet/physical ingress callback is therefore required before this
-    // test can be run against RTL.  Do not silently fall back to the MODEL
-    // responder, because that would make a REAL_DUT run a false pass.
+    // test can be run against RTL.  Do not silently fall back to the
+    // MODEL device model, because that would make a REAL_DUT run a false pass.
     if (!flow.execution_profile().has_model_device())
       `uvm_fatal("REAL_DUT_RX_SOURCE_UNAVAILABLE",
                 {"virtio_real_driver_rx_test requires a platform RX ingress ",
@@ -67,19 +66,15 @@ class virtio_real_driver_rx_test extends uvm_test;
     if (!ok)
       `uvm_fatal("REAL_RX", "RX queue setup failed")
 
-    if (flow.dut_responder() == null)
-      `uvm_fatal("REAL_RX", "fixture did not expose DUT responder")
-    flow.dut_responder().start();
-    if (!flow.dut_responder().running())
-      `uvm_fatal("REAL_RX", "DUT responder did not start")
+    if (flow.device() == null)
+      `uvm_fatal("REAL_RX", "fixture did not expose its device model")
 
-    hdr = '{default: 0};
-    notify_before = flow.dut_responder().notify_count();
-    writes_before = flow.dut_responder().dma_write_count();
-    completions_before = flow.dut_responder().completion_count();
-    interrupts_before = flow.dut_responder().interrupt_count();
+    notify_before = flow.device().notify_count();
+    writes_before = flow.device().dma_write_count();
+    completions_before = flow.device().completion_count();
+    interrupts_before = flow.device().interrupt_count();
 
-    // Queue packet arrivals before RX refill.  The responder must wait for a
+    // Queue packet arrivals before RX refill.  The device must wait for a
     // writable descriptor and then perform the real EP-originated DMA write.
     for (int unsigned i = 0; i < packet_count; i++) begin
       packet_item pkt;
@@ -91,10 +86,10 @@ class virtio_real_driver_rx_test extends uvm_test;
         `uvm_fatal("REAL_RX", "net_packet randomization failed")
       pkt.pkt.do_pack();
       expected.push_back(pkt);
-      flow.inject_rx(rx_queue_id, hdr, pkt, ok);
+      flow.inject_rx(rx_queue_id, pkt, ok);
       if (!ok)
         `uvm_fatal("REAL_RX", $sformatf(
-            "responder rejected RX packet %0d", i))
+            "device rejected RX packet %0d", i))
     end
 
     // Refill is the production operation: allocation, mapping, descriptor
@@ -117,14 +112,12 @@ class virtio_real_driver_rx_test extends uvm_test;
             "RX packet %0d payload mismatch", i))
     end
 
-    if (flow.dut_responder().notify_count() <= notify_before ||
-        flow.dut_responder().dma_write_count() <= writes_before ||
-        flow.dut_responder().completion_count() <= completions_before ||
-        flow.dut_responder().interrupt_count() <= interrupts_before)
+    if (flow.device().notify_count() <= notify_before ||
+        flow.device().dma_write_count() <= writes_before ||
+        flow.device().completion_count() <= completions_before ||
+        flow.device().interrupt_count() <= interrupts_before)
       `uvm_fatal("REAL_RX", "RX missed notify/DMA/used/interrupt path")
 
-    flow.dut_responder().stop();
-    flow.dut_responder().wait_stopped();
     flow.reset_and_teardown(ok);
     if (!ok)
       `uvm_fatal("REAL_RX", "RX reset/teardown failed")

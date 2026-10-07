@@ -82,13 +82,9 @@ class virtio_real_driver_flow_test extends uvm_test;
       `uvm_error("REAL_FLOW", "production queue setup failed")
 
     if (is_model) begin
-      if (flow.dut_responder() == null) begin
-        `uvm_error("REAL_FLOW", "MODEL fixture did not expose DUT responder")
+      if (flow.device() == null) begin
+        `uvm_error("REAL_FLOW", "MODEL fixture did not expose its device model")
       end else begin
-      flow.dut_responder().start();
-    if (!flow.dut_responder().running())
-        `uvm_error("REAL_FLOW", "DUT responder did not enter running state")
-      else begin
         virtio_real_driver_flow_packet pkt;
         virtio_net_hdr_t hdr;
         uvm_object completed[$];
@@ -102,11 +98,11 @@ class virtio_real_driver_flow_test extends uvm_test;
 
         pkt = virtio_real_driver_flow_packet::type_id::create("tx_packet");
         hdr = '{default: 0};
-        notify_before = flow.dut_responder().notify_count();
-        reads_before = flow.dut_responder().dma_read_count();
-        writes_before = flow.dut_responder().dma_write_count();
-        completions_before = flow.dut_responder().completion_count();
-        interrupts_before = flow.dut_responder().interrupt_count();
+        notify_before = flow.device().notify_count();
+        reads_before = flow.device().dma_read_count();
+        writes_before = flow.device().dma_write_count();
+        completions_before = flow.device().completion_count();
+        interrupts_before = flow.device().interrupt_count();
 
         // Submit through the production atomic TX operation.  The test does
         // not write descriptors or ring indices directly.
@@ -119,21 +115,15 @@ class virtio_real_driver_flow_test extends uvm_test;
           `uvm_error("REAL_FLOW", $sformatf(
               "TX completion failed count=%0d objects=%0d",
               completed_count, completed.size()))
-        if (flow.dut_responder().notify_count() <= notify_before ||
-            flow.dut_responder().dma_read_count() <= reads_before ||
-            flow.dut_responder().dma_write_count() <= writes_before ||
-            flow.dut_responder().completion_count() <= completions_before ||
-            flow.dut_responder().interrupt_count() <= interrupts_before)
+        if (flow.device().notify_count() <= notify_before ||
+            flow.device().dma_read_count() <= reads_before ||
+            flow.device().dma_write_count() <= writes_before ||
+            flow.device().completion_count() <= completions_before ||
+            flow.device().interrupt_count() <= interrupts_before)
           `uvm_error("REAL_FLOW", "TX did not traverse notify/DMA/used/interrupt path")
-
-        flow.dut_responder().stop();
-        flow.dut_responder().wait_stopped();
-        if (flow.dut_responder().running())
-          `uvm_error("REAL_FLOW", "DUT responder did not stop cleanly")
-      end
       end
     end else begin
-      // REAL_DUT has no local device responder.  The only valid evidence is
+      // REAL_DUT has no local device model.  The only valid evidence is
       // passive traffic decoded by the bound virtio monitor (and, when the
       // plain pcie_work path is used, the explicit RC Host-memory responder).
       if (!flow.real_dut_link_ready())

@@ -18,8 +18,8 @@ virtual class virtio_execution_profile extends uvm_object;
 
     // 对应的配置枚举，仅供日志与配置回显使用。
     pure virtual function virtio_execution_mode_e mode();
-    // 是否由本地 MODEL 扮演设备：创建 TLM completion adapter、EP responder，
-    // 安装端点配置镜像并用 MODEL DMA adapter 产生设备侧 DMA。
+    // 是否由本地 MODEL 扮演设备：创建 TLM completion adapter 与独立设备模型
+    // （vdev_virtio_pci 经 vdev_uvm_ep_port 应答配置/MMIO 并发起设备侧 DMA）。
     pure virtual function bit has_model_device();
     // 是否允许创建 RC 侧 Host-memory DMA responder（只服务 EP 发起的 MemRd/MemWr）。
     pure virtual function bit supports_host_mem_responder();
@@ -35,7 +35,7 @@ virtual class virtio_execution_profile extends uvm_object;
     pure virtual function string endpoint_unready_reason();
 endclass
 
-// 无 RTL DUT：VIP 的 responder 扮演设备，PCIe 走 TLM 回环。
+// 无 RTL DUT：独立设备模型扮演设备，PCIe 走 TLM 回环。
 class virtio_model_execution_profile extends virtio_execution_profile;
     `uvm_object_utils(virtio_model_execution_profile)
 

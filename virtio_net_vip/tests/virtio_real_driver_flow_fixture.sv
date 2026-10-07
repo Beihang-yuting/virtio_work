@@ -7,48 +7,6 @@ import dpu_resource_pkg::*;
 import pcie_tl_pkg::*;
 import virtio_net_pkg::*;
 
-// 中文说明：MODEL 端点驱动只增加 virtio common-config 的 DFSELECT 语义：
-// 驱动写 DFSELECT 后，同一 Function 的 DF 窗口改为对应的 32 位特性字
-// （0 -> 低 32 位，1 -> 高 32 位，其它 -> 0）。其余请求完全沿用基类。
-// 只有 fixture 登记过的 common-config 基址参与，其它 MemWr 不受影响。
-class virtio_feature_select_ep_driver extends pcie_tl_ep_driver;
-    `uvm_component_utils(virtio_feature_select_ep_driver)
-
-    // Keyed by the common-config base (= DFSELECT address) of each Function.
-    protected bit [63:0] m_features[bit [63:0]];
-
-    function new(string name = "virtio_feature_select_ep_driver",
-                 uvm_component parent = null);
-        super.new(name, parent);
-    endfunction
-
-    // Register one Function's offered features and present the low word.
-    function void add_feature_window(bit [63:0] common_base, bit [63:0] features);
-        m_features[common_base] = features;
-        serve_feature_word(common_base);
-    endfunction
-
-    virtual task handle_request(pcie_tl_tlp req);
-        pcie_tl_mem_tlp mem_req;
-        super.handle_request(req);
-        if ((req.kind == TLP_MEM_WR) && $cast(mem_req, req) &&
-            m_features.exists(mem_req.addr))
-            serve_feature_word(mem_req.addr);
-    endtask
-
-    protected function void serve_feature_word(bit [63:0] common_base);
-        bit [31:0] select;
-        bit [31:0] word;
-        for (int i = 0; i < 4; i++)
-            select[i*8 +: 8] = mem_space.exists(common_base + i) ?
-                               mem_space[common_base + i] : 8'h00;
-        word = (select == 0) ? m_features[common_base][31:0] :
-               (select == 1) ? m_features[common_base][63:32] : 32'h0;
-        for (int i = 0; i < 4; i++)
-            mem_space[common_base + VIRTIO_PCI_COMMON_DF + i] = word[i*8 +: 8];
-    endfunction
-endclass
-
 // Shared construction for tests which claim the real virtio-pci flow.  The
 // fixture deliberately has no BAR or BDF constants: those values are read
 // from the frozen dpu-common snapshot after the DPU environment resolves it.
@@ -64,7 +22,9 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     pcie_tl_env_config         pcie_cfg;
     host_mem_pool              host_mem_owners;
     virtio_tlm_completion_adapter tlm_adapter;
-    virtio_pcie_dut_responder  responder;
+    // MODEL 设备：每个 VIO PF 一个独立设备模型，经 vdev_uvm_ep_port 接在 EP driver 上。
+    vdev_uvm_ep_port           device_port;
+    vdev_virtio_pci            devices[];
     // Optional REAL_DUT RC service.  This is not a device model: it only
     // services EP-originated MemRd/MemWr against shared Host memory.
     virtio_pcie_real_dut_host_mem_responder host_mem_responder;
@@ -76,9 +36,8 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     // PCIe completion 超时（ns）。默认值与原 fixture 相同；会长时间推进仿真
     // 时间的测试可在 build_phase 之前放宽。
     int                         pcie_cpl_timeout_ns;
-    // MODEL 端点镜像为每个 VIO PF 提供的 64 位 device features（按 DFSELECT
-    // 分低/高 32 位返回）。缺省值保持原镜像行为（两个半字都是 0x1）；需要
-    // 其它特性集合的测试在 build_phase 之前设置。
+    // MODEL 设备模型提供的 64 位 device features（缺省 CSUM|VERSION_1）；需要其它
+    // 特性集合的测试在 build_phase 之前设置。
     bit [63:0]                  device_features;
 
     // 真实 DUT 模式的物理 PCIe 传输接口。该句柄由真实 DUT 顶层通过
@@ -101,7 +60,6 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     protected bit                    m_endpoint_ready;
     protected bit                    m_flow_ready;
     protected bit                    m_driver_flow_started;
-    protected bit                    m_responder_bound;
     protected bit                    m_host_mem_responder_bound;
     protected bit                    m_pcie_vif_bound;
     // PCIe/virtio bind is a separate readiness condition from snapshot
@@ -120,27 +78,11 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     // pcie_work API has no such field, and silently accepting one interface
     // would lose endpoint-originated DMA/completion traffic.
 
-    localparam bit [7:0] COMMON_CAP_OFFSET = 8'h50;
-    localparam bit [7:0] NOTIFY_CAP_OFFSET = 8'h64;
-    localparam bit [7:0] ISR_CAP_OFFSET    = 8'h7c;
-    localparam bit [7:0] DEVICE_CAP_OFFSET = 8'h8c;
-    localparam bit [7:0] MSIX_CAP_OFFSET   = 8'h9c;
-    localparam bit [31:0] COMMON_OFFSET = 32'h0;
-    localparam bit [31:0] COMMON_LENGTH = 32'h40;
-    localparam bit [31:0] NOTIFY_OFFSET = 32'h0;
-    localparam bit [31:0] NOTIFY_LENGTH = 32'h1000;
-    localparam bit [31:0] ISR_OFFSET = 32'h1000;
-    localparam bit [31:0] DEVICE_OFFSET = 32'h2000;
-    localparam bit [31:0] DEVICE_LENGTH = 32'h100;
-    localparam bit [31:0] MSIX_TABLE_OFFSET = 32'h0;
-    localparam bit [31:0] MSIX_PBA_OFFSET = 32'h8000;
-
     function new(string name, uvm_component parent);
         super.new(name, parent);
         m_endpoint_ready = 0;
         m_flow_ready = 0;
         m_driver_flow_started = 0;
-        m_responder_bound = 0;
         m_host_mem_responder_bound = 0;
         m_pcie_vif_bound = 0;
         m_pcie_path_bound = 0;
@@ -264,7 +206,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         m_virtio_env = virtio_net_env::type_id::create(
             "virtio_env", device_env);
 
-        // Completion adapter and endpoint responder are MODEL-only.  Keeping
+        // Completion adapter and device models are MODEL-only.  Keeping
         // them out of the REAL_DUT hierarchy prevents a passive PCIe monitor
         // from accidentally creating a second device-side implementation.
         if (m_profile.has_model_device()) begin
@@ -272,7 +214,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
                 "tlm_adapter");
             tlm_adapter.install_factory_overrides();
             pcie_tl_ep_driver::type_id::set_inst_override(
-                virtio_feature_select_ep_driver::get_type(), "pcie_env.*", this);
+                vdev_ep_driver::get_type(), "pcie_env.*", this);
         end else begin
             tlm_adapter = null;
             if (m_profile.supports_host_mem_responder())
@@ -309,10 +251,13 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         uvm_config_db#(pcie_tl_env_config)::set(
             this, "pcie_env", "cfg", pcie_cfg);
         m_pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
-        // REAL_DUT 模式只保留 PCIe/virtio 观察路径，绝不创建主动模型。
-        if (m_profile.has_model_device())
-            responder = virtio_pcie_dut_responder::type_id::create(
-                "responder", this);
+        // REAL_DUT 模式只保留 PCIe/virtio 观察路径，绝不创建设备模型。
+        if (m_profile.has_model_device()) begin
+            device_port = vdev_uvm_ep_port::type_id::create("device_port");
+            devices = new[vio_pf_count];
+            foreach (devices[i])
+                devices[i] = vdev_virtio_pci::type_id::create($sformatf("vdev%0d", i), this);
+        end
     endfunction
 
     virtual function void connect_phase(uvm_phase phase);
@@ -345,32 +290,14 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         else
             m_pcie_path_bound = 1;
 
-        // Analysis connections must be established during connect_phase.  The
-        // endpoint image itself is installed later from the frozen snapshot,
-        // but all identity/shared handles needed by the responder already
-        // exist here.
-        if ((m_profile != null) && m_profile.has_model_device() &&
-            (responder != null) && (host_mem_owners != null) &&
-            (m_virtio_env.iommu != null) &&
-            (m_pcie_env.ep_agent.ep_driver != null) &&
-            (m_virtio_env.function_instances.size() != 0)) begin
-            string responder_why;
-            m_host_mem = host_mem_owners.get_host(virtio_cfg.host_id);
-            m_selected_function = m_virtio_env.function_instances[0];
-            if ((m_host_mem != null) && (m_selected_function != null) &&
-                responder.bind_function(
-                    m_selected_function.driver_agent.monitor,
-                    m_selected_function.transport,
-                    m_selected_function.vq_mgr,
-                    m_host_mem,
-                    m_virtio_env.iommu,
-                    m_pcie_env.ep_agent.ep_driver,
-                    responder_why)) begin
-                m_responder_bound = 1;
-            end else begin
-                `uvm_error("REAL_FLOW", {"early responder bind failed: ",
-                                          responder_why})
-            end
+        // MODEL 设备端口接到 EP driver/monitor 与平台 IOMMU；设备在 end_of_elaboration
+        // 按冻结 snapshot 的 BDF 初始化后挂上端口。
+        if ((m_profile != null) && m_profile.has_model_device() && (device_port != null)) begin
+            string port_why;
+            if (!device_port.connect_ep(m_pcie_env.ep_agent.ep_driver,
+                                        m_pcie_env.ep_agent.monitor,
+                                        m_virtio_env.iommu, virtio_cfg.host_id, port_why))
+                `uvm_error("REAL_FLOW", {"device port bind failed: ", port_why})
         end
 
         // REAL_DUT Host-memory responder must wait for the frozen snapshot's
@@ -401,7 +328,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             return;
         // Resolve the function identity from the frozen snapshot for every
         // execution mode.  Previously this handle was populated only while
-        // binding the MODEL responder (or the optional local REAL_DUT
+        // binding the former MODEL responder (or the optional local REAL_DUT
         // responder), so a REAL_DUT run using an external pcie_work bridge
         // had a valid PCIe path but no semantic monitor/resource client.
         // Queue mapping helpers and passive observers must use the same BDF
@@ -424,14 +351,10 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         if (!m_device_snapshot.list_bars(m_function_key, m_bars, why) ||
             (m_bars.size() != 3))
             return;
-        // MODEL mode owns a local endpoint image.  In REAL_DUT the endpoint
-        // driver is passive/absent and all config/BAR responses come from RTL.
-        if (m_profile.has_model_device()) begin
-            if ((m_pcie_env.ep_agent.ep_driver == null) ||
-                !install_endpoint_image(why)) begin
-                `uvm_error("REAL_FLOW", {"endpoint image setup failed: ", why})
-                return;
-            end
+        // MODEL 由独立设备模型应答配置/MMIO；REAL_DUT 的配置/BAR 响应全部来自 RTL。
+        if (m_profile.has_model_device() && !configure_devices(why)) begin
+            `uvm_error("REAL_FLOW", {"device model setup failed: ", why})
+            return;
         end
         if (host_mem_owners == null) begin
             `uvm_error("REAL_FLOW", "shared Host memory pool is unavailable")
@@ -483,34 +406,6 @@ class virtio_real_driver_flow_fixture extends uvm_component;
                 end
             end
         end
-        if (m_profile.has_model_device() && (responder != null)) begin
-            virtio_function_instance selected_function;
-            foreach (m_virtio_env.function_instances[index]) begin
-                if ((m_virtio_env.function_instances[index] != null) &&
-                    (m_virtio_env.function_instances[index].bdf == m_pcie_id.bdf)) begin
-                    selected_function = m_virtio_env.function_instances[index];
-                    break;
-                end
-            end
-            m_selected_function = selected_function;
-            if ((selected_function == null) ||
-                (!m_responder_bound && !responder.bind_function(
-                    selected_function.driver_agent.monitor,
-                    selected_function.transport,
-                    selected_function.vq_mgr,
-                    m_host_mem,
-                    m_virtio_env.iommu,
-                    m_pcie_env.ep_agent.ep_driver,
-                    why))) begin
-                `uvm_error("REAL_FLOW", {"responder bind failed: ", why})
-                return;
-            end
-        end
-        if (m_pcie_env.ep_agent.ep_driver != null)
-            uvm_config_db#(uvm_object)::set(null, "", "ep_driver_ref",
-                m_pcie_env.ep_agent.ep_driver);
-        uvm_config_db#(uvm_object)::set(null, "", "cfg_mgr_ref",
-            m_pcie_env.cfg_mgr);
         m_endpoint_ready = 1;
     endfunction
 
@@ -614,8 +509,12 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         return m_resource_snapshot;
     endfunction
 
-    function virtio_pcie_dut_responder dut_responder();
-        return responder;
+    // 冻结 snapshot 选中的 Function 对应的设备模型；REAL_DUT 返回 null。
+    function vdev_virtio_pci device();
+        foreach (devices[i])
+            if ((devices[i] != null) && (devices[i].bdf == m_pcie_id.bdf))
+                return devices[i];
+        return null;
     endfunction
 
     function virtio_pcie_real_dut_host_mem_responder host_mem_dma_responder();
@@ -624,7 +523,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
 
     // Read-only accessors used by mode-aware contract tests.  The monitor is
     // the semantic observer connected to both PCIe directions; callers must
-    // not use a MODEL responder counter as evidence for REAL_DUT traffic.
+    // not use a MODEL device counter as evidence for REAL_DUT traffic.
     function virtio_monitor function_monitor();
         if (m_selected_function != null &&
             m_selected_function.driver_agent != null)
@@ -750,7 +649,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             host_mem_responder.shutdown();
     endtask
 
-    // 测试按执行策略选择断言来源（MODEL responder 计数或 REAL_DUT 被动观察），
+    // 测试按执行策略选择断言来源（MODEL 设备计数或 REAL_DUT 被动观察），
     // 不比较执行模式枚举。
     function virtio_execution_profile execution_profile();
         return m_profile;
@@ -778,10 +677,6 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         if ((m_pcie_env != null) && (pcie_cfg != null) &&
             (pcie_cfg.if_mode == SV_IF_MODE))
             void'(bind_pcie_vif());
-    endfunction
-
-    function bit model_responder_active();
-        return (responder != null) && responder.running();
     endfunction
 
     protected function bit bind_pcie_vif();
@@ -925,7 +820,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
 
     // Allocate/map/program one queue using the normal atomic operation.  This
     // method never writes descriptor, avail, used, or completion bytes itself;
-    // the responder observes the resulting common-config writes and owns all
+    // the device model receives the resulting common-config writes and owns all
     // device-side completion work.
     virtual task setup_queue(
         int unsigned queue_id,
@@ -1011,7 +906,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         ok = (desc_id != '1);
     endtask
 
-    // Poll the production used-ring completion operation until the responder
+    // Poll the production used-ring completion operation until the device
     // has processed the notify or the bounded wait expires.  This keeps the
     // test synchronized through the driver API rather than reading ring bytes
     // directly from the fixture.
@@ -1054,21 +949,29 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         ok = (completed.size() != 0);
     endtask
 
-    // Queue one RX packet at the DUT boundary.  The test supplies only a
-    // packet object; responder-side header encoding and all PCIe writes remain
-    // outside the driver fixture.
+    // 设备网络侧入包（MODEL）：帧原样交给设备，设备在 RX 队列有 buffer 时自行生成
+    // virtio-net header 并经 EP-originated PCIe DMA 写入。
     virtual task inject_rx(
         input int unsigned queue_id,
-        input virtio_net_hdr_t net_hdr,
         input uvm_object pkt,
         ref bit ok
     );
+        byte unsigned bytes[$];
+        bit [7:0] frame[$];
+        vdev_virtio_pci dev;
+
         ok = 0;
-        if ((responder == null) || (pkt == null)) begin
-            `uvm_error("REAL_FLOW", "inject_rx requires responder and packet")
+        dev = device();
+        if ((dev == null) || (pkt == null) || ((queue_id % 2) != 0) ||
+            !virtio_net_packet_adapter::pack(pkt, bytes)) begin
+            `uvm_error("REAL_FLOW",
+                       "inject_rx requires a MODEL device, an RX queue and a packable packet")
             return;
         end
-        responder.inject_rx_packet(queue_id, net_hdr, pkt, ok);
+        foreach (bytes[i])
+            frame.push_back(bytes[i]);
+        dev.inject_rx(queue_id / 2, frame);
+        ok = 1;
     endtask
 
     // Production RX refill owns Host-memory allocation, IOVA mapping, ring
@@ -1093,7 +996,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         ok = 1;
     endtask
 
-    // Wait for the responder's PCIe used-ring write, then consume packets via
+    // Wait for the device's PCIe used-ring write, then consume packets via
     // the production RX operation.  The bounded retry also covers asynchronous
     // posted-write delivery in the PCIe TL VIP.
     virtual task receive_rx(
@@ -1131,7 +1034,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         ok = (received_count != 0);
     endtask
 
-    // Quiesce responder/FSM workers first, then perform the verified normal
+    // Quiesce FSM workers first (the device stops its own DMA when status is reset), then perform the verified normal
     // driver reset.  The atomic reset path detaches queues, unmaps ring IOVAs,
     // retires any normal DMA records, and destroys queue objects.
     virtual task reset_and_teardown(ref bit ok);
@@ -1148,14 +1051,6 @@ class virtio_real_driver_flow_fixture extends uvm_component;
 
         if (host_mem_responder != null)
             host_mem_responder.shutdown();
-        if (responder != null)
-            responder.stop();
-        if (responder != null)
-            responder.wait_stopped();
-        if ((responder != null) && responder.running()) begin
-            `uvm_error("REAL_FLOW", "responder workers remain after stop")
-            return;
-        end
         if ((function_instance.driver_agent != null) &&
             (function_instance.driver_agent.fsm != null) &&
             (function_instance.driver_agent.fsm.state == FSM_RUNNING))
@@ -1188,211 +1083,52 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         ok = 1;
     endtask
 
-    protected function bit install_endpoint_image(output string why);
-        dpu_bar_pair_lease_t common_bar;
-        dpu_bar_pair_lease_t notify_bar;
-        dpu_bar_pair_lease_t msix_bar;
-        pcie_tl_cfg_space_manager cfg_mgr;
-        pcie_tl_ep_driver ep_drv;
+    // 每个 VIO Function 一个设备模型：BDF 取自冻结 snapshot，特性/队列取自本 fixture 配置；
+    // BAR 基址由 VIP 的 Fabric 发现经配置写编程。snapshot 租约须容纳设备 BAR。
+    protected function bit configure_devices(output string why);
+        int unsigned k;
+        dpu_bar_pair_lease_t bars[$];
+        bit [63:0] need[int unsigned];
 
         why = "";
-        if ((m_device_snapshot == null) || (m_pcie_env == null) ||
-            (m_pcie_env.ep_agent == null)) begin
-            why = "snapshot or PCIe endpoint agent is unavailable";
+        if ((device_port == null) || (m_virtio_env == null) || (m_device_snapshot == null)) begin
+            why = "device port, virtio environment or snapshot is unavailable";
             return 0;
         end
-        if (!m_device_snapshot.get_bar(m_function_key,
-                DPU_BAR_DEVICE_MEMORY, common_bar, why) ||
-            !m_device_snapshot.get_bar(m_function_key,
-                DPU_BAR_MAILBOX, notify_bar, why) ||
-            !m_device_snapshot.get_bar(m_function_key,
-                DPU_BAR_MSIX, msix_bar, why))
-            return 0;
-        if ((common_bar.size < (DEVICE_OFFSET + DEVICE_LENGTH)) ||
-            (common_bar.size <= ISR_OFFSET) ||
-            (notify_bar.size < NOTIFY_LENGTH) ||
-            (msix_bar.size < (MSIX_PBA_OFFSET + 8))) begin
-            why = "snapshot BAR lease is too small for the virtio image";
-            return 0;
-        end
-        cfg_mgr = m_pcie_env.cfg_mgr;
-        ep_drv = m_pcie_env.ep_agent.ep_driver;
-        if ((cfg_mgr == null) || (ep_drv == null)) begin
-            why = "PCIe endpoint driver/config manager is unavailable";
-            return 0;
-        end
-        cfg_mgr.init_type0_header(16'h1AF4, 16'h1041, 8'h01, 24'h020000);
-        // The PCIe environment initializes its standard PCIe capability during
-        // build_phase.  Reinitializing the Type-0 header above clears the
-        // config bytes but does not clear cfg_mgr.cap_list; leaving that stale
-        // list makes the first virtio capability link from a capability whose
-        // pointer byte was just erased, so the advertised pointer at 0x34
-        // becomes zero.  Rebuild the list and restore the standard PCIe
-        // capability before adding the virtio vendor capabilities.
-        cfg_mgr.cap_list.delete();
-        cfg_mgr.ext_cap_list.delete();
-        cfg_mgr.init_pcie_capability(8'h40);
-        cfg_mgr.cfg_space[6] = cfg_mgr.cfg_space[6] | 8'h10;
-        write_bar(cfg_mgr, common_bar);
-        write_bar(cfg_mgr, notify_bar);
-        write_bar(cfg_mgr, msix_bar);
-        register_virtio_caps(cfg_mgr, common_bar, notify_bar, msix_bar);
-        write_common_defaults(ep_drv, common_bar.base,
-                              virtio_cfg.default_num_pairs * 2);
-        if (!add_feature_window(ep_drv, common_bar.base, why))
-            return 0;
-        ep_drv.mem_space[common_bar.base + ISR_OFFSET] = 8'h00;
-        // Additional VIO PFs share this EP model's single configuration
-        // space; each function's Fabric discovery reprograms the BAR
-        // registers from its own lease before scanning capabilities.  Only
-        // the per-function common-config defaults live at distinct BAR0
-        // lease addresses and must be installed here.
+        need[0] = 64'h4000;
+        need[2] = 64'h1000;
+        need[4] = 64'h1_0000;
+        k = 0;
         foreach (m_virtio_env.function_instances[index]) begin
-            virtio_function_instance peer;
-            dpu_bar_pair_lease_t peer_common_bar;
-
-            peer = m_virtio_env.function_instances[index];
-            if ((peer == null) || !peer.pcie_id_valid ||
-                (peer.bdf == m_pcie_id.bdf))
+            virtio_function_instance f;
+            f = m_virtio_env.function_instances[index];
+            if ((f == null) || !f.pcie_id_valid)
                 continue;
-            if (!m_device_snapshot.get_bar(peer.function_key,
-                    DPU_BAR_DEVICE_MEMORY, peer_common_bar, why))
-                return 0;
-            if ((peer_common_bar.size < (DEVICE_OFFSET + DEVICE_LENGTH)) ||
-                (peer_common_bar.size <= ISR_OFFSET)) begin
-                why = $sformatf(
-                    "snapshot BAR0 lease of BDF 0x%04h is too small for the virtio image",
-                    peer.bdf);
+            if (k >= devices.size()) begin
+                why = "snapshot has more VIO functions than device models";
                 return 0;
             end
-            write_common_defaults(ep_drv, peer_common_bar.base,
-                                  virtio_cfg.default_num_pairs * 2);
-            if (!add_feature_window(ep_drv, peer_common_bar.base, why))
+            if (!m_device_snapshot.list_bars(f.function_key, bars, why))
                 return 0;
-            ep_drv.mem_space[peer_common_bar.base + ISR_OFFSET] = 8'h00;
+            foreach (bars[i])
+                if (need.exists(bars[i].even_bar_id) &&
+                    (bars[i].size < need[bars[i].even_bar_id])) begin
+                    why = $sformatf("BDF 0x%04h BAR%0d lease is smaller than the device BAR",
+                                    f.bdf, bars[i].even_bar_id);
+                    return 0;
+                end
+            devices[k].bdf = f.bdf;
+            devices[k].max_pairs = virtio_cfg.default_num_pairs;
+            devices[k].queue_max = virtio_cfg.default_queue_size;
+            devices[k].device_features = device_features;
+            devices[k].err_inj = m_virtio_env.err_inj;
+            devices[k].init();
+            device_port.attach(devices[k]);
+            k++;
         end
-        return 1;
-    endfunction
-
-    protected function void write_bar(
-        input pcie_tl_cfg_space_manager cfg_mgr,
-        input dpu_bar_pair_lease_t bar
-    );
-        int unsigned offset;
-        bit [31:0] low;
-        offset = 16'h10 + (bar.even_bar_id * 4);
-        low = bar.base[31:0] & 32'hfffffff0;
-        low[2:1] = 2'b10;
-        cfg_mgr.cfg_space[offset] = low[7:0];
-        cfg_mgr.cfg_space[offset + 1] = low[15:8];
-        cfg_mgr.cfg_space[offset + 2] = low[23:16];
-        cfg_mgr.cfg_space[offset + 3] = low[31:24];
-        cfg_mgr.cfg_space[offset + 4] = bar.base[39:32];
-        cfg_mgr.cfg_space[offset + 5] = bar.base[47:40];
-        cfg_mgr.cfg_space[offset + 6] = bar.base[55:48];
-        cfg_mgr.cfg_space[offset + 7] = bar.base[63:56];
-    endfunction
-
-    protected function void register_virtio_caps(
-        input pcie_tl_cfg_space_manager cfg_mgr,
-        input dpu_bar_pair_lease_t common_bar,
-        input dpu_bar_pair_lease_t notify_bar,
-        input dpu_bar_pair_lease_t msix_bar
-    );
-        bit [7:0] cap_data[];
-        pcie_capability msix;
-        cap_data = new[14];
-        foreach (cap_data[index]) cap_data[index] = 8'h00;
-        cap_data[0] = 8'h10; cap_data[1] = VIRTIO_PCI_CAP_COMMON_CFG;
-        cap_data[2] = common_bar.even_bar_id;
-        cap_data[6] = COMMON_OFFSET[7:0]; cap_data[7] = COMMON_OFFSET[15:8];
-        cap_data[8] = COMMON_OFFSET[23:16]; cap_data[9] = COMMON_OFFSET[31:24];
-        cap_data[10] = COMMON_LENGTH[7:0]; cap_data[11] = COMMON_LENGTH[15:8];
-        cap_data[12] = COMMON_LENGTH[23:16]; cap_data[13] = COMMON_LENGTH[31:24];
-        cfg_mgr.register_vendor_specific(cap_data, COMMON_CAP_OFFSET);
-        cap_data = new[18];
-        foreach (cap_data[index]) cap_data[index] = 8'h00;
-        cap_data[0] = 8'h14; cap_data[1] = VIRTIO_PCI_CAP_NOTIFY_CFG;
-        cap_data[2] = notify_bar.even_bar_id;
-        cap_data[6] = NOTIFY_OFFSET[7:0]; cap_data[7] = NOTIFY_OFFSET[15:8];
-        cap_data[8] = NOTIFY_OFFSET[23:16]; cap_data[9] = NOTIFY_OFFSET[31:24];
-        cap_data[10] = NOTIFY_LENGTH[7:0]; cap_data[11] = NOTIFY_LENGTH[15:8];
-        cap_data[12] = NOTIFY_LENGTH[23:16]; cap_data[13] = NOTIFY_LENGTH[31:24];
-        cap_data[14] = 8'h02; cap_data[15] = 8'h00;
-        cap_data[16] = 8'h00; cap_data[17] = 8'h00;
-        cfg_mgr.register_vendor_specific(cap_data, NOTIFY_CAP_OFFSET);
-        cap_data = new[14];
-        foreach (cap_data[index]) cap_data[index] = 8'h00;
-        cap_data[0] = 8'h10; cap_data[1] = VIRTIO_PCI_CAP_ISR_CFG;
-        cap_data[2] = common_bar.even_bar_id;
-        cap_data[6] = ISR_OFFSET[7:0]; cap_data[7] = ISR_OFFSET[15:8];
-        cap_data[8] = ISR_OFFSET[23:16]; cap_data[9] = ISR_OFFSET[31:24];
-        cap_data[10] = 8'h04;
-        cfg_mgr.register_vendor_specific(cap_data, ISR_CAP_OFFSET);
-        cap_data = new[14];
-        foreach (cap_data[index]) cap_data[index] = 8'h00;
-        cap_data[0] = 8'h10; cap_data[1] = VIRTIO_PCI_CAP_DEVICE_CFG;
-        cap_data[2] = common_bar.even_bar_id;
-        cap_data[6] = DEVICE_OFFSET[7:0]; cap_data[7] = DEVICE_OFFSET[15:8];
-        cap_data[8] = DEVICE_OFFSET[23:16]; cap_data[9] = DEVICE_OFFSET[31:24];
-        cap_data[10] = DEVICE_LENGTH[7:0]; cap_data[11] = DEVICE_LENGTH[15:8];
-        cap_data[12] = DEVICE_LENGTH[23:16]; cap_data[13] = DEVICE_LENGTH[31:24];
-        cfg_mgr.register_vendor_specific(cap_data, DEVICE_CAP_OFFSET);
-        msix = pcie_capability::type_id::create("real_flow_msix_cap");
-        msix.cap_id = CAP_ID_MSIX; msix.offset = MSIX_CAP_OFFSET;
-        msix.data = new[10];
-        foreach (msix.data[index]) msix.data[index] = 8'h00;
-        msix.data[0] = 8'h00; msix.data[1] = 8'h00;
-        msix.data[2] = MSIX_TABLE_OFFSET[7:0] | msix_bar.even_bar_id;
-        msix.data[3] = MSIX_TABLE_OFFSET[15:8];
-        msix.data[4] = MSIX_TABLE_OFFSET[23:16];
-        msix.data[5] = MSIX_TABLE_OFFSET[31:24];
-        msix.data[6] = MSIX_PBA_OFFSET[7:0] | msix_bar.even_bar_id;
-        msix.data[7] = MSIX_PBA_OFFSET[15:8];
-        msix.data[8] = MSIX_PBA_OFFSET[23:16];
-        msix.data[9] = MSIX_PBA_OFFSET[31:24];
-        cfg_mgr.register_capability(msix);
-    endfunction
-
-    protected function bit add_feature_window(
-        input pcie_tl_ep_driver ep_drv,
-        input bit [63:0] base,
-        output string why
-    );
-        virtio_feature_select_ep_driver feature_drv;
-        why = "";
-        if (!$cast(feature_drv, ep_drv)) begin
-            why = "PCIe endpoint driver does not model virtio DFSELECT";
-            return 0;
-        end
-        feature_drv.add_feature_window(base + COMMON_OFFSET, device_features);
-        return 1;
-    endfunction
-
-    protected function void write_common_defaults(
-        input pcie_tl_ep_driver ep_drv,
-        input bit [63:0] base,
-        input int unsigned total_queues
-    );
-        write_ep16(ep_drv, base + COMMON_OFFSET + 32'h10, 16'hffff);
-        write_ep16(ep_drv, base + COMMON_OFFSET + 32'h12,
-                   total_queues[15:0]);
-        write_ep16(ep_drv, base + COMMON_OFFSET + 32'h18, 16'h0100);
-        write_ep16(ep_drv, base + COMMON_OFFSET + 32'h1a, 16'hffff);
-    endfunction
-
-    protected function void write_ep16(pcie_tl_ep_driver ep_drv,
-                                       bit [63:0] addr, bit [15:0] data);
-        ep_drv.mem_space[addr] = data[7:0];
-        ep_drv.mem_space[addr + 1] = data[15:8];
-    endfunction
-
-    protected function void write_ep32(pcie_tl_ep_driver ep_drv,
-                                       bit [63:0] addr, bit [31:0] data);
-        ep_drv.mem_space[addr] = data[7:0];
-        ep_drv.mem_space[addr + 1] = data[15:8];
-        ep_drv.mem_space[addr + 2] = data[23:16];
-        ep_drv.mem_space[addr + 3] = data[31:24];
+        if (k == 0)
+            why = "no VIO function resolved a PCIe identity";
+        return k != 0;
     endfunction
 endclass
 
