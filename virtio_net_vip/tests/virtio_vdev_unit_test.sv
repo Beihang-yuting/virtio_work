@@ -1834,6 +1834,36 @@ class virtio_vdev_unit_test extends uvm_test;
         `uvm_info("VDEV_UNIT", "test_priv_backend_sequence PASSED", UVM_LOW)
     endtask
 
+    // 事件字段名（cosim 对比 PRIV-01）：msix_linear 只命名驱动 MSI-X 线性表（register.h:37–38，0xC0000 起、
+    // INTF_PCONFIG 0x140000 止）与本设备 srcid 的解码窗口（D-4：host≥1 时溢出到 0x140000 之后）；
+    // 其余未建模寄存器保持原始偏移名，不得冒用 msix_linear（RSS 0x4A9000、vport fwd 0x4AA000 等）。
+    task test_priv_event_field_names();
+        string trace[$];
+        string want[$];
+
+        priv.host_id = 0;
+        priv.init();
+        program_bars(PRIV_BDF, PRIV_BAR0, PRIV_BAR2, PRIV_BAR4);
+        port.host_cfg_write(PRIV_BDF, 12'h004, 32'h0000_0006, 4'h3);
+        priv_log.events.delete();
+        priv_wr(32'hc_0000 + 4 * 3, 32'h803);   // #16 host 0 线性表项 3
+        priv_wr(32'h13_fffc, 32'h0);            // 线性表最后一项
+        priv_wr(32'h14_0000, 32'h0);            // INTF_PCONFIG：线性表之后，host 0 不解码
+        priv_wr(32'h4a_9000, 32'h1);            // #26 RSS 组表
+        priv_wr(32'h4a_a000, 32'h1);            // #30 vport fwd
+        priv.host_id = 1;                       // D-4：host 1 的线性表窗口 0xC0000+4*((1<<10)<<7)=0x140000
+        priv_wr(32'h14_0008, 32'h802);
+        priv_wr(32'h14_0200, 32'h0);            // 窗口（128 项）之外
+        priv_log.reg_trace(trace);
+        want = '{"W bar0 msix_linear.3 0x803", "W bar0 msix_linear.131071 0x0", "W bar0 0x0140000 0x0",
+                 "W bar0 0x04a9000 0x1", "W bar0 0x04aa000 0x1", "W bar0 msix_linear.131074 0x802",
+                 "W bar0 0x0140200 0x0"};
+        expect_trace(trace, want, "event field names");
+        priv.host_id = 0;
+        priv.init();
+        `uvm_info("VDEV_UNIT", "test_priv_event_field_names PASSED", UVM_LOW)
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         echo.bdf = ECHO_BDF;
@@ -1859,6 +1889,7 @@ class virtio_vdev_unit_test extends uvm_test;
         test_vip_msix_mapping_readback();
         test_priv_driver_sequence();
         test_priv_backend_sequence();
+        test_priv_event_field_names();
         mem.leak_check();
         iommu.leak_check();
         `uvm_info("VDEV_UNIT", "virtio_vdev_unit_test PASSED", UVM_NONE)

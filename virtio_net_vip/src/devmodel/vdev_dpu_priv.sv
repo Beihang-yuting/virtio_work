@@ -106,6 +106,7 @@ class vdev_dpu_priv extends vdev_base;
     localparam bit [31:0] BDF_MAP_BASE     = 32'h005_6000;
     localparam bit [31:0] MB_AF_HOST       = 32'h006_0040;
     localparam bit [31:0] MSIX_LINEAR_BASE = 32'h00c_0000;
+    localparam bit [31:0] MSIX_LINEAR_END  = 32'h014_0000;   // INTF_PCONFIG（register.h:38），线性表之后
     localparam bit [31:0] VTX_RESET        = 32'h088_0100;
     localparam bit [31:0] VTX_RESET_DONE   = 32'h088_0104;
     localparam bit [31:0] VTX_RAM_CFG      = 32'h088_0130;
@@ -721,6 +722,9 @@ class vdev_dpu_priv extends vdev_base;
     endfunction
 
     protected function string bar0_field(bit [31:0] off);
+        bit [31:0] linear_window;
+
+        linear_window = MSIX_LINEAR_BASE + 4 * ((host_id << 10) << 7);
         case (off)
             MSIX_REARM:     return "msix_rearm";
             AF_DECLARATION: return "af_declaration";
@@ -761,7 +765,9 @@ class vdev_dpu_priv extends vdev_base;
             return $sformatf("msix_info.%0d", (off - MSIX_INFO_BASE) / 4);
         if ((off >= BDF_MAP_BASE) && (off < BDF_MAP_BASE + 32'h1000))
             return $sformatf("bdf_map.%0d", (off - BDF_MAP_BASE) / 4);
-        if ((off >= MSIX_LINEAR_BASE) && (off < MSIX_LINEAR_BASE + 32'h40_0000))
+        // 线性表本身，加上本设备 srcid 的解码窗口（cq_irq 的 128 项；D-4 溢出时落在 INTF_PCONFIG 之后）。
+        if (((off >= MSIX_LINEAR_BASE) && (off < MSIX_LINEAR_END)) ||
+            ((off >= linear_window) && (off < linear_window + 4 * 128)))
             return $sformatf("msix_linear.%0d", (off - MSIX_LINEAR_BASE) / 4);
         return $sformatf("0x%07h", off);
     endfunction
