@@ -390,8 +390,8 @@ class virtio_unit_test extends uvm_test;
                 IOMMU_IOVA_FIRST_FIT, why))
             `uvm_fatal("TEST", {"could not configure top IOVA aperture: ", why})
         fixed_iova = 64'hffff_ffff_ffff_e000;
-        if (iommu.map_fixed(16'h0124, 64'h0000_0000_7000_0000,
-                            4096, DMA_TO_DEVICE, fixed_iova) != fixed_iova)
+        if (iommu.map_fixed_for_host(0, 16'h0124, 64'h0000_0000_7000_0000,
+                                     4096, DMA_TO_DEVICE, fixed_iova) != fixed_iova)
             `uvm_fatal("TEST", "could not create top-of-address-space IOVA map")
 
         // Keep the request inside the mapped start address but make its end
@@ -399,13 +399,13 @@ class virtio_unit_test extends uvm_test;
         // unsigned ``iova + size`` without an overflow guard would otherwise
         // see the wrapped end (0x0000_0000_0000_dfff) and incorrectly accept
         // this translation.
-        ok = iommu.translate(16'h0124, fixed_iova, 32'hffff_ffff,
-                             DMA_TO_DEVICE, gpa, fault);
+        ok = iommu.translate_for_host(0, 16'h0124, fixed_iova, 32'hffff_ffff,
+                                      DMA_TO_DEVICE, gpa, fault);
         if (ok || (fault != IOMMU_FAULT_OUT_OF_RANGE))
             `uvm_fatal("TEST", $sformatf(
                 "wrapping IOVA translation was not rejected: ok=%0b fault=%s gpa=0x%016h",
                 ok, fault.name(), gpa))
-        iommu.unmap(16'h0124, fixed_iova);
+        iommu.unmap_for_host(0, 16'h0124, fixed_iova);
         `uvm_info("UNIT_TEST", "test_iommu_translation_overflow PASSED", UVM_LOW)
     endtask
 
@@ -535,27 +535,27 @@ class virtio_unit_test extends uvm_test;
         bit ok;
 
         // Map
-        iova = iommu.map(16'h0100, 64'hDEAD_0000, 4096, DMA_TO_DEVICE);
+        iova = iommu.map_for_host(0, 16'h0100, 64'hDEAD_0000, 4096, DMA_TO_DEVICE);
         assert(iova != 0) else `uvm_fatal("TEST", "map failed")
 
         // Translate
-        ok = iommu.translate(16'h0100, iova, 64, DMA_TO_DEVICE, gpa, fault);
+        ok = iommu.translate_for_host(0, 16'h0100, iova, 64, DMA_TO_DEVICE, gpa, fault);
         assert(ok) else `uvm_fatal("TEST", $sformatf("translate failed, fault=%s", fault.name()))
         assert(gpa == 64'hDEAD_0000) else `uvm_fatal("TEST", $sformatf("gpa mismatch: %h", gpa))
 
         // Permission violation on the public device-read translation path.
         // Device-to-guest writes are intentionally rejected before mapping
         // lookup and must use write_from_device().
-        write_iova = iommu.map(16'h0100, 64'hBEEF_0000, 4096,
-                               DMA_FROM_DEVICE);
-        ok = iommu.translate(16'h0100, write_iova, 64, DMA_TO_DEVICE,
-                             gpa, fault);
+        write_iova = iommu.map_for_host(0, 16'h0100, 64'hBEEF_0000, 4096,
+                                        DMA_FROM_DEVICE);
+        ok = iommu.translate_for_host(0, 16'h0100, write_iova, 64, DMA_TO_DEVICE,
+                                      gpa, fault);
         assert(!ok && fault == IOMMU_FAULT_PERMISSION)
             else `uvm_error("TEST", "expected permission fault")
 
         // Unmap
-        iommu.unmap(16'h0100, iova);
-        iommu.unmap(16'h0100, write_iova);
+        iommu.unmap_for_host(0, 16'h0100, iova);
+        iommu.unmap_for_host(0, 16'h0100, write_iova);
 
         // Leak check
         iommu.leak_check();
@@ -732,8 +732,8 @@ class virtio_unit_test extends uvm_test;
                 IOMMU_IOVA_RANDOM, why))
             `uvm_fatal("TEST", {"could not configure IOVA aperture: ", why})
         for (int index = 0; index < 12; index++) begin
-            iova = iommu.map(16'h0123, 64'h6000_0000 + index * 4096,
-                             4096, DMA_TO_DEVICE);
+            iova = iommu.map_for_host(0, 16'h0123, 64'h6000_0000 + index * 4096,
+                                      4096, DMA_TO_DEVICE);
             if ((iova == 0) || (iova == '1) ||
                 (iova < 64'h0000_0000_4000_0000) ||
                 (iova + 4096 > 64'h0000_0000_4002_0000))
@@ -745,15 +745,15 @@ class virtio_unit_test extends uvm_test;
             if ((index != 0) && (iova != iovas[0] + index * 4096))
                 saw_non_linear_random_slot = 1;
             iovas.push_back(iova);
-            ok = iommu.translate(16'h0123, iova, 4096,
-                                 DMA_TO_DEVICE, gpa, fault);
+            ok = iommu.translate_for_host(0, 16'h0123, iova, 4096,
+                                          DMA_TO_DEVICE, gpa, fault);
             if (!ok || (gpa != 64'h6000_0000 + index * 4096))
                 `uvm_fatal("TEST", "random IOVA translation mismatch")
         end
         invalid_map_catcher = new("invalid_map_catcher");
         uvm_report_cb::add(null, invalid_map_catcher);
-        if (iommu.map_fixed(16'h0123, 64'h7000_0000, 4096,
-                            DMA_TO_DEVICE, 64'h4000_0000) != '1)
+        if (iommu.map_fixed_for_host(0, 16'h0123, 64'h7000_0000, 4096,
+                                     DMA_TO_DEVICE, 64'h4000_0000) != '1)
             `uvm_fatal("TEST", "fixed IOVA outside aperture was accepted")
         uvm_report_cb::delete(null, invalid_map_catcher);
         if (invalid_map_catcher.caught_count != 1)
@@ -761,7 +761,7 @@ class virtio_unit_test extends uvm_test;
         if (!saw_non_linear_random_slot)
             `uvm_fatal("TEST", "random IOVA policy produced only linear slots")
         foreach (iovas[index])
-            iommu.unmap(16'h0123, iovas[index]);
+            iommu.unmap_for_host(0, 16'h0123, iovas[index]);
         `uvm_info("UNIT_TEST", "test_iommu_random_aperture PASSED", UVM_LOW)
     endtask
 

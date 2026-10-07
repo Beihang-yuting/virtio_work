@@ -238,8 +238,8 @@ class virtio_indirect_desc_test extends uvm_test;
             else `uvm_fatal("INDIRECT_TEST", $sformatf(
                 "indirect table length=%0d, expected 48", main_len))
 
-        translated = iommu.translate(vq.bdf, main_addr, main_len,
-                                     DMA_TO_DEVICE, table_gpa, fault);
+        translated = iommu.translate_for_host(0, vq.bdf, main_addr, main_len,
+                                              DMA_TO_DEVICE, table_gpa, fault);
         assert(translated)
             else `uvm_fatal("INDIRECT_TEST", $sformatf(
                 "main descriptor does not map its table (fault=%s)", fault.name()))

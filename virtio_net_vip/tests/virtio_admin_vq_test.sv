@@ -30,22 +30,24 @@ class virtio_admin_vq_test_iommu extends virtio_iommu_model;
         device_reset_requested_before_first_unmap = 0;
     endfunction
 
-    function bit [63:0] map(bit [15:0] bdf,
-                             bit [63:0] gpa,
-                             int unsigned size,
-                             dma_dir_e dir,
-                             string file = "",
-                             int line = 0);
+    function bit [63:0] map_for_host(int unsigned host_id,
+                                     bit [15:0] bdf,
+                                     bit [63:0] gpa,
+                                     int unsigned size,
+                                     dma_dir_e dir,
+                                     string file = "",
+                                     int line = 0);
         map_attempts++;
         if (fail_on_map_attempt != 0 && map_attempts == fail_on_map_attempt)
             return '1;
-        return super.map(bdf, gpa, size, dir, file, line);
+        return super.map_for_host(host_id, bdf, gpa, size, dir, file, line);
     endfunction
 
-    function void unmap(bit [15:0] bdf,
-                        bit [63:0] iova,
-                        string file = "",
-                        int line = 0);
+    function void unmap_for_host(int unsigned host_id,
+                                 bit [15:0] bdf,
+                                 bit [63:0] iova,
+                                 string file = "",
+                                 int line = 0);
         if (observe_unmap_order && !saw_unmap) begin
             saw_unmap = 1;
             queue_reset_requested_before_first_unmap =
@@ -53,7 +55,7 @@ class virtio_admin_vq_test_iommu extends virtio_iommu_model;
             device_reset_requested_before_first_unmap =
                 (transport_for_unmap != null && transport_for_unmap.device_reset_count != 0);
         end
-        super.unmap(bdf, iova, file, line);
+        super.unmap_for_host(host_id, bdf, iova, file, line);
     endfunction
 endclass : virtio_admin_vq_test_iommu
 
@@ -278,15 +280,15 @@ class virtio_admin_vq_test extends uvm_test;
         end
         assert(found_chain)
             else `uvm_fatal("ADMIN_VQ", "concurrent Admin command has no OUT plus IN descriptor chain")
-        assert(iommu.translate(vq.bdf, out_addr, out_len, DMA_TO_DEVICE,
-                               request_gpa, fault))
+        assert(iommu.translate_for_host(0, vq.bdf, out_addr, out_len, DMA_TO_DEVICE,
+                                        request_gpa, fault))
             else `uvm_fatal("ADMIN_VQ", "concurrent Admin request descriptor is not DMA mapped")
         mem.read_mem(request_gpa, out_len, request_data);
         assert(request_data.size() == 1 && request_data[0] == expected_command)
             else `uvm_fatal("ADMIN_VQ", "concurrent Admin request reached the wrong completion")
         device_response = '{VIRTIO_NET_OK, response_byte[7:0]};
-        assert(iommu.write_from_device(mem, vq.bdf, in_addr,
-                                       device_response, fault))
+        assert(iommu.write_from_device_for_host(0, mem, vq.bdf, in_addr,
+                                                device_response, fault))
             else `uvm_fatal("ADMIN_VQ", "concurrent Admin response DMA write failed")
         virtio_vq_test_kit::complete_split_at(
             mem, vq, used_slot, head, device_response.size(), used_slot + 1);
@@ -416,16 +418,16 @@ class virtio_admin_vq_test extends uvm_test;
                        in_len == ctx.response_capacity &&
                        in_flags == VIRTQ_DESC_F_WRITE && in_next == 0)
                     else `uvm_fatal("ADMIN_VQ", "Admin VQ did not build one OUT plus one IN chain")
-                assert(iommu.translate(vq.bdf, out_addr, out_len, DMA_TO_DEVICE,
-                                       response_gpa, fault))
+                assert(iommu.translate_for_host(0, vq.bdf, out_addr, out_len, DMA_TO_DEVICE,
+                                                response_gpa, fault))
                     else `uvm_fatal("ADMIN_VQ", "Admin request descriptor is not DMA mapped")
                 mem.read_mem(response_gpa, out_len, expected_request);
                 foreach (request[i])
                     assert(expected_request[i] == request[i])
                         else `uvm_fatal("ADMIN_VQ", "Admin request payload was not preserved")
                 device_response = '{VIRTIO_NET_OK, 8'hA5, 8'h5A};
-                assert(iommu.write_from_device(mem, vq.bdf, in_addr,
-                                               device_response, fault))
+                assert(iommu.write_from_device_for_host(0, mem, vq.bdf, in_addr,
+                                                        device_response, fault))
                     else `uvm_fatal("ADMIN_VQ", "Admin response DMA write failed")
                 virtio_vq_test_kit::complete_split_at(mem, vq, 0, 0, device_response.size(), 1);
             end
@@ -1114,8 +1116,8 @@ class virtio_admin_vq_test extends uvm_test;
                                 unused_flags, unused_next);
                 read_split_desc(mem, vq, 1, in_addr, in_len, in_flags, in_next);
                 device_response = '{VIRTIO_NET_ERR, 8'hE1};
-                assert(iommu.write_from_device(mem, vq.bdf, in_addr,
-                                               device_response, fault))
+                assert(iommu.write_from_device_for_host(0, mem, vq.bdf, in_addr,
+                                                        device_response, fault))
                     else `uvm_fatal("ADMIN_VQ", "error response DMA write failed")
                 virtio_vq_test_kit::complete_split_at(mem, vq, 0, 0, device_response.size(), 1);
             end

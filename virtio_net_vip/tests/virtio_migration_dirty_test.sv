@@ -298,7 +298,7 @@ class virtio_migration_dirty_test_fsm extends virtio_auto_fsm;
                 $sformatf("cross-page DMA write translation failed: %s",
                               fault.name()))
             if (unmap_write_on_stop)
-                iommu.unmap(bdf, mapped_iova);
+                iommu.unmap_for_host(0, bdf, mapped_iova);
             if (free_write_on_stop)
                 mem.free(mapped_gpa);
         end
@@ -506,21 +506,21 @@ class virtio_migration_dirty_test extends uvm_test;
         gpa = mem.alloc(64, 64);
         assert(gpa != '1)
             else `uvm_fatal("MIGRATION", "failed to allocate DMA bypass backing")
-        iova = iommu.map(16'h0900, gpa, 64, DMA_FROM_DEVICE);
-        bidir_iova = iommu.map(16'h0900, gpa, 64, DMA_BIDIRECTIONAL);
+        iova = iommu.map_for_host(0, 16'h0900, gpa, 64, DMA_FROM_DEVICE);
+        bidir_iova = iommu.map_for_host(0, 16'h0900, gpa, 64, DMA_BIDIRECTIONAL);
         assert((iova != '1) && (bidir_iova != '1) &&
                (iova != 0) && (bidir_iova != 0))
             else `uvm_fatal("MIGRATION", "failed to map DMA bypass backing")
-        iommu.begin_dirty_generation();
+        void'(iommu.begin_dirty_generation_for_host(0));
 
         catcher = new("direct_dma_bypass_catcher");
         uvm_report_cb::add(null, catcher);
-        translated = iommu.translate(16'h0900, iova, 16, DMA_FROM_DEVICE,
-                                     gpa, fault);
-        bidir_translated = iommu.translate(16'h0900, bidir_iova, 16,
-                                            DMA_BIDIRECTIONAL, gpa, fault);
+        translated = iommu.translate_for_host(0, 16'h0900, iova, 16, DMA_FROM_DEVICE,
+                                              gpa, fault);
+        bidir_translated = iommu.translate_for_host(0, 16'h0900, bidir_iova, 16,
+                                                     DMA_BIDIRECTIONAL, gpa, fault);
         uvm_report_cb::delete(null, catcher);
-        iommu.capture_dirty_generation(dirty_pages);
+        iommu.capture_dirty_generation_for_host(0, dirty_pages);
 
         assert(!translated && !bidir_translated &&
                (fault == IOMMU_FAULT_PERMISSION) &&
@@ -528,8 +528,8 @@ class virtio_migration_dirty_test extends uvm_test;
             else `uvm_error("MIGRATION",
                 "direct writable-DMA translation bypass was accepted")
 
-        iommu.unmap(16'h0900, bidir_iova);
-        iommu.unmap(16'h0900, iova);
+        iommu.unmap_for_host(0, 16'h0900, bidir_iova);
+        iommu.unmap_for_host(0, 16'h0900, iova);
         mem.free(gpa);
     endtask
 
@@ -563,8 +563,8 @@ class virtio_migration_dirty_test extends uvm_test;
         backing_gpa = mem.alloc(PAGE_SIZE * 2, PAGE_SIZE);
         assert(backing_gpa != '1)
             else `uvm_fatal("MIGRATION", "failed to allocate two-page migration backing")
-        backing_iova = iommu.map(16'h0901, backing_gpa, PAGE_SIZE * 2,
-                                  DMA_FROM_DEVICE);
+        backing_iova = iommu.map_for_host(0, 16'h0901, backing_gpa, PAGE_SIZE * 2,
+                                           DMA_FROM_DEVICE);
         assert((backing_iova != '1) && (backing_iova != 0))
             else `uvm_fatal("MIGRATION", "failed to map migration backing")
 
@@ -636,7 +636,7 @@ class virtio_migration_dirty_test extends uvm_test;
         // mapping/allocation is gone before the snapshot is materialized at
         // its original IOVA.  Keep corruption checks above this point, while
         // their live source bytes are still deliberately available.
-        iommu.unmap(16'h0901, backing_iova);
+        iommu.unmap_for_host(0, 16'h0901, backing_iova);
         mem.free(backing_gpa);
         fsm.inject_write_on_stop = 0;
         fsm.restore_from_migration(snapshot, restore_ok);
@@ -682,7 +682,7 @@ class virtio_migration_dirty_test extends uvm_test;
         backing_gpa = mem.alloc(128, 64);
         assert(backing_gpa != '1)
             else `uvm_fatal("MIGRATION", "failed to allocate sub-page migration backing")
-        backing_iova = iommu.map(16'h0902, backing_gpa, 64, DMA_FROM_DEVICE);
+        backing_iova = iommu.map_for_host(0, 16'h0902, backing_gpa, 64, DMA_FROM_DEVICE);
         assert((backing_iova != '1) && (backing_iova != 0))
             else `uvm_fatal("MIGRATION", "failed to map sub-page migration backing")
 
@@ -733,7 +733,7 @@ class virtio_migration_dirty_test extends uvm_test;
             else `uvm_error("MIGRATION",
                 "corrupted sub-page dirty backing was accepted or restarted")
 
-        iommu.unmap(16'h0902, backing_iova);
+        iommu.unmap_for_host(0, 16'h0902, backing_iova);
         mem.free(backing_gpa);
         fsm.inject_write_on_stop = 0;
         fsm.restore_from_migration(snapshot, restore_ok);
@@ -779,7 +779,7 @@ class virtio_migration_dirty_test extends uvm_test;
         backing_gpa = mem.alloc(64, 64);
         assert(backing_gpa != '1)
             else `uvm_fatal("MIGRATION", "failed to allocate retired mapping backing")
-        backing_iova = iommu.map(16'h0903, backing_gpa, 64, DMA_FROM_DEVICE);
+        backing_iova = iommu.map_for_host(0, 16'h0903, backing_gpa, 64, DMA_FROM_DEVICE);
         assert((backing_iova != '1) && (backing_iova != 0))
             else `uvm_fatal("MIGRATION", "failed to map retired mapping backing")
 
@@ -908,7 +908,7 @@ class virtio_migration_dirty_test extends uvm_test;
         backing_gpa = mem.alloc(64, 64);
         assert(backing_gpa != '1)
             else `uvm_fatal("MIGRATION", "failed to allocate real-reset backing")
-        backing_iova = iommu.map(16'h0904, backing_gpa, 64, DMA_FROM_DEVICE);
+        backing_iova = iommu.map_for_host(0, 16'h0904, backing_gpa, 64, DMA_FROM_DEVICE);
         assert((backing_iova != '1) && (backing_iova != 0))
             else `uvm_fatal("MIGRATION", "failed to map real-reset backing")
 
@@ -1046,8 +1046,8 @@ class virtio_migration_dirty_test extends uvm_test;
         tx_gpa = mem.alloc(64, 64);
         assert((dirty_gpa != '1) && (tx_gpa != '1))
             else `uvm_fatal("MIGRATION", "failed to allocate clean-TX migration DMA")
-        dirty_iova = iommu.map(16'h0905, dirty_gpa, 64, DMA_FROM_DEVICE);
-        tx_iova = iommu.map(16'h0905, tx_gpa, 64, DMA_TO_DEVICE);
+        dirty_iova = iommu.map_for_host(0, 16'h0905, dirty_gpa, 64, DMA_FROM_DEVICE);
+        tx_iova = iommu.map_for_host(0, 16'h0905, tx_gpa, 64, DMA_TO_DEVICE);
         assert((dirty_iova != '1) && (tx_iova != '1) &&
                (dirty_iova != 0) && (tx_iova != 0))
             else `uvm_fatal("MIGRATION", "failed to map clean-TX migration DMA")
@@ -1103,8 +1103,8 @@ class virtio_migration_dirty_test extends uvm_test;
                         restored_desc[16 + byte_index];
             end
         end
-        if (iommu.translate(transport.bdf, tx_iova, tx_payload.size(),
-                            DMA_TO_DEVICE, restored_tx_gpa, fault))
+        if (iommu.translate_for_host(0, transport.bdf, tx_iova, tx_payload.size(),
+                                     DMA_TO_DEVICE, restored_tx_gpa, fault))
             mem.read_mem(restored_tx_gpa, tx_payload.size(), restored_payload);
 
         assert(restored && (restored_desc_tx_iova == tx_iova) &&
@@ -1282,7 +1282,7 @@ class virtio_migration_dirty_test extends uvm_test;
             fsm.inject_write_on_stop = 1;
         end
         payload_gpa = mem.alloc(16, 16);
-        payload_iova = iommu.map(transport.bdf, payload_gpa, 16, DMA_TO_DEVICE);
+        payload_iova = iommu.map_for_host(0, transport.bdf, payload_gpa, 16, DMA_TO_DEVICE);
         assert((source_vq != null) && (payload_gpa != '1) &&
                (payload_iova != '1) && (payload_iova != 0))
             else `uvm_fatal("MIGRATION",
@@ -1415,9 +1415,9 @@ class virtio_migration_dirty_test extends uvm_test;
                               vq_type.name()))
         end
 
-        payload_translated = iommu.translate(transport.bdf, payload_iova,
-                                             payload.size(), DMA_TO_DEVICE,
-                                             restored_payload_gpa, fault);
+        payload_translated = iommu.translate_for_host(0, transport.bdf, payload_iova,
+                                                      payload.size(), DMA_TO_DEVICE,
+                                                      restored_payload_gpa, fault);
         if (payload_translated)
             mem.read_mem(restored_payload_gpa, payload.size(), restored_payload);
         assert(payload_translated && (fault == IOMMU_NO_FAULT) &&

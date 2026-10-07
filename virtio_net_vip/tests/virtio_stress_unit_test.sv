@@ -132,7 +132,7 @@ class virtio_stress_unit_test extends uvm_test;
         bit ok;
 
         // Map normally
-        iova = iommu.map(16'h0200, 64'hBEEF_0000, 4096, DMA_BIDIRECTIONAL);
+        iova = iommu.map_for_host(0, 16'h0200, 64'hBEEF_0000, 4096, DMA_BIDIRECTIONAL);
 
         // Add fault rule: any access to this IOVA range triggers DEVICE_ABORT
         rule.bdf_mask = '1;  // any BDF (0xFFFF wildcard)
@@ -145,16 +145,16 @@ class virtio_stress_unit_test extends uvm_test;
         iommu.add_fault_rule(rule);
 
         // First access should fault
-        ok = iommu.translate(16'h0200, iova, 64, DMA_TO_DEVICE, gpa, fault);
+        ok = iommu.translate_for_host(0, 16'h0200, iova, 64, DMA_TO_DEVICE, gpa, fault);
         assert(!ok && fault == IOMMU_FAULT_DEVICE_ABORT)
             else `uvm_error("TEST", "expected DEVICE_ABORT fault")
 
         // Second access should succeed (trigger_count=1, exhausted)
-        ok = iommu.translate(16'h0200, iova, 64, DMA_TO_DEVICE, gpa, fault);
+        ok = iommu.translate_for_host(0, 16'h0200, iova, 64, DMA_TO_DEVICE, gpa, fault);
         assert(ok) else `uvm_error("TEST", "second access should succeed after rule exhausted")
 
         iommu.clear_fault_rules();
-        iommu.unmap(16'h0200, iova);
+        iommu.unmap_for_host(0, 16'h0200, iova);
 
         `uvm_info("STRESS_TEST", "test_iommu_fault_injection PASSED", UVM_LOW)
     endtask
