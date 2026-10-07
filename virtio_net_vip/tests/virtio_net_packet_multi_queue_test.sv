@@ -209,7 +209,7 @@ class virtio_net_packet_multi_queue_test extends uvm_test;
                             2048, 0, DEVICE_BDF, 0);
         transport = virtio_mock_transport::type_id::create(
             "multi_queue_transport");
-        transport.bdf = DEVICE_BDF;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(DEVICE_BDF));
         ops = kit.make_ops(transport, "multi_queue_ops");
         ops.negotiated_features = features;
         dataplane.bind_ops(ops);

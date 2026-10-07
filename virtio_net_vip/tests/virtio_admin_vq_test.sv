@@ -315,7 +315,7 @@ class virtio_admin_vq_test extends uvm_test;
         kit.wait_pol.default_poll_interval_ns = 1;
         kit.wait_pol.default_timeout_ns = 8;
         kit.wait_pol.max_poll_attempts = 16;
-        transport.bdf = 16'h0708;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0708));
         vq = kit.make_split("admin_split_vq", 7, 8, 16'h0708);
 
         ctx = virtio_admin_vq_context::type_id::create("admin_vq_context");
@@ -463,7 +463,7 @@ class virtio_admin_vq_test extends uvm_test;
         wrong_transport = virtio_mock_transport::type_id::create(
             "wrong_admin_pf_transport"
         );
-        wrong_transport.bdf = 16'h0808;
+        wrong_transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0808));
         pf_mgr.pf_transport = wrong_transport;
         request = '{8'h36};
         catcher = new("admin_transport_mismatch_catcher", '{"PF_MGR"},

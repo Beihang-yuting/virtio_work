@@ -2098,6 +2098,7 @@ class virtio_dut_caps_test extends uvm_test;
             `uvm_fatal("DUT_CAPS",
                 "default PF driver config did not receive the env DUT capability")
         transport = virtio_pci_transport::type_id::create("mq_transport");
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0000));
         vq_mgr = virtqueue_manager::type_id::create("mq_vq_mgr");
         ops_spy = virtio_dut_caps_mq_ops_spy::type_id::create("mq_ops_spy");
         fsm_probe = virtio_dut_caps_mq_fsm_probe::type_id::create(
@@ -2133,6 +2134,7 @@ class virtio_dut_caps_test extends uvm_test;
         end
         rebind_transport = virtio_pci_transport::type_id::create(
             "mq_rebind_transport");
+        rebind_transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0000));
         rebind_vq_mgr = virtqueue_manager::type_id::create(
             "mq_rebind_vq_mgr");
         driver_cfg.max_vio_net_qpairs_per_device = 2;
@@ -2276,6 +2278,8 @@ class virtio_dut_caps_test extends uvm_test;
         mq_binding_function.drv_cfg = private_behavior;
         mq_binding_function.transport = virtio_pci_transport::type_id::create(
             "commit_failure_transport");
+        mq_binding_function.transport.configure_pcie_identity(
+            virtio_vq_test_kit::host0_pcie_id(16'h0000));
         mq_binding_function.vq_mgr = virtqueue_manager::type_id::create(
             "commit_failure_vq_mgr");
         mq_binding_function.driver_agent.ops = busy_ops;
@@ -3199,6 +3203,8 @@ class virtio_dut_caps_test extends uvm_test;
         bit commit_succeeded;
 
         factory_ops_function.drv_cfg.max_vio_net_qpairs_per_device = 1;
+        factory_ops_function.transport.configure_pcie_identity(
+            virtio_vq_test_kit::host0_pcie_id(factory_ops_function.transport.bdf));
         virtio_dut_caps_factory_ops_probe::reset_creation_probe();
         preflight_succeeded = factory_ops_function.preflight_bind_pcie(
             mq_pcie_seqr);

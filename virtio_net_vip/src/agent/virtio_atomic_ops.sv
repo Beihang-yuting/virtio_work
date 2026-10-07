@@ -76,14 +76,17 @@ class virtio_atomic_ops extends uvm_object;
         negotiated_features = '0;
     endfunction
 
-    // A numeric BDF is scoped by the PCIe host domain.  Standalone transports
-    // without a frozen identity retain the legacy host0 behavior.
+    // A numeric BDF is scoped by the PCIe host domain taken from the bound
+    // transport's frozen identity; there is no implicit host0 fallback.
     protected function int unsigned get_iommu_host_id(
         virtio_pci_transport t
     );
-        if (t != null)
-            return t.iommu_host_id();
-        return 0;
+        if (t == null) begin
+            `uvm_fatal("ATOMIC_OPS",
+                "DMA host domain requested without a bound transport")
+            return 0;
+        end
+        return t.iommu_host_id();
     endfunction
 
     // Retire one ordinary data-DMA ownership record.  This is deliberately

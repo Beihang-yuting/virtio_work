@@ -133,6 +133,26 @@ class virtio_expected_iommu_map_error_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_expected_iommu_map_error_catcher
 
+// Absorbs exactly the transport fatal raised when a DMA host domain is
+// requested from a transport that never received a frozen PCIe identity.
+class virtio_unit_expected_identity_fatal_catcher extends uvm_report_catcher;
+    int unsigned caught_count;
+
+    function new(string name = "virtio_unit_expected_identity_fatal_catcher");
+        super.new(name);
+        caught_count = 0;
+    endfunction
+
+    virtual function action_e catch();
+        if ((get_severity() == UVM_FATAL) && (get_id() == "TRANSPORT") &&
+            uvm_is_match("*has no frozen PCIe identity*", get_message())) begin
+            caught_count++;
+            return CAUGHT;
+        end
+        return THROW;
+    endfunction
+endclass : virtio_unit_expected_identity_fatal_catcher
+
 // 记录型发现策略：只统计调用与入参，验证 transport 把发现完全委托给策略对象。
 class virtio_unit_recording_discovery extends virtio_discovery_strategy;
     `uvm_object_utils(virtio_unit_recording_discovery)
@@ -352,6 +372,7 @@ class virtio_unit_test extends uvm_test;
         test_iommu_host_domains();
         test_iommu_random_aperture();
         test_iommu_translation_overflow();
+        test_transport_requires_frozen_identity();
         test_split_virtqueue();
         test_wait_policy();
         test_pcie_scoreboard_byte_enables();
@@ -375,6 +396,28 @@ class virtio_unit_test extends uvm_test;
     // A request that starts inside a valid mapping but wraps the 64-bit IOVA
     // end address must fail range checking instead of appearing smaller than
     // the mapped end after unsigned addition overflow.
+    // A transport without a frozen PCIe identity has no DMA host domain; it
+    // must not silently fall back to host0.
+    task test_transport_requires_frozen_identity();
+        virtio_pci_transport transport =
+            virtio_pci_transport::type_id::create("identityless_transport");
+        virtio_unit_expected_identity_fatal_catcher catcher;
+        int unsigned host_id;
+
+        catcher = new("identity_fatal_catcher");
+        uvm_report_cb::add(null, catcher);
+        host_id = transport.iommu_host_id();
+        uvm_report_cb::delete(null, catcher);
+        if (catcher.caught_count != 1)
+            `uvm_fatal("TEST", $sformatf(
+                "identityless transport resolved DMA host %0d without a fatal",
+                host_id))
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0042));
+        if (transport.iommu_host_id() != 0)
+            `uvm_fatal("TEST", "host0 identity did not resolve DMA host 0")
+        `uvm_info("UNIT_TEST", "test_transport_requires_frozen_identity PASSED", UVM_LOW)
+    endtask
+
     task test_iommu_translation_overflow();
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create(
             "overflow_iommu");
@@ -1241,7 +1284,7 @@ class virtio_unit_test extends uvm_test;
         iommu = virtio_iommu_model::type_id::create("backend_iommu");
         mem = host_mem_manager::type_id::create("backend_mem");
         mem.init_region(64'h7600_0000, 64'h7600_FFFF);
-        transport.bdf = 16'h0131;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0131));
         vq_mgr.mem = mem;
         vq_mgr.iommu = iommu;
         vq_mgr.bdf = transport.bdf;

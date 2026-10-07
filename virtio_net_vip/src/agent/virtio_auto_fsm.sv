@@ -76,11 +76,14 @@ class virtio_auto_fsm extends uvm_report_object;
     endfunction
 
     // 取本 function 在 IOMMU 视角下的 host id（经 transport 转发）；
-    // ops/transport 尚未接入时返回 0，调用方按默认 host 处理。
+    // ops/transport 尚未接入属于接线错误，直接 fatal，不默认 host0。
     protected function int unsigned iommu_host_id();
-        if ((ops != null) && (ops.transport != null))
-            return ops.transport.iommu_host_id();
-        return 0;
+        if ((ops == null) || (ops.transport == null)) begin
+            `uvm_fatal("AUTO_FSM",
+                "DMA host domain requested before ops/transport were bound")
+            return 0;
+        end
+        return ops.transport.iommu_host_id();
     endfunction
 
     // Snapshot the function's effective MQ limit.  Zero is the compatibility

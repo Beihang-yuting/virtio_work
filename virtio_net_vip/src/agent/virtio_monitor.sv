@@ -341,7 +341,8 @@ class virtio_monitor extends uvm_monitor;
         txn.monitor_length = size_bytes;
         txn.monitor_is_write = is_write;
         txn.monitor_bdf = (transport == null) ? '0 : transport.bdf;
-        txn.monitor_host_id = (transport == null) ? 0 : transport.iommu_host_id();
+        txn.monitor_host_id = (transport == null || !transport.pcie_id_valid) ?
+                              0 : transport.pcie_id.domain.host_id;
         txn.monitor_segment_id = (transport == null || !transport.pcie_id_valid) ?
                                  0 : transport.pcie_id.domain.segment_id;
         return txn;

@@ -526,7 +526,7 @@ class virtio_indirect_desc_test extends uvm_test;
         kit = virtio_vq_test_kit::create_kit("tx_gate", mem, iommu, 16'h0702);
         vq = kit.add_split(0, 16);
 
-        transport.bdf = 16'h0702;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0702));
         ops = kit.make_ops(transport, "tx_gate_ops");
         token = new("tx_gate_token");
         net_hdr = '{default: 0};
@@ -583,7 +583,7 @@ class virtio_indirect_desc_test extends uvm_test;
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
                             16'h0703);
-        transport.bdf = 16'h0703;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0703));
         ops = kit.make_ops(transport, "dataplane_gate_ops");
         ops.negotiated_features = features;
         dataplane.bind_ops(ops);
@@ -652,7 +652,7 @@ class virtio_indirect_desc_test extends uvm_test;
         kit = virtio_vq_test_kit::create_kit("atomic_full", mem, iommu, 16'h0704);
         vq = kit.add_split(0, 2);
 
-        transport.bdf = 16'h0704;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0704));
         ops = kit.make_ops(transport, "atomic_full_ops");
         net_hdr = '{default: 0};
         filler_token = new("atomic_full_filler");
@@ -726,7 +726,7 @@ class virtio_indirect_desc_test extends uvm_test;
         features = '0;
         dataplane.configure(features, 1500, 1460, RX_MODE_MERGEABLE, 1526, 16,
                             16'h0705);
-        transport.bdf = 16'h0705;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0705));
         ops = kit.make_ops(transport, "dataplane_full_ops");
         ops.negotiated_features = features;
         dataplane.bind_ops(ops);
@@ -801,7 +801,7 @@ class virtio_indirect_desc_test extends uvm_test;
         split_vq = kit.add_split(0, 16);
         packed_vq = kit.add_packed(1, 4);
 
-        transport.bdf = 16'h0704;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0704));
         ops = kit.make_ops(transport, "cursor_ops");
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
         token0 = new("cursor_token0");
@@ -884,7 +884,7 @@ class virtio_indirect_desc_test extends uvm_test;
         kit = virtio_vq_test_kit::create_kit("rx_nomrg", mem, iommu, 16'h0705);
         vq = kit.add_split(0, 16);
 
-        transport.bdf = 16'h0705;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0705));
         ops = kit.make_ops(transport, "rx_nomrg_ops");
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
 
@@ -961,7 +961,7 @@ class virtio_indirect_desc_test extends uvm_test;
         tx_vq = kit.add_split(1, 8);
         rx_vq = kit.add_split(0, 8);
 
-        transport.bdf = 16'h0706;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0706));
         ops = kit.make_ops(transport, "dataplane_notify_ops");
         features = '0;
         ops.negotiated_features = features;

@@ -2,6 +2,7 @@
 `define VIRTIO_VQ_TEST_KIT_SV
 
 import uvm_pkg::*;
+import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
 `include "uvm_macros.svh"
 
@@ -54,6 +55,16 @@ class virtio_vq_test_kit extends uvm_object;
         kit.vq_mgr.bdf = bdf;
         kit.vq_mgr.host_id = host_id;
         return kit;
+    endfunction
+
+    // 中文说明：单元测试用的 host0 PCIe identity（segment 0，BDF 由调用方给出）。
+    // 取代旧的“transport 未配置 identity 时默认 host0”兼容路径。
+    static function dpu_pcie_function_id_t host0_pcie_id(input bit [15:0] bdf);
+        dpu_pcie_function_id_t pcie_id;
+        pcie_id.domain.host_id = 0;
+        pcie_id.domain.segment_id = 0;
+        pcie_id.bdf = bdf;
+        return pcie_id;
     endfunction
 
     // 独立创建（不登记到 vq_mgr）并分配一个 split 队列，供只测队列本身的用例。

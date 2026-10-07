@@ -470,7 +470,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         pf_function.function_kind = DPU_FUNCTION_PF;
         pf_function.state = VF_ACTIVE;
         pf_function.transport = transport;
-        transport.bdf = 16'h0030;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0030));
         kit = virtio_vq_test_kit::create_kit(
             "real_worker_reset", mem, iommu, transport.bdf,
             pf_function.vq_mgr.host_id, pf_function.vq_mgr);
@@ -596,7 +596,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
 
         mem.init_region(64'h6000_0000, 64'h600F_FFFF);
         allocation_baseline = mem.outstanding_allocations();
-        transport.bdf = 16'h0020;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0020));
         pf_function.function_kind = DPU_FUNCTION_PF;
         pf_function.state = VF_ACTIVE;
         pf_function.transport = transport;
@@ -670,7 +670,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         // minimum block.  No space remains for the minimum 64-byte packet.
         mem.init_region(64'h6200_0000, 64'h6200_000F);
         allocation_baseline = mem.outstanding_allocations();
-        transport.bdf = 16'h0040;
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0040));
         kit = virtio_vq_test_kit::create_kit(
             "tx_second_alloc_fail", mem, iommu, transport.bdf);
         // 16 字节的 Host memory 只够 header，队列只登记不分配 ring。

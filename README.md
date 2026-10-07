@@ -57,7 +57,7 @@ IOMMU requester identity 使用 `{host_id, BDF, IOVA}`，不是仅用
 `{BDF, IOVA}`。因此不同 Host 可以合法复用同一数值 BDF 和 IOVA，映射、
 unmap、fault rule、dirty tracking 与迁移快照仍彼此隔离。冻结的 PCIe function
 identity 会把 `host_id` 传播到 virtqueue、atomic ops、Admin VQ 和独立 TX/RX
-dataplane；未绑定全局 identity 的旧 standalone 用法默认属于 host0。
+dataplane；未绑定冻结 identity 的 transport 没有 DMA host domain，请求时直接报错。
 
 这里的 `iommu.map_for_host` 只管理 DMA IOVA 到 GPA 的地址空间，不分配 BAR，也不处理
 notify、MSI-X、QSCH 或 global qpair。BAR/notify 属于 PCIe/DUT 配置平面，DMA

@@ -684,7 +684,7 @@ barrier.print_stats();
 IOVA bump cursor，因此 `host0 + 00:08.2 + 0x80000000` 与
 `host1 + 00:08.2 + 0x80000000` 可以同时存在。生产路径从冻结的
 `dpu_pcie_function_id_t.domain.host_id` 取得 Host；未绑定 PCIe identity
-的 standalone 对象兼容地落到 host0。
+的 transport 没有 DMA host domain，请求时直接报错。
 
 IOMMU 只管理 DMA 地址空间。BAR aperture、notify address、MSI-X table/PBA、
 QSCH/DSCH 和 global qpair placement 都由各自配置平面管理，不通过 `iommu.map_for_host()`。

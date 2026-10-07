@@ -109,10 +109,16 @@ class virtio_pci_transport extends uvm_object;
         notify_mgr.set_function_bdf(function_pcie_id.bdf);
     endfunction
 
-    // Canonical DMA requester-domain projection.  Fabric functions use the
-    // frozen PCIe identity; legacy standalone transports remain in host0.
+    // Canonical DMA requester-domain projection.  The host comes only from
+    // the frozen PCIe identity; a transport without one has no DMA domain.
     function int unsigned iommu_host_id();
-        return pcie_id_valid ? pcie_id.domain.host_id : 0;
+        if (!pcie_id_valid) begin
+            `uvm_fatal("TRANSPORT", $sformatf(
+                "transport BDF=0x%04h has no frozen PCIe identity; DMA host domain is undefined",
+                bdf))
+            return 0;
+        end
+        return pcie_id.domain.host_id;
     endfunction
 
     // 把外部已配置的 PCIe 通路(endpoint)绑到本 transport：要求先完成
