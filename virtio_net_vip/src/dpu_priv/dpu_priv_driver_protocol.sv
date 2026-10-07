@@ -29,6 +29,24 @@ class dpu_priv_driver_protocol extends virtio_driver_protocol;
         return 1;
     endfunction
 
+    // 私有环没有 virtio-net control VQ；队列数只能停机重配；快照不描述 CQ 与私有控制面。
+    virtual function bit has_ctrl_vq();
+        return 0;
+    endfunction
+
+    virtual function bit supports_mq();
+        return 0;
+    endfunction
+
+    virtual function bit supports_migration();
+        return 0;
+    endfunction
+
+    // 私有 Function 只使用私有环，与配置值无关。
+    virtual function virtqueue_type_e queue_format(virtqueue_type_e requested);
+        return VQ_CUSTOM;
+    endfunction
+
     // 校验私有配置与 VQ_CUSTOM/polling 行为，创建私有 ops/FSM；已提供的对象类型冲突时拒绝。
     virtual function bit prepare_candidates(
         string label, uvm_component parent, virtio_driver_config_t behavior,
@@ -72,8 +90,11 @@ class dpu_priv_driver_protocol extends virtio_driver_protocol;
             why = "私有协议要求 dpu_priv_config_backend";
             return 0;
         end
-        return private_ops.configure_private(private_cfg, behavior.num_queue_pairs,
-                                             private_backend, why);
+        if (!private_ops.configure_private(private_cfg, behavior.num_queue_pairs,
+                                           private_backend, why))
+            return 0;
+        ops.protocol = this;
+        return 1;
     endfunction
 
     // 私有 Function 复用标准引擎类与同一 ops；私有 buffer 容量不含 Virtio header，

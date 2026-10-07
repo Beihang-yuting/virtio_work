@@ -317,6 +317,10 @@
 
         // 所有失败路径都返回 ERR；只有读到设备写回的 OK 才改为 OK。
         ack = VIRTIO_NET_CTRL_ACK_ERR;
+        if ((protocol != null) && !protocol.has_ctrl_vq()) begin
+            `uvm_error("ATOMIC_OPS", "ctrl_send: driver protocol has no control VQ")
+            return;
+        end
 
         // 上一条命令超时且设备未确认复位：其缓冲仍在设备可达范围内，迟到完成可能
         // 随时出现，此时提交会消费别人的完成；必须先完成设备复位。

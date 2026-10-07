@@ -19,9 +19,11 @@
         virtio_queue_program_t qprog;
         int unsigned       max_size;
         int unsigned       eff_size;
-        int unsigned       desc_size;
-        int unsigned       avail_size;
-        int unsigned       used_size;
+        bit [63:0]         region_gpas[$];
+        int unsigned       region_sizes[$];
+        bit [63:0]         region_iovas[$];
+        int unsigned       ring_bytes;
+        bit                map_failed;
         bit [63:0]         desc_iova;
         bit [63:0]         avail_iova;
         bit [63:0]         used_iova;
@@ -81,56 +83,36 @@
         // 5. Allocate ring memory
         vq.alloc_rings();
 
-        // 6. Compute ring region sizes for IOMMU mapping
-        case (vq_type)
-            VQ_SPLIT: begin
-                desc_size  = 16 * eff_size;
-                avail_size = 6 + 2 * eff_size;
-                used_size  = 6 + 8 * eff_size;
-            end
-            VQ_PACKED: begin
-                desc_size  = 16 * eff_size;
-                // Packed rings place two independent 4-byte event
-                // suppression structures after the descriptor table.  Map
-                // each structure at its own programmed GPA; mapping 8 bytes
-                // from device_event_addr would run past the contiguous ring.
-                avail_size = 4;
-                used_size  = 4;
-            end
-            default: begin
-                desc_size  = 16 * eff_size;
-                avail_size = 6 + 2 * eff_size;
-                used_size  = 6 + 8 * eff_size;
-            end
-        endcase
-
-        // 7. Map ring addresses through IOMMU
-        desc_iova  = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, vq.desc_table_addr, desc_size, DMA_BIDIRECTIONAL);
-        avail_iova = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, vq.driver_ring_addr, avail_size, DMA_BIDIRECTIONAL);
-        used_iova  = iommu.map_for_host(get_iommu_host_id(transport),
-            transport.bdf, vq.device_ring_addr, used_size, DMA_BIDIRECTIONAL);
-        if ((desc_iova == '1) || (desc_iova == 0) ||
-            (avail_iova == '1) || (avail_iova == 0) ||
-            (used_iova == '1) || (used_iova == 0)) begin
-            if ((desc_iova != '1) && (desc_iova != 0))
-                iommu.unmap_for_host(get_iommu_host_id(transport),
-                                     transport.bdf, desc_iova);
-            if ((avail_iova != '1) && (avail_iova != 0))
-                iommu.unmap_for_host(get_iommu_host_id(transport),
-                                     transport.bdf, avail_iova);
-            if ((used_iova != '1) && (used_iova != 0))
-                iommu.unmap_for_host(get_iommu_host_id(transport),
-                                     transport.bdf, used_iova);
+        // 6-7. 按队列格式声明的 ring 区逐区映射（split 三区、packed 描述符环加两份
+        // 4B event 结构、私有环整块 desc+CQ）。全部映射后统一判定，失败撤销已成功的
+        // 映射并销毁队列；未分配出 ring（空区表）按映射失败处理。
+        vq.get_ring_regions(region_gpas, region_sizes);
+        map_failed = (region_gpas.size() == 0);
+        foreach (region_gpas[i]) begin
+            region_iovas.push_back(iommu.map_for_host(get_iommu_host_id(transport),
+                transport.bdf, region_gpas[i], region_sizes[i], DMA_BIDIRECTIONAL));
+            if ((region_iovas[i] == '1) || (region_iovas[i] == 0))
+                map_failed = 1;
+        end
+        if (map_failed) begin
+            foreach (region_iovas[i])
+                if ((region_iovas[i] != '1) && (region_iovas[i] != 0))
+                    iommu.unmap_for_host(get_iommu_host_id(transport),
+                                         transport.bdf, region_iovas[i]);
             vq_mgr.destroy_queue(queue_id);
             `uvm_error("ATOMIC_OPS", $sformatf(
                 "setup_queue: failed to map queue_id=%0d rings", queue_id))
             return;
         end
 
-        // Track ring IOVAs for cleanup
-        ring_iovas[queue_id] = '{desc_iova, avail_iova, used_iova};
+        // Track ring IOVAs for cleanup；三个设备视角地址按区内偏移换算。
+        ring_iovas[queue_id] = region_iovas;
+        desc_iova  = ring_iova_of(vq.desc_table_addr, region_gpas, region_sizes, region_iovas);
+        avail_iova = ring_iova_of(vq.driver_ring_addr, region_gpas, region_sizes, region_iovas);
+        used_iova  = ring_iova_of(vq.device_ring_addr, region_gpas, region_sizes, region_iovas);
+        ring_bytes = 0;
+        foreach (region_sizes[i])
+            ring_bytes += region_sizes[i];
 
         // 8. Determine MSI-X vector for this queue
         if (transport.notify_mgr.queue_vectors.size() > queue_id)
@@ -149,6 +131,7 @@
         qprog.desc_iova   = desc_iova;
         qprog.driver_iova = avail_iova;
         qprog.device_iova = used_iova;
+        qprog.ring_bytes  = ring_bytes;
         qprog.msix_vector = msix_vector;
         qprog.local_qid   = queue_id;
         qprog.tx_mode     = queue_id[0];
@@ -156,9 +139,9 @@
         if (configured)
             backend.enable_queue(qprog, configured);
         if (!configured) begin
-            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf, desc_iova);
-            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf, avail_iova);
-            iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf, used_iova);
+            foreach (region_iovas[i])
+                iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                                     region_iovas[i]);
             ring_iovas.delete(queue_id);
             vq_mgr.destroy_queue(queue_id);
             `uvm_error("ATOMIC_OPS", $sformatf(

@@ -413,6 +413,9 @@ class virtio_unit_test extends uvm_test;
         test_common_backend_queue_reset_result();
         test_setup_queue_rejects_host_mismatch();
         test_driver_protocol_selection();
+        test_driver_protocol_capabilities();
+        test_private_capability_gates();
+        test_setup_queue_maps_format_regions();
         test_standard_manual_kick_notifies();
         test_fabric_bar_layout_roles();
         test_setup_queue_range_rollback();
@@ -1466,6 +1469,149 @@ class virtio_unit_test extends uvm_test;
                 "host-mismatched setup_queue was not rejected and rolled back (ok=%0d caught=%0d queues=%0d calls=%p)",
                 ok, catcher.caught_count, vq_mgr.get_queue_count(), backend.calls))
         `uvm_info("UNIT_TEST", "test_setup_queue_rejects_host_mismatch PASSED", UVM_LOW)
+    endtask
+
+    // 协议能力是通用 ops/FSM 区分标准与私有 Function 的唯一依据；bind_ops 把协议
+    // 绑定进 ops，供 ops 内的能力查询使用。
+    task test_driver_protocol_capabilities();
+        virtio_standard_driver_protocol standard;
+        dpu_priv_driver_protocol private_protocol;
+        virtio_atomic_ops ops;
+        virtio_common_cfg_backend std_be;
+        virtio_driver_config_t behavior;
+        string why;
+
+        standard = virtio_standard_driver_protocol::type_id::create("cap_standard_protocol");
+        private_protocol = dpu_priv_driver_protocol::type_id::create("cap_private_protocol");
+        if (!standard.has_ctrl_vq() || !standard.supports_mq() ||
+            !standard.supports_migration() ||
+            (standard.queue_format(VQ_SPLIT) != VQ_SPLIT) ||
+            (standard.queue_format(VQ_PACKED) != VQ_PACKED))
+            `uvm_error("TEST", "standard protocol capabilities differ from virtio-net")
+        if (private_protocol.has_ctrl_vq() || private_protocol.supports_mq() ||
+            private_protocol.supports_migration() ||
+            (private_protocol.queue_format(VQ_SPLIT) != VQ_CUSTOM) ||
+            (private_protocol.queue_format(VQ_PACKED) != VQ_CUSTOM))
+            `uvm_error("TEST", "private protocol capabilities differ from the DPU private ring")
+
+        ops = virtio_atomic_ops::type_id::create("cap_ops");
+        std_be = virtio_common_cfg_backend::type_id::create("cap_std_backend");
+        behavior.num_queue_pairs = 1;
+        if (!standard.bind_ops(ops, std_be, behavior, why) || (ops.protocol != standard))
+            `uvm_error("TEST", "standard bind_ops did not bind the protocol into ops")
+        `uvm_info("UNIT_TEST", "test_driver_protocol_capabilities PASSED", UVM_LOW)
+    endtask
+
+    // 私有协议没有 control VQ、动态 MQ 与迁移：通用 ops/FSM 必须在访问队列或设备前
+    // 拒绝，且不改变 FSM 状态。ops 只有协议、没有 transport/队列，任何越过门控的
+    // 访问都会以空句柄失败。
+    task test_private_capability_gates();
+        dpu_priv_driver_protocol private_protocol;
+        virtio_atomic_ops ops;
+        virtio_auto_fsm fsm;
+        virtio_unit_exact_error_catcher catcher;
+        virtio_device_snapshot_t snap;
+        virtio_ctrl_ack_e ack;
+        byte unsigned data[];
+        string why;
+        bit ok;
+
+        private_protocol = dpu_priv_driver_protocol::type_id::create("gate_private_protocol");
+        ops = virtio_atomic_ops::type_id::create("gate_ops");
+        ops.protocol = private_protocol;
+        fsm = virtio_auto_fsm::type_id::create("gate_fsm");
+        fsm.ops = ops;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("TEST", why)
+
+        data = new[2];
+        data[0] = 8'h01;
+        data[1] = 8'h00;
+        ack = VIRTIO_NET_CTRL_ACK_OK;
+        catcher = new("gate_ctrl_catcher", "ATOMIC_OPS",
+                      "ctrl_send: driver protocol has no control VQ");
+        uvm_report_cb::add(null, catcher);
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, data, ack);
+        uvm_report_cb::delete(null, catcher);
+        if ((ack != VIRTIO_NET_CTRL_ACK_ERR) || (catcher.caught_count != 1))
+            `uvm_error("TEST", "private ctrl_send was not rejected before touching a queue")
+
+        catcher = new("gate_mq_catcher", "AUTO_FSM",
+                      "configure_mq: driver protocol does not support dynamic MQ");
+        uvm_report_cb::add(null, catcher);
+        fsm.configure_mq(1);
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught_count != 1) || (fsm.state != FSM_IDLE))
+            `uvm_error("TEST", "private configure_mq was not rejected by capability")
+
+        catcher = new("gate_freeze_catcher", "AUTO_FSM",
+                      "freeze_for_migration: driver protocol does not support migration");
+        uvm_report_cb::add(null, catcher);
+        fsm.freeze_for_migration(snap);
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught_count != 1) || (fsm.state != FSM_IDLE))
+            `uvm_error("TEST", "private freeze was not rejected by capability")
+
+        snap.num_queue_pairs = 1;
+        ok = 1;
+        catcher = new("gate_restore_catcher", "AUTO_FSM",
+                      "restore_from_migration: driver protocol does not support migration");
+        uvm_report_cb::add(null, catcher);
+        fsm.restore_from_migration(snap, ok);
+        uvm_report_cb::delete(null, catcher);
+        if (ok || (catcher.caught_count != 1) || (fsm.state != FSM_IDLE))
+            `uvm_error("TEST", "private restore was not rejected by capability")
+        `uvm_info("UNIT_TEST", "test_private_capability_gates PASSED", UVM_LOW)
+    endtask
+
+    // 通用 setup_queue 按队列格式声明的 ring 区映射：私有环整块 desc+CQ 只映射一次，
+    // CQ 的 IOVA 是同一映射内的偏移，没有 driver 区；拆除只解除这一条映射。
+    task test_setup_queue_maps_format_regions();
+        virtio_atomic_ops ops;
+        virtio_unit_recording_backend backend;
+        virtio_pci_transport transport;
+        virtqueue_manager vq_mgr;
+        virtio_iommu_model iommu;
+        host_mem_manager mem;
+        virtio_queue_program_t q;
+        int unsigned maps_before;
+        int unsigned unmaps_before;
+        bit ok;
+
+        ops = virtio_atomic_ops::type_id::create("regions_ops");
+        backend = virtio_unit_recording_backend::type_id::create("regions_backend");
+        transport = virtio_pci_transport::type_id::create("regions_transport");
+        vq_mgr = virtqueue_manager::type_id::create("regions_vq_mgr");
+        iommu = virtio_iommu_model::type_id::create("regions_iommu");
+        mem = host_mem_manager::type_id::create("regions_mem");
+        mem.init_region(64'h7800_0000, 64'h7801_FFFF);
+        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0133));
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.bdf = transport.bdf;
+        vq_mgr.host_id = transport.iommu_host_id();
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.iommu = iommu;
+        ops.mem = mem;
+        ops.config_backend = backend;
+
+        maps_before = iommu.total_maps;
+        unmaps_before = iommu.total_unmaps;
+        ops.setup_queue(1, 8, VQ_CUSTOM, ok);
+        q = backend.configured_program;
+        if (!ok || (iommu.total_maps != maps_before + 1) || (q.ring_bytes != 4096) ||
+            (q.desc_iova == 0) || (q.driver_iova != 0) ||
+            (q.device_iova != q.desc_iova + 8*16))
+            `uvm_error("TEST", $sformatf(
+                "private ring regions mapped wrongly (ok=%0d maps=%0d bytes=%0d desc=0x%0h driver=0x%0h device=0x%0h)",
+                ok, iommu.total_maps - maps_before, q.ring_bytes,
+                q.desc_iova, q.driver_iova, q.device_iova))
+        ops.teardown_queue(1);
+        if ((iommu.total_unmaps != unmaps_before + 1) || (vq_mgr.get_queue_count() != 0))
+            `uvm_error("TEST", "private ring teardown did not release its single mapping")
+        mem.leak_check();
+        `uvm_info("UNIT_TEST", "test_setup_queue_maps_format_regions PASSED", UVM_LOW)
     endtask
 
     // 驱动协议决定 ops/FSM 的类型、status 访问权限与关机复位语义；私有协议拒绝

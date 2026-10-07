@@ -1,6 +1,9 @@
 `ifndef VIRTIO_ATOMIC_OPS_SV
 `define VIRTIO_ATOMIC_OPS_SV
 
+// 驱动协议在本文件之后编译；ops 只查询其能力。
+typedef class virtio_driver_protocol;
+
 // ============================================================================
 // virtio_atomic_ops
 //
@@ -46,6 +49,11 @@ class virtio_atomic_ops extends uvm_object;
     // 选择并经协议下发（不经 Function 的装配方须显式注入）。为空即接线错误。
     virtio_config_backend      config_backend;
 
+    // ===== Driver protocol =====
+    // 由协议 bind_ops 在 Function 提交时注入；ops 只查询能力（control VQ 等）。
+    // 为空（直接构造 ops 的单元测试）时按标准 virtio 处理。
+    virtio_driver_protocol     protocol;
+
     // ===== Internal tracking =====
     // Normal data DMA owns both sides of a mapping.  Retaining only the IOVA
     // made reset/teardown able to unmap (at best) while leaking the host
@@ -63,7 +71,7 @@ class virtio_atomic_ops extends uvm_object;
     // a pre-freeze queue.  They still have normal DMA ownership and must be
     // retired by every later ordinary device reset.
     protected normal_dma_record_t migration_restore_dma[$];
-    protected bit [63:0]         ring_iovas[int unsigned][$];  // queue_id -> ring IOVAs (desc, avail, used)
+    protected bit [63:0]         ring_iovas[int unsigned][$];  // queue_id -> 每个 ring 区一个 IOVA
     // 每个已编程队列的设备视角参数；拆除时原样交回后端，复位后清空。
     protected virtio_queue_program_t queue_programs[int unsigned];
     // control VQ 超时且设备未确认复位时隔离的缓冲（ctrl_send 的 dma_set 移入）。期间
@@ -141,6 +149,19 @@ class virtio_atomic_ops extends uvm_object;
 
     // 是否为 DPU 私有环 ops；私有 FSM 用它确认 ops/FSM 配对，无需类型转换。
     virtual function bit uses_private_ring();
+        return 0;
+    endfunction
+
+    // ring 内地址 → 设备视角 IOVA：落在第 i 个已映射 ring 区内时按区内偏移换算；
+    // 0（私有环无 driver 区）或不在任何区内返回 0。
+    protected function bit [63:0] ring_iova_of(bit [63:0] gpa, bit [63:0] gpas[$],
+                                               int unsigned sizes[$],
+                                               bit [63:0] iovas[$]);
+        if (gpa == 0)
+            return 0;
+        foreach (gpas[i])
+            if ((gpa >= gpas[i]) && (gpa < gpas[i] + sizes[i]))
+                return iovas[i] + (gpa - gpas[i]);
         return 0;
     endfunction
 

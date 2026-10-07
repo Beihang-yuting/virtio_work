@@ -26,6 +26,15 @@ virtual class virtio_driver_protocol extends uvm_object;
     pure virtual function bit allows_status_access();
     // 驱动复位与 Function 关机是否必须等待设备确认停 DMA（失败保留全部资源）。
     pure virtual function bit requires_verified_reset();
+    // 能力声明：通用 ops/FSM 只按这些查询区分协议，不做类型判断。
+    // 是否有 virtio-net control VQ（ctrl_send 及其上的 MQ/RSS/announce 命令）。
+    pure virtual function bit has_ctrl_vq();
+    // 是否支持运行期改变队列对数（configure_mq）。
+    pure virtual function bit supports_mq();
+    // 是否支持迁移冻结与恢复。
+    pure virtual function bit supports_migration();
+    // 本协议实际使用的队列格式；requested 为 Function 配置值。
+    pure virtual function virtqueue_type_e queue_format(virtqueue_type_e requested);
     // 预检：校验行为配置，按需创建 ops/FSM 候选；已提供的对象类型不符时返回 0。
     // 不访问设备，不冻结配置。
     pure virtual function bit prepare_candidates(
@@ -70,6 +79,22 @@ class virtio_standard_driver_protocol extends virtio_driver_protocol;
         return 0;
     endfunction
 
+    virtual function bit has_ctrl_vq();
+        return 1;
+    endfunction
+
+    virtual function bit supports_mq();
+        return 1;
+    endfunction
+
+    virtual function bit supports_migration();
+        return 1;
+    endfunction
+
+    virtual function virtqueue_type_e queue_format(virtqueue_type_e requested);
+        return requested;
+    endfunction
+
     // 未提供时用 factory 创建标准 FSM 与 ops；创建失败留给调用方的空句柄检查报告。
     virtual function bit prepare_candidates(
         string label, uvm_component parent, virtio_driver_config_t behavior,
@@ -94,6 +119,7 @@ class virtio_standard_driver_protocol extends virtio_driver_protocol;
             return 0;
         end
         ops.config_backend = backend;
+        ops.protocol = this;
         return 1;
     endfunction
 

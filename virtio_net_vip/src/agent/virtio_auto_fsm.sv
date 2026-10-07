@@ -185,6 +185,13 @@ class virtio_auto_fsm extends uvm_report_object;
     //          -> FSM_MSIX_SETUP -> FSM_READY
     // ========================================================================
 
+    // 本 Function 的队列格式：驱动协议可改写配置值（私有协议固定 VQ_CUSTOM）。
+    protected function virtqueue_type_e queue_format();
+        if ((ops == null) || (ops.protocol == null))
+            return drv_cfg.vq_type;
+        return ops.protocol.queue_format(drv_cfg.vq_type);
+    endfunction
+
     task full_init();
         if ($isunknown(drv_cfg.num_queue_pairs) ||
             (drv_cfg.num_queue_pairs == 0) ||
@@ -531,6 +538,10 @@ class virtio_auto_fsm extends uvm_report_object;
     // configure_mq -- Change the number of active queue pairs
     // ------------------------------------------------------------------------
     task configure_mq(int unsigned num_pairs);
+        if ((ops != null) && (ops.protocol != null) && !ops.protocol.supports_mq()) begin
+            `uvm_error("AUTO_FSM", "configure_mq: driver protocol does not support dynamic MQ")
+            return;
+        end
         if ($isunknown(num_pairs) || (num_pairs == 0) ||
             (num_pairs > max_vio_net_qpairs_per_device)) begin
             `uvm_error("AUTO_FSM", $sformatf(
@@ -616,6 +627,10 @@ class virtio_auto_fsm extends uvm_report_object;
     virtual task freeze_for_migration(ref virtio_device_snapshot_t snap);
         bit capture_ok;
 
+        if ((ops != null) && (ops.protocol != null) && !ops.protocol.supports_migration()) begin
+            `uvm_error("AUTO_FSM", "freeze_for_migration: driver protocol does not support migration")
+            return;
+        end
         `uvm_info("AUTO_FSM", "freeze_for_migration: starting freeze", UVM_LOW)
 
         if ((ops == null) || (ops.iommu == null) || (ops.mem == null) ||
@@ -664,6 +679,10 @@ class virtio_auto_fsm extends uvm_report_object;
     task restore_from_migration(virtio_device_snapshot_t snap,
                                 output bit ok);
         ok = 0;
+        if ((ops != null) && (ops.protocol != null) && !ops.protocol.supports_migration()) begin
+            `uvm_error("AUTO_FSM", "restore_from_migration: driver protocol does not support migration")
+            return;
+        end
         if ($isunknown(snap.num_queue_pairs) ||
             (snap.num_queue_pairs == 0) ||
             (snap.num_queue_pairs > max_vio_net_qpairs_per_device)) begin
