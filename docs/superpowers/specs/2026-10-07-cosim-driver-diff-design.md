@@ -116,7 +116,7 @@ virtio_net_vip/src/devmodel/
 ### 环境
 
 - QEMU：用 `~/qemu-9.2.0.tar.xz` 编译，打 cosim-platform `qemu-plugin` 补丁。只有 TCG，没有 KVM。
-- cosim-platform：本地副本，只改一处，允许 `NUM_PFS=1` 时使用 `cosim-pcie-pf`（多 BAR + MSI-X）。
+- cosim-platform：本地副本，给 `cosim-pcie-rc` 打本地补丁（多 BAR、4 字节 MMIO、MSI-X）。不用 `cosim-pcie-pf`：它在 QEMU 内部处理 0x40 以上配置空间并自带 MSI-X 表，guest 看不到设备模型的 cap 链。
 - 传输：53 本机共享内存。
 - VCS 侧 `cosim_vdev_top`：
   - `vdev_cosim_port` 通过 DPI 调用：`bridge_vcs_poll_tlp`、`send_completion`、
@@ -127,13 +127,12 @@ virtio_net_vip/src/devmodel/
 
   | 设备 | ID | BAR |
   |---|---|---|
-  | 标准 | 1af4:1041 | BAR0 virtio 区域，BAR4 MSI-X |
+  | 标准 | 1af4:1041 | BAR0 common_cfg/ISR/device_cfg，BAR2 notify（VIP fabric 发现要求 notify 位于 mailbox BAR），BAR4 MSI-X |
   | 私有 | 20f9:5013 | BAR0 内存，BAR2 mailbox/qinfo，BAR4 MSI-X |
 
-- Guest：Ubuntu 6.8.0-107 镜像。
-  - 标准模式用内核自带的 virtio_net。
-  - 私有模式用 `dpu_snd1.ko`，针对 6.8 头文件编译；兼容修改以 patch 文件保存在临时目录。
-  - 编译失败时改用 Debian 镜像在 guest 内编译。
+- Guest：6.8.0-107 内核 + Alpine 用户空间（cosim 的 ubuntu 镜像）。
+  - 标准模式用内核内建的 virtio_net；加载/卸载用 sysfs bind/unbind 代替 modprobe/rmmod。
+  - 私有模式用 `dpu_snd1.ko`，在本机（Ubuntu 24.04）针对 6.8.0-107 头文件编译；兼容修改以 patch 文件保存在临时目录。
 - 场景分段：设备提供一个调试 vendor cap，内含 marker 寄存器。guest 用 `setpci` 写入场景号，
   对应的 `marker` 事件不参与对比。VIP 侧对比测试在同一位置发出同号 marker。
 
@@ -141,10 +140,10 @@ virtio_net_vip/src/devmodel/
 
 | 编号 | 场景 | guest 动作 | 模式 |
 |---|---|---|---|
-| S1 | 初始化与 feature 协商 | modprobe、`ip link up` | 标准、私有 |
+| S1 | 初始化与 feature 协商 | 驱动 bind（私有：insmod）、`ip link up` | 标准、私有 |
 | S2 | 单队列收发 | `vdev_pktgen`（静态 C 程序，AF_PACKET）发 N 个固定帧，接收回环帧并校验 | 标准、私有 |
 | S3 | 多队列与 ctrl VQ | `ethtool -L combined 2`，在第 2 对上收发 | 仅标准 |
-| S4 | 关闭与复位 | `ip link down`、rmmod | 标准、私有 |
+| S4 | 关闭与复位 | `ip link down`、驱动 unbind（私有：rmmod） | 标准、私有 |
 
 VIP 侧有两个临时对比测试（`vdev_diff_std_test` / `vdev_diff_priv_test`），场景、帧集合、marker 与
 guest 一致。`driver_caps` 取自 Linux 轨迹的 `drv_accepted`。这两个测试只编进临时 filelist，
@@ -200,7 +199,7 @@ guest 一致。`driver_caps` 取自 Linux 轨迹的 `drv_accepted`。这两个�
 | 风险 | 应对 |
 |---|---|
 | `cosim-pcie-pf` 在单 PF 下未验证过 | cosim 冒烟作为独立阶段：先验证配置空间读写和 `lspci`，再接驱动 |
-| `dpu_snd1.ko` 在 6.8 内核上编译失败 | patch 兼容问题；不行就用 Debian 镜像在 guest 内编译 |
+| `dpu_snd1.ko` 在 6.8 内核上编译失败 | 在本机用 6.8.0-107 头文件编译，patch 兼容问题 |
 | 私有设备行为在驱动源码中不明确 | 模型按驱动预期实现，疑点写入报告，不猜测语义 |
 | 独立设备模型让大量既有测试失败 | 逐个判定：属于 VIP 缺陷就修 VIP，属于测试依赖了 responder 的偷看行为就改测试的输入，不放宽断言 |
 | TCG 运行慢 | 每个模式只跑一轮完整场景（预计 10–15 分钟）；回归不依赖 cosim |
