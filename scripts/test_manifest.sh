@@ -33,6 +33,7 @@ VIRTIO_MAINTAINED_TESTS=(
   virtio_real_dut_iova_dma_test
   virtio_fabric_resource_test
   virtio_unit_test
+  virtio_vdev_unit_test
   virtio_host_mem_reclaim_test
   virtio_queue_semantics_test
   virtio_stress_unit_test

@@ -9,6 +9,8 @@ virtio_net_vip/tests/virtio_queue_host_mem_provider_adapter.sv
 // 测试公共件：无 PCIe 的 transport 替身与 virtqueue 测试 kit，须先于使用者编译。
 virtio_net_vip/tests/virtio_mock_transport.sv
 virtio_net_vip/tests/virtio_vq_test_kit.sv
+// 设备模型测试件：无 PCIe 回环端口、事件记录器、预期报告捕获器。
+virtio_net_vip/tests/vdev_loopback_port.sv
 $DPU_COMMON_ROOT/tests/dpu_resource_manager_test.sv
 $DPU_COMMON_ROOT/tests/dpu_reg_plan_test.sv
 $DPU_COMMON_ROOT/tests/dpu_pcie_reg_executor_test.sv
@@ -19,6 +21,7 @@ $DPU_COMMON_ROOT/tests/dpu_resource_resolver_test.sv
 $DPU_COMMON_ROOT/tests/dpu_device_bootstrap_plan_test.sv
 $DPU_COMMON_ROOT/tests/dpu_vio_reg_plan_test.sv
 virtio_net_vip/tests/virtio_unit_test.sv
+virtio_net_vip/tests/virtio_vdev_unit_test.sv
 virtio_net_vip/tests/virtio_shared_mem_fixture.sv
 virtio_net_vip/tests/virtio_real_driver_flow_fixture.sv
 virtio_net_vip/tests/virtio_host_mem_reclaim_test.sv
