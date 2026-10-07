@@ -833,6 +833,142 @@ class virtio_vdev_unit_test extends uvm_test;
         `uvm_info("VDEV_UNIT", "test_std_event_idx_and_queue_reset PASSED", UVM_LOW)
     endtask
 
+    // virtio 1.2 §5.1.2：未协商 MQ 时 N=1，ctrl VQ 为队列 2（不是 2*max_pairs）；
+    // 超出已协商队列集合的队列 queue_size 读 0。CTRL_RX PROMISC 应答 OK 且不置 NEEDS_RESET。
+    task test_std_ctrl_without_mq();
+        split_virtqueue cq;
+        bit [63:0] iovas[$];
+        bit [63:0] hdr_gpa, hdr_iova, data_gpa, data_iova, ack_gpa, ack_iova;
+        virtio_sg_list sgs[];
+        byte unsigned hdr_b[$], data_b[$], none[$];
+        byte got[];
+        uvm_object tok;
+        int unsigned len;
+        vdev_unit_token t;
+        vdev_event ev[$];
+        bit [63:0] saved;
+        bit [63:0] drv;
+
+        saved = std.device_features;
+        std.device_features[VIRTIO_NET_F_CTRL_RX] = 1;
+        drv = 64'h0000_0001_0000_0000;
+        drv[VIRTIO_NET_F_CTRL_VQ] = 1;
+        drv[VIRTIO_NET_F_CTRL_RX] = 1;
+        if (!(std_negotiate(drv) & DEV_STATUS_FEATURES_OK))
+            `uvm_fatal("VDEV_UNIT", "CTRL_VQ without MQ negotiation rejected")
+        std_wr(32'h16, 2, 3);
+        if (std_rd(32'h18, 2) != 0)
+            `uvm_fatal("VDEV_UNIT", "queue 3 outside the negotiated set (no MQ) reports a non-zero queue_size")
+        cq = std_kit.make_split("ctrl_nomq", 2, 8, STD_BDF);
+        std_program_queue(2, cq, 1, 0, iovas);
+        std_wr(32'h14, 1, 8'h0f);
+        std_log.events.delete();
+        hdr_b = '{VIRTIO_NET_CTRL_RX, 8'd0};
+        data_b = '{8'd1};
+        sgs = new[3];
+        std_buffer(hdr_b, 2, DMA_TO_DEVICE, hdr_gpa, hdr_iova, sgs[0]);
+        std_buffer(data_b, 1, DMA_TO_DEVICE, data_gpa, data_iova, sgs[1]);
+        std_buffer(none, 1, DMA_FROM_DEVICE, ack_gpa, ack_iova, sgs[2]);
+        got = new[1];
+        got[0] = 8'hff;
+        mem.write_mem(ack_gpa, got);
+        t = new("ctrl_nomq_tok");
+        void'(cq.add_buf(sgs, 2, 1, t, 0));
+        port.host_write(STD_BAR2 + 8, 2, 2);
+        wait_used(cq, tok, len);
+        mem.read_mem(ack_gpa, 1, got);
+        std_log.select(VDEV_CTRL, ev);
+        if ((tok != t) || (len != 1) || (got[0] != 0) || (ev.size() != 1) ||
+            (ev[0].ctrl_class != VIRTIO_NET_CTRL_RX) || (std_rd(32'h14, 1) & DEV_STATUS_DEVICE_NEEDS_RESET))
+            `uvm_fatal("VDEV_UNIT", "ctrl VQ at index 2 (MQ not negotiated) was not served as the control queue")
+        iommu.unmap_for_host(0, STD_BDF, hdr_iova);
+        iommu.unmap_for_host(0, STD_BDF, data_iova);
+        iommu.unmap_for_host(0, STD_BDF, ack_iova);
+        mem.free(hdr_gpa);
+        mem.free(data_gpa);
+        mem.free(ack_gpa);
+        std_wr(32'h14, 1, 0);
+        std_release(cq, iovas);
+        std.device_features = saved;
+        `uvm_info("VDEV_UNIT", "test_std_ctrl_without_mq PASSED", UVM_LOW)
+    endtask
+
+    // split INDIRECT：合法间接表（header SG + 帧 SG）展开成两段链并回环出原帧；
+    // 间接表内 next 越界 → 设备判链非法、置 DEVICE_NEEDS_RESET。
+    task test_std_split_indirect();
+        split_virtqueue txq;
+        bit [63:0] iovas[$];
+        bit [63:0] h_gpa, h_iova, f_gpa, f_iova, tbl_gpa;
+        virtio_sg_list sgs[];
+        byte unsigned hdr_b[$], frame_b[$];
+        byte raw[];
+        uvm_object tok;
+        int unsigned len;
+        int unsigned head;
+        vdev_unit_token t;
+        vdev_event ev[$];
+        vdev_expect_catcher catcher;
+        iommu_fault_e fault;
+        bit [63:0] tbl_iova;
+        bit [63:0] saved;
+        bit [63:0] drv;
+
+        saved = std.device_features;
+        std.device_features[VIRTIO_F_RING_INDIRECT_DESC] = 1;
+        drv = 64'h0000_0001_0000_0000;
+        drv[VIRTIO_F_RING_INDIRECT_DESC] = 1;
+        if (!(std_negotiate(drv) & DEV_STATUS_FEATURES_OK))
+            `uvm_fatal("VDEV_UNIT", "INDIRECT_DESC negotiation rejected")
+        txq = std_kit.make_split("ind_tx", 1, 8, STD_BDF);
+        std_program_queue(1, txq, 1, 0, iovas);
+        std_wr(32'h14, 1, 8'h0f);
+        for (int i = 0; i < 12; i++)
+            hdr_b.push_back(0);
+        frame_b = '{8'hca, 8'hfe, 8'hba, 8'hbe, 8'h55, 8'haa};
+        sgs = new[2];
+        std_buffer(hdr_b, 12, DMA_TO_DEVICE, h_gpa, h_iova, sgs[0]);
+        std_buffer(frame_b, 6, DMA_TO_DEVICE, f_gpa, f_iova, sgs[1]);
+        t = new("ind_tok");
+        std_log.events.delete();
+        void'(txq.add_buf(sgs, 2, 0, t, 1));
+        port.host_write(STD_BAR2 + 4, 2, 1);
+        wait_used(txq, tok, len);
+        std_log.select(VDEV_DESC_CHAIN, ev);
+        if ((tok != t) || (ev.size() != 1) || (ev[0].seg_len.size() != 2) || (ev[0].seg_len[1] != 6))
+            `uvm_fatal("VDEV_UNIT", "split indirect table was not expanded into its two segments")
+        std_log.select(VDEV_PKT, ev);
+        if ((ev.size() != 1) || (ev[0].bytes.size() != 6) || (ev[0].bytes[0] != 8'hca) || (ev[0].bytes[5] != 8'haa))
+            `uvm_fatal("VDEV_UNIT", "split indirect TX frame bytes mismatch")
+        // 第二条：发布后、通知前把间接表第 0 项的 next 改成 5（表只有 2 项）。
+        head = txq.add_buf(sgs, 2, 0, t, 1);
+        mem.read_mem(txq.desc_table_addr + 16 * head, 8, raw);
+        foreach (raw[i])
+            tbl_iova[8*i +: 8] = raw[i];
+        if (!iommu.translate_for_host(0, STD_BDF, tbl_iova, 32, DMA_TO_DEVICE, tbl_gpa, fault))
+            `uvm_fatal("VDEV_UNIT", "indirect table IOVA does not translate")
+        raw = new[2];
+        raw[0] = 8'h05;
+        raw[1] = 8'h00;
+        mem.write_mem(tbl_gpa + 14, raw);
+        catcher = new("ind_catcher");
+        catcher.id = "VDEV_RING";
+        catcher.text = "malformed descriptor chain";
+        uvm_report_cb::add(null, catcher);
+        port.host_write(STD_BAR2 + 4, 2, 1);
+        settle();
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught != 1) || !(std_rd(32'h14, 1) & DEV_STATUS_DEVICE_NEEDS_RESET))
+            `uvm_fatal("VDEV_UNIT", "out-of-range next inside an indirect table did not raise DEVICE_NEEDS_RESET")
+        iommu.unmap_for_host(0, STD_BDF, h_iova);
+        iommu.unmap_for_host(0, STD_BDF, f_iova);
+        mem.free(h_gpa);
+        mem.free(f_gpa);
+        std_wr(32'h14, 1, 0);
+        std_release(txq, iovas);
+        std.device_features = saved;
+        `uvm_info("VDEV_UNIT", "test_std_split_indirect PASSED", UVM_LOW)
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         echo.bdf = ECHO_BDF;
@@ -850,6 +986,8 @@ class virtio_vdev_unit_test extends uvm_test;
         test_std_ctrl_mq();
         test_std_device_fault_and_reset();
         test_std_event_idx_and_queue_reset();
+        test_std_ctrl_without_mq();
+        test_std_split_indirect();
         mem.leak_check();
         iommu.leak_check();
         `uvm_info("VDEV_UNIT", "virtio_vdev_unit_test PASSED", UVM_NONE)

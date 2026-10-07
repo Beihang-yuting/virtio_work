@@ -2,7 +2,7 @@
 // 寄存器：BAR0 common_cfg@0x0、ISR@0x1000、device_cfg@0x2000；BAR2 notify（off=q，multiplier 4）；
 // BAR4 MSI-X（底座）。数据路径：split/packed（含 INDIRECT）、TX→同对 RX 回环、ctrl VQ、事件抑制。
 // 只依据收到的寄存器写与 DMA 读到的 ring 字节工作，不引用驱动侧对象；header 编解码自实现。
-// 工作项编码：队列号 q（RX=偶、TX=奇、ctrl=2*max_pairs）。
+// 工作项编码：队列号 q（RX=偶、TX=奇、ctrl=2N；N 在协商 MQ 时为 max_pairs，否则为 1，virtio 1.2 §5.1.2）。
 `ifndef VDEV_VIRTIO_PCI_SV
 `define VDEV_VIRTIO_PCI_SV
 
@@ -114,14 +114,22 @@ class vdev_virtio_pci extends vdev_base;
     protected function bit is_packed();
         return driver_features[VIRTIO_F_RING_PACKED];
     endfunction
+    // 已协商的数据队列数 2N 即 ctrl VQ 的队列号。
+    protected function int unsigned data_queues();
+        return driver_features[VIRTIO_NET_F_MQ] ? 2 * max_pairs : 2;
+    endfunction
+    // 已协商队列集合：数据队列加（协商 CTRL_VQ 时）ctrl VQ；其余队列号不可用。
+    protected function bit queue_in_use(int unsigned q);
+        return (q < data_queues()) || is_ctrl(q);
+    endfunction
     protected function bit is_rx(int unsigned q);
-        return (q < 2 * max_pairs) && ((q % 2) == 0);
+        return (q < data_queues()) && ((q % 2) == 0);
     endfunction
     protected function bit is_tx(int unsigned q);
-        return (q < 2 * max_pairs) && ((q % 2) == 1);
+        return (q < data_queues()) && ((q % 2) == 1);
     endfunction
     protected function bit is_ctrl(int unsigned q);
-        return (q == 2 * max_pairs) && driver_features[VIRTIO_NET_F_CTRL_VQ];
+        return (q == data_queues()) && driver_features[VIRTIO_NET_F_CTRL_VQ];
     endfunction
     protected function int unsigned hdr_len();
         if (driver_features[VIRTIO_NET_F_HASH_REPORT])
@@ -179,7 +187,8 @@ class vdev_virtio_pci extends vdev_base;
         img[8*'h15 +: 8]  = generation;
         img[8*'h16 +: 16] = qsel;
         if (qsel < vqs.size()) begin
-            img[8*'h18 +: 16] = vqs[qsel].size;
+            // FEATURES_OK 之后，已协商集合以外的队列报告 queue_size 0（不可用）。
+            img[8*'h18 +: 16] = ((status & DEV_STATUS_FEATURES_OK) && !queue_in_use(qsel)) ? 16'h0 : vqs[qsel].size;
             img[8*'h1a +: 16] = vqs[qsel].msix;
             img[8*'h1c +: 16] = vqs[qsel].enable;
             img[8*'h1e +: 16] = qsel;
@@ -376,6 +385,8 @@ class vdev_virtio_pci extends vdev_base;
     protected function string enable_check(int unsigned q);
         if (!(status & DEV_STATUS_FEATURES_OK))
             return "FEATURES_OK not set";
+        if (!queue_in_use(q))
+            return $sformatf("queue %0d is outside the negotiated queue set", q);
         if ((vqs[q].size == 0) || (vqs[q].size > queue_max))
             return $sformatf("queue_size %0d outside 1..%0d", vqs[q].size, queue_max);
         if (!is_packed() && ((vqs[q].size & (vqs[q].size - 1)) != 0))
@@ -585,19 +596,18 @@ class vdev_virtio_pci extends vdev_base;
     endtask
 
     // INDIRECT 表：split 格式按 next 链接，packed 格式顺序排列；禁止嵌套。
+    // split 表内 next 越界或成环（跳数超过表项数）视为非法，ok=0，由 fetch 报 device_error。
     protected task read_indirect(desc_t ind, bit packed_fmt, output bit ok, ref desc_t chain[$]);
         desc_t d;
         int unsigned n;
         int unsigned i;
-        int unsigned guard;
 
         ok = 0;
         n = ind.len / 16;
         if ((ind.len == 0) || ((ind.len % 16) != 0))
             return;
         i = 0;
-        guard = 0;
-        while ((i < n) && (guard++ < n)) begin
+        for (int unsigned hop = 0; hop < n; hop++) begin
             read_desc(ind.addr + 16 * i, packed_fmt, ok, d);
             if (!ok || (d.flags & VIRTQ_DESC_F_INDIRECT)) begin
                 ok = 0;
@@ -606,13 +616,17 @@ class vdev_virtio_pci extends vdev_base;
             chain.push_back(d);
             if (packed_fmt) begin
                 i++;
-            end else begin
-                if (!(d.flags & VIRTQ_DESC_F_NEXT))
-                    break;
-                i = d.next;
+                continue;
             end
+            if (!(d.flags & VIRTQ_DESC_F_NEXT))
+                return;                     // ok=1：链在表内正常结束
+            if (d.next >= n) begin
+                ok = 0;
+                return;
+            end
+            i = d.next;
         end
-        ok = (chain.size() != 0);
+        ok = packed_fmt;                    // split 跳数用尽仍有 NEXT：成环
     endtask
 
     protected task read_split_chain(int unsigned q, int unsigned head, output bit ok,
