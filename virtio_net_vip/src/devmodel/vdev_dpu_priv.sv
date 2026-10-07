@@ -37,7 +37,7 @@
 // | 29 | open | dpu_alloc_rx_bufs txrx.c:964 | BAR0 | 0x0 | W | `1<<31 \| 511<<16 \| 0`=0x81FF0000 | RX doorbell |
 // | 30 | open | up_complete | BAR0 | 0x4AA000+gfid*4 RMW | R/W | vport fwd | 存储 |
 // | 31 | TX | dpu_tx_map txrx.c:1492 | BAR0 | 0x0 | W | `wrap[31]\|tail[30:16]\|lqid[15:0]`，1 包=0x80010001 | TX doorbell |
-// | 32 | IRQ | dpu_enable_msix_irq interrupt.c:276 | BAR0 | 0x1004 | W | `gv<<1`（mask_en=0）解除自屏蔽 | 解除 gv 自屏蔽 |
+// | 32 | IRQ | dpu_enable_msix_irq interrupt.c:276 | BAR0 | 0x1004 | W | `gv<<1`（mask_en=0）解除自屏蔽 | 解除 gv 自屏蔽，挂起时补发一次 |
 // | 33 | stop | dpu_down：control_tx(en=0)、reset_tx txrx.c:382–524、control_rx(en=0) af_mng.c:1570–1589、reset_rx txrx.c:543–550、clear_msix_irq_conf interrupt.c:234 | BAR0 | TX：#28 置 en=0；轮询 0xB22000+q*4 [11:9]=0；0x880100 写 `q`、`q\|1<<31`；轮询 0x880104 bit0；0x880154 写 `q\|1<<16`、`\|1<<31`；轮询 0x880158 bit0。RX：0x900210 写 `i<<14\|q`、`\|0x10000` 后读 0x900214（i=0..3）；写回 en=0；0x900200 `q`、`0x10000\|q`；0x90010C 写 0；0x900108 `q`、`q\|1<<31`；轮询 0x90010C bit0；0x54000+gv*4 写 0 | 见左 | 停队/复位完成位；`stall_queue_stop` 旋钮使完成位永不置位、QSCH 报在途 |
 // | 34–38 | remove | qid map 失效重写 + 0x20044、QSCH 删除、mailbox 中断关闭、清 0x56000/0xC0000、BAR2 0x2C/0x1C 拆除、0x60040=0、0x20040=0 | BAR0/BAR2 | — | W | rmmod | 存储（0x20040 写 0 即解除声明） |
 //
@@ -67,7 +67,8 @@
 // - M-2 doorbell → 全局队列：按活动 bank 中 notify 地址=本 BAR0、`{blk,lq}=lqid>>1` 的有效项取 gq，`lqid bit0` 为方向（驱动未写明，推断）。
 // - M-3 VRX tail 寄存器（0x902000+q*4）在 doorbell 后的值不明：模型返回 `{tail_wrap,tail}`，复位后 0x8000。
 // - M-4 完成信号：先写 CQ，再按 VTX/VRX `dma_msix`→info 表（valid、self_mask）→线性表反查本地 MSI-X 向量；self_mask=1 时发出后
-//   自屏蔽，0x1004 写 `gv<<1` 解除（推断）。
+//   自屏蔽，0x1004 写 `gv<<1` 解除（推断）。自屏蔽期间的完成置该 gv 挂起，解除时由 worker 补发一次：驱动 dpu_napi_poll
+//   （interrupt.c:279–335）在 napi_complete_done 后写 0x1004、不再轮询，窗口内的完成若丢弃则永远收不到中断。
 // - M-5 TX CQ `head_index` 为最后完成描述符的下一槽、`wrap` 为该位置的圈号（驱动只比较 head_index，wrap 读而不用）。
 // - M-6 QSCH 状态 0xB22000+q*4 的 vld/fly/regi（bit11/10/9）：模型空闲为 0，`stall_queue_stop` 时报 bit10。
 // - M-7 RX 一帧跨多个描述符（desc_num≤15，`head_idx`=首描述符号）；驱动只用 pkt_len 与 cq_wrapper。
@@ -109,6 +110,7 @@ class vdev_dpu_priv extends vdev_base;
     localparam bit [31:0] SOFT_RESET       = 32'h100_0014;
     localparam bit [31:0] FW_READY         = 32'h100_0020;
     localparam int unsigned MAX_QUEUES     = 128;
+    localparam int unsigned IRQ_WORK       = 2 * MAX_QUEUES;   // 工作项 IRQ_WORK+gv：补发挂起的 gv
 
     int unsigned host_id;
     bit          stall_queue_stop;
@@ -133,6 +135,7 @@ class vdev_dpu_priv extends vdev_base;
     protected ring_t     rings[int unsigned];     // 键 2*gq+tx
     protected bit        broken[int unsigned];    // 键 2*gq+tx
     protected bit        gv_masked[int unsigned];
+    protected bit        gv_pending[int unsigned];
     protected bit        vtx_reset_done;
     protected bit        vtx_tail_done;
     protected bit        vrx_reset_done;
@@ -179,6 +182,7 @@ class vdev_dpu_priv extends vdev_base;
         rings.delete();
         broken.delete();
         gv_masked.delete();
+        gv_pending.delete();
     endfunction
 
     protected function bit [31:0] reg_val(bit [31:0] off);
@@ -282,9 +286,11 @@ class vdev_dpu_priv extends vdev_base;
             // main.c:2035：魔数声明 AF；其它值不改变（main.c:2426 注释：写 0 不能清除，须写 0x20040）。
             if (data == 32'h5555_aaaa)
                 regs[PCMPL_AF_HOST] = {28'h0, 1'b1, host_id[2:0]};
-        end else if (off == MSIX_REARM)
+        end else if (off == MSIX_REARM) begin
             gv_masked[data[11:1]] = data[0];
-        else if (off == VTX_RAM_CFG) begin
+            if (!data[0] && gv_pending.exists(data[11:1]))
+                schedule(IRQ_WORK + data[11:1]);
+        end else if (off == VTX_RAM_CFG) begin
             if (data[13] && !data[12])
                 store_para(1, data[8:0]);
         end else if (off == VRX_WR_CFG) begin
@@ -407,7 +413,7 @@ class vdev_dpu_priv extends vdev_base;
         broken[2 * gq + tx] = 1;
     endfunction
 
-    // M-4：info.valid、全局屏蔽、自屏蔽都通过后，线性表反查本地向量并经底座发 MSI-X。
+    // M-4：info.valid、全局屏蔽、自屏蔽都通过后，线性表反查本地向量并经底座发 MSI-X；自屏蔽时置挂起。
     protected task cq_irq(int unsigned gv);
         bit [31:0] info;
         bit [31:0] ctrl;
@@ -416,8 +422,13 @@ class vdev_dpu_priv extends vdev_base;
 
         info = reg_val(MSIX_INFO_BASE + 4 * gv);
         ctrl = reg_val(MSIX_CTRL_BASE + 16 * gv + 32'hc);
-        if (!info[12] || ctrl[0] || (gv_masked.exists(gv) && gv_masked[gv]))
+        if (!info[12] || ctrl[0])
             return;
+        if (gv_masked.exists(gv) && gv_masked[gv]) begin
+            gv_pending[gv] = 1;
+            return;
+        end
+        gv_pending.delete(gv);
         srcid = host_id << 10;
         for (int unsigned i = 0; i < 128; i++) begin
             e = reg_val(MSIX_LINEAR_BASE + 4 * ((srcid << 7) + i));
@@ -432,7 +443,9 @@ class vdev_dpu_priv extends vdev_base;
 
     // ---------------- 数据路径 ----------------
     virtual task service_queue(int unsigned q);
-        if (q % 2)
+        if (q >= IRQ_WORK)
+            cq_irq(q - IRQ_WORK);
+        else if (q % 2)
             service_tx(q / 2);
         else
             service_rx(q / 2);

@@ -1293,17 +1293,25 @@ class virtio_vdev_unit_test extends uvm_test;
         expect_mem(tx_gpa + 128, cq_tx1, "TX CQ after one packet");
         expect_mem(rx_gpa + 128, cq_rx0, "RX CQ entry 0");
         expect_mem(r0_gpa, frame, "RX buffer 0");
-        // TX 与 RX 共用 gv0：TX 完成发一次后自屏蔽，RX 完成不再发
+        // TX 与 RX 共用 gv0：TX 完成发一次后自屏蔽，屏蔽期间的 RX 完成只挂起不发
         if ((port.msix_addr.size() != irq0 + 1) || (port.msix_data[irq0] != 32'h500))
             `uvm_fatal("VDEV_UNIT", "CQ completion did not raise exactly one self-masked MSI-X")
+        // 驱动 dpu_napi_poll 在 napi_complete_done 后写 0x1004 解除自屏蔽、不再轮询：挂起的完成须在解除时补发一次
         priv_wr(32'h1004, 32'h0);
+        settle();
+        if ((port.msix_addr.size() != irq0 + 2) || (port.msix_data[irq0 + 1] != 32'h500))
+            `uvm_fatal("VDEV_UNIT", "0x1004 re-arm did not deliver the completion latched while self-masked")
         priv_desc(tx_gpa + 16, f_iova, 64, 1, 0);
         priv_wr(32'h0, 32'h8002_0001);
         settle();
         expect_mem(tx_gpa + 128, cq_tx2, "TX CQ after two packets");
         expect_mem(rx_gpa + 128 + 16, cq_rx1, "RX CQ entry 1");
         if (port.msix_addr.size() != irq0 + 2)
-            `uvm_fatal("VDEV_UNIT", "0x1004 re-arm did not allow the next MSI-X")
+            `uvm_fatal("VDEV_UNIT", "completions while self-masked raised an MSI-X")
+        priv_wr(32'h1004, 32'h0);
+        settle();
+        if (port.msix_addr.size() != irq0 + 3)
+            `uvm_fatal("VDEV_UNIT", "0x1004 re-arm did not deliver exactly one MSI-X for the masked completions")
         priv_log.select(VDEV_PKT, ev);
         if ((ev.size() != 4) || (ev[0].dir != "tx") || (ev[0].q != 1) || (ev[1].dir != "rx") ||
             (ev[1].q != 0) || (ev[1].bytes.size() != 64))
