@@ -1251,6 +1251,11 @@ class virtio_vdev_unit_test extends uvm_test;
         priv_wr(32'h6_0040, (v & 32'h7) | 32'h8);
         if (!(priv_rd(32'h1010) & 32'h8))
             `uvm_fatal("VDEV_UNIT", "AF declaration lost")
+        // #9 dpu_af_res_mng_init af_mng.c:95：可分配全局 Function 数 = vport_port_num − 以太口数，为 0 时
+        // dpu_af_configure_func_msix_map 报 "There is no available function left"，probe 失败。
+        v = priv_rd(32'h100_010c);
+        if (v[15:0] <= (priv_rd(32'h100_0108) & 32'hf) + ((priv_rd(32'h100_0108) >> 16) & 32'hf))
+            `uvm_fatal("VDEV_UNIT", $sformatf("greg_vport_spec 0x%08h leaves no global function for the AF", v))
         port.host_write(PRIV_BAR2 + 32'h04, 4, (32'h1 << 16) | PRIV_BDF);
         srcid = host << 10;
         for (int unsigned i = 0; i < 15; i++)

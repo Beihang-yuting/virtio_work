@@ -18,7 +18,7 @@
 // | 6 | AF | main.c:2040 | BAR0 | 0x1010 | R | 须为 `8\|host` | 同 #4 |
 // | 7 | AF | main.c:2052 | BAR0 | 0x60040 | W | `(v&7)\|8`（INTF_MB_AF_HOST_ID） | 存储 |
 // | 8 | all | main.c:2124 | BAR0 | 0x1010 | R | 须 bit3 | 同 #4 |
-// | 9 | AF | 芯片初始化（split horizon、fw init 轮询 0x1000020 bit31、rx_mtu、pause、res_mng、rss_alg、macvlan、QSCH 0xB00100、l3mc、fec） | BAR0 | 多处 | R/W | 与数据队列无关 | 通用寄存器存储；0x1000020 读 bit31=1 |
+// | 9 | AF | 芯片初始化（split horizon、fw init 轮询 0x1000020 bit31、rx_mtu、pause、res_mng、rss_alg、macvlan、QSCH 0xB00100、l3mc、fec） | BAR0 | 多处 | R/W | 与数据队列无关；dpu_af_res_mng_init af_mng.c:88–95 读 GREG_INFO 规格 0x1000108–0x1000138 | 通用寄存器存储；0x1000020 读 bit31=1；0x100010C 读 136（M-13） |
 // | 10 | all | dpu_mailbox_cfg_bdf mailbox.c:441 | BAR2 | 0x04 | W | `1<<16 \| bdf` | 存储 |
 // | 11–15 | all | mailbox 队列 reset/config/tail/enable mailbox.c:158–372 | BAR2 | 0x2C/0x1C/0x20–0x28/0x10–0x18/0x00 | W | mailbox 环 | 存储，不处理消息 |
 // | 16 | AF | af_configure_func_msix_map af_mng.c:695 | BAR0 | 0xC0000+((srcid<<7)+i)*4，i<needed | W | `gv_i \| 1<<11`；needed=num_lan+1+13 | 线性表：CQ 中断反查本地向量 |
@@ -82,6 +82,12 @@
 // - M-11 全局屏蔽 0x48000+gv*16+0xC 未写时按 0（不屏蔽）处理：驱动只写 0（#27）、从不置 1 也不读，驱动与 reg plan 都未给出
 //   复位值；按 0 处理意味着漏写 #27 第二步不会被模型发现（若芯片复位值为 1，驱动的这一写是必需的）。
 // - M-12 VTX/VRX DW2 virtio_mode[5]=1（芯片 virtio 环模式）不建模：参数表照存并告警，数据面仍按私有环处理。
+// - M-13 GREG_INFO 规格寄存器（0x1000100+，只读芯片能力）驱动与 reg plan 都未给出取值。驱动从 vport_port_num 减以太口数得到
+//   可分配的全局 Function 数（af_mng.c:95），为 0 时 probe 在 af_mng.c:669 失败。模型令 vport_port_num=136
+//   （= DPU_MAX_HOST×DPU_MAX_FUNC，驱动 res_record 的容量），其余规格读 0：以太口 0、flow/mc/vblk 关、mac_num 0。
+//   因此 cosim 中 probe 打印 "There is no available VLAN slot left"（macvlan.c:1635，flow 关，VLAN 广播流表 0 项）；另有
+//   发往 ECPU 的组播地址 mailbox 消息（type 131 DPU_MAILBOX_CFG_MC_ADDR，adapter_ops.c:119/124）等待 USED 超时（M-8）。
+//   两者驱动均容忍，netdev 照常注册、收发。
 `ifndef VDEV_DPU_PRIV_SV
 `define VDEV_DPU_PRIV_SV
 
@@ -117,6 +123,8 @@ class vdev_dpu_priv extends vdev_base;
     localparam bit [31:0] QSCH_STATE       = 32'h0b2_2000;
     localparam bit [31:0] SOFT_RESET       = 32'h100_0014;
     localparam bit [31:0] FW_READY         = 32'h100_0020;
+    localparam bit [31:0] GREG_VPORT_SPEC  = 32'h100_010c;   // greg_vport_spec.vport_port_num[15:0]（只读，M-13）
+    localparam int unsigned VPORT_NUM      = 136;            // DPU_MAX_HOST(2) * DPU_MAX_FUNC(68)，hw.h:17–18
     localparam int unsigned MAX_QUEUES     = 128;
     localparam int unsigned IRQ_WORK       = 2 * MAX_QUEUES;   // 工作项 IRQ_WORK+gv：补发挂起的 gv
 
@@ -256,6 +264,8 @@ class vdev_dpu_priv extends vdev_base;
             return reg_val(PCMPL_AF_HOST);
         if (off == FW_READY)
             return 32'h8000_0000;
+        if (off == GREG_VPORT_SPEC)
+            return VPORT_NUM;
         if (off == VTX_RESET_DONE)
             return vtx_reset_done;
         if (off == VTX_STAT_CLR_DONE)
@@ -729,6 +739,7 @@ class vdev_dpu_priv extends vdev_base;
             VRX_RD_DATA:    return "vrx_rd_data";
             SOFT_RESET:     return "soft_reset";
             FW_READY:       return "fw_ready";
+            GREG_VPORT_SPEC: return "greg_vport_spec";
             default: ;
         endcase
         if ((off >= VTX_CONTENT) && (off < VTX_CONTENT + 16))
