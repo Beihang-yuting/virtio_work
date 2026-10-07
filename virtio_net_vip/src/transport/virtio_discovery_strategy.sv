@@ -7,8 +7,8 @@
 // 目录层次：src/transport；BAR/capability 发现策略。transport 只持有当前策略并在
 // discover_and_init_bars() 中调用；策略借用 transport 的 bar/cap_mgr/notify_mgr，
 // 不拥有它们，也不保存跨调用状态。
-//   fabric_preconfigured : 按冻结 snapshot 的 BAR 租约写配置空间，只扫描 capability，
-//                          再经 resource client 进入 device-ready。
+//   fabric_preconfigured : 按冻结 snapshot 的 BAR 租约写配置空间，打开 Memory Space 与
+//                          Bus Master，扫描 capability，再经 resource client 进入 device-ready。
 // 后续 verify_snapshot 策略在 fabric_preconfigured 之前读硬件身份并与 snapshot 核对。
 // 本文件在 virtio_pci_transport 之前编译，经 types 中的前向 typedef 引用 transport。
 // ============================================================================
@@ -92,7 +92,18 @@ class virtio_fabric_preconfigured_discovery extends virtio_discovery_strategy;
         return 1;
     endfunction
 
-    // 只对 Fabric 托管 function 生效：编程三对 BAR、扫描 capability、核对 BAR 角色窗口，
+    // 驱动 probe 的 pci_enable_device + pci_set_master：Command 寄存器读改写置 Memory Space
+    // 与 Bus Master（bit1/bit2），其余位保持。Fabric 只放置 BAR，不打开设备的 MMIO 应答与
+    // DMA/MSI-X 发起；不置位时设备不认领 BAR 访问、不发 DMA 与 MSI-X。
+    protected task enable_memory_and_bus_master(virtio_pci_transport transport);
+        bit [31:0] command;
+
+        command = '0;
+        transport.bar.config_read(PCI_CFG_COMMAND, command);
+        transport.bar.config_write(PCI_CFG_COMMAND, {16'h0, command[15:0] | 16'h0006}, 4'h3);
+    endtask
+
+    // 只对 Fabric 托管 function 生效：编程三对 BAR、打开 MSE/BME、扫描 capability、核对 BAR 角色窗口，
     // 最后由 resource client 标记 device-ready。配置错误直接 fatal（与原 transport 行为一致）。
     virtual task discover(virtio_pci_transport transport, output bit ok,
                           output string why);
@@ -117,6 +128,7 @@ class virtio_fabric_preconfigured_discovery extends virtio_discovery_strategy;
         transport.cap_mgr.bar_ref = transport.bar;
         transport.notify_mgr.bar = transport.bar;
         transport.bar.program_fabric_bar_pairs();
+        enable_memory_and_bus_master(transport);
         transport.cap_mgr.discover_capabilities();
         if (!capabilities_use_fabric_windows(transport, check_why)) begin
             `uvm_fatal("TRANSPORT", $sformatf(

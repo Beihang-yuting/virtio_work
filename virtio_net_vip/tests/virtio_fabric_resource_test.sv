@@ -35,7 +35,7 @@ class virtio_fabric_cfg_stub_accessor extends virtio_bar_accessor;
 
     // 按测试所需 capability 表返回配置读数据，并记录 BAR 编程前的非法访问。
     virtual task config_read(bit [11:0] addr, ref bit [31:0] data);
-        if (config_write_count != 6)
+        if (config_write_count < 6)
             discovery_started_before_bar_programming = 1;
         data = '0;
         case (addr)
@@ -730,9 +730,13 @@ class virtio_fabric_resource_test extends uvm_test;
                 function_instance.function_key.kind,
                 function_instance.function_key.vf_id))
         end
-        if (config_stub.config_write_count != 6) begin
+        // 六次 BAR 编程之后是一次 Command 写（Memory Space|Bus Master，低 16 位）。
+        if ((config_stub.config_write_count != 7) ||
+            (config_stub.config_writes[6].addr != PCI_CFG_COMMAND) ||
+            (config_stub.config_writes[6].data != 32'h0000_0006) ||
+            (config_stub.config_writes[6].be != 4'h3)) begin
             `uvm_fatal("FABRIC_RESOURCE", $sformatf(
-                "expected six Fabric BAR config writes for host %0d PF %0d kind %0d VF %0d, got %0d",
+                "expected six Fabric BAR config writes then Command=MSE|BME for host %0d PF %0d kind %0d VF %0d, got %0d writes",
                 function_instance.function_key.host_id,
                 function_instance.function_key.pf_id,
                 function_instance.function_key.kind,
