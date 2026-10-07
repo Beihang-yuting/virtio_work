@@ -1066,6 +1066,13 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             `uvm_error("REAL_FLOW", "selected function reset ops are unavailable")
             return;
         end
+        // 协议 SVA 接口每拍只释放一个暂存事件，零时间的数据面突发会积压；复位前等全部释放
+        // 并被采样，使本流程的 notify/完成都经过检查（复位会清空完成信用）。
+        if ((function_instance.driver_agent.monitor != null) &&
+            (function_instance.driver_agent.monitor.protocol_vif != null)) begin
+            wait (function_instance.driver_agent.monitor.protocol_vif.staged_pulses.size() == 0);
+            repeat (2) @(posedge function_instance.driver_agent.monitor.protocol_vif.clk);
+        end
         function_instance.driver_agent.ops.device_reset_verified(reset_complete);
         if (!reset_complete) begin
             `uvm_error("REAL_FLOW", "verified device reset did not complete")

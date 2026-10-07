@@ -5,7 +5,9 @@
 // worker 中发起。设备 DMA：按 IOVA/GPA 两侧 4KiB 边界切块，经平台 IOMMU 翻译
 // 后由 virtio_pcie_model_dma_adapter 发 EP-originated MemRd/MemWr。MSI-X：pcie_tl 的 RC 会把 EP MemWr
 // 写进 Host memory，APIC 窗口没有后备内存，因此端口把 MSI-X MemWr 直接发布到 EP monitor 的 tlp_ap——
-// 与真实链路上被动观察到的 TLP 相同，VIP observer 照常解码。
+// 与真实链路上被动观察到的 TLP 相同，VIP observer 照常解码。EP monitor 在 1ns 后才发布同一时刻的
+// RC→EP 写（触发本次服务的 notify）与设备先发出的 DMA 写，MSI-X 须晚于它们发布（posted 写不得越过
+// 先前的 posted 写；完成须在 notify 之后被观察到）。
 // 所有权：借用 EP driver/monitor/IOMMU；只创建每个 requester 的 DMA adapter。
 `ifndef VDEV_UVM_EP_PORT_SV
 `define VDEV_UVM_EP_PORT_SV
@@ -20,6 +22,8 @@ class vdev_ep_driver extends pcie_tl_ep_driver;
     `uvm_component_utils(vdev_ep_driver)
 
     localparam int unsigned COMPLETION_LATENCY_NS = 2;
+    // MSI-X 发布延迟：大于 EP monitor 的 1ns 发布延迟，使中断排在同一时刻的 notify 与 DMA 写之后。
+    localparam int unsigned MSIX_PUBLISH_DELAY_NS = 2;
 
     vdev_uvm_ep_port port;
 
@@ -250,7 +254,13 @@ class vdev_uvm_ep_port extends vdev_port;
         tlp.payload = new[4];
         foreach (tlp.payload[i])
             tlp.payload[i] = data[8*i +: 8];
-        m_ep_monitor.tlp_ap.write(tlp);
+        // 只推迟被观察的时刻，不阻塞设备 worker（中断计数与后续 DMA 时序不变）。
+        fork
+            begin
+                #(vdev_ep_driver::MSIX_PUBLISH_DELAY_NS * 1ns);
+                m_ep_monitor.tlp_ap.write(tlp);
+            end
+        join_none
     endtask
 
     // 按 IOVA 与翻译后 GPA 两侧 4KiB 边界切块并翻译；翻译失败报告并返回 0。
