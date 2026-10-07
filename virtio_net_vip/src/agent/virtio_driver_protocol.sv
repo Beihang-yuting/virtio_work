@@ -31,8 +31,10 @@ virtual class virtio_driver_protocol extends uvm_object;
     pure virtual function bit prepare_candidates(
         string label, uvm_component parent, virtio_driver_config_t behavior,
         ref virtio_atomic_ops candidate_ops, ref virtio_auto_fsm candidate_fsm);
-    // 提交：把协议专属配置冻结进 ops；失败时 why 说明原因。
+    // 提交：把 Function 选定的配置后端与协议专属配置一起冻结进 ops；失败时 why 说明
+    // 原因且 ops 不被修改。
     pure virtual function bit bind_ops(virtio_atomic_ops ops,
+                                       virtio_config_backend backend,
                                        virtio_driver_config_t behavior,
                                        output string why);
     // 让 Function 的 dataplane 引擎与 sequence/FSM 共用同一个 ops。
@@ -81,11 +83,17 @@ class virtio_standard_driver_protocol extends virtio_driver_protocol;
         return 1;
     endfunction
 
-    // 标准驱动没有需要冻结的协议专属配置。
+    // 标准驱动只下发配置后端，没有其他需要冻结的协议专属配置。
     virtual function bit bind_ops(virtio_atomic_ops ops,
+                                  virtio_config_backend backend,
                                   virtio_driver_config_t behavior,
                                   output string why);
         why = "";
+        if (backend == null) begin
+            why = "标准协议缺少配置后端";
+            return 0;
+        end
+        ops.config_backend = backend;
         return 1;
     endfunction
 

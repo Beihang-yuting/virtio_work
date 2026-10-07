@@ -115,6 +115,13 @@ class virtio_vq_test_kit extends uvm_object;
         return vq;
     endfunction
 
+    // 标准 Function 的配置后端由 virtio_function_instance 在提交时下发；不经 Function
+    // 直接装配 ops 的测试用本函数显式注入 common-config 后端。
+    static function void bind_common_backend(virtio_atomic_ops ops);
+        ops.config_backend = virtio_common_cfg_backend::type_id::create(
+            {ops.get_name(), "_cfg_backend"});
+    endfunction
+
     // 把 ops 接到本套件的 vq_mgr/mem/iommu/wait_pol 与给定 transport；ops 为空时新建
     // 标准 virtio_atomic_ops。不修改 transport.bdf，由调用方设置。
     function virtio_atomic_ops make_ops(
@@ -127,6 +134,7 @@ class virtio_vq_test_kit extends uvm_object;
         ops.mem = mem;
         ops.iommu = iommu;
         ops.wait_pol = wait_pol;
+        bind_common_backend(ops);
         return ops;
     endfunction
 

@@ -2075,6 +2075,7 @@ class virtio_dut_caps_test extends uvm_test;
         virtio_dut_caps_expected_fsm_mq_error over_cap_catcher;
         virtio_dut_caps_expected_fsm_mq_error zero_catcher;
         virtio_dut_caps_expected_mq_bind_fatal rebind_catcher;
+        virtio_common_cfg_backend common_backend;
         string why;
         bit bind_succeeded;
 
@@ -2120,6 +2121,11 @@ class virtio_dut_caps_test extends uvm_test;
             (mq_binding_function.driver_agent.protocol != mq_binding_function.protocol))
             `uvm_fatal("DUT_CAPS",
                 "committed function did not hand its driver protocol to the agent")
+        // 标准 Function 提交时选择 common-config 后端，绑定本 Function 的 transport 后下发给 ops。
+        if (!$cast(common_backend, ops.config_backend) || (common_backend == null) ||
+            (common_backend.bound_transport() != transport))
+            `uvm_fatal("DUT_CAPS",
+                "committed standard function did not hand down a common-config backend bound to its transport")
         mq_driver.ops = ops;
         mq_driver.fsm = fsm;
         fsm_probe.state = FSM_RUNNING;
@@ -2304,7 +2310,8 @@ class virtio_dut_caps_test extends uvm_test;
             (mq_binding_function.pending_pcie_ops_candidate() != null) ||
             (mq_binding_function.pending_pcie_fsm_candidate() != null) ||
             (mq_binding_function.protocol != saved_protocol) ||
-            (busy_ops.transport != null) || (private_fsm.ops != null)) begin
+            (busy_ops.transport != null) || (busy_ops.config_backend != null) ||
+            (private_fsm.ops != null)) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
                 {"function commit failure kept staged candidates or partial ",
                  "bindings: preflight=%0d result=%0d caught=%0d ",

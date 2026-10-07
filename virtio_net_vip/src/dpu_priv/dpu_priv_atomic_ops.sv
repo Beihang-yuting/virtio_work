@@ -23,17 +23,16 @@ class dpu_priv_atomic_ops extends virtio_atomic_ops;
 
     // 冻结一份 Function 配置，避免运行时修改共享 env_cfg 改变活跃队列；有队列时
     // 拒绝重配。control 仍借用，上层须保证其有效到所有 DMA 完成并销毁队列。
-    function bit configure_private(dpu_priv_driver_config cfg,
-                                    int unsigned pairs, output string why);
-        if ((cfg == null) || (contexts.num() != 0)) begin
+    function bit configure_private(dpu_priv_driver_config cfg, int unsigned pairs,
+                                    dpu_priv_config_backend backend, output string why);
+        if ((cfg == null) || (backend == null) || (contexts.num() != 0)) begin
             why = "private 配置为空或仍有活动队列";
             return 0;
         end
         if (!cfg.validate(pairs, why)) return 0;
-        private_backend = dpu_priv_config_backend::type_id::create(
-            {get_name(), "_private_backend"});
-        private_backend.control = cfg.control;
-        config_backend = private_backend;
+        backend.control = cfg.control;
+        private_backend = backend;
+        config_backend = backend;
         configured_pairs = pairs;
         default_size = cfg.default_queue_size;
         rx_size = cfg.rx_buf_size;

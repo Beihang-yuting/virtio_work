@@ -353,6 +353,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         ops.mem = ops_mem;
         ops.iommu = iommu;
         ops.wait_pol = wait_pol;
+        virtio_vq_test_kit::bind_common_backend(ops);
     endfunction
 
     // 设备 max_virtqueue_pairs=2、当前 1 对：control VQ 必须是 4，扩到 2 对时
@@ -570,6 +571,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         ops.mem = mem;
         ops.iommu = iommu;
         ops.wait_pol = wait_pol;
+        virtio_vq_test_kit::bind_common_backend(ops);
         ops.negotiated_features = '0;
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
         ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
@@ -806,6 +808,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         ops.mem = mem;
         ops.iommu = iommu;
         ops.wait_pol = mq_wait_pol;
+        virtio_vq_test_kit::bind_common_backend(ops);
         ops.negotiated_features = '0;
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
         ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;

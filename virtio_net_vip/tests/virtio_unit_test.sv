@@ -288,8 +288,8 @@ class virtio_unit_exact_error_catcher extends uvm_report_catcher;
     endfunction
 
     virtual function action_e catch();
-        if ((get_severity() == UVM_ERROR) && (get_id() == expected_id) &&
-            (get_message() == expected_message)) begin
+        if (((get_severity() == UVM_ERROR) || (get_severity() == UVM_FATAL)) &&
+            (get_id() == expected_id) && (get_message() == expected_message)) begin
             caught_count++;
             return CAUGHT;
         end
@@ -321,6 +321,19 @@ class virtio_unit_range_ops extends virtio_atomic_ops;
         teardown_qids.push_back(queue_id);
     endtask
 endclass : virtio_unit_range_ops
+
+// 只暴露受保护的 cfg_backend()，验证未下发后端时 ops 不再自建。
+class virtio_unit_backend_probe_ops extends virtio_atomic_ops;
+    `uvm_object_utils(virtio_unit_backend_probe_ops)
+
+    function new(string name = "virtio_unit_backend_probe_ops");
+        super.new(name);
+    endfunction
+
+    function virtio_config_backend probe_backend();
+        return cfg_backend();
+    endfunction
+endclass : virtio_unit_backend_probe_ops
 
 // ============================================================================
 // virtio_unit_test
@@ -396,6 +409,7 @@ class virtio_unit_test extends uvm_test;
         test_injected_discovery_survives_fabric_config();
         test_config_backend_injection();
         test_config_reads_use_backend();
+        test_ops_requires_selected_backend();
         test_common_backend_queue_reset_result();
         test_setup_queue_rejects_host_mismatch();
         test_driver_protocol_selection();
@@ -1395,6 +1409,7 @@ class virtio_unit_test extends uvm_test;
 
         ops = virtio_atomic_ops::type_id::create("queue_reset_ops");
         ops.transport = transport;
+        ops.config_backend = backend;
         catcher = new("queue_reset_catcher", "ATOMIC_OPS",
                       "reset_queue: config backend did not confirm queue_id=3 reset");
         uvm_report_cb::add(null, catcher);
@@ -1465,9 +1480,13 @@ class virtio_unit_test extends uvm_test;
         dpu_priv_auto_fsm typed_fsm;
         virtio_driver_config_t behavior;
         virtio_unit_exact_error_catcher catcher;
+        virtio_common_cfg_backend std_backend;
+        dpu_priv_config_backend priv_backend;
         string why;
 
         behavior.num_queue_pairs = 1;
+        std_backend = virtio_common_cfg_backend::type_id::create("unit_standard_backend");
+        priv_backend = dpu_priv_config_backend::type_id::create("unit_private_backend");
         standard = virtio_standard_driver_protocol::type_id::create(
             "unit_standard_protocol");
         ops = null;
@@ -1475,7 +1494,8 @@ class virtio_unit_test extends uvm_test;
         if (!standard.allows_status_access() || standard.requires_verified_reset() ||
             !standard.prepare_candidates("unit_standard", null, behavior, ops, fsm) ||
             (ops == null) || (fsm == null) || ops.uses_private_ring() ||
-            !standard.bind_ops(ops, behavior, why))
+            !standard.bind_ops(ops, std_backend, behavior, why) ||
+            (ops.config_backend != std_backend))
             `uvm_error("TEST", "standard driver protocol did not select standard ops/FSM")
 
         private_cfg = dpu_priv_driver_config::type_id::create("unit_private_cfg");
@@ -1493,8 +1513,14 @@ class virtio_unit_test extends uvm_test;
             !private_protocol.prepare_candidates("unit_private", null, behavior, ops, fsm) ||
             !$cast(typed_ops, ops) || !$cast(typed_fsm, fsm) ||
             (typed_ops == null) || (typed_fsm == null) || !ops.uses_private_ring() ||
-            !private_protocol.bind_ops(ops, behavior, why))
+            !private_protocol.bind_ops(ops, priv_backend, behavior, why) ||
+            (ops.config_backend != priv_backend) ||
+            (priv_backend.control != private_cfg.control))
             `uvm_error("TEST", {"private driver protocol did not select private ops/FSM: ", why})
+        if (private_protocol.bind_ops(ops, std_backend, behavior, why) ||
+            (why != "私有协议要求 dpu_priv_config_backend") ||
+            (ops.config_backend != priv_backend))
+            `uvm_error("TEST", {"private protocol accepted a common-config backend: ", why})
 
         ops = virtio_atomic_ops::type_id::create("unit_conflicting_ops");
         fsm = null;
@@ -1669,6 +1695,26 @@ class virtio_unit_test extends uvm_test;
                 "status/net config reads bypassed the config backend (ctrl_at_4=%0b ok=%0b net_cfg=%0d status=%0d direct_net_cfg=%0d)",
                 ctrl_at_4, ok, net_config_calls, status_calls, transport.net_config_reads))
         `uvm_info("UNIT_TEST", "test_config_reads_use_backend PASSED", UVM_LOW)
+    endtask
+
+    // 后端由 Function 在提交时选择并下发；ops 未获下发时是接线错误，不得自建后端。
+    task test_ops_requires_selected_backend();
+        virtio_unit_backend_probe_ops ops;
+        virtio_unit_exact_error_catcher catcher;
+        virtio_config_backend backend;
+
+        ops = virtio_unit_backend_probe_ops::type_id::create("backendless_ops");
+        ops.transport = virtio_mock_transport::type_id::create("backendless_transport");
+        catcher = new("backendless_catcher", "ATOMIC_OPS",
+            "no config backend selected; virtio_function_instance hands one down at commit");
+        uvm_report_cb::add(null, catcher);
+        backend = ops.probe_backend();
+        uvm_report_cb::delete(null, catcher);
+        if ((backend != null) || (ops.config_backend != null) || (catcher.caught_count != 1))
+            `uvm_error("TEST", $sformatf(
+                "ops without a selected backend created one (backend=%0b caught=%0d)",
+                backend != null, catcher.caught_count))
+        `uvm_info("UNIT_TEST", "test_ops_requires_selected_backend PASSED", UVM_LOW)
     endtask
 
 endclass

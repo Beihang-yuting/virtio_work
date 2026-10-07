@@ -42,8 +42,8 @@ class virtio_atomic_ops extends uvm_object;
     bit [63:0]                 negotiated_features;
 
     // ===== Device configuration backend =====
-    // 设备配置副作用的唯一出口；为空时使用绑定当前 transport 的 common-config
-    // 后端。私有 ops 与后续 AF 直配在此注入其他实现。
+    // 设备配置副作用的唯一出口；由 virtio_function_instance 在提交时按 Function 配置
+    // 选择并经协议下发（不经 Function 的装配方须显式注入）。为空即接线错误。
     virtio_config_backend      config_backend;
 
     // ===== Internal tracking =====
@@ -127,12 +127,14 @@ class virtio_atomic_ops extends uvm_object;
         return (migration_restore_dma.size() != 0) || (ctrl_quarantined_gpas.size() != 0);
     endfunction
 
-    // 返回本 ops 的配置后端：未注入时创建 common-config 后端；每次调用都重新绑定
-    // 当前 transport，测试或 Function 替换 transport 后不会访问旧对象。
+    // 返回 Function 下发的配置后端；ops 不自建后端，未下发时 UVM_FATAL。每次调用都
+    // 重新绑定当前 transport，测试或 Function 替换 transport 后不会访问旧对象。
     protected function virtio_config_backend cfg_backend();
-        if (config_backend == null)
-            config_backend = virtio_common_cfg_backend::type_id::create(
-                {get_name(), "_cfg_backend"});
+        if (config_backend == null) begin
+            `uvm_fatal("ATOMIC_OPS",
+                "no config backend selected; virtio_function_instance hands one down at commit")
+            return null;
+        end
         config_backend.bind_transport(transport);
         return config_backend;
     endfunction

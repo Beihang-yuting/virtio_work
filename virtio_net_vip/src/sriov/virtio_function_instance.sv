@@ -67,8 +67,9 @@ class virtio_function_instance extends uvm_component;
     endfunction
 
     // 选择本 Function 的驱动协议并由协议创建/校验 ops/FSM 候选；这是 driver 工厂
-    // 选择的唯一位置，预检不访问设备。private_cfg 是否为空只在这里判断一次，其余
-    // 标准/私有差异都经协议对象分派；factory 返回空对象时 UVM_FATAL。配置仅在提交时冻结。
+    // 选择的唯一位置，预检不访问设备。配置后端在提交时按同一 private_cfg 选择
+    // （select_config_backend），其余标准/私有差异都经协议对象分派；factory 返回空对象时
+    // UVM_FATAL。配置仅在提交时冻结。
     protected function bit prepare_driver_candidates(
         string label, virtio_driver_config_t behavior,
         ref virtio_atomic_ops candidate_ops, ref virtio_auto_fsm candidate_fsm
@@ -356,6 +357,14 @@ class virtio_function_instance extends uvm_component;
         return 1;
     endfunction
 
+    // 按冻结的 Function 配置选择配置后端：私有环（private_cfg 非空）用私有后端，否则
+    // common-config 后端。后端的唯一创建点；只创建对象，不访问设备。
+    local function virtio_config_backend select_config_backend(string label);
+        if (private_cfg != null)
+            return dpu_priv_config_backend::type_id::create({label, "_cfg_backend"});
+        return virtio_common_cfg_backend::type_id::create({label, "_cfg_backend"});
+    endfunction
+
     // 只由 commit_bind_pcie 调用：接线已通过 preflight_bind_pcie 空句柄、factory
     // 与 qpair 上限检查的组件；失败只返回 0，不接受半初始化的 driver/transport。
     local function bit commit_validated_pcie_components(
@@ -374,13 +383,17 @@ class virtio_function_instance extends uvm_component;
         input virtio_auto_fsm fsm
     );
         string why;
+        virtio_config_backend backend;
 
         if (pending_protocol == null) begin
             `uvm_fatal("FUNCTION_BIND", $sformatf(
                 "%s PCIe bind commit has no driver protocol", function_name))
             return 0;
         end
-        if (!pending_protocol.bind_ops(ops, driver_cfg, why)) begin
+        // 后端与协议一起下发；协议只在成功时写入 ops，失败的提交不留半绑定。
+        backend = select_config_backend(function_name);
+        backend.bind_transport(transport_ref);
+        if (!pending_protocol.bind_ops(ops, backend, driver_cfg, why)) begin
             `uvm_error("FUNCTION_BIND", {"无法冻结私有驱动配置: ", why})
             return 0;
         end

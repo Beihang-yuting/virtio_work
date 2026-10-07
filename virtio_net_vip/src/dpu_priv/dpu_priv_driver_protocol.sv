@@ -55,18 +55,25 @@ class dpu_priv_driver_protocol extends virtio_driver_protocol;
         return (candidate_ops != null) && (candidate_fsm != null);
     endfunction
 
-    // 冻结一份私有配置进 ops（有活动队列时 ops 拒绝重配）。
+    // 冻结一份私有配置与私有配置后端进 ops（有活动队列时 ops 拒绝重配）。
     virtual function bit bind_ops(virtio_atomic_ops ops,
+                                  virtio_config_backend backend,
                                   virtio_driver_config_t behavior,
                                   output string why);
         dpu_priv_atomic_ops private_ops;
+        dpu_priv_config_backend private_backend;
 
         why = "";
         if (!$cast(private_ops, ops) || (private_ops == null)) begin
             why = "私有协议要求 dpu_priv_atomic_ops";
             return 0;
         end
-        return private_ops.configure_private(private_cfg, behavior.num_queue_pairs, why);
+        if (!$cast(private_backend, backend) || (private_backend == null)) begin
+            why = "私有协议要求 dpu_priv_config_backend";
+            return 0;
+        end
+        return private_ops.configure_private(private_cfg, behavior.num_queue_pairs,
+                                             private_backend, why);
     endfunction
 
     // 私有 Function 复用标准引擎类与同一 ops；私有 buffer 容量不含 Virtio header，
