@@ -231,6 +231,13 @@ class virtio_common_cfg_backend extends virtio_config_backend;
 
             // Unmask all vectors
             transport.notify_mgr.unmask_all();
+
+            // MSI-X Enable 与 Function Mask 在 PCI 配置空间（能力 +2 的 Message Control）；
+            // 设备只有看到 Enable=1、Function Mask=0 才会发 MSI-X。向量分配回退到 INTx
+            // 时不打开 MSI-X。
+            if (actual_mode != IRQ_INTX)
+                transport.bar.config_write({4'h0, transport.cap_mgr.msix_cap_offset},
+                                           32'h8000_0000, 4'hc);
         end else begin
             transport.notify_mgr.irq_mode = IRQ_INTX;
             transport.notify_mgr.intx_enabled = 1;
@@ -240,6 +247,9 @@ class virtio_common_cfg_backend extends virtio_config_backend;
 
     virtual task clear_msix(output bit ok);
         transport.notify_mgr.mask_all();
+        if (transport.cap_mgr.has_msix())
+            transport.bar.config_write({4'h0, transport.cap_mgr.msix_cap_offset},
+                                       32'hc000_0000, 4'hc);
         ok = 1;
     endtask
 

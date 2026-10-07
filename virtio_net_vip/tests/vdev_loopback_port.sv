@@ -95,6 +95,50 @@ class vdev_loopback_port extends vdev_port;
     endtask
 endclass
 
+// 回环 BAR accessor：把 VIP transport 的 MMIO/配置访问直接交给 vdev_loopback_port（无 PCIe）。
+// 保留基类的 BAR 角色守卫；bar_base 由测试设置（Fabric 布局存在时由 Function 绑定写入）。
+class vdev_loopback_bar_accessor extends virtio_bar_accessor;
+    `uvm_object_utils(vdev_loopback_bar_accessor)
+
+    vdev_loopback_port port;
+    bit [15:0]         target_bdf;
+
+    function new(string name = "vdev_loopback_bar_accessor");
+        super.new(name);
+    endfunction
+
+    virtual task read_reg(int unsigned bar_id, bit [31:0] offset, int unsigned size,
+                          ref bit [31:0] data);
+        if ((bar_id > 5) || !allow_functional_bar_access(bar_id)) begin
+            data = '0;
+            return;
+        end
+        data = port.host_read(bar_base[bar_id] + offset, size);
+    endtask
+
+    virtual task write_reg(int unsigned bar_id, bit [31:0] offset, int unsigned size,
+                           bit [31:0] data);
+        if ((bar_id > 5) || !allow_functional_bar_access(bar_id))
+            return;
+        port.host_write(bar_base[bar_id] + offset, size, data);
+    endtask
+
+    virtual task write_msix_reg(int unsigned bar_id, bit [31:0] offset, int unsigned size,
+                                bit [31:0] data);
+        if ((bar_id > 5) || !allow_msix_bar_access(bar_id))
+            return;
+        port.host_write(bar_base[bar_id] + offset, size, data);
+    endtask
+
+    virtual task config_read(bit [11:0] addr, ref bit [31:0] data);
+        data = port.host_cfg_read(target_bdf, addr);
+    endtask
+
+    virtual task config_write(bit [11:0] addr, bit [31:0] data, bit [3:0] be);
+        port.host_cfg_write(target_bdf, addr, data, be);
+    endtask
+endclass
+
 class vdev_event_log extends uvm_subscriber #(vdev_event);
     `uvm_component_utils(vdev_event_log)
 

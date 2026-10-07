@@ -969,6 +969,53 @@ class virtio_vdev_unit_test extends uvm_test;
         `uvm_info("VDEV_UNIT", "test_std_split_indirect PASSED", UVM_LOW)
     endtask
 
+    // 独立设备暴露的 VIP 缺陷：common-config 后端 set_msix 必须在设备上打开 MSI-X（Enable=1、
+    // Function Mask=0）并清掉所用向量的 Vector Control；clear_msix 必须重新屏蔽。
+    task test_vip_msix_enables_device();
+        virtio_pci_transport t;
+        vdev_loopback_bar_accessor acc;
+        virtio_common_cfg_backend be;
+        int unsigned qids[$];
+        bit [31:0] v;
+        bit [7:0] cap;
+        bit ok;
+
+        t = virtio_pci_transport::type_id::create("vip_msix_transport");
+        t.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(STD_BDF));
+        acc = vdev_loopback_bar_accessor::type_id::create("vip_msix_bar");
+        acc.port = port;
+        acc.target_bdf = STD_BDF;
+        acc.bar_base[0] = STD_BAR0;
+        acc.bar_base[2] = STD_BAR2;
+        acc.bar_base[4] = STD_BAR4;
+        t.bar = acc;
+        t.cap_mgr.bar_ref = acc;
+        t.notify_mgr.bar = acc;
+        t.cap_mgr.discover_capabilities();
+        cap = find_cap(STD_BDF, 8'h11);
+        // 回到设备复位后的 MSI-X 状态：关闭使能、全部向量屏蔽。
+        port.host_cfg_write(STD_BDF, {4'h0, cap}, 32'h0, 4'hc);
+        for (int unsigned i = 0; i < 6; i++)
+            port.host_write(STD_BAR4 + 16*i + 12, 4, 1);
+        be = virtio_common_cfg_backend::type_id::create("vip_msix_backend");
+        be.bind_transport(t);
+        qids.push_back(0);
+        qids.push_back(1);
+        be.set_msix(qids, ok);
+        v = port.host_cfg_read(STD_BDF, {4'h0, cap});
+        if (!ok || !v[31] || v[30])
+            `uvm_fatal("VDEV_UNIT", $sformatf(
+                "set_msix left device MSI-X disabled or function-masked (ctrl=0x%04h)", v[31:16]))
+        for (int unsigned i = 0; i < 3; i++)
+            if (port.host_read(STD_BAR4 + 16*i + 12, 4) != 0)
+                `uvm_fatal("VDEV_UNIT", $sformatf("set_msix left vector %0d masked in the device table", i))
+        be.clear_msix(ok);
+        v = port.host_cfg_read(STD_BDF, {4'h0, cap});
+        if (!ok || !v[30] || (port.host_read(STD_BAR4 + 12, 4) != 1))
+            `uvm_fatal("VDEV_UNIT", "clear_msix did not mask the device MSI-X function/vectors")
+        `uvm_info("VDEV_UNIT", "test_vip_msix_enables_device PASSED", UVM_LOW)
+    endtask
+
     virtual task run_phase(uvm_phase phase);
         phase.raise_objection(this);
         echo.bdf = ECHO_BDF;
@@ -988,6 +1035,7 @@ class virtio_vdev_unit_test extends uvm_test;
         test_std_event_idx_and_queue_reset();
         test_std_ctrl_without_mq();
         test_std_split_indirect();
+        test_vip_msix_enables_device();
         mem.leak_check();
         iommu.leak_check();
         `uvm_info("VDEV_UNIT", "virtio_vdev_unit_test PASSED", UVM_NONE)

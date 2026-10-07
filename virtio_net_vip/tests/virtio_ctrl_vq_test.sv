@@ -99,7 +99,8 @@ class virtio_ctrl_vq_test_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_ctrl_vq_test_catcher
 
-// MSI-X 表写入桩：只吞掉表项 MMIO，不需要 PCIe 通路；向量分配仍走生产 notification manager。
+// MSI-X 写入桩：只吞掉表项 MMIO 与 Message Control 配置写，不需要 PCIe 通路；向量分配仍走
+// 生产 notification manager。
 class virtio_ctrl_vq_test_null_bar extends virtio_bar_accessor;
     `uvm_object_utils(virtio_ctrl_vq_test_null_bar)
 
@@ -109,6 +110,9 @@ class virtio_ctrl_vq_test_null_bar extends virtio_bar_accessor;
 
     virtual task write_msix_reg(int unsigned bar_id, bit [31:0] offset,
                                 int unsigned size, bit [31:0] data);
+    endtask
+
+    virtual task config_write(bit [11:0] addr, bit [31:0] data, bit [3:0] be);
     endtask
 endclass : virtio_ctrl_vq_test_null_bar
 

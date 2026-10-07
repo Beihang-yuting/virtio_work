@@ -19,8 +19,8 @@
 // 通知方式及其统计。
 // 职责：经 bar.write_msix_reg 真实写 MSI-X 表(受 Fabric BAR4 守卫约束)、
 // 三级降级分配向量、维护 per-vector 与 function 级 mask 的本地影子、INTx
-// 的 ISR 读清语义、NAPI 回调开关，以及三种中断错误注入。注意 mask/unmask
-// 只改本地影子状态，不回写设备端 Vector Control。
+// 的 ISR 读清语义、NAPI 回调开关，以及三种中断错误注入。mask/unmask 同时
+// 更新本地影子并写回设备端 Vector Control。
 // 依赖：virtio_bar_accessor(唯一 MMIO 通道)、msix_entry_t/interrupt_mode_e
 // 类型定义。
 // 所有权/生命周期：uvm_object，由 virtio_pci_transport 构造时创建持有；
@@ -45,6 +45,9 @@ class virtio_notification_manager extends uvm_object;
     int unsigned      queue_vectors[];        // queue_id -> vector mapping
     bit               msix_mask[];            // per-vector mask
     bit               msix_function_mask = 0; // global function mask
+    // setup_msix 记录的设备表位置；屏蔽位经它写回表项 Vector Control（+0xC）。
+    protected int unsigned msix_table_bar_id;
+    protected bit [31:0]   msix_table_base;
     // Stable namespace used only for model-generated default table entries.
     // Explicit table entries retain their caller-provided address/data.
     bit [15:0]        function_bdf;
@@ -106,6 +109,8 @@ class virtio_notification_manager extends uvm_object;
 
         msix_table = new[num_vectors];
         msix_mask  = new[num_vectors];
+        msix_table_bar_id = msix_table_bar;
+        msix_table_base = msix_table_offset;
 
         for (int i = 0; i < num_vectors; i++) begin
             bit [31:0] entry_offset;
@@ -277,9 +282,16 @@ class virtio_notification_manager extends uvm_object;
     endtask
 
     // ========================================================================
-    // mask/unmask：只更新本地 msix_mask/msix_table.masked 影子位，供
-    // on_interrupt_received 判定是否压制；不回写设备端 Vector Control 寄存器。
+    // mask/unmask：更新影子位并写回设备端 Vector Control 寄存器。
     // ========================================================================
+
+    // 把向量的影子屏蔽位写进设备 MSI-X 表项 Vector Control；未建表或无 BAR accessor 时不访问设备。
+    protected task write_vector_control(int unsigned vector);
+        if ((bar == null) || (vector >= msix_mask.size()))
+            return;
+        bar.write_msix_reg(msix_table_bar_id, msix_table_base + vector * 16 + 32'hC, 4,
+                           {31'h0, msix_mask[vector]});
+    endtask
 
     // 屏蔽单个向量；越界仅告警不生效。
     virtual task mask_vector(int unsigned vector);
@@ -291,6 +303,7 @@ class virtio_notification_manager extends uvm_object;
         end
         msix_mask[vector] = 1;
         msix_table[vector].masked = 1;
+        write_vector_control(vector);
 
         `uvm_info("NOTIFY_MGR",
             $sformatf("Masked MSI-X vector %0d", vector), UVM_HIGH)
@@ -306,6 +319,7 @@ class virtio_notification_manager extends uvm_object;
         end
         msix_mask[vector] = 0;
         msix_table[vector].masked = 0;
+        write_vector_control(vector);
 
         `uvm_info("NOTIFY_MGR",
             $sformatf("Unmasked MSI-X vector %0d", vector), UVM_HIGH)
@@ -317,6 +331,7 @@ class virtio_notification_manager extends uvm_object;
         for (int i = 0; i < msix_mask.size(); i++) begin
             msix_mask[i] = 1;
             msix_table[i].masked = 1;
+            write_vector_control(i);
         end
         `uvm_info("NOTIFY_MGR", "All MSI-X vectors masked (function mask)", UVM_MEDIUM)
     endtask
@@ -327,6 +342,7 @@ class virtio_notification_manager extends uvm_object;
         for (int i = 0; i < msix_mask.size(); i++) begin
             msix_mask[i] = 0;
             msix_table[i].masked = 0;
+            write_vector_control(i);
         end
         `uvm_info("NOTIFY_MGR", "All MSI-X vectors unmasked", UVM_MEDIUM)
     endtask
