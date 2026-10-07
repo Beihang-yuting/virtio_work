@@ -339,6 +339,7 @@ class virtio_unit_test extends uvm_test;
         test_discovery_strategy_selection();
         test_config_backend_injection();
         test_driver_protocol_selection();
+        test_fabric_bar_layout_roles();
         test_dma_buffer_set();
 
         `uvm_info("UNIT_TEST", "All unit tests PASSED", UVM_NONE)
@@ -1313,6 +1314,51 @@ class virtio_unit_test extends uvm_test;
         if (catcher.caught_count != 1)
             `uvm_error("TEST", "private protocol did not report the ops/FSM type conflict")
         `uvm_info("UNIT_TEST", "test_driver_protocol_selection PASSED", UVM_LOW)
+    endtask
+
+    // BAR 角色只由 snapshot 租约构造的布局对象回答；非法租约给出与 bar accessor
+    // 相同的上下文消息且不产生布局。
+    task test_fabric_bar_layout_roles();
+        dpu_bar_pair_lease_t bars[$];
+        dpu_bar_pair_lease_t lease;
+        fabric_bar_layout layout;
+        dpu_bar_role_e role;
+        string why;
+
+        lease.role = DPU_BAR_MAILBOX;
+        lease.even_bar_id = 2;
+        lease.base = 64'h0001_0000_2000_0000;
+        lease.size = 64'h0000_0000_0001_0000;
+        bars.push_back(lease);
+        lease.role = DPU_BAR_MSIX;
+        lease.even_bar_id = 4;
+        lease.base = 64'h0001_0000_3000_0000;
+        lease.size = 64'h0000_0000_0001_0000;
+        bars.push_back(lease);
+        lease.role = DPU_BAR_DEVICE_MEMORY;
+        lease.even_bar_id = 0;
+        lease.base = 64'h0001_0000_1000_0000;
+        lease.size = 64'h0000_0000_0010_0000;
+        bars.push_back(lease);
+        if (!fabric_bar_layout::build(bars, layout, why) || (layout == null) ||
+            (layout.even_bar_for(DPU_BAR_DEVICE_MEMORY) != 0) ||
+            (layout.even_bar_for(DPU_BAR_MAILBOX) != 2) ||
+            (layout.even_bar_for(DPU_BAR_MSIX) != 4) ||
+            !layout.role_of(5, role) || (role != DPU_BAR_MSIX) ||
+            !layout.has_role(1, DPU_BAR_DEVICE_MEMORY) ||
+            layout.has_role(2, DPU_BAR_MSIX))
+            `uvm_error("TEST", {"valid Fabric BAR leases produced a wrong layout: ", why})
+
+        bars[0].even_bar_id = 4;
+        if (fabric_bar_layout::build(bars, layout, why) || (layout != null) ||
+            (why != "Fabric BAR lease 0 has invalid role 1 for even BAR4; expected BAR0=device-memory, BAR2=mailbox, or BAR4=MSI-X"))
+            `uvm_error("TEST", {"misplaced mailbox lease was not rejected: ", why})
+
+        bars.delete();
+        if (fabric_bar_layout::build(bars, layout, why) ||
+            (why != "Fabric BAR lease set must contain exactly three unique pairs; got 0"))
+            `uvm_error("TEST", {"empty Fabric BAR lease set was not rejected: ", why})
+        `uvm_info("UNIT_TEST", "test_fabric_bar_layout_roles PASSED", UVM_LOW)
     endtask
 
 endclass

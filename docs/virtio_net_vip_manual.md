@@ -337,6 +337,7 @@ virtio_net_vip/
 |   |   +-- virtqueue_manager.sv            -- 工厂 + 生命周期管理器
 |   +-- transport/
 |   |   +-- virtio_pci_regs.sv              -- PCI Common Config 寄存器偏移常量
+|   |   +-- fabric_bar_layout.sv            -- snapshot BAR 租约 -> BAR 角色布局
 |   |   +-- virtio_bar_accessor.sv          -- BAR MMIO/Config -> PCIe TLP 翻译
 |   |   +-- virtio_pci_cap_manager.sv       -- PCI Capability 链表遍历与解析
 |   |   +-- virtio_notification_manager.sv  -- MSI-X/INTx/polling 中断管理

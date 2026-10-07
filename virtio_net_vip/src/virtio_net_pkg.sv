@@ -64,6 +64,7 @@ package virtio_net_pkg;
   // ---------------------------------------------------------------------------
   `include "transport/virtio_pci_regs.sv"
   typedef class virtio_tlm_completion_adapter;
+  `include "transport/fabric_bar_layout.sv"
   `include "transport/virtio_bar_accessor.sv"
   `include "transport/virtio_tlm_completion_adapter.sv"
   `include "transport/virtio_pcie_function_endpoint.sv"

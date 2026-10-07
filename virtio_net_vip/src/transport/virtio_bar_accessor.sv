@@ -303,9 +303,8 @@ class virtio_bar_accessor extends uvm_object;
     bit [63:0]  bar_base[6];        // BAR0-5 base addresses
     bit [63:0]  bar_size[6];        // BAR0-5 sizes (for enumeration)
     bit [2:0]   bar_type[6];        // PCI BAR bits [2:0]; 3'b100=64-bit MMIO
-    bit         fabric_bar_layout_active;
-    bit         fabric_bar_role_valid[6];
-    dpu_bar_role_e fabric_bar_role[6];
+    // Fabric BAR 角色布局（由 snapshot 租约构造）；null 表示非 Fabric function。
+    fabric_bar_layout fabric_layout;
 
     // ===== PCIe layer references =====
     uvm_sequencer #(pcie_tl_tlp) pcie_rc_seqr;   // RC Agent's sequencer
@@ -328,13 +327,11 @@ class virtio_bar_accessor extends uvm_object;
         pcie_id_valid       = 0;
         endpoint_completion_adapter = null;
         next_bar_alloc_addr = 64'h0000_0000_C000_0000;  // Default MMIO window
-        fabric_bar_layout_active = 0;
+        fabric_layout = null;
         for (int i = 0; i < 6; i++) begin
             bar_base[i] = '0;
             bar_size[i] = '0;
             bar_type[i] = '0;
-            fabric_bar_role_valid[i] = 0;
-            fabric_bar_role[i] = DPU_BAR_DEVICE_MEMORY;
         end
     endfunction
 
@@ -366,78 +363,39 @@ class virtio_bar_accessor extends uvm_object;
     virtual function void configure_fabric_bar_pairs(
         input dpu_bar_pair_lease_t bars[$]
     );
-        bit lease_seen[3];
+        fabric_bar_layout layout;
+        string why;
 
-        if (bars.size() != 3) begin
-            `uvm_error("BAR_ACCESSOR", $sformatf(
-                "Fabric BAR lease set must contain exactly three unique pairs; got %0d",
-                bars.size()))
+        if (!fabric_bar_layout::build(bars, layout, why)) begin
+            `uvm_error("BAR_ACCESSOR", why)
             return;
-        end
-        foreach (bars[index]) begin
-            int unsigned lease_slot;
-
-            if ((bars[index].even_bar_id == 0) &&
-                (bars[index].role == DPU_BAR_DEVICE_MEMORY)) begin
-                lease_slot = 0;
-            end
-            else if ((bars[index].even_bar_id == 2) &&
-                     (bars[index].role == DPU_BAR_MAILBOX)) begin
-                lease_slot = 1;
-            end
-            else if ((bars[index].even_bar_id == 4) &&
-                     (bars[index].role == DPU_BAR_MSIX)) begin
-                lease_slot = 2;
-            end
-            else begin
-                `uvm_error("BAR_ACCESSOR", $sformatf(
-                    "Fabric BAR lease %0d has invalid role %0d for even BAR%0d; expected BAR0=device-memory, BAR2=mailbox, or BAR4=MSI-X",
-                    index, bars[index].role, bars[index].even_bar_id))
-                return;
-            end
-            if (lease_seen[lease_slot]) begin
-                `uvm_error("BAR_ACCESSOR", $sformatf(
-                    "Fabric BAR lease %0d duplicates the required BAR%0d role %0d pair",
-                    index, bars[index].even_bar_id, bars[index].role))
-                return;
-            end
-            lease_seen[lease_slot] = 1;
-        end
-        for (int unsigned lease_slot = 0; lease_slot < 3; lease_slot++) begin
-            if (!lease_seen[lease_slot]) begin
-                `uvm_error("BAR_ACCESSOR", $sformatf(
-                    "Fabric BAR lease set is missing required pair slot %0d",
-                    lease_slot))
-                return;
-            end
         end
 
         // Do not mutate an existing Fabric layout until the entire input set
         // has validated.  A malformed retry must not leave a partial layout
         // that can later be programmed into PCI config space.
-        fabric_bar_layout_active = 1;
+        fabric_layout = layout;
         for (int unsigned bar_id = 0; bar_id < 6; bar_id++) begin
             bar_base[bar_id] = '0;
             bar_size[bar_id] = '0;
             bar_type[bar_id] = '0;
-            fabric_bar_role_valid[bar_id] = 0;
-            fabric_bar_role[bar_id] = DPU_BAR_DEVICE_MEMORY;
         end
         foreach (bars[index]) begin
             bar_base[bars[index].even_bar_id] = bars[index].base;
             bar_size[bars[index].even_bar_id] = bars[index].size;
             bar_type[bars[index].even_bar_id] = 3'b100;
-            fabric_bar_role_valid[bars[index].even_bar_id] = 1;
-            fabric_bar_role[bars[index].even_bar_id] = bars[index].role;
-            fabric_bar_role_valid[bars[index].even_bar_id + 1] = 1;
-            fabric_bar_role[bars[index].even_bar_id + 1] = bars[index].role;
         end
     endfunction
 
     // 查询 Fabric BAR 布局是否已生效(configure_fabric_bar_pairs 校验通过后
     // 置位)；纯查询，无副作用。
     function bit fabric_bar_layout_is_active();
-        return fabric_bar_layout_active;
+        return (fabric_layout != null);
+    endfunction
+
+    // 返回当前 Fabric BAR 布局（非 Fabric 时为 null），供发现策略校验 capability 窗口。
+    function fabric_bar_layout get_fabric_layout();
+        return fabric_layout;
     endfunction
 
     // 纯校验(无副作用)：判断一个 Fabric 64 位 BAR 对能否安全写入 PCI 配置
@@ -450,20 +408,22 @@ class virtio_bar_accessor extends uvm_object;
         output string why
     );
         bit [63:0] pair_size;
+        dpu_bar_role_e low_role;
+        dpu_bar_role_e high_role;
 
         why = "";
         if ((even_bar_id > 4) || ((even_bar_id % 2) != 0)) begin
             why = $sformatf("invalid even BAR ID %0d", even_bar_id);
             return 0;
         end
-        if (!fabric_bar_role_valid[even_bar_id] ||
-            !fabric_bar_role_valid[even_bar_id + 1]) begin
+        if ((fabric_layout == null) ||
+            !fabric_layout.role_of(even_bar_id, low_role) ||
+            !fabric_layout.role_of(even_bar_id + 1, high_role)) begin
             why = $sformatf("BAR%0d/%0d has no complete Fabric role lease",
                             even_bar_id, even_bar_id + 1);
             return 0;
         end
-        if ((fabric_bar_role[even_bar_id] != expected_role) ||
-            (fabric_bar_role[even_bar_id + 1] != expected_role)) begin
+        if ((low_role != expected_role) || (high_role != expected_role)) begin
             why = $sformatf("BAR%0d/%0d role mismatch (expected %0d)",
                             even_bar_id, even_bar_id + 1, expected_role);
             return 0;
@@ -514,17 +474,18 @@ class virtio_bar_accessor extends uvm_object;
         bit [31:0] low_dword;
         bit [11:0] low_addr;
 
-        if (!fabric_bar_layout_active) begin
+        if (fabric_layout == null) begin
             `uvm_fatal("BAR_FABRIC_PROGRAM",
                 "cannot program Fabric BARs without an active Fabric layout")
             return;
         end
         if (!fabric_bar_pair_is_programmable(
-            0, DPU_BAR_DEVICE_MEMORY, why
+            fabric_layout.even_bar_for(DPU_BAR_DEVICE_MEMORY),
+            DPU_BAR_DEVICE_MEMORY, why
         ) || !fabric_bar_pair_is_programmable(
-            2, DPU_BAR_MAILBOX, why
+            fabric_layout.even_bar_for(DPU_BAR_MAILBOX), DPU_BAR_MAILBOX, why
         ) || !fabric_bar_pair_is_programmable(
-            4, DPU_BAR_MSIX, why
+            fabric_layout.even_bar_for(DPU_BAR_MSIX), DPU_BAR_MSIX, why
         )) begin
             `uvm_fatal("BAR_FABRIC_PROGRAM", $sformatf(
                 "cannot program Fabric BAR pairs for BDF 0x%04h: %s",
@@ -551,10 +512,14 @@ class virtio_bar_accessor extends uvm_object;
     endtask
 
     // Fabric 访问守卫：非 Fabric 模式一律放行；Fabric 模式下功能 MMIO 只允许
-    // 角色匹配的 BAR0(device-memory)或 BAR2(mailbox)偶数基址，BAR4(MSI-X)
-    // 与奇数 BAR 一律拒绝。拒绝路径带 uvm_error 副作用，调用方按返回值放弃访问。
+    // 布局中 device-memory 或 mailbox 角色的偶数基址，MSI-X BAR 与奇数 BAR 一律
+    // 拒绝。拒绝路径带 uvm_error 副作用，调用方按返回值放弃访问。
     protected function bit allow_functional_bar_access(input int unsigned bar_id);
-        if (!fabric_bar_layout_active)
+        int unsigned msix_bar;
+        int unsigned device_bar;
+        int unsigned mailbox_bar;
+
+        if (fabric_layout == null)
             return 1;
         if ((bar_id > 5) || ((bar_id % 2) != 0)) begin
             `uvm_error("BAR_FUNCTION_WINDOW", $sformatf(
@@ -562,38 +527,35 @@ class virtio_bar_accessor extends uvm_object;
                 bar_id))
             return 0;
         end
-        if (bar_id == 4) begin
+        msix_bar = fabric_layout.even_bar_for(DPU_BAR_MSIX);
+        if (bar_id == msix_bar) begin
             `uvm_error("BAR_MSIX_ONLY", $sformatf(
                 "functional MMIO access to MSI-X-only BAR%0d was blocked", bar_id))
             return 0;
         end
-        if ((bar_id == 0) && fabric_bar_role_valid[0] &&
-            (fabric_bar_role[0] == DPU_BAR_DEVICE_MEMORY))
+        device_bar = fabric_layout.even_bar_for(DPU_BAR_DEVICE_MEMORY);
+        mailbox_bar = fabric_layout.even_bar_for(DPU_BAR_MAILBOX);
+        if ((bar_id == device_bar) || (bar_id == mailbox_bar))
             return 1;
-        if ((bar_id == 2) && fabric_bar_role_valid[2] &&
-            (fabric_bar_role[2] == DPU_BAR_MAILBOX))
-            return 1;
-        if ((bar_id == 0) || (bar_id == 2)) begin
-            `uvm_error("BAR_FUNCTION_WINDOW", $sformatf(
-                "functional MMIO access to Fabric BAR%0d has an incompatible role",
-                bar_id))
-            return 0;
-        end
         `uvm_error("BAR_FUNCTION_WINDOW", $sformatf(
-            "functional MMIO access must use Fabric BAR0/1 or BAR2/3, not BAR%0d",
-            bar_id))
+            "functional MMIO access must use Fabric BAR%0d/%0d or BAR%0d/%0d, not BAR%0d",
+            device_bar, device_bar + 1, mailbox_bar, mailbox_bar + 1, bar_id))
         return 0;
     endfunction
 
-    // MSI-X 访问守卫：与上面对偶——Fabric 模式下 MSI-X 表访问只允许 BAR4，
-    // 其余拒绝并报错；非 Fabric 模式放行。
+    // MSI-X 访问守卫：与上面对偶——Fabric 模式下 MSI-X 表访问只允许布局中
+    // MSI-X 角色的偶数 BAR，其余拒绝并报错；非 Fabric 模式放行。
     protected function bit allow_msix_bar_access(input int unsigned bar_id);
-        if (!fabric_bar_layout_active)
+        int unsigned msix_bar;
+
+        if (fabric_layout == null)
             return 1;
-        if (bar_id == 4)
+        msix_bar = fabric_layout.even_bar_for(DPU_BAR_MSIX);
+        if (bar_id == msix_bar)
             return 1;
         `uvm_error("BAR_MSIX_ONLY", $sformatf(
-            "MSI-X access must use Fabric BAR4/5, not BAR%0d", bar_id))
+            "MSI-X access must use Fabric BAR%0d/%0d, not BAR%0d",
+            msix_bar, msix_bar + 1, bar_id))
         return 0;
     endfunction
 
@@ -876,7 +838,7 @@ class virtio_bar_accessor extends uvm_object;
         bit [11:0] bar_cfg_addr;
         int i;
 
-        if (fabric_bar_layout_active) begin
+        if (fabric_layout != null) begin
             `uvm_error("BAR_FABRIC_OWNED",
                 "BAR enumeration is forbidden for Fabric-owned BAR placements")
             return;

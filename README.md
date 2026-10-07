@@ -231,6 +231,7 @@ virtio_net_vip/
 │   │   └── virtqueue_error_injector.sv     ← 队列错误注入器
 │   ├── transport/                          ← PCI 传输层
 │   │   ├── virtio_pci_regs.sv              ← Common Config 寄存器偏移常量
+│   │   ├── fabric_bar_layout.sv            ← snapshot BAR 租约 → BAR 角色布局
 │   │   ├── virtio_bar_accessor.sv          ← BAR 读写 → PCIe TLP 翻译
 │   │   ├── virtio_pci_cap_manager.sv       ← PCI Capability 链表发现
 │   │   ├── virtio_notification_manager.sv  ← MSI-X/INTx/轮询/自适应中断管理

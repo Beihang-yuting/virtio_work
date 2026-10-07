@@ -82,38 +82,50 @@ class virtio_fabric_preconfigured_discovery extends virtio_discovery_strategy;
         return "fabric_preconfigured";
     endfunction
 
-    // Fabric 专用校验(无副作用)：确认发现到的 virtio 能力落在 Fabric 约定的
-    // BAR 角色窗口内——common/ISR/device/pci cfg 在 BAR0、notify 在 BAR2
-    // (mailbox)、MSI-X 在 BAR4；任何偏离都拒绝并经 why 说明原因，
+    // Fabric 专用校验(无副作用)：确认发现到的 virtio 能力落在 BAR 布局约定的
+    // 角色窗口内——common/ISR/device/pci cfg 在 device-memory BAR、notify 在
+    // mailbox BAR、MSI-X 在 MSI-X BAR；任何偏离都拒绝并经 why 说明原因，
     // 防止把错误的 BAR 角色布局当成合法 DUT profile。
     protected function bit capabilities_use_fabric_windows(
         virtio_pci_transport transport,
         output string why
     );
+        fabric_bar_layout layout;
+        int unsigned device_bar;
+        int unsigned mailbox_bar;
+        int unsigned msix_bar;
+
         why = "";
+        layout = transport.bar.get_fabric_layout();
+        device_bar = layout.even_bar_for(DPU_BAR_DEVICE_MEMORY);
+        mailbox_bar = layout.even_bar_for(DPU_BAR_MAILBOX);
+        msix_bar = layout.even_bar_for(DPU_BAR_MSIX);
         if (!transport.cap_mgr.common_cfg_found || !transport.cap_mgr.notify_found ||
             !transport.cap_mgr.isr_found) begin
             why = "mandatory virtio capabilities were not discovered";
             return 0;
         end
-        // The Fabric profile has a split functional layout: BAR0/1 carries
-        // common/ISR/device configuration, while BAR2/3 is the mailbox and
-        // therefore owns the virtio notification capability.  Do not force
-        // notify into BAR0; doing so rejects the real-DUT profile even though
-        // the discovered BAR role and notify address are correct.
-        if ((transport.cap_mgr.common_cfg_cap.bar != 0) ||
-            (transport.cap_mgr.notify_cap.bar != 2) ||
-            (transport.cap_mgr.isr_cap.bar != 0) ||
+        // The Fabric profile has a split functional layout: the device-memory
+        // pair carries common/ISR/device configuration, while the mailbox pair
+        // owns the virtio notification capability.  Do not force notify into
+        // the device-memory BAR; doing so rejects the real-DUT profile even
+        // though the discovered BAR role and notify address are correct.
+        if ((transport.cap_mgr.common_cfg_cap.bar != device_bar) ||
+            (transport.cap_mgr.notify_cap.bar != mailbox_bar) ||
+            (transport.cap_mgr.isr_cap.bar != device_bar) ||
             (transport.cap_mgr.device_cfg_found &&
-             (transport.cap_mgr.device_cfg_cap.bar != 0)) ||
+             (transport.cap_mgr.device_cfg_cap.bar != device_bar)) ||
             (transport.cap_mgr.pci_cfg_found &&
-             (transport.cap_mgr.pci_cfg_cap.bar != 0))) begin
-            why = "virtio functional capability did not resolve to Fabric BAR0/1";
+             (transport.cap_mgr.pci_cfg_cap.bar != device_bar))) begin
+            why = $sformatf(
+                "virtio functional capability did not resolve to Fabric BAR%0d/%0d",
+                device_bar, device_bar + 1);
             return 0;
         end
         if (transport.cap_mgr.msix_found &&
-            (transport.cap_mgr.msix_table_bir != 4)) begin
-            why = "MSI-X capability did not resolve to Fabric BAR4/5";
+            (transport.cap_mgr.msix_table_bir != msix_bar)) begin
+            why = $sformatf("MSI-X capability did not resolve to Fabric BAR%0d/%0d",
+                            msix_bar, msix_bar + 1);
             return 0;
         end
         return 1;
