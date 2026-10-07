@@ -145,8 +145,9 @@ class virtio_pci_transport extends uvm_object;
         return 1;
     endfunction
 
-    // 切换到 Fabric 托管模式：BAR 布局由 DPU 资源管理器下发、发现策略切换为
-    // fabric_preconfigured。会清掉能力发现完成标志；
+    // 切换到 Fabric 托管模式：BAR 布局由 DPU 资源管理器下发。会清掉能力发现
+    // 完成标志；不改发现策略（构造时已是 fabric_preconfigured，经
+    // set_discovery_strategy() 注入的策略必须保留）。
     // resource_client 为借用引用，负责 device-ready 生命周期上报。
     virtual function void configure_fabric_managed(
         input virtio_resource_client resource_client
@@ -154,8 +155,6 @@ class virtio_pci_transport extends uvm_object;
         fabric_managed = 1;
         fabric_capability_discovered = 0;
         fabric_resource_client = resource_client;
-        discovery_strategy = virtio_fabric_preconfigured_discovery::type_id::create(
-            "fabric_preconfigured_discovery");
     endfunction
 
     // 查询是否处于 Fabric 托管模式；纯查询，无副作用。
@@ -732,20 +731,6 @@ class virtio_pci_transport extends uvm_object;
         discovery_strategy.discover(this, ok, why);
         if (!ok)
             `uvm_fatal("TRANSPORT", {"BAR/capability discovery failed: ", why})
-    endtask
-
-    // Fabric 预配置发现的显式入口（virtio_fabric_resource_test 直接调用）；与
-    // configure_fabric_managed() 安装的策略为同一实现，不经 discovery_strategy 分派。
-    virtual task discover_fabric_preconfigured_bars();
-        virtio_fabric_preconfigured_discovery fabric_discovery;
-        bit ok;
-        string why;
-
-        fabric_discovery = virtio_fabric_preconfigured_discovery::type_id::create(
-            "fabric_preconfigured_discovery");
-        fabric_discovery.discover(this, ok, why);
-        if (!ok)
-            `uvm_fatal("TRANSPORT", {"Fabric discovery failed: ", why})
     endtask
 
 endclass : virtio_pci_transport

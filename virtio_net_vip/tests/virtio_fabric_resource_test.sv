@@ -782,7 +782,7 @@ class virtio_fabric_resource_test extends uvm_test;
         function_instance.transport.notify_mgr.bar = config_stub;
         function_instance.transport.cap_mgr.bar_ref = config_stub;
 
-        function_instance.transport.discover_fabric_preconfigured_bars();
+        function_instance.transport.discover_and_init_bars();
         if (!function_instance.transport.fabric_capability_discovered) begin
             `uvm_fatal("FABRIC_RESOURCE",
                 "Fabric capability discovery did not complete")

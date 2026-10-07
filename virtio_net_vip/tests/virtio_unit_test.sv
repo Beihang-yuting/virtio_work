@@ -383,6 +383,7 @@ class virtio_unit_test extends uvm_test;
         test_tlm_completion_factory_owner();
         test_late_driver_agent_binding();
         test_discovery_strategy_selection();
+        test_injected_discovery_survives_fabric_config();
         test_config_backend_injection();
         test_driver_protocol_selection();
         test_fabric_bar_layout_roles();
@@ -1261,6 +1262,30 @@ class virtio_unit_test extends uvm_test;
                 "discover_and_init_bars did not delegate exactly once (count=%0d)",
                 recorder.discover_count))
         `uvm_info("UNIT_TEST", "test_discovery_strategy_selection PASSED", UVM_LOW)
+    endtask
+
+    // 先注入策略（后续 verify_snapshot 的接入方式）、再走 function 提交路径的
+    // configure_fabric_managed()，发现仍必须委托给注入的策略而不是被覆盖回 fabric。
+    task test_injected_discovery_survives_fabric_config();
+        virtio_pci_transport transport;
+        virtio_unit_recording_discovery recorder;
+        virtio_resource_client client;
+
+        transport = virtio_pci_transport::type_id::create("injected_discovery_transport");
+        recorder = virtio_unit_recording_discovery::type_id::create(
+            "injected_discovery_recorder");
+        transport.set_discovery_strategy(recorder);
+        client = virtio_resource_client::type_id::create("injected_discovery_client");
+        transport.configure_fabric_managed(client);
+        if (transport.discovery_strategy_name() != "unit_recording")
+            `uvm_error("TEST", {"configure_fabric_managed replaced injected strategy with ",
+                                transport.discovery_strategy_name()})
+        transport.discover_and_init_bars();
+        if ((recorder.discover_count != 1) || (recorder.last_transport != transport))
+            `uvm_error("TEST", $sformatf(
+                "injected strategy not used after configure_fabric_managed (count=%0d)",
+                recorder.discover_count))
+        `uvm_info("UNIT_TEST", "test_injected_discovery_survives_fabric_config PASSED", UVM_LOW)
     endtask
 
     // atomic ops 的 status/feature/queue/MSI-X/复位副作用全部经注入后端，且队列
