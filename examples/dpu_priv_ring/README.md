@@ -104,7 +104,7 @@ if (function_instance.get_state() != VF_DISABLED)
 须先 `full_init()`；停机失败则 Function/FSM 分别进入 `VF_RESET_FAILED/FSM_ERROR`。
 数据面处于 `FSM_RUNNING` 时 `full_init()` 报 `UVM_ERROR` 并拒绝执行，须先停止数据面。
 
-队列大小可为 2..4096，不要求 2 的幂（`default_queue_size` 本身仍须为 2 的幂）；
+队列大小须为 2 的幂，2..4096（VTX/VRX `q_depth` 按 log2 编码，非 2 的幂由 `prepare_queue` 拒绝）；
 显式请求大小超过 `default_queue_size` 时截到该值并给出 `UVM_WARNING`。
 TX 遇到 ring 满（剩余槽不足以容纳本包描述符）时报 `UVM_ERROR`（`DPU_PRIV_RING`，
 与 split 一致），不再静默返回；调用方应先回收完成再投递。

@@ -405,8 +405,8 @@ class vdev_virtio_pci extends vdev_base;
         vdev_event e;
 
         if (!v) begin
-            // virtio 1.x 驱动不应写 0；按停队处理，后续 notify 被忽略。
-            vqs[q].enable = 0;
+            // virtio 1.2 §4.1.4.3.2：驱动不得写 0；告警且不停队（停队只能经 Q_RESET 或设备复位）。
+            `uvm_warning("VDEV_QUEUE", $sformatf("BDF 0x%04h queue %0d: driver wrote queue_enable=0", bdf, q))
             return;
         end
         if (vqs[q].enable)

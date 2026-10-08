@@ -896,7 +896,7 @@ else
   在 `alloc_rings` 前写入，分配后冻结。
 - desc 与 CQ 为一块连续分配，经 `get_ring_regions` 一次映射，CQ IOVA = ring IOVA + `queue_size*16`。
 - 通知字 `{wrap, tail, local_qid}` 由 ops 经配置后端写 doorbell。
-- 队列大小 2..4096，不要求 2 的幂；显式请求大小超过私有配置的 `default_queue_size`
+- 队列大小须为 2 的幂，2..4096（`q_depth` 按 log2 编码，非 2 的幂由 `prepare_queue` 拒绝）；显式请求大小超过私有配置的 `default_queue_size`
   时按通用 `setup_queue` 规则截到该值并给出 `UVM_WARNING`。
 - TX 在 ring 满时与 split 一致报 `UVM_ERROR`（`DPU_PRIV_RING`），不再静默返回。
 - 私有协议要求确认停 DMA 的复位，数据面处于 `FSM_RUNNING` 时 `full_init` 报错拒绝，

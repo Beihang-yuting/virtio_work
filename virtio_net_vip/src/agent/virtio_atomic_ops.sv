@@ -157,6 +157,20 @@ class virtio_atomic_ops extends uvm_object;
         return 1;
     endfunction
 
+    // 后端调用使用的队列编程参数：已建队返回记录值，否则返回只含 host/BDF/队列号的空程序
+    // （后端据此判定该队列未配置）。
+    protected function virtio_queue_program_t queue_program_of(int unsigned queue_id);
+        virtio_queue_program_t qprog;
+
+        if (queue_programs.exists(queue_id))
+            return queue_programs[queue_id];
+        qprog = virtio_empty_queue_program();
+        qprog.host_id  = get_iommu_host_id(transport);
+        qprog.bdf      = transport.bdf;
+        qprog.queue_id = queue_id;
+        return qprog;
+    endfunction
+
     // 是否仍有已编程队列；驱动协议据此拒绝对活动 ops 重新冻结配置。
     function bit has_active_queues();
         return queue_programs.num() != 0;
@@ -182,21 +196,15 @@ class virtio_atomic_ops extends uvm_object;
     protected task kick_with_fault(virtqueue_base vq, int unsigned qid,
                                    virtio_pci_transport via = null);
         virtio_config_backend backend;
-        virtio_queue_program_t qprog;
 
         void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
         if (vq.prepare_notify()) begin
             if (via != null)
                 via.kick(qid, vq.get_notify_next_idx(), vq.get_notify_wrap());
             else begin
-                if (queue_programs.exists(qid))
-                    qprog = queue_programs[qid];
-                else begin
-                    qprog = virtio_empty_queue_program();
-                    qprog.queue_id = qid;
-                end
                 backend = cfg_backend();
-                backend.notify_queue(qprog, vq.get_notify_next_idx(), vq.get_notify_wrap());
+                backend.notify_queue(queue_program_of(qid), vq.get_notify_next_idx(),
+                                     vq.get_notify_wrap());
             end
         end
         void'(vq.process_error_injection(VQ_FAULT_POST_NOTIFY));

@@ -313,7 +313,8 @@ class dpu_priv_config_backend extends virtio_config_backend;
     endtask
 
     // 把参数表应用到新建的私有队列（方向、本地号、TX 首描述符控制）与编程参数
-    // （本地号、RX 容量、doorbell 位置）；非私有格式或表外队列拒绝。
+    // （本地号、RX 容量、doorbell 位置）；非私有格式、表外队列或非 2 的幂深度（VTX/VRX
+    // q_depth 按 log2 编码，设备解码为 1<<depth）拒绝。
     virtual function bit prepare_queue(virtqueue_base vq, ref virtio_queue_program_t q);
         custom_virtqueue pvq;
         dpu_priv_queue_config c;
@@ -321,6 +322,12 @@ class dpu_priv_config_backend extends virtio_config_backend;
         if (!$cast(pvq, vq) || (pvq == null) || !queue_cfg.exists(q.queue_id)) begin
             `uvm_error("DPU_PRIV_BACKEND", $sformatf(
                 "prepare_queue: queue %0d 不是已配置的私有队列", q.queue_id))
+            return 0;
+        end
+        if ((q.queue_size & (q.queue_size - 1)) != 0) begin
+            `uvm_error("DPU_PRIV_BACKEND", $sformatf(
+                "prepare_queue: queue %0d 深度 %0d 不是 2 的幂（q_depth 按 log2 编码）",
+                q.queue_id, q.queue_size))
             return 0;
         end
         c = queue_cfg[q.queue_id];
@@ -442,9 +449,9 @@ class dpu_priv_config_backend extends virtio_config_backend;
         active.delete(q.queue_id);
     endtask
 
-    // 私有队列复位 = 停队（teardown 已确认）+ 重建；这里没有寄存器动作。
+    // 私有设备不协商 RING_RESET、没有 Q_RESET；单队列停止由 disable_queue 完成。不访问设备，返回未确认。
     virtual task reset_queue(int unsigned queue_id, output bit ok);
-        ok = 1;
+        ok = 0;
     endtask
 
     // VIP 私有数据面固定 polling，不编程 PCI MSI-X 表；设备侧映射在 discover/enable_queue 中按驱动建立。

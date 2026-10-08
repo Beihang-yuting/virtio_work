@@ -94,9 +94,10 @@ virtual class virtio_config_backend extends uvm_object;
     pure virtual task configure_queue(virtio_queue_program_t q, output bit ok);
     // 允许设备开始访问已编程的队列。
     pure virtual task enable_queue(virtio_queue_program_t q, output bit ok);
-    // 停止队列并等待其 DMA 排空。
+    // 未协商 VIRTIO_F_RING_RESET 时的单队列停止；ok=1 表示设备已确认不再访问该队列。
     pure virtual task disable_queue(virtio_queue_program_t q, output bit ok);
-    // 单队列复位（virtio 1.2 Q_RESET 语义）。
+    // 单队列复位（virtio 1.2 Q_RESET 语义，需协商 VIRTIO_F_RING_RESET）；ok=1 表示复位完成、
+    // 设备已停止访问该队列。
     pure virtual task reset_queue(int unsigned queue_id, output bit ok);
     // 为 queue_ids 中的每条队列（升序的实际队列号）与 config change 建立 MSI-X
     // （或回退 INTx）。队列号可以不连续（control VQ 位于 2*max_virtqueue_pairs）。
@@ -192,11 +193,10 @@ class virtio_common_cfg_backend extends virtio_config_backend;
         ok = 1;
     endtask
 
-    // Q_SELECT 后写 Q_ENABLE=0；标准设备无停止确认，按已停止处理。
+    // virtio 1.2 §4.1.4.3.2：驱动不得向 queue_enable 写 0，未协商 RING_RESET 时标准设备没有单队列
+    // 停止手段（只能 Function 复位）。不访问设备，返回未确认。
     virtual task disable_queue(virtio_queue_program_t q, output bit ok);
-        transport.select_queue(q.queue_id);
-        transport.write_queue_enable(0);
-        ok = 1;
+        ok = 0;
     endtask
 
     // 写 Q_RESET 并轮询完成；超时由 transport 报告并返回 ok=0。

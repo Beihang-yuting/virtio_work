@@ -600,7 +600,16 @@ class virtio_vdev_unit_test extends uvm_test;
         if ((std_rd(32'h1c, 2) != 1) || (ev.size() != 1) || (ev[0].q != 0) || (ev[0].size != 8) ||
             (ev[0].vector != 1) || (ev[0].ring_fmt != "split"))
             `uvm_fatal("VDEV_UNIT", "complete queue programming did not enable the queue")
+        // virtio 1.2 §4.1.4.3.2：驱动不得写 queue_enable=0；设备告警且不当作停队，停队只能经复位。
+        catcher = new("enable0_catcher");
+        catcher.id = "VDEV_QUEUE";
+        catcher.text = "queue_enable=0";
+        uvm_report_cb::add(null, catcher);
         std_wr(32'h1c, 2, 0);
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught != 1) || (std_rd(32'h1c, 2) != 1))
+            `uvm_fatal("VDEV_UNIT", "queue_enable=0 write was not flagged or stopped the queue")
+        std_wr(32'h14, 1, 0);
         std_release(vq, iovas);
         `uvm_info("VDEV_UNIT", "test_std_enable_requires_all_addresses PASSED", UVM_LOW)
     endtask
@@ -1658,6 +1667,8 @@ class virtio_vdev_unit_test extends uvm_test;
         vdev_loopback_bar_accessor acc;
         dpu_priv_config_backend be;
         dpu_priv_driver_config cfg;
+        custom_virtqueue pvq;
+        vdev_expect_catcher catcher;
         virtio_queue_program_t rxp, txp, rx1p, tx1p, stray;
         virtio_queue_program_t progs[4];
         string trace[$];
@@ -1721,6 +1732,18 @@ class virtio_vdev_unit_test extends uvm_test;
         priv_log.reg_trace(trace);
         if (trace.size() != 0)
             `uvm_fatal("VDEV_UNIT", "private discover repeated the probe sequence")
+        // VTX/VRX q_depth 是 log2 编码：非 2 的幂的大小（300）在建队前拒绝，不访问设备
+        pvq = custom_virtqueue::type_id::create("priv_npot_vq");
+        rxp = virtio_empty_queue_program();
+        rxp.queue_size = 300;
+        catcher = new("priv_npot_catcher");
+        catcher.id = "DPU_PRIV_BACKEND";
+        catcher.text = "2 的幂";
+        uvm_report_cb::add(null, catcher);
+        ok = be.prepare_queue(pvq, rxp);
+        uvm_report_cb::delete(null, catcher);
+        if (ok || (catcher.caught != 1))
+            `uvm_fatal("VDEV_UNIT", "private prepare_queue accepted non-power-of-two size 300")
         // open：RX 建队+中断，TX 建队+使能
         rx_ring = map_buffer(PRIV_BDF, 4096, DMA_BIDIRECTIONAL, rx_gpa);
         tx_ring = map_buffer(PRIV_BDF, 4096, DMA_BIDIRECTIONAL, tx_gpa);

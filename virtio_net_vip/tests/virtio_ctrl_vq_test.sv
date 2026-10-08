@@ -330,6 +330,42 @@ class virtio_ctrl_vq_test_device extends virtio_mock_transport;
     endfunction
 endclass : virtio_ctrl_vq_test_device
 
+// 停队顺序探针：记录 queue_enable 写、Q_RESET 与 ring/DMA 解映射的先后（同一日志）。
+class virtio_ctrl_vq_test_order_transport extends virtio_mock_transport;
+    `uvm_object_utils(virtio_ctrl_vq_test_order_transport)
+
+    string log[$];
+
+    function new(string name = "virtio_ctrl_vq_test_order_transport");
+        super.new(name);
+    endfunction
+
+    virtual task write_queue_enable(bit enable);
+        log.push_back($sformatf("enable %0d", enable));
+    endtask
+
+    virtual task write_queue_reset_verified(int unsigned queue_id, ref bit reset_complete);
+        super.write_queue_reset_verified(queue_id, reset_complete);
+        log.push_back($sformatf("qreset %0d", queue_id));
+    endtask
+endclass : virtio_ctrl_vq_test_order_transport
+
+class virtio_ctrl_vq_test_order_iommu extends virtio_ctrl_vq_test_iommu;
+    `uvm_object_utils(virtio_ctrl_vq_test_order_iommu)
+
+    virtio_ctrl_vq_test_order_transport log_to;
+
+    function new(string name = "virtio_ctrl_vq_test_order_iommu");
+        super.new(name);
+    endfunction
+
+    virtual function void unmap_for_host(int unsigned host_id, bit [15:0] bdf, bit [63:0] iova,
+                                         string file = "", int line = 0);
+        log_to.log.push_back("unmap");
+        super.unmap_for_host(host_id, bdf, iova, file, line);
+    endfunction
+endclass : virtio_ctrl_vq_test_order_iommu
+
 class virtio_ctrl_vq_test extends uvm_test;
     `uvm_component_utils(virtio_ctrl_vq_test)
 
@@ -348,6 +384,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         test_ctrl_vq_outside_data_range_migration_and_msix();
         test_mq_expansion_binds_new_queue_vectors();
         test_full_init_binds_msix_before_enable();
+        test_queue_stop_uses_ring_reset();
         `uvm_info("CTRL_VQ_TEST", "control VQ tests PASSED", UVM_NONE)
         phase.drop_objection(this);
     endtask
@@ -432,8 +469,7 @@ class virtio_ctrl_vq_test extends uvm_test;
             else `uvm_fatal("CTRL_VQ_TEST",
                 "MQ expansion 1->2 collided with the control VQ")
 
-        foreach (expected_qids[i])
-            ops.teardown_queue(expected_qids[i]);
+        ops.device_reset();
         assert((vq_mgr.get_queue_count() == 0) &&
                (iommu.active_mapping_count() == 0) &&
                (mem.outstanding_allocations() == 0))
@@ -470,8 +506,10 @@ class virtio_ctrl_vq_test extends uvm_test;
             else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
                 "without MQ the control VQ must be queue 2 (ok=%0b q2=%0b count=%0d net_config_reads=%0d)",
                 ok, vq_mgr.has_queue(2), vq_mgr.get_queue_count(), transport.net_config_reads))
-        for (int unsigned qid = 0; qid < 3; qid++)
-            ops.teardown_queue(qid);
+        // 未协商 RING_RESET 不能单独停队：设备复位回收，再恢复本用例的协商结果。
+        ops.device_reset();
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
 
         catcher = new("nomq_pairs_catcher");
         catcher.expect_error("ATOMIC_OPS", "*requires VIRTIO_NET_F_MQ*");
@@ -539,7 +577,7 @@ class virtio_ctrl_vq_test extends uvm_test;
                 iommu.active_mapping_count(), maps_before, transport.kick_count,
                 ctrl_vq.get_free_count()))
 
-        ops.teardown_queue(2);
+        ops.device_reset();
         assert((iommu.active_mapping_count() == 0) &&
                (ring_mem.outstanding_allocations() == 0))
             else `uvm_fatal("CTRL_VQ_TEST", "alloc-failure test leaked control queue resources")
@@ -598,7 +636,7 @@ class virtio_ctrl_vq_test extends uvm_test;
                 allocs_before, iommu.active_mapping_count(), maps_before,
                 transport.kick_count, ctrl_vq.get_free_count()))
 
-        ops.teardown_queue(2);
+        ops.device_reset();
         assert((iommu.active_mapping_count() == 0) &&
                (mem.outstanding_allocations() == 0))
             else `uvm_fatal("CTRL_VQ_TEST", "map-failure test leaked control queue resources")
@@ -715,8 +753,7 @@ class virtio_ctrl_vq_test extends uvm_test;
                     expected_qids[i], transport.enable_vectors, transport.notify_mgr.queue_vectors,
                     transport.notify_mgr.config_vector))
 
-        foreach (expected_qids[i])
-            ops.teardown_queue(expected_qids[i]);
+        ops.device_reset();
         if ((vq_mgr.get_queue_count() != 0) ||
             (iommu.active_mapping_count() != 0) ||
             (mem.outstanding_allocations() != 0))
@@ -828,6 +865,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         catcher = new("quarantine_catcher");
         catcher.expect_error("ATOMIC_OPS", "*ctrl_send: timeout waiting for control VQ completion*");
         catcher.expect_error("ATOMIC_OPS", "*DMA is quarantined until device reset*");
+        catcher.expect_error("ATOMIC_OPS", "*teardown_queue: config backend did not confirm queue_id=2 stopped*");
         catcher.expect_error("ATOMIC_OPS", "*ctrl_send: control VQ has quarantined DMA; device reset required*");
         uvm_report_cb::add(null, catcher);
         ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
@@ -846,7 +884,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
                       data, second_ack);
         uvm_report_cb::delete(null, catcher);
-        assert((second_ack == VIRTIO_NET_CTRL_ACK_ERR) && (catcher.caught_count == 3) &&
+        assert((second_ack == VIRTIO_NET_CTRL_ACK_ERR) && (catcher.caught_count == 4) &&
                (device.kick_count == 1))
             else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
                 "control VQ accepted a command while DMA was quarantined (ack=%s caught=%0d kicks=%0d)",
@@ -947,8 +985,7 @@ class virtio_ctrl_vq_test extends uvm_test;
             seen_vectors[transport.enable_vectors[qids[i]]] = 1;
         end
 
-        foreach (qids[i])
-            ops.teardown_queue(qids[i]);
+        ops.device_reset();
         if ((vq_mgr.get_queue_count() != 0) || (iommu.active_mapping_count() != 0) ||
             (mem.outstanding_allocations() != 0))
             `uvm_error("CTRL_VQ_TEST", "MQ MSI-X test leaked queue resources")
@@ -1021,13 +1058,101 @@ class virtio_ctrl_vq_test extends uvm_test;
                     transport.notify_mgr.config_vector))
         end
 
-        foreach (qids[i])
-            ops.teardown_queue(qids[i]);
+        ops.device_reset();
         if ((vq_mgr.get_queue_count() != 0) || (iommu.active_mapping_count() != 0) ||
             (mem.outstanding_allocations() != 0))
             `uvm_error("CTRL_VQ_TEST", "full_init MSI-X test leaked queue resources")
         mem.leak_check();
         `uvm_info("CTRL_VQ_TEST", "full_init MSI-X before enable test PASSED", UVM_LOW)
+    endtask
+
+    // virtio 1.2 §4.1.4.3.2：驱动不得写 queue_enable=0。单队列复位（reset_single_queue）与 MQ 缩容都经
+    // teardown_queue 停队：协商 RING_RESET 时先 Q_RESET（已确认）再解映射；未协商时标准设备无法单独停队，
+    // 拒绝并保留队列（不写 enable=0、不解映射），缩容在提交 MQ 命令前拒绝。
+    task test_queue_stop_uses_ring_reset();
+        virtio_ctrl_vq_test_order_transport transport =
+            virtio_ctrl_vq_test_order_transport::type_id::create("order_transport");
+        virtio_ctrl_vq_test_mq_ops ops = virtio_ctrl_vq_test_mq_ops::type_id::create("order_ops");
+        virtqueue_manager vq_mgr = virtqueue_manager::type_id::create("order_vq_mgr");
+        virtio_ctrl_vq_test_mem mem = virtio_ctrl_vq_test_mem::type_id::create("order_mem");
+        virtio_ctrl_vq_test_order_iommu iommu =
+            virtio_ctrl_vq_test_order_iommu::type_id::create("order_iommu");
+        virtio_ctrl_vq_test_migration_fsm fsm =
+            virtio_ctrl_vq_test_migration_fsm::type_id::create("order_fsm");
+        virtio_ctrl_vq_test_catcher catcher;
+        int unsigned qids[$];
+        int unsigned expected_qids[$];
+        string want[$];
+        bit ok;
+        string why;
+
+        mem.init_region(64'h7800_0000, 64'h7800_FFFF);
+        iommu.log_to = transport;
+        wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h0908);
+        transport.mock_net_config.max_virtqueue_pairs = 2;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_all_queues(2, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 5))
+            `uvm_fatal("CTRL_VQ_TEST", "queue-stop test setup did not create queues {0..4}")
+        fsm.ops = ops;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.set_topology(2, 5);
+
+        // 未协商 RING_RESET：拒绝，不访问设备、不解映射，队列保留。
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b0;
+        transport.log.delete();
+        catcher = new("order_refuse_catcher");
+        catcher.expect_error("ATOMIC_OPS", "*teardown_queue: config backend did not confirm queue_id=1 stopped*");
+        catcher.expect_error("AUTO_FSM", "*reset_single_queue: queue 1 was not stopped*");
+        catcher.expect_error("AUTO_FSM", "*configure_mq: shrinking 2->1 pairs requires VIRTIO_F_RING_RESET*");
+        uvm_report_cb::add(null, catcher);
+        fsm.reset_single_queue(1);
+        fsm.state = FSM_READY;
+        fsm.configure_mq(1);
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught_count != 3) || (transport.log.size() != 0) ||
+            (vq_mgr.get_queue_count() != 5) || (ops.mq_requests.size() != 0))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "queue stop without RING_RESET was not refused cleanly (caught=%0d log=%p queues=%0d mq=%p)",
+                catcher.caught_count, transport.log, vq_mgr.get_queue_count(), ops.mq_requests))
+
+        // 协商 RING_RESET：reset_single_queue 先 Q_RESET 再解映射，重建后队列 1 回到设备。
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        transport.log.delete();
+        transport.programmed_qids.delete();
+        fsm.reset_single_queue(1);
+        want = '{"qreset 1", "unmap", "unmap", "unmap"};
+        expected_qids = '{1};
+        if ((fsm.state == FSM_ERROR) || (transport.log != want) || !vq_mgr.has_queue(1) ||
+            (transport.programmed_qids != expected_qids))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "reset_single_queue did not Q_RESET before unmapping (state=%s log=%p programmed=%p)",
+                fsm.state.name(), transport.log, transport.programmed_qids))
+
+        // MQ 缩容 2->1 走同一停队路径：每条队列先 Q_RESET 再解映射。
+        transport.log.delete();
+        fsm.configure_mq(1);
+        want = '{"qreset 2", "unmap", "unmap", "unmap", "qreset 3", "unmap", "unmap", "unmap"};
+        vq_mgr.get_queue_ids(qids);
+        expected_qids = '{0, 1, 4};
+        if ((fsm.state == FSM_ERROR) || (transport.log != want) || (qids != expected_qids))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "MQ shrink did not Q_RESET each queue before unmapping (state=%s log=%p queues=%p)",
+                fsm.state.name(), transport.log, qids))
+
+        ops.device_reset();
+        if ((vq_mgr.get_queue_count() != 0) || (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("CTRL_VQ_TEST", "queue-stop test leaked queue resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST", "queue stop via RING_RESET test PASSED", UVM_LOW)
     endtask
 endclass : virtio_ctrl_vq_test
 

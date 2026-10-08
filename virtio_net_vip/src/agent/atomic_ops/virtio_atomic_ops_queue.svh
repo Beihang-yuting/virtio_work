@@ -178,29 +178,25 @@
     endtask
 
     // ------------------------------------------------------------------------
-    // teardown_queue -- Disable, detach, unmap, and destroy a queue
+    // teardown_queue -- Stop (confirmed), detach, unmap, and destroy a queue
     // ------------------------------------------------------------------------
     virtual task teardown_queue(int unsigned queue_id);
         virtqueue_base vq;
         uvm_object tokens[$];
         virtio_config_backend backend;
-        virtio_queue_program_t qprog;
         bit stopped;
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("teardown_queue: queue_id=%0d", queue_id), UVM_MEDIUM)
 
-        // 1. 经配置后端停用队列；后端未确认停止时保留全部 ring/DMA 所有权。
-        if (queue_programs.exists(queue_id))
-            qprog = queue_programs[queue_id];
-        else begin
-            qprog = virtio_empty_queue_program();
-            qprog.host_id  = get_iommu_host_id(transport);
-            qprog.bdf      = transport.bdf;
-            qprog.queue_id = queue_id;
-        end
+        // 1. 先确认设备停止访问该队列再动 ring/DMA。virtio 1.2 §4.1.4.3.2 禁止写 queue_enable=0：
+        // 协商 VIRTIO_F_RING_RESET 时经后端 Q_RESET 并轮询完成；否则由后端停队（标准设备没有单队列
+        // 停止手段，返回未确认；私有设备走寄存器停队）。未确认时保留全部 ring/DMA，由 Function 复位回收。
         backend = cfg_backend();
-        backend.disable_queue(qprog, stopped);
+        if (negotiated_features[VIRTIO_F_RING_RESET])
+            backend.reset_queue(queue_id, stopped);
+        else
+            backend.disable_queue(queue_program_of(queue_id), stopped);
         if (!stopped) begin
             `uvm_error("ATOMIC_OPS", $sformatf(
                 "teardown_queue: config backend did not confirm queue_id=%0d stopped; retaining queue DMA",

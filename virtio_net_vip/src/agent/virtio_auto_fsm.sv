@@ -578,10 +578,18 @@ class virtio_auto_fsm extends uvm_report_object;
     // （任一失败拆除本次新建的全部队列并 FSM_ERROR；新队列由 setup_queue 分配向量并在
     // queue_enable 之前写入，已使能队列的向量不变），最后更新 active_num_pairs 与
     // num_total_queues。
-    // 设备拒绝时仅报错、不动现有队列。
+    // 设备拒绝时仅报错、不动现有队列。缩容要拆队，未协商 VIRTIO_F_RING_RESET 时标准设备
+    // 无法单独停队（virtio 1.2 §4.1.4.3.2），在提交 MQ 变更前拒绝。
     protected virtual task do_configure_mq(int unsigned num_pairs);
         bit success;
         bit setup_ok;
+
+        if ((num_pairs < active_num_pairs) && !ops.negotiated_features[VIRTIO_F_RING_RESET]) begin
+            `uvm_error("AUTO_FSM", $sformatf(
+                "configure_mq: shrinking %0d->%0d pairs requires VIRTIO_F_RING_RESET to stop queues",
+                active_num_pairs, num_pairs))
+            return;
+        end
 
         `uvm_info("AUTO_FSM",
             $sformatf("configure_mq: changing from %0d to %0d pairs",
@@ -590,11 +598,15 @@ class virtio_auto_fsm extends uvm_report_object;
         ops.ctrl_set_mq_pairs(num_pairs, success);
 
         if (success) begin
-            // Teardown queues that are no longer needed
-            if (num_pairs < active_num_pairs) begin
-                for (int unsigned i = num_pairs; i < active_num_pairs; i++) begin
-                    ops.teardown_queue(i * 2);      // receiveq
-                    ops.teardown_queue(i * 2 + 1);  // transmitq
+            // 缩容拆除多余队列对；任一队列未确认停止即保留并 FSM_ERROR。
+            for (int unsigned i = num_pairs; i < active_num_pairs; i++) begin
+                ops.teardown_queue(i * 2);      // receiveq
+                ops.teardown_queue(i * 2 + 1);  // transmitq
+                if (ops.vq_mgr.has_queue(i * 2) || ops.vq_mgr.has_queue(i * 2 + 1)) begin
+                    state = FSM_ERROR;
+                    `uvm_error("AUTO_FSM", $sformatf(
+                        "configure_mq: queue pair %0d was not stopped; retaining it", i))
+                    return;
                 end
             end
 
@@ -602,7 +614,7 @@ class virtio_auto_fsm extends uvm_report_object;
             // created by this expansion before reporting.
             if (num_pairs > active_num_pairs) begin
                 ops.setup_queue_range(active_num_pairs, num_pairs - active_num_pairs,
-                                      drv_cfg.vq_type, drv_cfg.queue_size, setup_ok);
+                                      queue_format(), drv_cfg.queue_size, setup_ok);
                 if (!setup_ok) begin
                     state = FSM_ERROR;
                     `uvm_error("AUTO_FSM", $sformatf(
@@ -851,8 +863,9 @@ class virtio_auto_fsm extends uvm_report_object;
     // ------------------------------------------------------------------------
     // reset_single_queue -- Reset and re-setup a single queue
     //
-    // 先停后台 worker（它们会轮询被拆除的队列），teardown 未确认停 DMA 时保留队列并
-    // 进入 FSM_ERROR；重建成功后 RX 队列补 buffer，原先运行的数据面重新启动。
+    // 先停后台 worker（它们会轮询被拆除的队列）。teardown 内完成停队确认（协商 RING_RESET
+    // 时即 Q_RESET；未协商时标准设备无法单独停队），未确认时保留队列并进入 FSM_ERROR；
+    // 重建成功后 RX 队列补 buffer，原先运行的数据面重新启动。
     // ------------------------------------------------------------------------
     virtual task reset_single_queue(int unsigned queue_id);
         bit setup_ok;
@@ -871,9 +884,6 @@ class virtio_auto_fsm extends uvm_report_object;
                 "reset_single_queue: queue %0d was not stopped; retaining it", queue_id))
             return;
         end
-
-        // 经配置后端复位（标准：Q_RESET；私有：teardown 已完成停队）
-        ops.reset_queue(queue_id);
 
         ops.setup_queue(queue_id, drv_cfg.queue_size, queue_format(), setup_ok);
         if (!setup_ok) begin
