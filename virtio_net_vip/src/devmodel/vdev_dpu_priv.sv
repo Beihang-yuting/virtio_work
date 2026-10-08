@@ -88,6 +88,9 @@
 //   因此 cosim 中 probe 打印 "There is no available VLAN slot left"（macvlan.c:1635，flow 关，VLAN 广播流表 0 项）；另有
 //   发往 ECPU 的组播地址 mailbox 消息（type 131 DPU_MAILBOX_CFG_MC_ADDR，adapter_ops.c:119/124）等待 USED 超时（M-8）。
 //   两者驱动均容忍，netdev 照常注册、收发。
+// - AF 特殊队列（cosim 对比 PRIV-04）：AF probe 另建 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）
+//   两个管理队列（main.c:2247/2255 激活，txrx.c:3852–3866 定义、:4082 建队；dpu_remove main.c:2520–2521 停用），走与数据
+//   队列相同的 #24/#25/#27/#28/#33 序列。它们不属于 Function 的数据队列对，只出现在 Linux 轨迹，VIP 后端不建，对比时列白名单。
 `ifndef VDEV_DPU_PRIV_SV
 `define VDEV_DPU_PRIV_SV
 
