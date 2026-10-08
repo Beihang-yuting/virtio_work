@@ -1185,6 +1185,22 @@ virtio_auto_fsm   virtio_atomic_ops
 该状态时主动执行整 Function 复位，成功后进入 `FSM_REINIT_REQUIRED`，失败则进入
 `FSM_ERROR` 并保留仍可能被设备访问的资源。
 
+`full_init()` 可以先按 `drv_cfg.num_queue_pairs` 建好全部 Host 队列，而标准设备在
+Function reset 后的 MQ 缺省值仍是一对。FSM 因此同时保存目标对数和
+`mq_pair_count_is_committed()` 有效位：首次 `configure_mq(N)` 即使 `N` 与预建目标
+相同，也必须发送 `VQ_PAIRS_SET`；设备 ACK 且 Host 拓扑完整提交后，后续同值请求才
+作为无副作用操作返回。有效位为 0 时拒绝启动数据面，避免 worker 使用设备尚未激活
+的队列。
+
+该提交边界同样适用于自动恢复和迁移恢复。`DEVICE_NEEDS_RESET` 触发的完整初始化在
+多队列目标下先执行同值 `configure_mq(N)`，只有提交成功才重启 worker；设备明确拒绝
+时保留 `FSM_READY`、未提交标志和安全预建的 Host 队列供调用方重试，命令结果不确定
+时沿用整 Function 复位产生的 `FSM_REINIT_REQUIRED` 或 `FSM_ERROR`。迁移恢复在真正
+复位前清除旧提交标志，完整重建快照队列并进入 `DRIVER_OK` 后重新提交多队列目标。
+明确拒绝意味着本次迁移未原子完成，因此执行 verified Function reset：复位成功回收
+全部目标端资源并进入 `FSM_REINIT_REQUIRED`，复位失败则进入 `FSM_ERROR` 并保留仍
+可能被设备访问的 DMA。任何恢复路径都只在 `FSM_READY` 且提交标志有效时启动数据面。
+
 #### 4.7.3 自动状态机 (`virtio_auto_fsm`)
 
 **FSM 状态转换图：**
@@ -2258,6 +2274,7 @@ lease，RC 再按 lease 调用 `program_fabric_bar_pairs()` 编程 PCIe config-s
 | `send_packets` | task | 发送报文 |
 | `wait_packets` | task | 等待接收报文 |
 | `configure_mq` | task | 动态调整 MQ 对数 |
+| `mq_pair_count_is_committed` | function | 查询当前 MQ 目标是否已由设备确认并完成 Host 拓扑提交 |
 | `configure_rss` | task | 配置 RSS |
 | `freeze_for_migration` | task | 冻结设备 (迁移) |
 | `restore_from_migration` | task | 恢复设备 (迁移) |

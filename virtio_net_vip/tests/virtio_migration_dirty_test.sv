@@ -353,6 +353,16 @@ class virtio_migration_dirty_test_fsm extends virtio_auto_fsm;
     endtask
 
     virtual task start_dataplane();
+        // 该桩只替代后台 worker，不得绕过生产 FSM 新增的 MQ 提交门禁。单对恢复在
+        // 队列完整重建后会自然提交；若未来多对用例漏发 VQ_PAIRS_SET，本断言会在
+        // 伪造 FSM_RUNNING 之前暴露顺序错误。
+        if ((state != FSM_READY) || !mq_pair_count_is_committed()) begin
+            `uvm_fatal("MIGRATION", $sformatf(
+                {"migration start bypassed readiness gate: state=%s ",
+                 "committed=%0b"}, state.name(),
+                mq_pair_count_is_committed()))
+            return;
+        end
         start_count++;
         state = FSM_RUNNING;
     endtask

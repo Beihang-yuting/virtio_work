@@ -281,13 +281,30 @@ endclass : virtio_ctrl_vq_migration_transport
 class virtio_ctrl_vq_test_migration_fsm extends virtio_auto_fsm;
     `uvm_object_utils(virtio_ctrl_vq_test_migration_fsm)
 
+    int unsigned start_count;
+
     function new(string name = "virtio_ctrl_vq_test_migration_fsm");
         super.new(name);
+        start_count = 0;
     endfunction
 
     function void set_topology(int unsigned num_pairs, int unsigned num_queues);
         active_num_pairs = num_pairs;
         num_total_queues = num_queues;
+        // 手工注入的拓扑用于模拟设备已经接受的运行前基线；显式设置提交态，避免
+        // 测试依赖构造函数缺省值，也与 migration restore 的未提交阶段清楚区分。
+        mq_pairs_committed = 1;
+    endfunction
+
+    // 暴露生产自动恢复体供测试驱动；实现仍完整执行基类的 reset/full_init/MQ 提交
+    // 顺序，本 wrapper 不改变状态或资源。
+    task run_complete_device_recovery();
+        complete_device_recovery();
+    endtask
+
+    // 返回 FSM 维护的队列诊断计数，用于断言迁移回滚成功后已经记录空拓扑。
+    function int unsigned tracked_total_queue_count();
+        return num_total_queues;
     endfunction
 
     virtual task stop_dataplane();
@@ -295,6 +312,15 @@ class virtio_ctrl_vq_test_migration_fsm extends virtio_auto_fsm;
     endtask
 
     virtual task start_dataplane();
+        // 测试桩只省略无限 worker，不得省略生产入口的 MQ 提交门禁；若调用方在
+        // committed=0 时试图启动，立即失败，从而让迁移/自动恢复顺序错误可见。
+        if ((state != FSM_READY) || !mq_pairs_committed) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"migration FSM start bypassed readiness gate: state=%s ",
+                 "committed=%0b"}, state.name(), mq_pairs_committed))
+            return;
+        end
+        start_count++;
         state = FSM_RUNNING;
     endtask
 endclass : virtio_ctrl_vq_test_migration_fsm
@@ -326,6 +352,9 @@ class virtio_ctrl_vq_test_runtime_mq_fsm extends virtio_auto_fsm;
     );
         active_num_pairs = num_pairs;
         num_total_queues = num_queues;
+        // 本 helper 构造的是已经由设备接受并正在运行的入口拓扑；显式置位避免测试
+        // 依赖构造函数的缺省值，也区分 full_init 尚待首次 control 提交的预建拓扑。
+        mq_pairs_committed = 1;
         worker_generation = 1;
         worker_qids.delete();
         for (int unsigned pair = 0; pair < active_num_pairs; pair++) begin
@@ -545,6 +574,10 @@ class virtio_ctrl_vq_test extends uvm_test;
         test_ctrl_send_rebuild_failure_requires_verified_reset();
         test_ctrl_send_timeout_quarantines_without_ring_reset();
         test_ctrl_vq_outside_data_range_migration_and_msix();
+        test_two_pair_migration_recommits_mq_before_start();
+        test_two_pair_migration_mq_reject_rolls_back();
+        test_two_pair_device_recovery_recommits_mq();
+        test_two_pair_device_recovery_mq_reject_stays_ready();
         test_mq_expansion_binds_new_queue_vectors();
         test_runtime_mq_restarts_matching_workers();
         test_runtime_mq_device_reject_keeps_old_topology();
@@ -553,6 +586,7 @@ class virtio_ctrl_vq_test extends uvm_test;
         test_runtime_mq_rollback_reset_requires_reinit();
         test_runtime_mq_partial_shrink_requires_reset();
         test_runtime_mq_partial_shrink_reset_failure();
+        test_full_init_same_target_programs_mq_once();
         test_full_init_binds_msix_before_enable();
         test_queue_stop_uses_ring_reset();
         `uvm_info("CTRL_VQ_TEST", "control VQ tests PASSED", UVM_NONE)
@@ -590,6 +624,104 @@ class virtio_ctrl_vq_test extends uvm_test;
         ops.wait_pol = wait_pol;
         virtio_vq_test_kit::bind_common_backend(ops);
     endfunction
+
+    // 为迁移与自动恢复用例构造同一套两对标准 Virtio Function：固定 control VQ=4，
+    // 真实使用生产队列 manager、IOMMU、Host memory、配置后端和 atomic ops，仅用本地
+    // transport 吞掉 PCIe MMIO。所有句柄由本 task 创建并返回，调用方负责最终 reset
+    // 和 leak_check。
+    protected task build_two_pair_lifecycle_context(
+        input string                              prefix,
+        input bit [15:0]                          bdf,
+        input bit [63:0]                          mem_base,
+        output virtio_ctrl_vq_migration_transport transport,
+        output virtio_ctrl_vq_test_mq_ops         ops,
+        output virtqueue_manager                  vq_mgr,
+        output virtio_ctrl_vq_test_mem            mem,
+        output virtio_ctrl_vq_test_iommu          iommu,
+        output virtio_ctrl_vq_test_migration_fsm  fsm
+    );
+        virtio_memory_barrier_model barrier;
+        virtio_wait_policy wait_pol;
+        bit [63:0] features;
+        string why;
+
+        transport = virtio_ctrl_vq_migration_transport::type_id::create(
+            {prefix, "_transport"});
+        ops = virtio_ctrl_vq_test_mq_ops::type_id::create({prefix, "_ops"});
+        vq_mgr = virtqueue_manager::type_id::create({prefix, "_vq_mgr"});
+        mem = virtio_ctrl_vq_test_mem::type_id::create({prefix, "_mem"});
+        iommu = virtio_ctrl_vq_test_iommu::type_id::create({prefix, "_iommu"});
+        fsm = virtio_ctrl_vq_test_migration_fsm::type_id::create(
+            {prefix, "_fsm"});
+        barrier = virtio_memory_barrier_model::type_id::create(
+            {prefix, "_barrier"});
+        wait_pol = virtio_wait_policy::type_id::create({prefix, "_wait_pol"});
+
+        mem.init_region(mem_base, mem_base + 64'hFFFF);
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.barrier = barrier;
+        vq_mgr.wait_pol = wait_pol;
+        vq_mgr.bdf = bdf;
+        transport.configure_pcie_identity(
+            virtio_vq_test_kit::host0_pcie_id(bdf));
+        transport.max_virtqueue_pairs = 2;
+        transport.cap_mgr.msix_found = 1;
+        transport.cap_mgr.msix_table_size = 8;
+        transport.cap_mgr.msix_table_bir = 4;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = wait_pol;
+        virtio_vq_test_kit::bind_common_backend(ops);
+
+        features = '0;
+        features[VIRTIO_F_VERSION_1] = 1'b1;
+        features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        features[VIRTIO_NET_F_MQ] = 1'b1;
+        fsm.ops = ops;
+        fsm.drv_cfg.driver_features = features;
+        fsm.drv_cfg.num_queue_pairs = 2;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+    endtask
+
+    // 把两对 fixture 推进到已提交且正在运行的源端状态。full_init 只预建队列，随后
+    // 必须恰好一次同值 MQ 命令提交设备目标，再由门禁感知的轻量 start 桩进入 RUNNING。
+    protected task start_two_pair_source(
+        virtio_ctrl_vq_test_migration_fsm fsm,
+        virtio_ctrl_vq_test_mq_ops        ops,
+        virtqueue_manager                 vq_mgr
+    );
+        fsm.full_init();
+        if ((fsm.state != FSM_READY) ||
+            (fsm.active_queue_pair_count() != 2) ||
+            fsm.mq_pair_count_is_committed() ||
+            (vq_mgr.get_queue_count() != 5))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"two-pair source full_init mismatch: state=%s active=%0d ",
+                 "committed=%0b queues=%0d"},
+                fsm.state.name(), fsm.active_queue_pair_count(),
+                fsm.mq_pair_count_is_committed(), vq_mgr.get_queue_count()))
+
+        fsm.configure_mq(2);
+        if ((fsm.state != FSM_READY) ||
+            !fsm.mq_pair_count_is_committed() ||
+            (ops.mq_requests.size() != 1) || (ops.mq_requests[0] != 2))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"two-pair source MQ commit mismatch: state=%s committed=%0b ",
+                 "requests=%p"}, fsm.state.name(),
+                fsm.mq_pair_count_is_committed(), ops.mq_requests))
+
+        fsm.start_dataplane();
+        if ((fsm.state != FSM_RUNNING) || (fsm.start_count != 1))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "two-pair source did not start: state=%s starts=%0d",
+                fsm.state.name(), fsm.start_count))
+    endtask
 
     // 设备 max_virtqueue_pairs=2、当前 1 对：control VQ 必须是 4，扩到 2 对时
     // 新建的 RX1/TX1（2/3）不得与 control VQ 冲突。
@@ -936,6 +1068,231 @@ class virtio_ctrl_vq_test extends uvm_test;
 
         `uvm_info("CTRL_VQ_TEST",
             "control VQ outside data range migration and MSI-X test PASSED", UVM_LOW)
+    endtask
+
+    // 两对源端完成 freeze 后，目标端 restore 的 verified reset 会把设备活动对数恢复
+    // 为一。生产 FSM 必须在全部队列恢复和 DRIVER_OK 之后恰好重发一次 MQ=2，并且只
+    // 能在该命令提交后调用 start。该用例同时验证恢复成功会同步 drv_cfg 镜像。
+    task test_two_pair_migration_recommits_mq_before_start();
+        virtio_ctrl_vq_migration_transport transport;
+        virtio_ctrl_vq_test_mq_ops ops;
+        virtqueue_manager vq_mgr;
+        virtio_ctrl_vq_test_mem mem;
+        virtio_ctrl_vq_test_iommu iommu;
+        virtio_ctrl_vq_test_migration_fsm fsm;
+        virtio_device_snapshot_t snapshot;
+        bit restore_ok;
+
+        build_two_pair_lifecycle_context(
+            "migration_mq_success", 16'h0911, 64'h7B00_0000,
+            transport, ops, vq_mgr, mem, iommu, fsm);
+        start_two_pair_source(fsm, ops, vq_mgr);
+        fsm.freeze_for_migration(snapshot);
+        if ((fsm.state != FSM_FROZEN) || (snapshot.num_queue_pairs != 2) ||
+            (snapshot.queue_count != 5))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"two-pair freeze mismatch: state=%s pairs=%0d queues=%0d"},
+                fsm.state.name(), snapshot.num_queue_pairs,
+                snapshot.queue_count))
+
+        // 清理源端资源后复用同一 fixture 模拟目标端。故意把行为镜像改成一对，证明
+        // restore 成功由快照值覆盖，而不是偶然沿用源端配置。
+        ops.device_reset();
+        if ((vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "two-pair migration source reset leaked resources")
+        ops.mq_requests.delete();
+        fsm.start_count = 0;
+        fsm.drv_cfg.num_queue_pairs = 1;
+
+        fsm.restore_from_migration(snapshot, restore_ok);
+        if (!restore_ok || (fsm.state != FSM_RUNNING) ||
+            !fsm.mq_pair_count_is_committed() ||
+            (fsm.active_queue_pair_count() != 2) ||
+            (fsm.drv_cfg.num_queue_pairs != 2) ||
+            (fsm.start_count != 1) ||
+            (ops.mq_requests.size() != 1) || (ops.mq_requests[0] != 2) ||
+            (vq_mgr.get_queue_count() != 5))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"two-pair migration did not recommit MQ before start: ",
+                 "ok=%0b state=%s committed=%0b active/cfg=%0d/%0d ",
+                 "starts=%0d requests=%p queues=%0d"},
+                restore_ok, fsm.state.name(),
+                fsm.mq_pair_count_is_committed(),
+                fsm.active_queue_pair_count(), fsm.drv_cfg.num_queue_pairs,
+                fsm.start_count, ops.mq_requests,
+                vq_mgr.get_queue_count()))
+
+        ops.device_reset();
+        if ((vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("CTRL_VQ_TEST",
+                "two-pair migration success test leaked resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+            "two-pair migration MQ recommit test PASSED", UVM_LOW)
+    endtask
+
+    // 目标端队列全部恢复后若设备明确拒绝 MQ=2，设备结果是确定的 ACK_ERR，但整个
+    // migration restore 仍未原子完成。FSM 必须执行一次 verified Function reset，
+    // 成功回收全部目标端资源并进入 REINIT_REQUIRED，且不得调用 start 桩。
+    task test_two_pair_migration_mq_reject_rolls_back();
+        virtio_ctrl_vq_migration_transport transport;
+        virtio_ctrl_vq_test_mq_ops ops;
+        virtqueue_manager vq_mgr;
+        virtio_ctrl_vq_test_mem mem;
+        virtio_ctrl_vq_test_iommu iommu;
+        virtio_ctrl_vq_test_migration_fsm fsm;
+        virtio_ctrl_vq_test_catcher catcher;
+        virtio_device_snapshot_t snapshot;
+        bit restore_ok;
+
+        build_two_pair_lifecycle_context(
+            "migration_mq_reject", 16'h0912, 64'h7C00_0000,
+            transport, ops, vq_mgr, mem, iommu, fsm);
+        start_two_pair_source(fsm, ops, vq_mgr);
+        fsm.freeze_for_migration(snapshot);
+        ops.device_reset();
+        if ((vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "migration reject source reset leaked resources")
+
+        ops.mq_requests.delete();
+        ops.accept_mq_requests = 0;
+        fsm.start_count = 0;
+        catcher = new("migration_mq_reject_catcher");
+        catcher.expect_error("AUTO_FSM",
+            "*configure_mq: device rejected MQ change to 2 pairs*");
+        catcher.expect_error("AUTO_FSM",
+            "*restore_from_migration: MQ target 2 was not committed; restore stopped in state FSM_REINIT_REQUIRED*");
+        uvm_report_cb::add(null, catcher);
+        fsm.restore_from_migration(snapshot, restore_ok);
+        uvm_report_cb::delete(null, catcher);
+
+        if (restore_ok || (catcher.caught_count != 2) ||
+            (fsm.state != FSM_REINIT_REQUIRED) ||
+            fsm.mq_pair_count_is_committed() || (fsm.start_count != 0) ||
+            (ops.mq_requests.size() != 1) || (ops.mq_requests[0] != 2) ||
+            (fsm.tracked_total_queue_count() != 0) ||
+            (vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"rejected migration MQ did not roll back atomically: ok=%0b ",
+                 "caught=%0d state=%s committed=%0b starts=%0d requests=%p ",
+                 "tracked/queues=%0d/%0d maps=%0d allocs=%0d"},
+                restore_ok, catcher.caught_count, fsm.state.name(),
+                fsm.mq_pair_count_is_committed(), fsm.start_count,
+                ops.mq_requests, fsm.tracked_total_queue_count(),
+                vq_mgr.get_queue_count(), iommu.active_mapping_count(),
+                mem.outstanding_allocations()))
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+            "two-pair migration MQ reject rollback test PASSED", UVM_LOW)
+    endtask
+
+    // DEVICE_NEEDS_RESET 的自动恢复会重新 full_init；两对配置在该初始化结束时仍是
+    // READY+未提交。恢复体必须先发一次同值 MQ=2，再启动恰好一代数据面。
+    task test_two_pair_device_recovery_recommits_mq();
+        virtio_ctrl_vq_migration_transport transport;
+        virtio_ctrl_vq_test_mq_ops ops;
+        virtqueue_manager vq_mgr;
+        virtio_ctrl_vq_test_mem mem;
+        virtio_ctrl_vq_test_iommu iommu;
+        virtio_ctrl_vq_test_migration_fsm fsm;
+
+        build_two_pair_lifecycle_context(
+            "device_recovery_mq_success", 16'h0913, 64'h7D00_0000,
+            transport, ops, vq_mgr, mem, iommu, fsm);
+        start_two_pair_source(fsm, ops, vq_mgr);
+        ops.mq_requests.delete();
+        fsm.start_count = 0;
+
+        fsm.run_complete_device_recovery();
+        if ((fsm.state != FSM_RUNNING) ||
+            !fsm.mq_pair_count_is_committed() ||
+            (fsm.active_queue_pair_count() != 2) ||
+            (fsm.start_count != 1) ||
+            (ops.mq_requests.size() != 1) || (ops.mq_requests[0] != 2) ||
+            (vq_mgr.get_queue_count() != 5))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"two-pair automatic recovery did not recommit before start: ",
+                 "state=%s committed=%0b active=%0d starts=%0d requests=%p ",
+                 "queues=%0d"}, fsm.state.name(),
+                fsm.mq_pair_count_is_committed(),
+                fsm.active_queue_pair_count(), fsm.start_count,
+                ops.mq_requests, vq_mgr.get_queue_count()))
+
+        ops.device_reset();
+        if ((vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("CTRL_VQ_TEST",
+                "two-pair automatic recovery success test leaked resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+            "two-pair automatic recovery MQ recommit test PASSED", UVM_LOW)
+    endtask
+
+    // 自动恢复期间的明确 MQ ACK_ERR 不表示设备状态不确定，因此保留 full_init 已经
+    // 安全建立的五条队列，状态停在 READY+未提交供调用方重试；不得启动 worker，也
+    // 不得把数值相同的 active_num_pairs 误当作恢复成功。
+    task test_two_pair_device_recovery_mq_reject_stays_ready();
+        virtio_ctrl_vq_migration_transport transport;
+        virtio_ctrl_vq_test_mq_ops ops;
+        virtqueue_manager vq_mgr;
+        virtio_ctrl_vq_test_mem mem;
+        virtio_ctrl_vq_test_iommu iommu;
+        virtio_ctrl_vq_test_migration_fsm fsm;
+        virtio_ctrl_vq_test_catcher catcher;
+
+        build_two_pair_lifecycle_context(
+            "device_recovery_mq_reject", 16'h0914, 64'h7E00_0000,
+            transport, ops, vq_mgr, mem, iommu, fsm);
+        start_two_pair_source(fsm, ops, vq_mgr);
+        ops.mq_requests.delete();
+        ops.accept_mq_requests = 0;
+        fsm.start_count = 0;
+        catcher = new("device_recovery_mq_reject_catcher");
+        catcher.expect_error("AUTO_FSM",
+            "*configure_mq: device rejected MQ change to 2 pairs*");
+        uvm_report_cb::add(null, catcher);
+        fsm.run_complete_device_recovery();
+        uvm_report_cb::delete(null, catcher);
+
+        if ((catcher.caught_count != 1) || (fsm.state != FSM_READY) ||
+            fsm.mq_pair_count_is_committed() || (fsm.start_count != 0) ||
+            (fsm.active_queue_pair_count() != 2) ||
+            (ops.mq_requests.size() != 1) || (ops.mq_requests[0] != 2) ||
+            (fsm.tracked_total_queue_count() != 5) ||
+            (vq_mgr.get_queue_count() != 5) ||
+            (iommu.active_mapping_count() == 0) ||
+            (mem.outstanding_allocations() == 0))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"rejected automatic-recovery MQ did not preserve stopped ",
+                 "prebuilt topology: caught=%0d state=%s committed=%0b ",
+                 "starts=%0d active=%0d requests=%p tracked/queues=%0d/%0d ",
+                 "maps=%0d allocs=%0d"}, catcher.caught_count,
+                fsm.state.name(), fsm.mq_pair_count_is_committed(),
+                fsm.start_count, fsm.active_queue_pair_count(),
+                ops.mq_requests, fsm.tracked_total_queue_count(),
+                vq_mgr.get_queue_count(), iommu.active_mapping_count(),
+                mem.outstanding_allocations()))
+
+        ops.device_reset();
+        if ((vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("CTRL_VQ_TEST",
+                "two-pair automatic recovery reject test leaked resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+            "two-pair automatic recovery MQ reject test PASSED", UVM_LOW)
     endtask
 
     // 协商 RING_RESET：显式登记 control VQ 2 后再建立编号更高的普通队列 7，ctrl_send
@@ -2132,6 +2489,171 @@ class virtio_ctrl_vq_test extends uvm_test;
         mem.leak_check();
         `uvm_info("CTRL_VQ_TEST",
                   "runtime MQ partial-shrink reset-failure test PASSED", UVM_LOW)
+    endtask
+
+    // full_init 可以先按目标值建立两对 Host 队列，但设备在 Function reset 后仍只激活
+    // 缺省的一对。首次 configure_mq(2) 即使数值与 active_num_pairs 相同，也必须发送
+    // VQ_PAIRS_SET；明确 ACK_ERR 后保持未提交，重试 ACK_OK 才能置为 committed。完成后
+    // 第二次同值请求才是零命令、零建拆队、零资源副作用的真正 no-op。
+    task test_full_init_same_target_programs_mq_once();
+        virtio_ctrl_vq_migration_transport transport =
+            virtio_ctrl_vq_migration_transport::type_id::create(
+                "init_same_mq_transport");
+        virtio_ctrl_vq_test_mq_ops ops =
+            virtio_ctrl_vq_test_mq_ops::type_id::create("init_same_mq_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create("init_same_mq_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("init_same_mq_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("init_same_mq_iommu");
+        virtio_auto_fsm fsm =
+            virtio_auto_fsm::type_id::create("init_same_mq_fsm");
+        virtio_memory_barrier_model barrier =
+            virtio_memory_barrier_model::type_id::create(
+                "init_same_mq_barrier");
+        virtio_wait_policy init_wait_pol =
+            virtio_wait_policy::type_id::create("init_same_mq_wait_pol");
+        virtio_ctrl_vq_test_catcher catcher;
+        int unsigned programs_before;
+        int unsigned mappings_before;
+        int unsigned allocations_before;
+        bit [63:0] features;
+        string why;
+
+        mem.init_region(64'h76A0_0000, 64'h76A0_FFFF);
+        vq_mgr.mem = mem;
+        vq_mgr.iommu = iommu;
+        vq_mgr.barrier = barrier;
+        vq_mgr.wait_pol = init_wait_pol;
+        vq_mgr.bdf = 16'h0910;
+        transport.configure_pcie_identity(
+            virtio_vq_test_kit::host0_pcie_id(16'h0910));
+        transport.max_virtqueue_pairs = 2;
+        transport.cap_mgr.msix_found = 1;
+        transport.cap_mgr.msix_table_size = 8;
+        transport.cap_mgr.msix_table_bir = 4;
+        ops.transport = transport;
+        ops.vq_mgr = vq_mgr;
+        ops.mem = mem;
+        ops.iommu = iommu;
+        ops.wait_pol = init_wait_pol;
+        virtio_vq_test_kit::bind_common_backend(ops);
+        fsm.ops = ops;
+        features = '0;
+        features[VIRTIO_F_VERSION_1] = 1'b1;
+        features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        features[VIRTIO_NET_F_MQ] = 1'b1;
+        fsm.drv_cfg.driver_features = features;
+        fsm.drv_cfg.num_queue_pairs = 2;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.full_init();
+
+        programs_before = transport.programmed_qids.size();
+        mappings_before = iommu.active_mapping_count();
+        allocations_before = mem.outstanding_allocations();
+        if ((fsm.state != FSM_READY) ||
+            (fsm.active_queue_pair_count() != 2) ||
+            fsm.mq_pair_count_is_committed() ||
+            (vq_mgr.get_queue_count() != 5) || (programs_before != 5)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"full_init did not leave the prebuilt two-pair MQ target ",
+                 "uncommitted: state=%s active=%0d committed=%0b queues=%0d ",
+                 "programs=%0d"},
+                fsm.state.name(), fsm.active_queue_pair_count(),
+                fsm.mq_pair_count_is_committed(), vq_mgr.get_queue_count(),
+                programs_before))
+        end
+
+        // 未提交的预建目标不能启动 worker；该调用必须在任何 RX refill/fork 之前返回。
+        catcher = new("init_same_mq_start_gate_catcher");
+        catcher.expect_error("AUTO_FSM",
+            "*start_dataplane: MQ target has not been committed*");
+        uvm_report_cb::add(null, catcher);
+        fsm.start_dataplane();
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught_count != 1) || (fsm.state != FSM_READY) ||
+            (iommu.active_mapping_count() != mappings_before) ||
+            (mem.outstanding_allocations() != allocations_before)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"uncommitted initial MQ target bypassed the dataplane gate: ",
+                 "caught=%0d state=%s maps=%0d/%0d allocs=%0d/%0d"},
+                catcher.caught_count, fsm.state.name(),
+                iommu.active_mapping_count(), mappings_before,
+                mem.outstanding_allocations(), allocations_before))
+        end
+
+        // 第一次同值请求由设备明确拒绝：它必须真正到达 control 层，但不得把目标
+        // 标成已提交，也不得重建 full_init 已经准备好的队列。
+        ops.accept_mq_requests = 0;
+        catcher = new("init_same_mq_reject_catcher");
+        catcher.expect_error("AUTO_FSM",
+            "*configure_mq: device rejected MQ change to 2 pairs*");
+        uvm_report_cb::add(null, catcher);
+        fsm.configure_mq(2);
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught_count != 1) ||
+            (ops.mq_requests.size() != 1) || (ops.mq_requests[0] != 2) ||
+            fsm.mq_pair_count_is_committed() || (fsm.state != FSM_READY) ||
+            (transport.programmed_qids.size() != programs_before) ||
+            (vq_mgr.get_queue_count() != 5) ||
+            (iommu.active_mapping_count() != mappings_before) ||
+            (mem.outstanding_allocations() != allocations_before)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"rejected initial same-target MQ request was treated as a ",
+                 "no-op or committed: caught=%0d requests=%p committed=%0b ",
+                 "state=%s programs=%0d/%0d queues=%0d maps=%0d/%0d ",
+                 "allocs=%0d/%0d"},
+                catcher.caught_count, ops.mq_requests,
+                fsm.mq_pair_count_is_committed(), fsm.state.name(),
+                transport.programmed_qids.size(), programs_before,
+                vq_mgr.get_queue_count(), iommu.active_mapping_count(),
+                mappings_before, mem.outstanding_allocations(),
+                allocations_before))
+        end
+
+        // ACK_OK 只提交既有目标，不重复建队；随后再请求 2 才允许幂等返回。
+        ops.accept_mq_requests = 1;
+        fsm.configure_mq(2);
+        if ((ops.mq_requests.size() != 2) || (ops.mq_requests[1] != 2) ||
+            !fsm.mq_pair_count_is_committed() || (fsm.state != FSM_READY) ||
+            (transport.programmed_qids.size() != programs_before) ||
+            (vq_mgr.get_queue_count() != 5) ||
+            (iommu.active_mapping_count() != mappings_before) ||
+            (mem.outstanding_allocations() != allocations_before)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"accepted initial same-target MQ request did not commit in ",
+                 "place: requests=%p committed=%0b state=%s programs=%0d/%0d ",
+                 "queues=%0d maps=%0d/%0d allocs=%0d/%0d"},
+                ops.mq_requests, fsm.mq_pair_count_is_committed(),
+                fsm.state.name(), transport.programmed_qids.size(),
+                programs_before, vq_mgr.get_queue_count(),
+                iommu.active_mapping_count(), mappings_before,
+                mem.outstanding_allocations(), allocations_before))
+        end
+        fsm.configure_mq(2);
+        if ((ops.mq_requests.size() != 2) ||
+            (transport.programmed_qids.size() != programs_before) ||
+            (vq_mgr.get_queue_count() != 5)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"committed same-target MQ request was not side-effect free: ",
+                 "requests=%p programs=%0d/%0d queues=%0d"},
+                ops.mq_requests, transport.programmed_qids.size(),
+                programs_before, vq_mgr.get_queue_count()))
+        end
+
+        ops.device_reset();
+        if ((vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("CTRL_VQ_TEST",
+                "initial same-target MQ test leaked queue resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+                  "full_init same-target MQ commit test PASSED", UVM_LOW)
     endtask
 
     // virtio 1.2 §4.1.4.3.2：驱动 MUST 在 queue_enable 之前配置好其余队列字段（含 queue_msix_vector）。

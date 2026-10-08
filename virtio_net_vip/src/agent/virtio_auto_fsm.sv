@@ -49,6 +49,10 @@ class virtio_auto_fsm extends uvm_report_object;
     // ===== Internal state =====
     protected int unsigned  num_total_queues;
     protected int unsigned  active_num_pairs;
+    // active_num_pairs 还描述 Host 已准备交付的队列集合；full_init 可以先建立多对
+    // 队列，再经 control VQ 激活相同的目标值。因此数值相等不能证明设备已经接受
+    // VQ_PAIRS_SET。该有效位只在设备侧 MQ 值与 Host 目标完整同步后置位。
+    protected bit           mq_pairs_committed;
     local int unsigned      max_vio_net_qpairs_per_device;
     local bit               mq_pair_limit_bound;
 
@@ -67,6 +71,9 @@ class virtio_auto_fsm extends uvm_report_object;
         interrupt_event         = new("interrupt_event");
         num_total_queues        = 0;
         active_num_pairs        = 1;
+        // 标准 Virtio Function reset 后的 MQ 缺省值是一对；full_init 会按协议和目标
+        // 对数重新计算该值。
+        mq_pairs_committed      = 1;
         max_vio_net_qpairs_per_device = DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE;
         mq_pair_limit_bound = 0;
         migration = virtio_migration_engine::type_id::create({name, "_migration"});
@@ -135,11 +142,33 @@ class virtio_auto_fsm extends uvm_report_object;
         return max_vio_net_qpairs_per_device;
     endfunction
 
-    // 只读返回最近一次完整提交的活动队列对数。动态重配调用方须同时检查 FSM 状态：
-    // READY/RUNNING 时该值对应可用拓扑，ERROR/REINIT_REQUIRED 时仅是恢复诊断基线。
+    // 只读返回当前 Host 拓扑的目标队列对数。动态重配调用方须同时检查 FSM 状态和
+    // mq_pair_count_is_committed()：full_init 预建多对但尚未发送 control 命令时，
+    // READY 中该值仍只是待提交目标；ERROR/REINIT_REQUIRED 中则是恢复诊断基线。
     // 函数无副作用，在初始化前返回构造时的缺省值 1。
     function int unsigned active_queue_pair_count();
         return active_num_pairs;
+    endfunction
+
+    // 返回 active_num_pairs 是否已经与设备侧 MQ 状态同步。full_init 预建多对队列后
+    // 该值仍为 0，首次同值 configure_mq 必须发送 control 命令；完整 ACK 后才返回 1。
+    function bit mq_pair_count_is_committed();
+        return mq_pairs_committed;
+    endfunction
+
+    // 判断建队完成时是否无需 control 命令即可视为已提交。标准设备 reset 后缺省为
+    // 一对；不支持动态 MQ 的协议由队列使能直接提交全部配置，不经过 control VQ。
+    // 零对只供迁移引擎的受保护 topology-free 单元路径使用：公开 restore/full_init
+    // 均会拒绝该值；该内部路径没有数据队列和 MQ 目标，因此提交条件平凡成立。
+    protected function bit mq_target_committed_without_control(
+        int unsigned num_pairs
+    );
+        if (num_pairs == 0)
+            return 1;
+        if ((ops != null) && (ops.protocol != null) &&
+            !ops.protocol.supports_mq())
+            return 1;
+        return (num_pairs == 1);
     endfunction
 
     // 迁移快照整体校验和（委托迁移引擎）；派生 FSM/测试改写快照后据此重算。
@@ -234,6 +263,10 @@ class virtio_auto_fsm extends uvm_report_object;
 
         `uvm_info("AUTO_FSM", "full_init: starting initialization sequence", UVM_LOW)
 
+        // 新一轮初始化在设备复位和队列建立完成前不能继承上一生命周期的 MQ 提交
+        // 结论；队列建立成功后再按协议与目标对数重新置位。
+        mq_pairs_committed = 0;
+
         // ---- Step 1: BAR discovery ----
         state = FSM_DISCOVERING;
         `uvm_info("AUTO_FSM",
@@ -298,6 +331,11 @@ class virtio_auto_fsm extends uvm_report_object;
             return;
         end
 
+        // Host 队列全部建立后，才允许根据协议与 reset 缺省值确认 MQ 状态。标准
+        // 多队列目标仍等待首次 VQ_PAIRS_SET；私有协议和标准单对在此完整提交。
+        mq_pairs_committed =
+            mq_target_committed_without_control(active_num_pairs);
+
         // ---- Step 5: DRIVER_OK ----
         ops.set_driver_ok();
         state = FSM_READY;
@@ -322,6 +360,12 @@ class virtio_auto_fsm extends uvm_report_object;
         if (state != FSM_READY) begin
             `uvm_error("AUTO_FSM",
                 $sformatf("start_dataplane: invalid state %s (expected FSM_READY)", state.name()))
+            return;
+        end
+        if (!mq_pairs_committed) begin
+            `uvm_error("AUTO_FSM",
+                {"start_dataplane: MQ target has not been committed to the ",
+                 "device; configure_mq must complete first"})
             return;
         end
         if ((dataplane_workers_expected != 0) &&
@@ -559,10 +603,10 @@ class virtio_auto_fsm extends uvm_report_object;
     // Reconfiguration
     // ========================================================================
 
-    // 改变活动队列对数。输入必须符合 Function 冻结的 MQ 上限和驱动协议能力；同值
-    // 请求幂等返回且不访问 control VQ。若入口为 FSM_RUNNING，本 task 先等待旧代
-    // 数据面全部退出，再执行设备命令和队列变更；只有目标对数确实生效且 FSM 仍为
-    // READY 才启动新一代 worker。设备拒绝、建队/拆队失败或错误状态均保持停机。
+    // 改变活动队列对数。输入必须符合 Function 冻结的 MQ 上限和驱动协议能力；仅已
+    // 提交的同值请求幂等返回且不访问 control VQ。若入口为 FSM_RUNNING，本 task 先
+    // 等待旧代数据面全部退出，再执行设备命令和队列变更；只有目标对数确实生效且
+    // FSM 仍为 READY 才启动新一代 worker。设备拒绝、建队/拆队失败或错误状态均保持停机。
     task configure_mq(int unsigned num_pairs);
         bit restart_dataplane;
 
@@ -589,7 +633,7 @@ class virtio_auto_fsm extends uvm_report_object;
             return;
         end
 
-        if (num_pairs == active_num_pairs) begin
+        if ((num_pairs == active_num_pairs) && mq_pairs_committed) begin
             `uvm_info("AUTO_FSM",
                 $sformatf("configure_mq: %0d pairs already active; no change needed",
                           num_pairs), UVM_MEDIUM)
@@ -612,7 +656,7 @@ class virtio_auto_fsm extends uvm_report_object;
         // active_num_pairs 是 do_configure_mq 的提交标志。仅检查 state 会把设备
         // 拒绝（其状态仍为 READY）误当作成功，并让旧队列集合上的 worker 重新运行。
         if (restart_dataplane && (state == FSM_READY) &&
-            (active_num_pairs == num_pairs)) begin
+            (active_num_pairs == num_pairs) && mq_pairs_committed) begin
             start_dataplane();
         end
     endtask
@@ -647,6 +691,9 @@ class virtio_auto_fsm extends uvm_report_object;
         ops.ctrl_set_mq_pairs(num_pairs, success);
 
         if (success) begin
+            // 设备已接受目标值，但 Host 建拆队尚未完成；整个拓扑提交前不得把相同
+            // 数值当作 no-op，也不得启动使用半提交队列集合的 worker。
+            mq_pairs_committed = 0;
             // 缩容逐条确认设备已停队后才释放 Host 资源。一个 pair 的 RX/TX 不是
             // 原子寄存器操作，前一条可能已成功而后一条失败；此时只能升级为 verified
             // Function reset。复位成功表示全部旧队列已安全回收并要求重新初始化；
@@ -750,10 +797,12 @@ class virtio_auto_fsm extends uvm_report_object;
             active_num_pairs = num_pairs;
             drv_cfg.num_queue_pairs = num_pairs;
             num_total_queues = ops.vq_mgr.get_queue_count();
+            mq_pairs_committed = 1;
         end else if (ops.control_vq_requires_recovery()) begin
             // control 命令已经发布但没有有效完成时，ACK_ERR 只表示 Host 没拿到结果，
             // 不能证明设备拒绝了 new_pairs。即使 control Q_RESET/重建成功，设备可能
             // 已经提交新值；整 Function 复位是收敛设备配置与 Host 拓扑的唯一安全边界。
+            mq_pairs_committed = 0;
             ops.device_reset_verified(reset_ok);
             if (reset_ok) begin
                 num_total_queues = 0;
@@ -875,8 +924,9 @@ class virtio_auto_fsm extends uvm_report_object;
 
     // restore_from_migration 的实现体：先做全部前置校验（依赖组件齐全、
     // snapshot 整体校验和、队列数/各队列 snapshot 合法性、普通与队列 DMA
-    // 记录、脏页记录），任一失败即 FSM_ERROR + set_failed 并保持 ok=0；
-    // 校验通过后才复位设备、回放映射与脏页、重建队列并重启数据面。
+    // 记录、脏页记录），校验通过后才复位设备、回放映射与脏页、重建队列、重新
+    // 提交 MQ 并重启数据面。前置或重建失败进入 FSM_ERROR；恢复后 MQ/启动失败执行
+    // verified reset，成功进入 FSM_REINIT_REQUIRED，失败进入 FSM_ERROR 并保留 DMA。
     // 输出 ok=1 仅当完整恢复成功。
     protected virtual task do_restore_from_migration(
         virtio_device_snapshot_t snap,
@@ -884,6 +934,7 @@ class virtio_auto_fsm extends uvm_report_object;
     );
         bit set_failed_required;
         bit step_ok;
+        bit reset_ok;
         virtio_migration_engine::migration_record_group_t mapping_groups[$];
 
         ok = 0;
@@ -912,9 +963,18 @@ class virtio_auto_fsm extends uvm_report_object;
         end
         migration.collect_dirty_fallback_groups(snap, mapping_groups);
 
+        // 从这里开始 restore 会执行 verified Function reset。无论复位最终成功还是
+        // 失败，都不能再沿用源端生命周期的 MQ 提交结论：成功复位会把标准设备恢复
+        // 到一对队列，失败则设备状态不确定。先保守清零，后面只有队列完整恢复并且
+        // 必要的 VQ_PAIRS_SET 得到 ACK 后才重新置位。
+        mq_pairs_committed = 0;
+
         // 1-3. 验证式复位、恢复原特性字、按固定 IOVA 重建映射与普通 DMA 所有权。
         migration.restore_device_and_dma(ops, snap, mapping_groups, step_ok);
         if (!step_ok) begin
+            // restore_device_and_dma 的失败路径可能已经完成或尝试过回滚；诊断计数
+            // 始终以 manager 当前仍持有的队列为准，避免保留上一个生命周期的数字。
+            num_total_queues = ops.vq_mgr.get_queue_count();
             state = FSM_ERROR;
             return;
         end
@@ -928,22 +988,81 @@ class virtio_auto_fsm extends uvm_report_object;
         // 5. 按快照拓扑重建队列并覆盖 ring 状态。
         migration.restore_queues(ops, snap, drv_cfg, step_ok);
         if (!step_ok) begin
+            // migration engine 已对部分恢复资源执行 verified rollback；同步实际剩余
+            // 队列数，并保持 committed=0，防止错误态诊断声称一个半恢复拓扑已提交。
+            num_total_queues = ops.vq_mgr.get_queue_count();
             state = FSM_ERROR;
             return;
         end
 
-        // 6. DRIVER_OK
+        // Host 队列与快照状态全部恢复后，才允许根据 reset 缺省值判断是否已经提交。
+        // 标准单对和无需 control VQ 的协议可直接提交；标准多对仍须在 DRIVER_OK 后
+        // 通过恢复好的 control VQ 重新发送 VQ_PAIRS_SET。
+        mq_pairs_committed =
+            mq_target_committed_without_control(active_num_pairs);
+
+        // 6. DRIVER_OK；control VQ 命令只能在设备进入 DRIVER_OK 后发布。
         ops.set_driver_ok();
         state = FSM_READY;
 
-        // 7. Restart data plane
+        // Function reset 已把标准设备的活动对数恢复为一。多对快照虽然已经重建全部
+        // Host 队列，仍必须执行一次同值 configure_mq 才能重新激活设备侧队列。
+        // configure_mq 的超时路径会自行执行 verified reset 并精确设置
+        // REINIT_REQUIRED/ERROR；这里保留该结果，不做第二次复位或覆盖状态。
+        if (!mq_pairs_committed) begin
+            configure_mq(active_num_pairs);
+            if (!mq_pairs_committed) begin
+                if (state == FSM_READY) begin
+                    // READY+未提交只可能是设备明确 ACK_ERR（或命令根本未发布）。迁移
+                    // 恢复必须具备原子性，不能把目标端的半恢复资源留给调用方，因此
+                    // 执行一次 verified Function reset。成功表示资源已全部回收，可重新
+                    // 初始化；失败则保留仍可能被设备访问的 DMA 并进入 ERROR。
+                    ops.device_reset_verified(reset_ok);
+                    if (reset_ok) begin
+                        num_total_queues = 0;
+                        state = FSM_REINIT_REQUIRED;
+                    end else begin
+                        num_total_queues = ops.vq_mgr.get_queue_count();
+                        state = FSM_ERROR;
+                    end
+                end
+                `uvm_error("AUTO_FSM", $sformatf(
+                    {"restore_from_migration: MQ target %0d was not committed; ",
+                     "restore stopped in state %s"},
+                    active_num_pairs, state.name()))
+                return;
+            end
+        end
+
+        // 队列、设备侧 MQ 与 Host 拓扑已经作为一个整体提交；同步行为配置镜像，
+        // 尤其覆盖单对快照无需经过 configure_mq、因而不会由其更新 drv_cfg 的路径。
+        drv_cfg.num_queue_pairs = active_num_pairs;
+
+        // 7. Restart data plane。除 READY+committed 外不得启动；该显式条件同时保护
+        // 将来 configure_mq 新增其他终态时不会误把恢复失败当作成功。
+        if ((state != FSM_READY) || !mq_pairs_committed) begin
+            `uvm_error("AUTO_FSM", $sformatf(
+                {"restore_from_migration: restored topology is not ready for ",
+                 "dataplane start (state=%s committed=%0b)"},
+                state.name(), mq_pairs_committed))
+            return;
+        end
         start_dataplane();
         if (state != FSM_RUNNING) begin
-            migration.rollback(ops);
-            state = FSM_ERROR;
+            // start_dataplane 未进入 RUNNING 后，本次迁移仍然失败。先撤销 MQ 提交
+            // 结论，再用可观测结果的 verified reset 回收全部恢复资源；成功与失败
+            // 分别进入 REINIT_REQUIRED/ERROR，并保持诊断计数与真实所有权一致。
+            mq_pairs_committed = 0;
+            ops.device_reset_verified(reset_ok);
+            if (reset_ok) begin
+                num_total_queues = 0;
+                state = FSM_REINIT_REQUIRED;
+            end else begin
+                num_total_queues = ops.vq_mgr.get_queue_count();
+                state = FSM_ERROR;
+            end
             `uvm_error("AUTO_FSM",
                 "restore_from_migration: data plane did not restart")
-            ops.set_failed();
             return;
         end
 
@@ -966,7 +1085,14 @@ class virtio_auto_fsm extends uvm_report_object;
         state = FSM_IDLE;
         full_init();
 
-        if (state == FSM_READY)
+        // full_init 可以按目标值预建多对 Host 队列，但标准设备在 Function reset 后
+        // 仍只激活一对。自动恢复不能直接越过该边界启动 worker；先用同值 MQ 命令
+        // 提交设备侧目标。明确 ACK_ERR 保留 READY+未提交的安全预建拓扑供调用方重试，
+        // 命令超时则沿用 configure_mq 已设置的 REINIT_REQUIRED/ERROR，均不得启动。
+        if ((state == FSM_READY) && !mq_pairs_committed)
+            configure_mq(active_num_pairs);
+
+        if ((state == FSM_READY) && mq_pairs_committed)
             start_dataplane();
     endtask
 

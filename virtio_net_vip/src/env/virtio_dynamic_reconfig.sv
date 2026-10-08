@@ -151,8 +151,8 @@ class virtio_dynamic_reconfig extends uvm_report_object;
     // live_mq_resize 的实现体（目标值已通过上限校验）：先校验 VF/FSM 接线、FSM 的
     // 实际活动对数与 old_pairs 一致，以及 traffic_active 请求确实从 RUNNING 进入。
     // 随后统一调用 FSM.configure_mq；FSM 负责同值 no-op、control 命令、建拆队和
-    // worker 停启。本 task 只在 accessor 确认 new_pairs 已生效、且运行态请求已经
-    // 恢复 RUNNING 后更新 vf.drv_cfg。任一失败均保留原配置镜像。
+    // worker 停启。本 task 只在 accessor 确认 new_pairs 已生效、设备 MQ 提交有效，
+    // 且运行态请求已经恢复 RUNNING 后更新 vf.drv_cfg。任一失败均保留原配置镜像。
     protected virtual task do_live_mq_resize(
         virtio_vf_instance vf,
         int unsigned old_pairs,
@@ -207,12 +207,13 @@ class virtio_dynamic_reconfig extends uvm_report_object;
 
         fsm.configure_mq(new_pairs);
 
-        if (fsm.active_queue_pair_count() != new_pairs) begin
+        if ((fsm.active_queue_pair_count() != new_pairs) ||
+            !fsm.mq_pair_count_is_committed()) begin
             `uvm_error("DYN_RECONFIG", $sformatf(
                 {"live_mq_resize: VF%0d MQ resize to %0d pairs did not ",
-                 "complete; active pairs=%0d state=%s"},
+                 "complete; active pairs=%0d committed=%0b state=%s"},
                 vf.vf_index, new_pairs, fsm.active_queue_pair_count(),
-                fsm.state.name()))
+                fsm.mq_pair_count_is_committed(), fsm.state.name()))
             return;
         end
         if (traffic_active && (fsm.state != FSM_RUNNING)) begin
