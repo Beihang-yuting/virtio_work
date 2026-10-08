@@ -28,7 +28,7 @@
 | dpu_snd1 在 53 上编译，或回退到 Debian guest 内编译 | 在本机 Ubuntu 24.04（gcc 13.3）用 apt download 的 6.8.0-107 头文件编译 | 53 是 gcc 9 / glibc 2.31，跑不了 noble 的 fixdep/modpost，内核配置也要求 gcc ≥ 12。Debian 镜像既无工具链也无头文件 |
 | 只有 strict/order 两类比较 | 增加 review（寄存器写多重集合、notify/irq 集合、描述符与完成）与 info（读访问，只记录），并引入白名单（每条必须带理由，未使用的条目要报告） | 两种驱动的寄存器访问不可能逐条相同，需要逐条判定，又不能让差异静默通过 |
 | 私有模式对比使用规则文件的原文 | 第 3 条偏序的后项收紧为 `mb_af_host_id=0x8`（PRIV-02） | S4 rmmod 时写 0 会造成误报；驱动 probe 写入的值是 `(v&7)\|8` |
-| 私有对比测试采用 VIP 的默认环大小 | `drv_cfg.queue_size=512`（PRIV-03） | 与驱动 `DPU_DEFAULT_*_DESC_NUM` 一致，使 queue_cfg 能做 strict 比较 |
+| 私有对比测试沿用父类示例的环大小 | `drv_cfg.queue_size=512`（PRIV-03） | 父类示例 `virtio_system_env_example_test.sv:704/719–722` 为 VF 注册了 `default_queue_size=256` 的显式 service 配置，按 `virtio_net_env_config.sv:366–373` 的优先级它覆盖私有 `default_queue_size`（512）；对比测试改为与驱动 `DPU_DEFAULT_*_DESC_NUM` 相同的 512，使 queue_cfg 能做 strict 比较 |
 | 私有设备的 GREG 规格寄存器 | `vport_port_num=136`，其余读 0（E3 `bf69294`，M-13） | 驱动与 reg plan 都没有给出值，读 0 时 probe 会失败。136 取自驱动 `res_record` 的容量 |
 | 私有 Linux 的发送 offload | `ethtool -K tso off gso off` | 设备模型按 R4 原样回环，丢弃大于 16383 B 的 GSO 帧 |
 
@@ -42,7 +42,7 @@
 | std | S4 关闭与复位 | PASS | 0 / 0 / 4 | 合规：STD-08、12、13、21 |
 | priv | S1 初始化 | PASS | 0 / 1 / 5 | 模型：PRIV-01；合规：PRIV-04、06、07、09、10；测试件：PRIV-03 |
 | priv | S2 单队列收发 | PASS | 0 / 0 / 2 | 合规：PRIV-07、08 |
-| priv | S4 关闭与复位 | PASS | 1 / 0 / 5 | VIP：PRIV-05；合规：PRIV-04、07、09、10、11；规则：PRIV-02 |
+| priv | S4 关闭与复位 | PASS | 1 / 1 / 5 | VIP：PRIV-05；模型：PRIV-01；合规：PRIV-04、07、09、10、11；规则：PRIV-02 |
 
 最终对比输出：
 - `VDEV_DIFF PASS mode=std`：S1–S4 的 strict/order/review 都是 0，info 行数为 54/3/3/16，白名单 20 条全部用到。
@@ -88,8 +88,8 @@
 |---|---|---|---|---|---|---|---|
 | PRIV-01 | S1、S4 | 字段名 | 0x0C0000–0x4BFFFF 的寄存器都被记为 `msix_linear.N`，例如 0x4AA000 vport fwd 记为 `msix_linear.950272` | 同 | 模型 | `5e433e0`：`msix_linear` 只覆盖线性表（0xC0000–0x140000，register.h:37–38）和本设备 srcid 的 128 项解码窗口，其余保留原始偏移名 | `virtio_vdev_unit_test::test_priv_event_field_names` |
 | PRIV-02 | S4 | order | rmmod 写 INTF_MB_AF_HOST_ID=0，段内没有 AF 声明 | — | 规则 | 第 3 条偏序的后项收紧为 `mb_af_host_id=0x8`（main.c:2052 `(v&7)\|8`） | — |
-| PRIV-03 | S1 | strict.queue_cfg | 环大小 512（hw.h:28–29） | 256（FSM `drv_cfg.queue_size` 缺省值；私有 `default_queue_size=512` 只作上限） | 测试件 | 对比测试设为 512，之后 q0/q1 strict 相等 | — |
-| PRIV-04 | S1、S4 | strict.queue_cfg、review.reg_wr | 多出 AF 特殊队列：forward capture gq1（lqid 2/3、gv1）与 BPDU capture gq2（lqid 4/5、gv2），包括配置、中断 info 与停用 | 只建数据队列对 gq0 | 合规 | 白名单 4 条：main.c:2248/2256、txrx.c:3852–3866/4082、main.c:2392–2395。这两个是 AF 管理队列，不属于 Function 的数据队列；正则按值限定为 gq1/gq2 | — |
+| PRIV-03 | S1 | strict.queue_cfg | 环大小 512（hw.h:28–29） | 256：父类示例为 VF 注册了 `default_queue_size=256` 的显式 service 配置（example_test.sv:704/719–722），按 env_config.sv:366–373 有意优先于私有 `default_queue_size=512`（无 service 配置时才用后者） | 测试件 | 不是 VIP 缺陷。对比测试设为 512，之后 q0/q1 strict 相等 | — |
+| PRIV-04 | S1、S4 | strict.queue_cfg、review.reg_wr | 多出 AF 特殊队列：forward capture gq1（lqid 2/3、gv1）与 BPDU capture gq2（lqid 4/5、gv2），包括配置、中断 info 与停用 | 只建数据队列对 gq0 | 合规 | 白名单 4 条：main.c:2247/2255 激活，txrx.c:3852–3866/4082 建队，`dpu_remove` main.c:2520–2521 停用。这两个是 AF 管理队列，不属于 Function 的数据队列；正则按值限定为 gq1/gq2 | — |
 | PRIV-05 | S4 | review.reg_wr | 停 RX 时间接读 VRX 参数 4 个 DW（i=0..3） | 读 3 个 DW | VIP | `ce48d92`：`sizeof(struct vrx_queue_para_table_entry)` 因 u64 对齐为 16 B（af_mng.c:1564），改为读 4 DW、写回 3 DW；同步更正模型文件头 #33。D4 修复轮按 12 B 推算有误 | `virtio_vdev_unit_test::test_priv_backend_sequence`（期望 4 DW） |
 | PRIV-06 | S1 | review.notify | open 时补充 RX：q0 投放 511 个，特殊队列 q2/q4 同样预填 | full_init 不补充，在 S2 补充 | 合规 | 白名单：补充时机不影响语义（同 STD-05） | — |
 | PRIV-07 | S1/S2/S4 | review.irq、review.reg_wr | 用 MSI-X 向量 0；写 0x1004 解除自屏蔽（#32）；建立并释放 MSI-X 表（#18） | 私有数据面轮询，MSI-X Enable 不置位；只写中断 info/ctrl（#27，两侧一致） | 合规 | 白名单 3 条 | — |
@@ -140,7 +140,7 @@
 | 无 SR-IOV 能力时的配置读（D-11） | sriov.c | — | pos=0 时读标准头 | 原样应答 |
 | VRX 停队读回 DW 数（F3 新增，PRIV-05） | af_mng.c:1564 | reg plan 没有停队读回序列 | 结构按 u64 对齐为 16 B，读 4 DW 写回 3 DW；D4 修复轮误作 3 DW | 模型 i=0..3 照常应答；VIP 读 4 DW |
 | 模型推断 M-1..M-13 | 见文件头 | — | 软复位语义、doorbell→gq 路由、VRX tail 值、CQ 中断与自屏蔽挂起、TX CQ head、QSCH 位、RX 多描述符、mailbox 未建模、gq/gv 分配、host 位不比、全局屏蔽复位值、virtio_mode、GREG 规格 136 | 见文件头 |
-| AF 特殊队列（F3 观察，PRIV-04） | txrx.c:3852–3866、main.c:2248/2256 | reg plan 没有 | forward/BPDU capture 两个 AF 管理队列占用 gq1/gq2、gv1/gv2 | 模型按普通队列处理；VIP 不建 |
+| AF 特殊队列（F3 观察，PRIV-04） | txrx.c:3852–3866/4082、main.c:2247/2255、`dpu_remove` main.c:2520–2521 | reg plan 没有 | forward/BPDU capture 两个 AF 管理队列占用 gq1/gq2、gv1/gv2 | 模型按普通队列处理；VIP 不建 |
 
 ### 私有偏序规则的驱动源码依据（`rules_priv.json`）
 
@@ -199,6 +199,14 @@
 | F2-c2 | SVA 信用按可用 buffer 计 | 检查器语义改变（按规范更正） |
 | F2-c3 | 只在临时对比测试中关闭 pcie_tl data integrity | 对比运行失去 scoreboard 数据检查，由事件对比覆盖 |
 | F2 修复轮 2 | 迁移恢复与 STD-02 同类，立即修复 | 小 |
+| C1 命名（用户要求） | 私有队列类命名为 `custom_virtqueue`（`src/virtqueue/custom_virtqueue.sv` 原地重写），保留枚举 `VQ_CUSTOM`；plan C2 起与规范同步更新 | 名字不如 dpu_priv_* 具体 |
+| C1 提交范围 | C1 提交同时加入 `virtio_unit_test.sv`、`virtio_dut_caps_test.sv`、`dpu_priv_ring/README.md` | 无 |
+| A3/A4 → B1 | 删除 dataplane `configure()` 的 `device_host_id=0` 缺省（规范 R3.4“不静默落到 host0”），4 处 indirect_desc_test 调用显式传 host，作为 B1 的额外提交 | 多一个小提交 |
+| C3 | 私有 Function RUNNING 时 full_init 的保护恢复（verified-reset 协议），加单元断言 | — |
+| D1 → D3 | VIP/fixture 必须写配置 0x004=0x6（MSE\|BME），否则设备忽略 MMIO/DMA/MSI-X | — |
+| D2 | 未用的 `std_log.select` 结果改为断言 | 无 |
+| D3 | INTx 回退后 `set_msix` 不再写 MSI-X Enable | 无 |
+| E1 | 临时基础设施无法在 E2 前运行验证，rc 补丁随 E2 冒烟一并审查 | 补丁缺陷晚一个任务发现 |
 | 流程 | 实现者工作期间控制者不提交，提交时使用 `git commit -- <paths>`（C1 时 `91e1dd5` 误带暂存的删除，`fbdc036` 恢复，留下一个不可二分的提交） | — |
 
 ### 遗留（parked / deferred minor）
@@ -252,9 +260,10 @@
   - M7：full_init 中的冗余向量写。
   - F1：IOVA 已映射范围检查缺口。
   - marker 1 之后的配置写只记 info（plan 规定）。
-- **F3 新增：**
-  - 私有 `default_queue_size` 的名字像“缺省值”，实际只作上限，环大小取自 FSM `drv_cfg.queue_size`（PRIV-03），可以考虑更名或在 bind 时采用。
-  - qid map 整组符号化（PRIV-15）。
+- **F2 复审 2（低）：** STD-19 的测试只检查“先屏蔽后写地址”，未覆盖写数据与解屏蔽的顺序；迁移恢复回滚路径（MSI-X 早已使能时）未经追踪验证。
+- **F3：**
+  - qid map 整组符号化（PRIV-15），只在文档中记录。
+  - 私有对比测试中的 STD-16 scoreboard 关闭调用实际不起作用（PRIV-14，临时代码）。
 
 ## 附录 A 复跑说明（53 `~/cosim_diff`）
 
@@ -459,19 +468,19 @@ python3 -I tools/vdev_diff.py selftest             # vdev_diff selftest PASS
   "rule": "strict.queue_cfg",
   "scenario": 1,
   "key_re": "^only_linux x1 \\((2|3|4|5), 512, (1|2), 1, 'priv'\\)$",
-  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2248/2256 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（main.c:2392–2395）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。"
+  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2247/2255 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（dpu_remove main.c:2520–2521）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。"
  },
  {
   "rule": "review.reg_wr",
   "scenario": 1,
   "key_re": "^only_linux x\\d+ \\(None, 'bar0', '(vtx_ram_cfg', -1, (1|2|8193|8194)|vrx_wr_cfg', -1, (1|2|65537|65538)|vtx_content\\.dw2', -1, (32905|32921|65673|65689)|vrx_content\\.dw2', -1, (524313|1048601)|msix_info\\.(1|2)', -1, 6144|msix_ctrl\\.(1|2)\\.dw3', -1, 0)\\)$",
-  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2248/2256 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（main.c:2392–2395）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。 这些是 gq1/gq2 的 VTX/VRX 参数表写（ram_cfg/wr_cfg 低位=gq，DW2 的 dma_msix=gv1/gv2）与 gv1/gv2 中断 info/ctrl（#24/#25/#27/#28）。"
+  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2247/2255 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（dpu_remove main.c:2520–2521）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。 这些是 gq1/gq2 的 VTX/VRX 参数表写（ram_cfg/wr_cfg 低位=gq，DW2 的 dma_msix=gv1/gv2）与 gv1/gv2 中断 info/ctrl（#24/#25/#27/#28）。"
  },
  {
   "rule": "review.reg_wr",
   "scenario": 1,
   "key_re": "^only_linux x(1|2) \\(None, 'bar0', '(vtx|vrx)_content\\.dw0', -1, '@(vtx|vrx)_content\\.dw0\\.q-1#[23]'\\)$|^only_linux x4 \\(None, 'bar0', 'vtx_content\\.dw[13]', -1, ('@vtx_content\\.dw1\\.q-1#1'|0)\\)$|^only_linux x2 \\(None, 'bar0', 'vrx_content\\.dw1', -1, '@vrx_content\\.dw1\\.q-1#1'\\)$",
-  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2248/2256 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（main.c:2392–2395）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。 环地址按出现顺序符号化：Linux 三个环（gq1、gq2、gq0）占 #1–#3、高 32 位均为 0（同一符号），VIP 只有 gq0 一个环（#1）；VIP 的 #1 与 Linux 先配置的 gq1 配对，多出的 #2/#3 两组、Linux 高 32 位为 0 的多余 dw1 写与 DW3 写都来自特殊队列。若 VIP 漏写 gq0 环地址，会多出未豁免的 #1。"
+  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2247/2255 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（dpu_remove main.c:2520–2521）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。 环地址按出现顺序符号化：Linux 三个环（gq1、gq2、gq0）占 #1–#3、高 32 位均为 0（同一符号），VIP 只有 gq0 一个环（#1）；VIP 的 #1 与 Linux 先配置的 gq1 配对，多出的 #2/#3 两组、Linux 高 32 位为 0 的多余 dw1 写与 DW3 写都来自特殊队列。若 VIP 漏写 gq0 环地址，会多出未豁免的 #1。"
  },
  {
   "rule": "review.notify",
@@ -512,7 +521,7 @@ python3 -I tools/vdev_diff.py selftest             # vdev_diff selftest PASS
  {
   "rule": "review.reg_wr",
   "scenario": "*",
-  "key_re": "^only_linux x\\d+ \\(None, 'bar0', '0x0(a[8-e]|b[0-3])[0-9a-f]{4}', -1, \\d+\\)$",
+  "key_re": "^only_linux x\\d+ \\(None, 'bar0', '0x0(a[8-e]|b[01])[0-9a-f]{4}', -1, \\d+\\)$",
   "reason": "PRIV-09 AF 芯片初始化与转发表（D4 表 #9、#22、#23、#26、#30）只出现在 Linux：DSCH 块：shaping 0xA80000–0xAE0000 与 QSCH 0xB00000/0xB00100 初始化，以及 add_vnet/queue_2_qsch 的 QSCH 映射 0xB10000–0xB13000（main.c:1133/1185，#22），rmmod 时删除。调度器配置与队列 DMA 无关，VIP 私有后端不做；模型的 QSCH 在途状态（0xB22000，M-6）不依赖这些映射。"
  },
  {
@@ -543,13 +552,13 @@ python3 -I tools/vdev_diff.py selftest             # vdev_diff selftest PASS
   "rule": "review.reg_wr",
   "scenario": 4,
   "key_re": "^only_linux x\\d+ \\(None, 'bar0', '(vtx_reset', -1, (1|2|2147483649|2147483650)|vrx_reset', -1, (1|2|2147483649|2147483650)|vtx_stat_clr_cfg', -1, (65537|65538|2147549185|2147549186)|vrx_rd_cfg', -1, (1|2|16385|16386|32769|32770|49153|49154|65537|65538|81921|81922|98305|98306|114689|114690)|vtx_ram_cfg', -1, (1|2|8193|8194)|vrx_wr_cfg', -1, (1|2|65537|65538)|vtx_content\\.dw2', -1, (32905|65673)|vrx_content\\.dw2', -1, (524297|1048585)|msix_info\\.(1|2)', -1, 0)\\)$",
-  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2248/2256 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（main.c:2392–2395）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。 S4 rmmod 停用特殊队列：gq1/gq2 的 TX 置 en=0、复位、清统计，RX 读回 4 DW、置 en=0、复位（与 gq0 相同的 #33 序列，低位=gq1/gq2），以及 gv1/gv2 的 info 清零。gq0 的同一序列两侧一致。"
+  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2247/2255 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（dpu_remove main.c:2520–2521）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。 S4 rmmod 停用特殊队列：gq1/gq2 的 TX 置 en=0、复位、清统计，RX 读回 4 DW、置 en=0、复位（与 gq0 相同的 #33 序列，低位=gq1/gq2），以及 gv1/gv2 的 info 清零。gq0 的同一序列两侧一致。"
  },
  {
   "rule": "review.reg_wr",
   "scenario": 4,
   "key_re": "^only_linux x1 \\(None, 'bar0', '(vtx|vrx)_content\\.dw0', -1, '@(vtx|vrx)_content\\.dw0\\.q-1#[23]'\\)$|^only_linux x2 \\(None, 'bar0', '((vtx|vrx)_content\\.dw1', -1, '@(vtx|vrx)_content\\.dw1\\.q-1#1'|(vtx_content\\.dw3|vrx_reset_done)', -1, 0)\\)$",
-  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2248/2256 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（main.c:2392–2395）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。 S4 停用 gq1/gq2 时写回参数表的地址字（按出现顺序符号化，三个环占 #1–#3）、DW3 与复位完成位清零。"
+  "reason": "PRIV-04 AF 特殊队列：驱动 probe 在 AF 上激活 forward capture（gq1，lqid 2/3，gv1）与 BPDU capture（gq2，lqid 4/5，gv2）两个特殊队列（main.c:2247/2255 → dpu_af_activate_special_queue txrx.c:4082，表 txrx.c:3852–3866），rmmod 时停用（dpu_remove main.c:2520–2521）；它们是 AF 管理队列，不属于该 Function 的数据队列对，VIP 私有驱动只建数据队列对（gq0）。 S4 停用 gq1/gq2 时写回参数表的地址字（按出现顺序符号化，三个环占 #1–#3）、DW3 与复位完成位清零。"
  },
  {
   "rule": "review.reg_wr",
