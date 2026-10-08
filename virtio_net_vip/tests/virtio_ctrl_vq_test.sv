@@ -14,16 +14,75 @@ class virtio_ctrl_vq_test_mq_ops extends virtio_atomic_ops;
     `uvm_object_utils(virtio_ctrl_vq_test_mq_ops)
 
     int unsigned mq_requests[$];
+    bit          accept_mq_requests;
+    bit          fail_next_setup_range;
 
+    // 构造可编程 MQ ops 桩；默认接受设备命令且不注入建队失败，无外部资源副作用。
     function new(string name = "virtio_ctrl_vq_test_mq_ops");
         super.new(name);
+        accept_mq_requests = 1;
+        fail_next_setup_range = 0;
     endfunction
 
+    // 记录 MQ 目标并返回测试指定的设备 ACK；输入为目标队列对数，success 为设备
+    // 接受结果。该桩不改队列，后续建拆队仍由生产 atomic ops 完成。
     virtual task ctrl_set_mq_pairs(int unsigned num_pairs, ref bit success);
         mq_requests.push_back(num_pairs);
-        success = 1;
+        success = accept_mq_requests;
+    endtask
+
+    // 可注入一次扩容建队失败，用于验证运行态 FSM 失败后保持 worker 停止；未注入时
+    // 原样调用生产 setup_queue_range，输出 ok 保留真实建队与回滚结果。
+    virtual task setup_queue_range(
+        int unsigned     first_pair,
+        int unsigned     num_pairs,
+        virtqueue_type_e vq_type,
+        int unsigned     queue_size,
+        output bit       ok
+    );
+        if (fail_next_setup_range) begin
+            fail_next_setup_range = 0;
+            ok = 0;
+            return;
+        end
+        super.setup_queue_range(first_pair, num_pairs, vq_type, queue_size, ok);
     endtask
 endclass : virtio_ctrl_vq_test_mq_ops
+
+// control VQ 重建失败注入：正常建队仍走生产实现，测试在超时前置位
+// fail_next_setup 后，只拒绝下一次 setup_queue。这样可精确覆盖“Q_RESET 已确认、旧队列
+// 已销毁，但同编号 control VQ 无法重新建立”的边界，不伪造停队和资源回收结果。
+class virtio_ctrl_vq_test_rebuild_fail_ops extends virtio_atomic_ops;
+    `uvm_object_utils(virtio_ctrl_vq_test_rebuild_fail_ops)
+
+    bit          fail_next_setup;
+    int unsigned setup_attempts;
+
+    function new(string name = "virtio_ctrl_vq_test_rebuild_fail_ops");
+        super.new(name);
+        fail_next_setup = 0;
+        setup_attempts = 0;
+    endfunction
+
+    // 建队探针：输入输出与生产 setup_queue 一致；注入打开时本次返回 ok=0、产生一条
+    // 可捕获错误且不创建任何队列，随后自动关闭注入。其余调用完整委托生产实现。
+    virtual task setup_queue(
+        int unsigned     queue_id,
+        int unsigned     queue_size,
+        virtqueue_type_e vq_type,
+        output bit       ok
+    );
+        setup_attempts++;
+        if (fail_next_setup) begin
+            fail_next_setup = 0;
+            ok = 0;
+            `uvm_error("CTRL_VQ_TEST_INJECT", $sformatf(
+                "injected setup failure for control VQ %0d", queue_id))
+            return;
+        end
+        super.setup_queue(queue_id, queue_size, vq_type, ok);
+    endtask
+endclass : virtio_ctrl_vq_test_rebuild_fail_ops
 
 // 只为断言暴露受保护的分配表，不改变分配行为。
 class virtio_ctrl_vq_test_mem extends host_mem_manager;
@@ -240,6 +299,77 @@ class virtio_ctrl_vq_test_migration_fsm extends virtio_auto_fsm;
     endtask
 endclass : virtio_ctrl_vq_test_migration_fsm
 
+// 运行期 MQ 测试需要观察 worker 的生命周期，但不能让无限循环的真实 worker 掩盖
+// 建拆队结果。本桩只替换数据面启停：每次 start 记录一个新代次及当代 RX/TX qid，
+// configure_mq/do_configure_mq 和队列资源操作仍完整复用生产实现。
+class virtio_ctrl_vq_test_runtime_mq_fsm extends virtio_auto_fsm;
+    `uvm_object_utils(virtio_ctrl_vq_test_runtime_mq_fsm)
+
+    int unsigned stop_count;
+    int unsigned start_count;
+    int unsigned worker_generation;
+    int unsigned worker_qids[$];
+
+    // 构造运行态探针；计数和 worker 集合清零，拓扑由 prime_running_topology 注入。
+    function new(string name = "virtio_ctrl_vq_test_runtime_mq_fsm");
+        super.new(name);
+        stop_count = 0;
+        start_count = 0;
+        worker_generation = 0;
+    endfunction
+
+    // 建立测试入口拓扑并模拟一代正在运行的 worker。输入为活动队列对数和含 control
+    // VQ 的总队列数；副作用是状态进入 RUNNING、代次置 1 并刷新 worker_qids。
+    function void prime_running_topology(
+        int unsigned num_pairs,
+        int unsigned num_queues
+    );
+        active_num_pairs = num_pairs;
+        num_total_queues = num_queues;
+        worker_generation = 1;
+        worker_qids.delete();
+        for (int unsigned pair = 0; pair < active_num_pairs; pair++) begin
+            worker_qids.push_back(pair * 2);
+            worker_qids.push_back(pair * 2 + 1);
+        end
+        state = FSM_RUNNING;
+    endfunction
+
+    // 暴露生产 FSM 维护的总队列计数供恢复断言使用；只读，不改变拓扑所有权。
+    // verified Function reset 成功后该值必须为 0，即使 active_num_pairs 仍保留最近
+    // 一次成功提交的诊断值。
+    function int unsigned tracked_total_queue_count();
+        return num_total_queues;
+    endfunction
+
+    // 模拟同步停止旧代 worker；无输入输出，副作用是 stop_count 加一、清空 worker
+    // 集合并进入 READY。测试只在 RUNNING 调用，其他状态视为测试接线错误。
+    virtual task stop_dataplane();
+        if (state != FSM_RUNNING)
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "runtime MQ stop entered from %s", state.name()))
+        stop_count++;
+        worker_qids.delete();
+        state = FSM_READY;
+    endtask
+
+    // 按已经提交的 active_num_pairs 模拟启动新代 worker；无输入输出，副作用是
+    // start_count/worker_generation 加一、记录全部 RX/TX qid 并进入 RUNNING。
+    virtual task start_dataplane();
+        if (state != FSM_READY)
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "runtime MQ start entered from %s", state.name()))
+        start_count++;
+        worker_generation++;
+        worker_qids.delete();
+        for (int unsigned pair = 0; pair < active_num_pairs; pair++) begin
+            worker_qids.push_back(pair * 2);
+            worker_qids.push_back(pair * 2 + 1);
+        end
+        state = FSM_RUNNING;
+    endtask
+endclass : virtio_ctrl_vq_test_runtime_mq_fsm
+
 // control VQ 设备桩：kick 时从 split avail ring 取走新命令并登记 {head, ack IOVA}；
 // answer_on_kick=1 时立即以 VIRTIO_NET_OK 完成，否则留给 complete_pending()（迟到完成）。
 // Q_RESET 确认后丢弃待完成命令并从 0 重新计数，与真实设备的队列复位语义一致。
@@ -335,9 +465,26 @@ class virtio_ctrl_vq_test_order_transport extends virtio_mock_transport;
     `uvm_object_utils(virtio_ctrl_vq_test_order_transport)
 
     string log[$];
+    bit          fail_queue_reset_once;
+    int unsigned fail_queue_reset_qid;
+    virtqueue_manager reset_probe_vq_mgr;
+    bit          queue2_present_at_function_reset;
+    bit          queue3_present_at_function_reset;
 
     function new(string name = "virtio_ctrl_vq_test_order_transport");
         super.new(name);
+        fail_queue_reset_once = 0;
+        fail_queue_reset_qid = '1;
+        reset_probe_vq_mgr = null;
+        queue2_present_at_function_reset = 0;
+        queue3_present_at_function_reset = 0;
+    endfunction
+
+    // 让指定 qid 的下一次 Q_RESET 返回“未确认”，随后自动撤销注入。其余 Q_RESET
+    // 继续使用 mock transport 的真实计数和默认成功结果。
+    function void fail_next_queue_reset(int unsigned queue_id);
+        fail_queue_reset_once = 1;
+        fail_queue_reset_qid = queue_id;
     endfunction
 
     virtual task write_queue_enable(bit enable);
@@ -346,7 +493,22 @@ class virtio_ctrl_vq_test_order_transport extends virtio_mock_transport;
 
     virtual task write_queue_reset_verified(int unsigned queue_id, ref bit reset_complete);
         super.write_queue_reset_verified(queue_id, reset_complete);
+        if (fail_queue_reset_once && (queue_id == fail_queue_reset_qid)) begin
+            reset_complete = 0;
+            fail_queue_reset_once = 0;
+        end
         log.push_back($sformatf("qreset %0d", queue_id));
+    endtask
+
+    // 在设备复位真正执行前记下边界；结合 IOMMU 的 unmap 日志，可以证明 q2 已在
+    // q3 停队失败前释放，而 q3 的资源一直保留到 verified Function reset。
+    virtual task reset_device_verified(ref bit reset_complete);
+        log.push_back("freset");
+        if (reset_probe_vq_mgr != null) begin
+            queue2_present_at_function_reset = reset_probe_vq_mgr.has_queue(2);
+            queue3_present_at_function_reset = reset_probe_vq_mgr.has_queue(3);
+        end
+        super.reset_device_verified(reset_complete);
     endtask
 endclass : virtio_ctrl_vq_test_order_transport
 
@@ -380,9 +542,17 @@ class virtio_ctrl_vq_test extends uvm_test;
         test_ctrl_send_alloc_failure_rolls_back();
         test_ctrl_send_map_failure_rolls_back();
         test_ctrl_send_timeout_resets_queue();
+        test_ctrl_send_rebuild_failure_requires_verified_reset();
         test_ctrl_send_timeout_quarantines_without_ring_reset();
         test_ctrl_vq_outside_data_range_migration_and_msix();
         test_mq_expansion_binds_new_queue_vectors();
+        test_runtime_mq_restarts_matching_workers();
+        test_runtime_mq_device_reject_keeps_old_topology();
+        test_runtime_mq_timeout_requires_function_reset();
+        test_runtime_mq_failure_keeps_workers_stopped();
+        test_runtime_mq_rollback_reset_requires_reinit();
+        test_runtime_mq_partial_shrink_requires_reset();
+        test_runtime_mq_partial_shrink_reset_failure();
         test_full_init_binds_msix_before_enable();
         test_queue_stop_uses_ring_reset();
         `uvm_info("CTRL_VQ_TEST", "control VQ tests PASSED", UVM_NONE)
@@ -461,6 +631,8 @@ class virtio_ctrl_vq_test extends uvm_test;
         fsm.drv_cfg.vq_type = VQ_SPLIT;
         assert(fsm.bind_mq_pair_limit(2, why))
             else `uvm_fatal("CTRL_VQ_TEST", why)
+        // 手工装配已完成，与 full_init 成功后的可重配入口状态保持一致。
+        fsm.state = FSM_READY;
         fsm.configure_mq(2);
         expected_qids = '{0, 1, 4, 2, 3};
         assert((fsm.state != FSM_ERROR) && (ops.mq_requests.size() == 1) &&
@@ -551,7 +723,8 @@ class virtio_ctrl_vq_test extends uvm_test;
         ctrl_mem.init_region(64'h7200_0000, 64'h7200_000F);
         wire_ops(ops, transport, vq_mgr, ring_mem, ctrl_mem, iommu, 16'h0902);
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
-        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.setup_control_queue(1, VQ_SPLIT, 8, ok);
         assert(ok) else `uvm_fatal("CTRL_VQ_TEST", "control queue setup failed")
         ctrl_vq = vq_mgr.get_queue(2);
         maps_before = iommu.active_mapping_count();
@@ -607,7 +780,8 @@ class virtio_ctrl_vq_test extends uvm_test;
         mem.init_region(64'h7300_0000, 64'h7300_FFFF);
         wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h0903);
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
-        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.setup_control_queue(1, VQ_SPLIT, 8, ok);
         assert(ok) else `uvm_fatal("CTRL_VQ_TEST", "control queue setup failed")
         ctrl_vq = vq_mgr.get_queue(2);
         maps_before = iommu.active_mapping_count();
@@ -764,8 +938,10 @@ class virtio_ctrl_vq_test extends uvm_test;
             "control VQ outside data range migration and MSI-X test PASSED", UVM_LOW)
     endtask
 
-    // 协商 RING_RESET：第一条命令设备不应答 → 超时后 Q_RESET 并重新启用 control VQ；
-    // 设备随后的迟到完成不得被第二条命令消费，第二条命令拿到自己的 ack，描述符全部归还。
+    // 协商 RING_RESET：显式登记 control VQ 2 后再建立编号更高的普通队列 7，ctrl_send
+    // 仍必须使用 2。第一条命令设备不应答，超时后 Q_RESET 并重新建立 control VQ；
+    // 局部资源虽已安全恢复，设备是否执行过命令仍不确定，因此后续命令必须被闸门拒绝。
+    // 只有 verified Function reset 能清除该状态，重新初始化后的命令才可成功。
     task test_ctrl_send_timeout_resets_queue();
         virtio_ctrl_vq_test_device device =
             virtio_ctrl_vq_test_device::type_id::create("timeout_reset_device");
@@ -777,10 +953,14 @@ class virtio_ctrl_vq_test extends uvm_test;
             virtio_ctrl_vq_test_iommu::type_id::create("timeout_reset_iommu");
         virtio_ctrl_vq_test_catcher catcher;
         virtio_ctrl_ack_e first_ack;
-        virtio_ctrl_ack_e second_ack;
+        virtio_ctrl_ack_e blocked_ack;
+        virtio_ctrl_ack_e recovered_ack;
         byte unsigned data[];
         int unsigned expected_qids[$];
+        int unsigned ctrl_qid;
+        bit id_valid;
         bit ok;
+        bit reset_complete;
 
         mem.init_region(64'h7400_0000, 64'h7400_FFFF);
         wire_ops(ops, device, vq_mgr, mem, mem, iommu, 16'h0904);
@@ -789,9 +969,12 @@ class virtio_ctrl_vq_test extends uvm_test;
         device.iommu = iommu;
         ops.wait_pol.default_timeout_ns = 200;
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
         ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
-        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        ops.setup_control_queue(1, VQ_SPLIT, 8, ok);
         assert(ok) else `uvm_fatal("CTRL_VQ_TEST", "control queue setup failed")
+        ops.setup_queue(7, 8, VQ_SPLIT, ok);
+        assert(ok) else `uvm_fatal("CTRL_VQ_TEST", "higher non-control queue setup failed")
 
         data = new[2];
         data[0] = 8'h01;
@@ -803,27 +986,228 @@ class virtio_ctrl_vq_test extends uvm_test;
                       data, first_ack);
         uvm_report_cb::delete(null, catcher);
 
-        device.complete_pending();   // 迟到完成：已确认复位的设备不再持有该命令
-        device.answer_on_kick = 1;
-        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
-                      data, second_ack);
-        expected_qids = '{2, 2};
+        expected_qids = '{2, 7, 2};
         assert((first_ack == VIRTIO_NET_CTRL_ACK_ERR) &&
-               (second_ack == VIRTIO_NET_CTRL_ACK_OK) && (catcher.caught_count == 1) &&
+               (catcher.caught_count == 1) &&
+               ops.control_vq_requires_recovery() &&
                (device.queue_reset_count == 1) && (device.last_reset_queue_id == 2) &&
                (device.programmed_qids == expected_qids) &&
                (vq_mgr.get_queue(2).get_free_count() == 8))
             else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
-                "ctrl_send timeout did not reset the control VQ before reuse (acks=%s/%s caught=%0d resets=%0d programmed=%p free=%0d)",
-                first_ack.name(), second_ack.name(), catcher.caught_count,
+                {"ctrl_send timeout did not recover resources and close the Function ",
+                 "gate (ack=%s caught=%0d pending=%0b resets=%0d programmed=%p free=%0d)"},
+                first_ack.name(), catcher.caught_count,
+                ops.control_vq_requires_recovery(),
                 device.queue_reset_count, device.programmed_qids,
                 vq_mgr.get_queue(2).get_free_count()))
 
-        ops.teardown_queue(2);
-        assert((iommu.active_mapping_count() == 0) && (mem.outstanding_allocations() == 0))
+        // Q_RESET 已使迟到完成失效，但没有证明命令副作用未发生。第二次提交必须在
+        // 分配 DMA 和 kick 之前拒绝；随后整 Function reset 清空普通队列 7 和 control VQ。
+        device.complete_pending();
+        device.answer_on_kick = 1;
+        catcher = new("timeout_pending_catcher");
+        catcher.expect_error("ATOMIC_OPS",
+            "*control VQ recovery is pending; verified device reset required*");
+        uvm_report_cb::add(null, catcher);
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      data, blocked_ack);
+        uvm_report_cb::delete(null, catcher);
+        assert((blocked_ack == VIRTIO_NET_CTRL_ACK_ERR) &&
+               (catcher.caught_count == 1) && (device.kick_count == 1) &&
+               (vq_mgr.get_queue_count() == 2))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"ambiguous control result did not block a second command ",
+                 "(ack=%s caught=%0d kicks=%0d queues=%0d)"},
+                blocked_ack.name(), catcher.caught_count,
+                device.kick_count, vq_mgr.get_queue_count()))
+
+        ops.device_reset_verified(reset_complete);
+        id_valid = ops.get_control_queue_id(ctrl_qid);
+        assert(reset_complete && !id_valid &&
+               !ops.control_vq_requires_recovery() &&
+               (vq_mgr.get_queue_count() == 0) &&
+               (iommu.active_mapping_count() == 0) &&
+               (mem.outstanding_allocations() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"verified reset did not clear ambiguous control state ",
+                 "(reset=%0b id=%0b/%0d pending=%0b queues=%0d maps=%0d allocs=%0d)"},
+                reset_complete, id_valid, ctrl_qid,
+                ops.control_vq_requires_recovery(), vq_mgr.get_queue_count(),
+                iommu.active_mapping_count(), mem.outstanding_allocations()))
+
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_control_queue(1, VQ_SPLIT, 8, ok);
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      data, recovered_ack);
+        expected_qids = '{2, 7, 2, 2};
+        assert(ok && (recovered_ack == VIRTIO_NET_CTRL_ACK_OK) &&
+               (device.programmed_qids == expected_qids) &&
+               (device.kick_count == 2))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"control command did not recover after verified reset ",
+                 "(setup=%0b ack=%s programmed=%p kicks=%0d)"},
+                ok, recovered_ack.name(), device.programmed_qids,
+                device.kick_count))
+
+        ops.device_reset_verified(reset_complete);
+        assert(reset_complete && (iommu.active_mapping_count() == 0) &&
+               (mem.outstanding_allocations() == 0))
             else `uvm_fatal("CTRL_VQ_TEST", "timeout-reset test leaked control queue resources")
         mem.leak_check();
         `uvm_info("CTRL_VQ_TEST", "ctrl_send timeout queue-reset test PASSED", UVM_LOW)
+    endtask
+
+    // Q_RESET 已确认但 control VQ 重建被注入失败：旧请求 DMA 可以释放，但 Function
+    // 必须保留显式 control qid 并进入 recovery pending。第二条命令和普通建队都应在
+    // 分配/通知/设备编程前被拒绝；只有成功的 verified device reset 清除身份和闸门，
+    // 之后重新初始化才能发送。
+    task test_ctrl_send_rebuild_failure_requires_verified_reset();
+        virtio_ctrl_vq_test_device device =
+            virtio_ctrl_vq_test_device::type_id::create("rebuild_fail_device");
+        virtio_ctrl_vq_test_rebuild_fail_ops ops =
+            virtio_ctrl_vq_test_rebuild_fail_ops::type_id::create("rebuild_fail_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create("rebuild_fail_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("rebuild_fail_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("rebuild_fail_iommu");
+        virtio_ctrl_vq_test_catcher catcher;
+        virtio_ctrl_ack_e first_ack;
+        virtio_ctrl_ack_e blocked_ack;
+        virtio_ctrl_ack_e recovered_ack;
+        byte unsigned data[];
+        int unsigned ctrl_qid;
+        bit id_valid;
+        bit ok;
+        bit reset_complete;
+
+        mem.init_region(64'h7480_0000, 64'h7480_FFFF);
+        wire_ops(ops, device, vq_mgr, mem, mem, iommu, 16'h0914);
+        device.vq_mgr = vq_mgr;
+        device.mem = mem;
+        device.iommu = iommu;
+        ops.wait_pol.default_timeout_ns = 200;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_control_queue(1, VQ_SPLIT, 8, ok);
+        id_valid = ops.get_control_queue_id(ctrl_qid);
+        assert(ok && id_valid && (ctrl_qid == 2) &&
+               !ops.control_vq_requires_recovery())
+            else `uvm_fatal("CTRL_VQ_TEST",
+                "rebuild-failure fixture did not register control VQ 2")
+
+        data = new[2];
+        data[0] = 8'h01;
+        data[1] = 8'h00;
+        ops.fail_next_setup = 1;
+        catcher = new("rebuild_fail_catcher");
+        catcher.expect_error("ATOMIC_OPS",
+            "*ctrl_send: timeout waiting for control VQ completion*");
+        catcher.expect_error("CTRL_VQ_TEST_INJECT",
+            "*injected setup failure for control VQ 2*");
+        catcher.expect_error("ATOMIC_OPS",
+            "*control VQ 2 could not be re-enabled after reset; verified device reset required*");
+        catcher.expect_error("ATOMIC_OPS",
+            "*control VQ recovery is pending; verified device reset required*");
+        catcher.expect_error("ATOMIC_OPS",
+            "*setup_queue: verified Function reset required before creating another queue*");
+        uvm_report_cb::add(null, catcher);
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ,
+                      VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, data, first_ack);
+        id_valid = ops.get_control_queue_id(ctrl_qid);
+        assert((first_ack == VIRTIO_NET_CTRL_ACK_ERR) && id_valid &&
+               (ctrl_qid == 2) && ops.control_vq_requires_recovery() &&
+               !vq_mgr.has_queue(2) && (device.queue_reset_count == 1) &&
+               (ops.setup_attempts == 2) &&
+               (mem.outstanding_allocations() == 0) &&
+               (iommu.active_mapping_count() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "failed control VQ rebuild did not close recovery (ack=%s id=%0b/%0d pending=%0b queue=%0b resets=%0d setups=%0d allocs=%0d maps=%0d)",
+                first_ack.name(), id_valid, ctrl_qid,
+                ops.control_vq_requires_recovery(), vq_mgr.has_queue(2),
+                device.queue_reset_count, ops.setup_attempts,
+                mem.outstanding_allocations(), iommu.active_mapping_count()))
+
+        // control VQ 恢复失败属于 Function 生命周期边界；公开的普通建队入口也不能
+        // 在同一旧生命周期里创建 q7。探针计数会记录调用本身，但设备编程和资源数
+        // 必须保持不变。
+        ops.setup_queue(7, 8, VQ_SPLIT, ok);
+        assert(!ok && (ops.setup_attempts == 3) &&
+               (device.programmed_qids.size() == 1) &&
+               (mem.outstanding_allocations() == 0) &&
+               (iommu.active_mapping_count() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"control recovery gate allowed ordinary queue setup ",
+                 "(ok=%0b setups=%0d programmed=%p allocs=%0d maps=%0d)"},
+                ok, ops.setup_attempts, device.programmed_qids,
+                mem.outstanding_allocations(), iommu.active_mapping_count()))
+
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ,
+                      VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, data, blocked_ack);
+        uvm_report_cb::delete(null, catcher);
+        assert((blocked_ack == VIRTIO_NET_CTRL_ACK_ERR) &&
+               (catcher.caught_count == 5) && (device.kick_count == 1) &&
+               (ops.setup_attempts == 3) &&
+               (mem.outstanding_allocations() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "recovery-pending control command was not rejected before side effects (ack=%s caught=%0d kicks=%0d setups=%0d allocs=%0d)",
+                blocked_ack.name(), catcher.caught_count, device.kick_count,
+                ops.setup_attempts, mem.outstanding_allocations()))
+
+        // 一次未确认的整设备复位仍不能解除闸门；随后设备确认完成才清除状态。
+        device.device_reset_complete = 0;
+        catcher = new("rebuild_reset_fail_catcher");
+        catcher.expect_error("ATOMIC_OPS",
+            "*device_reset: transport reset did not complete; retaining PF DMA*");
+        uvm_report_cb::add(null, catcher);
+        ops.device_reset_verified(reset_complete);
+        uvm_report_cb::delete(null, catcher);
+        id_valid = ops.get_control_queue_id(ctrl_qid);
+        assert(!reset_complete && (catcher.caught_count == 1) && id_valid &&
+               (ctrl_qid == 2) && ops.control_vq_requires_recovery())
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "unverified device reset cleared control recovery state (reset=%0b caught=%0d id=%0b/%0d pending=%0b)",
+                reset_complete, catcher.caught_count, id_valid, ctrl_qid,
+                ops.control_vq_requires_recovery()))
+
+        device.device_reset_complete = 1;
+        ops.device_reset_verified(reset_complete);
+        id_valid = ops.get_control_queue_id(ctrl_qid);
+        assert(reset_complete && !id_valid &&
+               !ops.control_vq_requires_recovery())
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "verified device reset did not clear control recovery state (reset=%0b id=%0b/%0d pending=%0b)",
+                reset_complete, id_valid, ctrl_qid,
+                ops.control_vq_requires_recovery()))
+
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_control_queue(1, VQ_SPLIT, 8, ok);
+        device.answer_on_kick = 1;
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ,
+                      VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, data, recovered_ack);
+        assert(ok && (recovered_ack == VIRTIO_NET_CTRL_ACK_OK) &&
+               !ops.control_vq_requires_recovery() &&
+               (ops.setup_attempts == 4))
+            else `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                "control VQ did not recover after verified reset (setup=%0b ack=%s pending=%0b setups=%0d)",
+                ok, recovered_ack.name(), ops.control_vq_requires_recovery(),
+                ops.setup_attempts))
+
+        ops.device_reset_verified(reset_complete);
+        assert(reset_complete && (vq_mgr.get_queue_count() == 0) &&
+               (iommu.active_mapping_count() == 0) &&
+               (mem.outstanding_allocations() == 0))
+            else `uvm_fatal("CTRL_VQ_TEST",
+                "control VQ rebuild-failure recovery test leaked resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+            "ctrl_send rebuild-failure verified-reset recovery test PASSED", UVM_LOW)
     endtask
 
     // 未协商 RING_RESET：超时命令无法单独复位，其缓冲保持映射与分配（IOVA 不会被
@@ -853,7 +1237,8 @@ class virtio_ctrl_vq_test extends uvm_test;
         device.iommu = iommu;
         ops.wait_pol.default_timeout_ns = 200;
         ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
-        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.setup_control_queue(1, VQ_SPLIT, 8, ok);
         assert(ok) else `uvm_fatal("CTRL_VQ_TEST", "control queue setup failed")
         ctrl_vq = vq_mgr.get_queue(2);
         maps_before = iommu.active_mapping_count();
@@ -959,6 +1344,8 @@ class virtio_ctrl_vq_test extends uvm_test;
         fsm.drv_cfg.vq_type = VQ_SPLIT;
         if (!fsm.bind_mq_pair_limit(2, why))
             `uvm_fatal("CTRL_VQ_TEST", why)
+        // 此用例绕过 full_init 手工建立初始拓扑，需显式进入合法 MQ 状态。
+        fsm.state = FSM_READY;
         fsm.configure_mq(2);
 
         vq_mgr.get_queue_ids(qids);
@@ -992,6 +1379,761 @@ class virtio_ctrl_vq_test extends uvm_test;
         mem.leak_check();
         `uvm_info("CTRL_VQ_TEST", "MQ expansion new-queue vector binding test PASSED", UVM_LOW)
     endtask
+
+    // 从 RUNNING 连续执行 1->2 扩容、同值 no-op 和 2->1 缩容。生产 atomic ops
+    // 负责真实建拆队，runtime FSM 桩记录 worker 代次与 qid；每次有效变更必须恰好
+    // stop/start 一次，新代 worker 集合必须与最终活动队列对完全一致，同值请求不得
+    // 访问 control VQ 或切换 worker。
+    task test_runtime_mq_restarts_matching_workers();
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("runtime_mq_transport");
+        virtio_ctrl_vq_test_mq_ops ops =
+            virtio_ctrl_vq_test_mq_ops::type_id::create("runtime_mq_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create("runtime_mq_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("runtime_mq_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("runtime_mq_iommu");
+        virtio_ctrl_vq_test_runtime_mq_fsm fsm =
+            virtio_ctrl_vq_test_runtime_mq_fsm::type_id::create("runtime_mq_fsm");
+        int unsigned expected_workers[$];
+        int unsigned qids[$];
+        int unsigned requests_before_noop;
+        bit ok;
+        string why;
+
+        mem.init_region(64'h7900_0000, 64'h7900_FFFF);
+        wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h0909);
+        transport.mock_net_config.max_virtqueue_pairs = 2;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 3))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "runtime MQ setup did not create data pair 0 and control VQ")
+
+        fsm.ops = ops;
+        fsm.drv_cfg.num_queue_pairs = 1;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.prime_running_topology(1, 3);
+
+        fsm.configure_mq(2);
+        expected_workers = '{0, 1, 2, 3};
+        if ((fsm.state != FSM_RUNNING) ||
+            (fsm.active_queue_pair_count() != 2) ||
+            (fsm.drv_cfg.num_queue_pairs != 2) ||
+            (fsm.stop_count != 1) || (fsm.start_count != 1) ||
+            (fsm.worker_generation != 2) ||
+            (fsm.worker_qids != expected_workers) ||
+            (vq_mgr.get_queue_count() != 5) ||
+            (ops.mq_requests.size() != 1) || (ops.mq_requests[0] != 2)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"runtime MQ expansion did not replace workers atomically: ",
+                 "state=%s active=%0d cfg=%0d stop/start=%0d/%0d gen=%0d ",
+                 "workers=%p queues=%0d requests=%p"},
+                fsm.state.name(), fsm.active_queue_pair_count(),
+                fsm.drv_cfg.num_queue_pairs, fsm.stop_count, fsm.start_count,
+                fsm.worker_generation, fsm.worker_qids,
+                vq_mgr.get_queue_count(), ops.mq_requests))
+        end
+
+        requests_before_noop = ops.mq_requests.size();
+        fsm.configure_mq(2);
+        if ((ops.mq_requests.size() != requests_before_noop) ||
+            (fsm.stop_count != 1) || (fsm.start_count != 1) ||
+            (fsm.worker_generation != 2) ||
+            (fsm.worker_qids != expected_workers) ||
+            (fsm.state != FSM_RUNNING)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"same-pair MQ request was not a side-effect-free no-op: ",
+                 "requests=%p stop/start=%0d/%0d gen=%0d workers=%p state=%s"},
+                ops.mq_requests, fsm.stop_count, fsm.start_count,
+                fsm.worker_generation, fsm.worker_qids, fsm.state.name()))
+        end
+
+        fsm.configure_mq(1);
+        expected_workers = '{0, 1};
+        vq_mgr.get_queue_ids(qids);
+        if ((fsm.state != FSM_RUNNING) ||
+            (fsm.active_queue_pair_count() != 1) ||
+            (fsm.drv_cfg.num_queue_pairs != 1) ||
+            (fsm.stop_count != 2) || (fsm.start_count != 2) ||
+            (fsm.worker_generation != 3) ||
+            (fsm.worker_qids != expected_workers) ||
+            (qids.size() != 3) || !vq_mgr.has_queue(0) ||
+            !vq_mgr.has_queue(1) || !vq_mgr.has_queue(4) ||
+            vq_mgr.has_queue(2) || vq_mgr.has_queue(3) ||
+            (ops.mq_requests.size() != 2) || (ops.mq_requests[1] != 1)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"runtime MQ shrink did not replace workers atomically: ",
+                 "state=%s active=%0d cfg=%0d stop/start=%0d/%0d gen=%0d ",
+                 "workers=%p queues=%p requests=%p"},
+                fsm.state.name(), fsm.active_queue_pair_count(),
+                fsm.drv_cfg.num_queue_pairs, fsm.stop_count, fsm.start_count,
+                fsm.worker_generation, fsm.worker_qids, qids,
+                ops.mq_requests))
+        end
+
+        fsm.stop_dataplane();
+        ops.device_reset();
+        if ((vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("CTRL_VQ_TEST", "runtime MQ test leaked queue resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+                  "runtime MQ worker replacement test PASSED", UVM_LOW)
+    endtask
+
+    // 运行态 MQ 命令被设备拒绝时，旧 worker 已经按运行期重配约束同步退出，但设备
+    // 和 Host 拓扑都没有提交变化。FSM 应停在 READY，保留旧 active/cfg/队列资源，
+    // 不得建拆队、复位设备或误启动新一代 worker。
+    task test_runtime_mq_device_reject_keeps_old_topology();
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("runtime_mq_reject_transport");
+        virtio_ctrl_vq_test_mq_ops ops =
+            virtio_ctrl_vq_test_mq_ops::type_id::create("runtime_mq_reject_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create("runtime_mq_reject_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("runtime_mq_reject_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("runtime_mq_reject_iommu");
+        virtio_ctrl_vq_test_runtime_mq_fsm fsm =
+            virtio_ctrl_vq_test_runtime_mq_fsm::type_id::create(
+                "runtime_mq_reject_fsm");
+        virtio_ctrl_vq_test_catcher catcher;
+        int unsigned mappings_before;
+        int unsigned allocations_before;
+        int unsigned programs_before;
+        bit ok;
+        string why;
+
+        mem.init_region(64'h7904_0000, 64'h7904_FFFF);
+        wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h090D);
+        transport.mock_net_config.max_virtqueue_pairs = 2;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 3))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "runtime MQ rejection setup did not create queues {0,1,4}")
+
+        fsm.ops = ops;
+        fsm.drv_cfg.num_queue_pairs = 1;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.prime_running_topology(1, 3);
+        mappings_before = iommu.active_mapping_count();
+        allocations_before = mem.outstanding_allocations();
+        programs_before = transport.programmed_qids.size();
+        ops.accept_mq_requests = 0;
+
+        catcher = new("runtime_mq_reject_catcher");
+        catcher.expect_error("AUTO_FSM",
+            "*configure_mq: device rejected MQ change to 2 pairs*");
+        uvm_report_cb::add(null, catcher);
+        fsm.configure_mq(2);
+        uvm_report_cb::delete(null, catcher);
+
+        if ((catcher.caught_count != 1) || (fsm.state != FSM_READY) ||
+            (fsm.active_queue_pair_count() != 1) ||
+            (fsm.drv_cfg.num_queue_pairs != 1) ||
+            (fsm.tracked_total_queue_count() != 3) ||
+            (fsm.stop_count != 1) || (fsm.start_count != 0) ||
+            (fsm.worker_generation != 1) || (fsm.worker_qids.size() != 0) ||
+            (vq_mgr.get_queue_count() != 3) || !vq_mgr.has_queue(0) ||
+            !vq_mgr.has_queue(1) || !vq_mgr.has_queue(4) ||
+            (iommu.active_mapping_count() != mappings_before) ||
+            (mem.outstanding_allocations() != allocations_before) ||
+            (transport.programmed_qids.size() != programs_before) ||
+            (transport.queue_reset_count != 0) ||
+            (transport.device_reset_count != 0) ||
+            ops.queues_require_recovery() ||
+            (ops.mq_requests.size() != 1) ||
+            (ops.mq_requests[0] != 2)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"rejected runtime MQ changed old topology or workers: caught=%0d ",
+                 "state=%s active=%0d cfg=%0d tracked/actual=%0d/%0d ",
+                 "stop/start=%0d/%0d gen=%0d workers=%p maps=%0d/%0d ",
+                 "allocs=%0d/%0d programs=%0d/%0d qreset/freset=%0d/%0d ",
+                 "pending=%0b requests=%p"},
+                catcher.caught_count, fsm.state.name(),
+                fsm.active_queue_pair_count(), fsm.drv_cfg.num_queue_pairs,
+                fsm.tracked_total_queue_count(), vq_mgr.get_queue_count(),
+                fsm.stop_count, fsm.start_count, fsm.worker_generation,
+                fsm.worker_qids, iommu.active_mapping_count(), mappings_before,
+                mem.outstanding_allocations(), allocations_before,
+                transport.programmed_qids.size(), programs_before,
+                transport.queue_reset_count, transport.device_reset_count,
+                ops.queues_require_recovery(), ops.mq_requests))
+        end
+
+        ops.device_reset_verified(ok);
+        if (!ok || (vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "runtime MQ rejection cleanup did not release resources")
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+                  "runtime MQ device-rejection test PASSED", UVM_LOW)
+    endtask
+
+    // 运行态 MQ 命令已经发布，但设备不返回 used/ACK。control Q_RESET 和同号重建只能
+    // 证明旧描述符不再被访问，不能证明设备没有应用新 pair 数。FSM 必须识别 control
+    // recovery pending，主动完成 verified Function reset，清空全部队列并进入
+    // REINIT_REQUIRED；旧 worker 已停止且不得重启。
+    task test_runtime_mq_timeout_requires_function_reset();
+        virtio_ctrl_vq_test_device device =
+            virtio_ctrl_vq_test_device::type_id::create(
+                "runtime_mq_timeout_device");
+        virtio_atomic_ops ops =
+            virtio_atomic_ops::type_id::create("runtime_mq_timeout_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create("runtime_mq_timeout_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("runtime_mq_timeout_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create(
+                "runtime_mq_timeout_iommu");
+        virtio_ctrl_vq_test_runtime_mq_fsm fsm =
+            virtio_ctrl_vq_test_runtime_mq_fsm::type_id::create(
+                "runtime_mq_timeout_fsm");
+        virtio_ctrl_vq_test_catcher catcher;
+        bit ok;
+        string why;
+
+        mem.init_region(64'h7906_0000, 64'h7906_FFFF);
+        wire_ops(ops, device, vq_mgr, mem, mem, iommu, 16'h090F);
+        device.vq_mgr = vq_mgr;
+        device.mem = mem;
+        device.iommu = iommu;
+        device.mock_net_config.max_virtqueue_pairs = 2;
+        ops.wait_pol.default_timeout_ns = 200;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 3) ||
+            !vq_mgr.has_queue(0) || !vq_mgr.has_queue(1) ||
+            !vq_mgr.has_queue(4))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "runtime MQ timeout setup did not create queues {0,1,4}")
+
+        fsm.ops = ops;
+        fsm.drv_cfg.num_queue_pairs = 1;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.prime_running_topology(1, 3);
+
+        catcher = new("runtime_mq_timeout_catcher");
+        catcher.expect_error("ATOMIC_OPS",
+            "*ctrl_send: timeout waiting for control VQ completion*");
+        catcher.expect_error("AUTO_FSM",
+            {"*configure_mq: control command for 2 pairs completed with an unknown ",
+             "device result; verified Function reset completed, reinitialization required*"});
+        uvm_report_cb::add(null, catcher);
+        fsm.configure_mq(2);
+        uvm_report_cb::delete(null, catcher);
+
+        if ((catcher.caught_count != 2) ||
+            (fsm.state != FSM_REINIT_REQUIRED) ||
+            (fsm.active_queue_pair_count() != 1) ||
+            (fsm.drv_cfg.num_queue_pairs != 1) ||
+            (fsm.tracked_total_queue_count() != 0) ||
+            (fsm.stop_count != 1) || (fsm.start_count != 0) ||
+            (fsm.worker_generation != 1) || (fsm.worker_qids.size() != 0) ||
+            (device.kick_count != 1) ||
+            (device.queue_reset_count != 1) ||
+            (device.last_reset_queue_id != 4) ||
+            (device.device_reset_count != 1) ||
+            ops.control_vq_requires_recovery() ||
+            ops.queues_require_recovery() ||
+            (vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"ambiguous runtime MQ result was not closed by Function reset: ",
+                 "caught=%0d state=%s active=%0d cfg=%0d tracked/actual=%0d/%0d ",
+                 "stop/start=%0d/%0d gen=%0d workers=%p kicks=%0d qreset=%0d/%0d ",
+                 "freset=%0d ctrl/queue_pending=%0b/%0b maps=%0d allocs=%0d"},
+                catcher.caught_count, fsm.state.name(),
+                fsm.active_queue_pair_count(), fsm.drv_cfg.num_queue_pairs,
+                fsm.tracked_total_queue_count(), vq_mgr.get_queue_count(),
+                fsm.stop_count, fsm.start_count, fsm.worker_generation,
+                fsm.worker_qids, device.kick_count, device.queue_reset_count,
+                device.last_reset_queue_id, device.device_reset_count,
+                ops.control_vq_requires_recovery(),
+                ops.queues_require_recovery(), iommu.active_mapping_count(),
+                mem.outstanding_allocations()))
+        end
+
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+                  "runtime MQ ambiguous-timeout recovery test PASSED", UVM_LOW)
+    endtask
+
+    // 运行态扩容在设备接受 MQ 命令后注入建队失败。即使没有创建出新队列，设备已经
+    // 接受新 pair 数，FSM 也必须主动完成 verified Function reset，清空 Host 拓扑并进入
+    // REINIT_REQUIRED；旧代 worker 保持停止，不得启动新代。随后以同一活动对数再次请求，
+    // 验证恢复状态检查位于同值 no-op 之前，不会绕过重新初始化。
+    task test_runtime_mq_failure_keeps_workers_stopped();
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("runtime_mq_fail_transport");
+        virtio_ctrl_vq_test_mq_ops ops =
+            virtio_ctrl_vq_test_mq_ops::type_id::create("runtime_mq_fail_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create("runtime_mq_fail_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("runtime_mq_fail_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("runtime_mq_fail_iommu");
+        virtio_ctrl_vq_test_runtime_mq_fsm fsm =
+            virtio_ctrl_vq_test_runtime_mq_fsm::type_id::create(
+                "runtime_mq_fail_fsm");
+        virtio_ctrl_vq_test_catcher catcher;
+        bit ok;
+        string why;
+
+        mem.init_region(64'h7901_0000, 64'h7901_FFFF);
+        wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h090A);
+        transport.mock_net_config.max_virtqueue_pairs = 2;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 3))
+            `uvm_fatal("CTRL_VQ_TEST", "runtime MQ failure setup did not create queues")
+
+        fsm.ops = ops;
+        fsm.drv_cfg.num_queue_pairs = 1;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.prime_running_topology(1, 3);
+        ops.fail_next_setup_range = 1;
+
+        catcher = new("runtime_mq_fail_catcher");
+        catcher.expect_error("AUTO_FSM",
+            "*configure_mq: failed to setup queue pairs 1..1*");
+        uvm_report_cb::add(null, catcher);
+        fsm.configure_mq(2);
+        uvm_report_cb::delete(null, catcher);
+
+        if ((catcher.caught_count != 1) ||
+            (fsm.state != FSM_REINIT_REQUIRED) ||
+            (fsm.active_queue_pair_count() != 1) ||
+            (fsm.drv_cfg.num_queue_pairs != 1) ||
+            (fsm.tracked_total_queue_count() != 0) ||
+            (fsm.stop_count != 1) || (fsm.start_count != 0) ||
+            (fsm.worker_generation != 1) || (fsm.worker_qids.size() != 0) ||
+            (vq_mgr.get_queue_count() != 0) ||
+            ops.queue_rollback_used_function_reset() ||
+            ops.queues_require_recovery() ||
+            (transport.device_reset_count != 1) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0) ||
+            (ops.mq_requests.size() != 1) ||
+            (ops.mq_requests[0] != 2)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"failed runtime MQ expansion did not reset to reinit: ",
+                 "caught=%0d state=%s active=%0d cfg=%0d stop/start=%0d/%0d ",
+                 "gen=%0d workers=%p tracked/actual=%0d/%0d used_reset=%0b ",
+                 "pending=%0b resets=%0d maps=%0d allocs=%0d requests=%p"},
+                catcher.caught_count, fsm.state.name(),
+                fsm.active_queue_pair_count(), fsm.drv_cfg.num_queue_pairs,
+                fsm.stop_count, fsm.start_count, fsm.worker_generation,
+                fsm.worker_qids, fsm.tracked_total_queue_count(),
+                vq_mgr.get_queue_count(),
+                ops.queue_rollback_used_function_reset(),
+                ops.queues_require_recovery(), transport.device_reset_count,
+                iommu.active_mapping_count(), mem.outstanding_allocations(),
+                ops.mq_requests))
+        end
+
+        // active_num_pairs 仍为 1；若同值 no-op 先于状态检查，这次调用会静默成功。
+        // 正确实现必须报告恢复状态错误，且不再发 control 命令或再次复位。
+        catcher = new("runtime_mq_reinit_guard_catcher");
+        catcher.expect_error("AUTO_FSM",
+            "*configure_mq: requires FSM_READY or FSM_RUNNING, got FSM_REINIT_REQUIRED*");
+        uvm_report_cb::add(null, catcher);
+        fsm.configure_mq(1);
+        uvm_report_cb::delete(null, catcher);
+        if ((catcher.caught_count != 1) ||
+            (fsm.state != FSM_REINIT_REQUIRED) ||
+            (ops.mq_requests.size() != 1) ||
+            (transport.device_reset_count != 1) ||
+            (fsm.stop_count != 1) || (fsm.start_count != 0)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"MQ recovery-state guard was bypassed by same-pair request: ",
+                 "caught=%0d state=%s requests=%p resets=%0d stop/start=%0d/%0d"},
+                catcher.caught_count, fsm.state.name(), ops.mq_requests,
+                transport.device_reset_count, fsm.stop_count, fsm.start_count))
+        end
+
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+                  "runtime MQ failure reset/worker-stop test PASSED", UVM_LOW)
+    endtask
+
+    // 扩容时让新 RX 队列建成、新 TX 队列映射失败；未协商 RING_RESET，因此生产
+    // setup_queue_range 无法逐队回滚 RX，只能执行 verified Function reset。FSM 必须
+    // 根据 rollback-used-reset 与 recovery-pending 的组合进入 REINIT_REQUIRED，不得把
+    // 已被整复位清空的 Function 当作仍有旧队列可恢复，也不得启动新代 worker。
+    task test_runtime_mq_rollback_reset_requires_reinit();
+        virtio_mock_transport transport =
+            virtio_mock_transport::type_id::create("runtime_mq_reset_transport");
+        virtio_ctrl_vq_test_mq_ops ops =
+            virtio_ctrl_vq_test_mq_ops::type_id::create("runtime_mq_reset_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create("runtime_mq_reset_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create("runtime_mq_reset_mem");
+        virtio_ctrl_vq_test_iommu iommu =
+            virtio_ctrl_vq_test_iommu::type_id::create("runtime_mq_reset_iommu");
+        virtio_ctrl_vq_test_runtime_mq_fsm fsm =
+            virtio_ctrl_vq_test_runtime_mq_fsm::type_id::create(
+                "runtime_mq_reset_fsm");
+        virtio_ctrl_vq_test_catcher catcher;
+        bit ok;
+        string why;
+
+        mem.init_region(64'h7902_0000, 64'h7902_FFFF);
+        wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h090B);
+        transport.mock_net_config.max_virtqueue_pairs = 2;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        // 故意不协商 RING_RESET：新 RX 建成后若新 TX 失败，窄回滚无法确认停 DMA。
+        ops.setup_all_queues(1, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 3))
+            `uvm_fatal("CTRL_VQ_TEST", "runtime MQ reset setup did not create queues")
+
+        fsm.ops = ops;
+        fsm.drv_cfg.num_queue_pairs = 1;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.prime_running_topology(1, 3);
+
+        // split ring 每条队列映射 3 个区域；让新 q2 的三次映射成功，q3 首次映射起失败。
+        iommu.fail_map_after = iommu.map_calls + 4;
+        catcher = new("runtime_mq_reset_catcher");
+        catcher.expect_error("ATOMIC_OPS", "*failed to map queue_id=3 rings*");
+        catcher.expect_error("ATOMIC_OPS",
+            "*teardown_queue: config backend did not confirm queue_id=2 stopped*");
+        catcher.expect_error("AUTO_FSM",
+            {"*configure_mq: failed to setup queue pairs 1..1; ",
+             "verified Function reset completed, reinitialization required*"});
+        uvm_report_cb::add(null, catcher);
+        fsm.configure_mq(2);
+        uvm_report_cb::delete(null, catcher);
+
+        if ((catcher.caught_count != 3) ||
+            (fsm.state != FSM_REINIT_REQUIRED) ||
+            (fsm.active_queue_pair_count() != 1) ||
+            (fsm.drv_cfg.num_queue_pairs != 1) ||
+            (fsm.tracked_total_queue_count() != 0) ||
+            (fsm.stop_count != 1) || (fsm.start_count != 0) ||
+            (fsm.worker_generation != 1) || (fsm.worker_qids.size() != 0) ||
+            (vq_mgr.get_queue_count() != 0) ||
+            !ops.queue_rollback_used_function_reset() ||
+            ops.queues_require_recovery() ||
+            (transport.device_reset_count != 1) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"MQ rollback reset was not converted to reinit: caught=%0d ",
+                 "state=%s active=%0d cfg=%0d stop/start=%0d/%0d gen=%0d ",
+                 "workers=%p tracked/actual=%0d/%0d used_reset=%0b pending=%0b resets=%0d ",
+                 "maps=%0d allocs=%0d"},
+                catcher.caught_count, fsm.state.name(),
+                fsm.active_queue_pair_count(), fsm.drv_cfg.num_queue_pairs,
+                fsm.stop_count, fsm.start_count, fsm.worker_generation,
+                fsm.worker_qids, fsm.tracked_total_queue_count(),
+                vq_mgr.get_queue_count(),
+                ops.queue_rollback_used_function_reset(),
+                ops.queues_require_recovery(), transport.device_reset_count,
+                iommu.active_mapping_count(), mem.outstanding_allocations()))
+        end
+
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+                  "runtime MQ rollback-reset reinit test PASSED", UVM_LOW)
+    endtask
+
+    // 从 RUNNING 缩容 2->1 时，注入“q2/RX 的 Q_RESET 成功，q3/TX 的 Q_RESET
+    // 未确认”。q2 必须在失败发生前独立释放；随后 FSM 必须升级为 verified Function
+    // reset，清空 q3 及其余 Function 资源，进入 REINIT_REQUIRED，并保持 worker 停止。
+    task test_runtime_mq_partial_shrink_requires_reset();
+        virtio_ctrl_vq_test_order_transport transport =
+            virtio_ctrl_vq_test_order_transport::type_id::create(
+                "runtime_mq_partial_shrink_transport");
+        virtio_ctrl_vq_test_mq_ops ops =
+            virtio_ctrl_vq_test_mq_ops::type_id::create(
+                "runtime_mq_partial_shrink_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create(
+                "runtime_mq_partial_shrink_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create(
+                "runtime_mq_partial_shrink_mem");
+        virtio_ctrl_vq_test_order_iommu iommu =
+            virtio_ctrl_vq_test_order_iommu::type_id::create(
+                "runtime_mq_partial_shrink_iommu");
+        virtio_ctrl_vq_test_runtime_mq_fsm fsm =
+            virtio_ctrl_vq_test_runtime_mq_fsm::type_id::create(
+                "runtime_mq_partial_shrink_fsm");
+        virtio_ctrl_vq_test_catcher catcher;
+        string expected_prefix[$];
+        bit prefix_matches;
+        bit ok;
+        string why;
+
+        mem.init_region(64'h7903_0000, 64'h7903_FFFF);
+        iommu.log_to = transport;
+        wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h090C);
+        transport.mock_net_config.max_virtqueue_pairs = 2;
+        transport.reset_probe_vq_mgr = vq_mgr;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_all_queues(2, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 5))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "partial-shrink setup did not create queues {0,1,2,3,4}")
+
+        fsm.ops = ops;
+        fsm.drv_cfg.num_queue_pairs = 2;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.prime_running_topology(2, 5);
+
+        transport.log.delete();
+        transport.fail_next_queue_reset(3);
+        catcher = new("runtime_mq_partial_shrink_catcher");
+        catcher.expect_error("ATOMIC_OPS",
+            "*teardown_queue: config backend did not confirm queue_id=3 stopped*");
+        catcher.expect_error("AUTO_FSM",
+            {"*configure_mq: transmit queue 3 of pair 1 was not stopped; ",
+             "verified Function reset completed*"});
+        uvm_report_cb::add(null, catcher);
+        fsm.configure_mq(1);
+        uvm_report_cb::delete(null, catcher);
+
+        // 前缀精确表达半个 pair 的时序：q2 reset 后先释放三个 ring 映射，q3 reset
+        // 才失败，之后才允许发起整 Function reset。整复位产生的其余 unmap 位于后面。
+        expected_prefix = '{"qreset 2", "unmap", "unmap", "unmap",
+                            "qreset 3", "freset"};
+        prefix_matches = (transport.log.size() >= expected_prefix.size());
+        if (prefix_matches) begin
+            foreach (expected_prefix[i]) begin
+                if (transport.log[i] != expected_prefix[i])
+                    prefix_matches = 0;
+            end
+        end
+
+        if ((catcher.caught_count != 2) || !prefix_matches ||
+            transport.queue2_present_at_function_reset ||
+            !transport.queue3_present_at_function_reset ||
+            (fsm.state != FSM_REINIT_REQUIRED) ||
+            (fsm.active_queue_pair_count() != 2) ||
+            (fsm.drv_cfg.num_queue_pairs != 2) ||
+            (fsm.tracked_total_queue_count() != 0) ||
+            (fsm.stop_count != 1) || (fsm.start_count != 0) ||
+            (fsm.worker_generation != 1) || (fsm.worker_qids.size() != 0) ||
+            (vq_mgr.get_queue_count() != 0) ||
+            ops.queues_require_recovery() ||
+            (transport.queue_reset_count != 2) ||
+            (transport.last_reset_queue_id != 3) ||
+            (transport.device_reset_count != 1) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0) ||
+            (ops.mq_requests.size() != 1) ||
+            (ops.mq_requests[0] != 1)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"partial MQ shrink did not escalate safely: caught=%0d log=%p ",
+                 "q2/q3_at_reset=%0b/%0b state=%s active=%0d cfg=%0d ",
+                 "tracked/actual=%0d/%0d stop/start=%0d/%0d gen=%0d workers=%p ",
+                 "pending=%0b qresets=%0d last_qid=%0d freset=%0d maps=%0d ",
+                 "allocs=%0d requests=%p"},
+                catcher.caught_count, transport.log,
+                transport.queue2_present_at_function_reset,
+                transport.queue3_present_at_function_reset,
+                fsm.state.name(), fsm.active_queue_pair_count(),
+                fsm.drv_cfg.num_queue_pairs, fsm.tracked_total_queue_count(),
+                vq_mgr.get_queue_count(), fsm.stop_count, fsm.start_count,
+                fsm.worker_generation, fsm.worker_qids,
+                ops.queues_require_recovery(), transport.queue_reset_count,
+                transport.last_reset_queue_id, transport.device_reset_count,
+                iommu.active_mapping_count(), mem.outstanding_allocations(),
+                ops.mq_requests))
+        end
+
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+                  "runtime MQ partial-shrink reset test PASSED", UVM_LOW)
+    endtask
+
+    // 与上一用例相同地让 q2 成功释放、q3 停队未确认，但同时让第一次 Function reset
+    // 失败。FSM 必须进入 ERROR，把总队列诊断值更新为 manager 中实际剩余的 4 条，
+    // 并保留 q3/其余队列的 ring DMA；断言完成后重试成功的 verified reset 统一回收。
+    task test_runtime_mq_partial_shrink_reset_failure();
+        virtio_ctrl_vq_test_order_transport transport =
+            virtio_ctrl_vq_test_order_transport::type_id::create(
+                "runtime_mq_shrink_reset_fail_transport");
+        virtio_ctrl_vq_test_mq_ops ops =
+            virtio_ctrl_vq_test_mq_ops::type_id::create(
+                "runtime_mq_shrink_reset_fail_ops");
+        virtqueue_manager vq_mgr =
+            virtqueue_manager::type_id::create(
+                "runtime_mq_shrink_reset_fail_vq_mgr");
+        virtio_ctrl_vq_test_mem mem =
+            virtio_ctrl_vq_test_mem::type_id::create(
+                "runtime_mq_shrink_reset_fail_mem");
+        virtio_ctrl_vq_test_order_iommu iommu =
+            virtio_ctrl_vq_test_order_iommu::type_id::create(
+                "runtime_mq_shrink_reset_fail_iommu");
+        virtio_ctrl_vq_test_runtime_mq_fsm fsm =
+            virtio_ctrl_vq_test_runtime_mq_fsm::type_id::create(
+                "runtime_mq_shrink_reset_fail_fsm");
+        virtio_ctrl_vq_test_catcher catcher;
+        string expected_log[$];
+        int unsigned mappings_before;
+        int unsigned allocations_before;
+        bit ok;
+        string why;
+
+        mem.init_region(64'h7905_0000, 64'h7905_FFFF);
+        iommu.log_to = transport;
+        wire_ops(ops, transport, vq_mgr, mem, mem, iommu, 16'h090E);
+        transport.mock_net_config.max_virtqueue_pairs = 2;
+        transport.reset_probe_vq_mgr = vq_mgr;
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_all_queues(2, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 5))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "shrink-reset-failure setup did not create queues {0,1,2,3,4}")
+
+        fsm.ops = ops;
+        fsm.drv_cfg.num_queue_pairs = 2;
+        fsm.drv_cfg.queue_size = 8;
+        fsm.drv_cfg.vq_type = VQ_SPLIT;
+        if (!fsm.bind_mq_pair_limit(2, why))
+            `uvm_fatal("CTRL_VQ_TEST", why)
+        fsm.prime_running_topology(2, 5);
+        mappings_before = iommu.active_mapping_count();
+        allocations_before = mem.outstanding_allocations();
+
+        transport.log.delete();
+        transport.fail_next_queue_reset(3);
+        transport.device_reset_complete = 0;
+        catcher = new("runtime_mq_shrink_reset_fail_catcher");
+        catcher.expect_error("ATOMIC_OPS",
+            "*teardown_queue: config backend did not confirm queue_id=3 stopped*");
+        catcher.expect_error("ATOMIC_OPS",
+            "*device_reset: transport reset did not complete; retaining PF DMA*");
+        catcher.expect_error("AUTO_FSM",
+            {"*configure_mq: transmit queue 3 of pair 1 was not stopped; ",
+             "verified Function reset failed*"});
+        uvm_report_cb::add(null, catcher);
+        fsm.configure_mq(1);
+        uvm_report_cb::delete(null, catcher);
+
+        expected_log = '{"qreset 2", "unmap", "unmap", "unmap",
+                         "qreset 3", "freset"};
+        if ((catcher.caught_count != 3) || (transport.log != expected_log) ||
+            transport.queue2_present_at_function_reset ||
+            !transport.queue3_present_at_function_reset ||
+            (fsm.state != FSM_ERROR) ||
+            (fsm.active_queue_pair_count() != 2) ||
+            (fsm.drv_cfg.num_queue_pairs != 2) ||
+            (fsm.tracked_total_queue_count() != 4) ||
+            (fsm.stop_count != 1) || (fsm.start_count != 0) ||
+            (fsm.worker_generation != 1) || (fsm.worker_qids.size() != 0) ||
+            (vq_mgr.get_queue_count() != 4) || vq_mgr.has_queue(2) ||
+            !vq_mgr.has_queue(0) || !vq_mgr.has_queue(1) ||
+            !vq_mgr.has_queue(3) || !vq_mgr.has_queue(4) ||
+            !ops.queues_require_recovery() ||
+            (transport.queue_reset_count != 2) ||
+            (transport.last_reset_queue_id != 3) ||
+            (transport.device_reset_count != 1) ||
+            (iommu.active_mapping_count() != mappings_before - 3) ||
+            (mem.outstanding_allocations() != allocations_before - 3) ||
+            (ops.mq_requests.size() != 1) ||
+            (ops.mq_requests[0] != 1)) begin
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"failed shrink reset did not retain the partial topology: ",
+                 "caught=%0d log=%p expected=%p q2/q3_at_reset=%0b/%0b ",
+                 "state=%s active=%0d cfg=%0d tracked/actual=%0d/%0d ",
+                 "stop/start=%0d/%0d gen=%0d workers=%p q2=%0b q3=%0b ",
+                 "pending=%0b qresets=%0d last_qid=%0d freset=%0d ",
+                 "maps=%0d/%0d allocs=%0d/%0d requests=%p"},
+                catcher.caught_count, transport.log, expected_log,
+                transport.queue2_present_at_function_reset,
+                transport.queue3_present_at_function_reset,
+                fsm.state.name(), fsm.active_queue_pair_count(),
+                fsm.drv_cfg.num_queue_pairs, fsm.tracked_total_queue_count(),
+                vq_mgr.get_queue_count(), fsm.stop_count, fsm.start_count,
+                fsm.worker_generation, fsm.worker_qids,
+                vq_mgr.has_queue(2), vq_mgr.has_queue(3),
+                ops.queues_require_recovery(), transport.queue_reset_count,
+                transport.last_reset_queue_id, transport.device_reset_count,
+                iommu.active_mapping_count(), mappings_before - 3,
+                mem.outstanding_allocations(), allocations_before - 3,
+                ops.mq_requests))
+        end
+
+        // 失败路径有意保留仍可能被设备访问的 DMA。设备随后确认 Function reset 时，
+        // 由同一个 verified 接口清除 recovery 闸门并释放全部剩余所有权。
+        transport.device_reset_complete = 1;
+        ops.device_reset_verified(ok);
+        if (!ok || ops.queues_require_recovery() ||
+            (transport.device_reset_count != 2) ||
+            (vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_fatal("CTRL_VQ_TEST", $sformatf(
+                {"verified reset retry did not clean retained shrink resources: ",
+                 "ok=%0b pending=%0b resets=%0d queues=%0d maps=%0d allocs=%0d"},
+                ok, ops.queues_require_recovery(), transport.device_reset_count,
+                vq_mgr.get_queue_count(), iommu.active_mapping_count(),
+                mem.outstanding_allocations()))
+
+        mem.leak_check();
+        `uvm_info("CTRL_VQ_TEST",
+                  "runtime MQ partial-shrink reset-failure test PASSED", UVM_LOW)
+    endtask
+
     // virtio 1.2 §4.1.4.3.2：驱动 MUST 在 queue_enable 之前配置好其余队列字段（含 queue_msix_vector）。
     // FSM full_init 建 1 对 + CTRL_VQ（max_virtqueue_pairs=2，队列 {0,1,4}）：每条队列使能时写入的向量
     // 必须就是最终绑定的有效向量（非 NO_VECTOR、非 config 向量），而不是先用占位向量使能、事后改绑。
@@ -1068,7 +2210,8 @@ class virtio_ctrl_vq_test extends uvm_test;
 
     // virtio 1.2 §4.1.4.3.2：驱动不得写 queue_enable=0。单队列复位（reset_single_queue）与 MQ 缩容都经
     // teardown_queue 停队：协商 RING_RESET 时先 Q_RESET（已确认）再解映射；未协商时标准设备无法单独停队，
-    // 拒绝并保留队列（不写 enable=0、不解映射），缩容在提交 MQ 命令前拒绝。
+    // 拒绝并保留队列（不写 enable=0、不解映射）且进入 recovery pending，只能经 verified Function reset
+    // 清理后重新建立测试拓扑；缩容仍在提交 MQ 命令前拒绝。
     task test_queue_stop_uses_ring_reset();
         virtio_ctrl_vq_test_order_transport transport =
             virtio_ctrl_vq_test_order_transport::type_id::create("order_transport");
@@ -1083,6 +2226,8 @@ class virtio_ctrl_vq_test extends uvm_test;
         int unsigned qids[$];
         int unsigned expected_qids[$];
         string want[$];
+        byte unsigned blocked_ctrl_data[];
+        virtio_ctrl_ack_e blocked_ctrl_ack;
         bit ok;
         string why;
 
@@ -1112,19 +2257,51 @@ class virtio_ctrl_vq_test extends uvm_test;
         catcher.expect_error("ATOMIC_OPS", "*teardown_queue: config backend did not confirm queue_id=1 stopped*");
         catcher.expect_error("AUTO_FSM", "*reset_single_queue: queue 1 was not stopped*");
         catcher.expect_error("AUTO_FSM", "*configure_mq: shrinking 2->1 pairs requires VIRTIO_F_RING_RESET*");
+        catcher.expect_error("ATOMIC_OPS",
+            "*Function queue recovery is pending; verified device reset required before another control command*");
         uvm_report_cb::add(null, catcher);
         fsm.reset_single_queue(1);
         fsm.state = FSM_READY;
         fsm.configure_mq(1);
+        blocked_ctrl_data = new[0];
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ,
+                      VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      blocked_ctrl_data, blocked_ctrl_ack);
         uvm_report_cb::delete(null, catcher);
-        if ((catcher.caught_count != 3) || (transport.log.size() != 0) ||
-            (vq_mgr.get_queue_count() != 5) || (ops.mq_requests.size() != 0))
+        if ((catcher.caught_count != 4) ||
+            (blocked_ctrl_ack != VIRTIO_NET_CTRL_ACK_ERR) ||
+            (transport.kick_count != 0) || (transport.log.size() != 0) ||
+            (vq_mgr.get_queue_count() != 5) || (ops.mq_requests.size() != 0) ||
+            !ops.queues_require_recovery())
             `uvm_fatal("CTRL_VQ_TEST", $sformatf(
-                "queue stop without RING_RESET was not refused cleanly (caught=%0d log=%p queues=%0d mq=%p)",
-                catcher.caught_count, transport.log, vq_mgr.get_queue_count(), ops.mq_requests))
+                {"queue stop without RING_RESET was not refused cleanly ",
+                 "(caught=%0d ctrl_ack=%s kicks=%0d log=%p queues=%0d mq=%p)"},
+                catcher.caught_count, blocked_ctrl_ack.name(),
+                transport.kick_count, transport.log,
+                vq_mgr.get_queue_count(), ops.mq_requests))
+
+        // 未确认停队后禁止直接重建。先由 verified Function reset 统一停 DMA、释放旧
+        // 拓扑，再重新协商并建队；这也验证 recovery 闸门只由确认完成的整复位清除。
+        ops.device_reset_verified(ok);
+        if (!ok || ops.queues_require_recovery() ||
+            (vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "verified Function reset did not close the unconfirmed queue stop")
+        ops.negotiated_features = '0;
+        ops.negotiated_features[VIRTIO_F_VERSION_1] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_CTRL_VQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_NET_F_MQ] = 1'b1;
+        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
+        ops.setup_all_queues(2, VQ_SPLIT, 8, ok);
+        if (!ok || (vq_mgr.get_queue_count() != 5))
+            `uvm_fatal("CTRL_VQ_TEST",
+                "queue-stop test could not rebuild after verified recovery")
+        fsm.set_topology(2, 5);
+        fsm.state = FSM_READY;
 
         // 协商 RING_RESET：reset_single_queue 先 Q_RESET 再解映射，重建后队列 1 回到设备。
-        ops.negotiated_features[VIRTIO_F_RING_RESET] = 1'b1;
         transport.log.delete();
         transport.programmed_qids.delete();
         fsm.reset_single_queue(1);

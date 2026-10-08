@@ -5,9 +5,12 @@
     // Device Lifecycle
     // ========================================================================
 
-    // ------------------------------------------------------------------------
-    // device_reset -- Write status=0 and clean up all queue/DMA state
-    // ------------------------------------------------------------------------
+    // device_reset_verified -- 确认整设备复位后统一释放本 Function 的队列与 DMA
+    //
+    // 输出 reset_complete 只有在配置后端确认设备复位完成后为 1。成功时拆除全部队列、
+    // 解映射并释放普通/迁移/control 隔离 DMA，清空协商特性和 control VQ 身份/恢复闸门；
+    // 上下文不完整或设备未确认复位时返回 0，保留所有可能仍被设备访问的资源与状态，
+    // 并关闭普通建队与 control VQ 提交入口，直到后续 verified reset 成功。
     virtual task device_reset_verified(ref bit reset_complete);
         int unsigned tx_qids[$];
         int unsigned rx_qids[$];
@@ -18,12 +21,22 @@
         reset_complete = 0;
         if ((transport == null) || (vq_mgr == null) || (iommu == null) ||
             ((mem == null) && has_pending_normal_dma())) begin
+            // 复位上下文不完整时无法证明上一代 Function 已停止 DMA。此处同时关闭
+            // 普通建队与 control VQ 提交入口；只有后续 verified reset 走完下方成功
+            // 清理路径，才可重新开放两个入口。
+            queue_recovery_pending = 1;
+            ctrl_recovery_pending = 1;
             `uvm_error("ATOMIC_OPS", "device_reset: incomplete PF lifecycle context")
             return;
         end
         backend = cfg_backend();
         backend.reset(reset_complete);
         if (!reset_complete) begin
+            // 失败或部分完成的 Function reset 使全部旧队列的设备所有权不确定。
+            // 保留 Host 的 DMA 所有权并关闭两个公开提交入口；只有后续确认完成的
+            // Function reset 才能清除恢复门禁。
+            queue_recovery_pending = 1;
+            ctrl_recovery_pending = 1;
             `uvm_error("ATOMIC_OPS", "device_reset: transport reset did not complete; retaining PF DMA")
             return;
         end
@@ -70,7 +83,13 @@
         // manager entry before the PF can be reinitialized.
         vq_mgr.destroy_all();
 
+        // control VQ 的身份和 recovery pending 都属于本次设备生命周期。只有走到这里的
+        // 已确认整设备复位才可清除；Q_RESET 或一次普通建队成功均不得解除恢复闸门。
+        ctrl_queue_id_valid = 0;
+        ctrl_queue_id_value = 0;
+        ctrl_recovery_pending = 0;
         negotiated_features = '0;
+        queue_recovery_pending = 0;
 
         `uvm_info("ATOMIC_OPS", "device_reset: complete", UVM_MEDIUM)
     endtask

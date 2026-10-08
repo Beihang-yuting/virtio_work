@@ -93,6 +93,34 @@ class vdev_unit_vector_refusing_pci extends vdev_virtio_pci;
     endfunction
 endclass
 
+// 私有 Function reset 重试故障注入后端：除一次指定 qid 的停队返回未确认外，
+// 所有寄存器操作与 active/MSI-X 所有权都复用生产 dpu_priv_config_backend。
+// 注入发生前已停队列保持生产副作用，用于重现“部分 RX 停止后失败”。
+class vdev_unit_priv_reset_retry_backend extends dpu_priv_config_backend;
+    `uvm_object_utils(vdev_unit_priv_reset_retry_backend)
+
+    int unsigned fail_once_queue_id;
+    bit          fail_once_armed;
+
+    // 构造一次性停队故障注入器；默认不匹配任何 qid，不访问设备。
+    function new(string name = "vdev_unit_priv_reset_retry_backend");
+        super.new(name);
+        fail_once_queue_id = '1;
+        fail_once_armed = 0;
+    endfunction
+
+    // 停队输入/输出与生产后端一致。首次命中 fail_once_queue_id 时返回 ok=0、
+    // 不访问寄存器且自动解除注入；其余调用完整委托生产实现。
+    virtual task disable_queue(virtio_queue_program_t q, output bit ok);
+        if (fail_once_armed && (q.queue_id == fail_once_queue_id)) begin
+            fail_once_armed = 0;
+            ok = 0;
+            return;
+        end
+        super.disable_queue(q, ok);
+    endtask
+endclass : vdev_unit_priv_reset_retry_backend
+
 class virtio_vdev_unit_test extends uvm_test;
     `uvm_component_utils(virtio_vdev_unit_test)
 
@@ -1666,6 +1694,7 @@ class virtio_vdev_unit_test extends uvm_test;
         virtio_pci_transport t;
         vdev_loopback_bar_accessor acc;
         dpu_priv_config_backend be;
+        vdev_unit_priv_reset_retry_backend retry_be;
         dpu_priv_driver_config cfg;
         custom_virtqueue pvq;
         vdev_expect_catcher catcher;
@@ -1675,6 +1704,8 @@ class virtio_vdev_unit_test extends uvm_test;
         string want[$];
         bit [31:0] e[4];
         bit [63:0] rx_gpa, tx_gpa, rx_ring, tx_ring, rx1_gpa, tx1_gpa, rx1_ring, tx1_ring;
+        int unsigned invalid_queue_sizes[$];
+        int unsigned valid_queue_sizes[$];
         bit ok;
 
         priv.host_id = 0;
@@ -1732,18 +1763,40 @@ class virtio_vdev_unit_test extends uvm_test;
         priv_log.reg_trace(trace);
         if (trace.size() != 0)
             `uvm_fatal("VDEV_UNIT", "private discover repeated the probe sequence")
-        // VTX/VRX q_depth 是 log2 编码：非 2 的幂的大小（300）在建队前拒绝，不访问设备
-        pvq = custom_virtqueue::type_id::create("priv_npot_vq");
-        rxp = virtio_empty_queue_program();
-        rxp.queue_size = 300;
-        catcher = new("priv_npot_catcher");
-        catcher.id = "DPU_PRIV_BACKEND";
-        catcher.text = "2 的幂";
-        uvm_report_cb::add(null, catcher);
-        ok = be.prepare_queue(pvq, rxp);
-        uvm_report_cb::delete(null, catcher);
-        if (ok || (catcher.caught != 1))
-            `uvm_fatal("VDEV_UNIT", "private prepare_queue accepted non-power-of-two size 300")
+        // VTX/VRX q_depth 是 log2 编码，custom ring 还保留一个槽：合法边界为 2 和
+        // 4096；1、越界的 8192、以及区间内非 2 的幂 300 都必须在分配/寄存器访问前
+        // 被 prepare_queue 拒绝。这里直接测后端输入边界，避免 setup_queue 把大于设备
+        // 默认深度的请求裁剪后掩盖非法原值。
+        invalid_queue_sizes = '{1, 300, 8192};
+        foreach (invalid_queue_sizes[i]) begin
+            pvq = custom_virtqueue::type_id::create(
+                $sformatf("priv_invalid_size_%0d_vq", invalid_queue_sizes[i]));
+            rxp = virtio_empty_queue_program();
+            rxp.queue_size = invalid_queue_sizes[i];
+            catcher = new($sformatf("priv_invalid_size_%0d_catcher",
+                                    invalid_queue_sizes[i]));
+            catcher.id = "DPU_PRIV_BACKEND";
+            catcher.text = "2..4096";
+            uvm_report_cb::add(null, catcher);
+            ok = be.prepare_queue(pvq, rxp);
+            uvm_report_cb::delete(null, catcher);
+            if (ok || (catcher.caught != 1))
+                `uvm_fatal("VDEV_UNIT", $sformatf(
+                    "private prepare_queue accepted invalid size %0d",
+                    invalid_queue_sizes[i]))
+        end
+        valid_queue_sizes = '{2, 4096};
+        foreach (valid_queue_sizes[i]) begin
+            pvq = custom_virtqueue::type_id::create(
+                $sformatf("priv_valid_size_%0d_vq", valid_queue_sizes[i]));
+            rxp = virtio_empty_queue_program();
+            rxp.queue_size = valid_queue_sizes[i];
+            ok = be.prepare_queue(pvq, rxp);
+            if (!ok)
+                `uvm_fatal("VDEV_UNIT", $sformatf(
+                    "private prepare_queue rejected valid boundary size %0d",
+                    valid_queue_sizes[i]))
+        end
         // open：RX 建队+中断，TX 建队+使能
         rx_ring = map_buffer(PRIV_BDF, 4096, DMA_BIDIRECTIONAL, rx_gpa);
         tx_ring = map_buffer(PRIV_BDF, 4096, DMA_BIDIRECTIONAL, tx_gpa);
@@ -1804,7 +1857,9 @@ class virtio_vdev_unit_test extends uvm_test;
         // 2 个队列对：驱动 dpu_down 先停全部 TX、再停全部 RX，最后 dpu_clear_msix_irqs_conf 按向量升序清 info
         priv.init();
         program_bars(PRIV_BDF, PRIV_BAR0, PRIV_BAR2, PRIV_BAR4);
-        be = dpu_priv_config_backend::type_id::create("priv_backend2");
+        retry_be = vdev_unit_priv_reset_retry_backend::type_id::create(
+            "priv_backend2");
+        be = retry_be;
         be.bind_transport(t);
         be.bind_private(cfg, 2);
         be.discover();
@@ -1834,20 +1889,48 @@ class virtio_vdev_unit_test extends uvm_test;
         priv_log.reg_trace(trace);
         if (!ok || (trace.size() != 0) || !priv.queue_enabled(0, 0) || !priv.queue_enabled(1, 0))
             `uvm_fatal("VDEV_UNIT", "disabling an unconfigured private queue touched the device")
+        // 首轮在 TX0/TX1/RX0 已成功停止后让 RX1 失败。后端会从 active[]
+        // 删除前三条队列，但两个 RX MSI-X info 的 Function 所有权都必须
+        // 跨越失败保留；未完整 reset 之前不得只清部分向量。
+        retry_be.fail_once_queue_id = 2;
+        retry_be.fail_once_armed = 1;
         priv_log.events.delete();
         be.reset(ok);
-        if (!ok || priv.queue_enabled(0, 0) || priv.queue_enabled(0, 1) ||
-            priv.queue_enabled(1, 0) || priv.queue_enabled(1, 1))
-            `uvm_fatal("VDEV_UNIT", "private reset did not stop both queue pairs")
+        if (ok || priv.queue_enabled(0, 0) || !priv.queue_enabled(0, 1) ||
+            priv.queue_enabled(1, 0) || priv.queue_enabled(1, 1)) begin
+            `uvm_fatal("VDEV_UNIT",
+                "partial private reset did not stop TX0/TX1/RX0 and retain RX1")
+        end
         priv_log.reg_trace(trace);
         want.delete();
         push_tx_stop(0, tx_ring, 32'h93, want);
         push_tx_stop(1, tx1_ring, 32'h8093, want);
         push_rx_stop(0, rx_ring, 32'h13, want);
+        expect_trace(trace, want, "stop 2 pairs partial failure");
+        if ((priv_rd(32'h5_4000) != 32'h1800) ||
+            (priv_rd(32'h5_4004) != 32'h1800)) begin
+            `uvm_fatal("VDEV_UNIT",
+                "failed private reset cleared or lost an RX MSI-X info mapping")
+        end
+
+        // 第二轮只会从 active[] 看到 RX1。它成功停止后，reset 必须依保存的
+        // Function 所有权表按 gv 升序同时清 gv0/gv1，不能遗漏首轮已停的 RX0。
+        priv_log.events.delete();
+        be.reset(ok);
+        if (!ok || priv.queue_enabled(0, 0) || priv.queue_enabled(0, 1) ||
+            priv.queue_enabled(1, 0) || priv.queue_enabled(1, 1)) begin
+            `uvm_fatal("VDEV_UNIT", "retried private reset did not stop the final RX queue")
+        end
+        priv_log.reg_trace(trace);
+        want.delete();
         push_rx_stop(1, rx1_ring, 32'h8_0013, want);
         want.push_back("W bar0 msix_info.0 0x0");
         want.push_back("W bar0 msix_info.1 0x0");
-        expect_trace(trace, want, "stop 2 pairs");
+        expect_trace(trace, want, "stop 2 pairs retry");
+        if ((priv_rd(32'h5_4000) != 0) || (priv_rd(32'h5_4004) != 0)) begin
+            `uvm_fatal("VDEV_UNIT",
+                "successful private reset retry left a stale RX MSI-X info mapping")
+        end
         iommu.unmap_for_host(0, PRIV_BDF, rx_ring);
         iommu.unmap_for_host(0, PRIV_BDF, tx_ring);
         iommu.unmap_for_host(0, PRIV_BDF, rx1_ring);

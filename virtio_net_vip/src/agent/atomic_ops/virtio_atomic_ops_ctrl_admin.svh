@@ -247,19 +247,15 @@
             admin_context.submit_lock.put(1);
     endtask
 
-    // ------------------------------------------------------------------------
-    // ctrl_send -- Send a control command and wait for ACK
+    // ctrl_send -- 在显式登记的 control VQ 上提交一条命令并等待设备 ACK
     //
-    // Steps:
-    //   1. Build ctrl header: {class[7:0], cmd[7:0]}
-    //   2. Build data buffer
-    //   3. Build ack buffer (1 byte, device-writable)
-    //   4. sgs: [hdr_sg(out)] [data_sg(out)] [ack_sg(in)]
-    //   5. add_buf to control queue
-    //   6. Kick control queue
-    //   7. Poll used ring until ack buffer filled
-    //   8. Read ack status from host_mem
-    // ------------------------------------------------------------------------
+    // 输入 ctrl_class/cmd/data 组成两个设备只读段，第三段是设备写回的一字节 ACK；
+    // ack 默认返回 ERR，只有完成项到达且 ACK 为 OK 时改为 OK。该 task 分配、映射并
+    // 发布三段 DMA，正常完成后释放；超时则先确认单队列停止，再按原大小和格式重建。
+    // 命令一旦发布却没有有效完成，设备侧副作用是否已经发生便无法判定：即使 Q_RESET
+    // 和重建成功，也必须记录 recovery pending，拒绝后续 control 命令和普通建队，
+    // 直到 verified Function reset 成功。停队未确认时还要隔离 DMA，避免消费上一代
+    // 队列的迟到完成或释放设备仍可能访问的缓冲。
     virtual task ctrl_send(
         virtio_ctrl_class_e  ctrl_class,
         bit [7:0]            cmd,
@@ -297,25 +293,33 @@
             return;
         end
 
-        // 上一条命令超时且设备未确认复位：其缓冲仍在设备可达范围内，迟到完成可能
-        // 随时出现，此时提交会消费别人的完成；必须先完成设备复位。
-        if (ctrl_quarantined_gpas.size() != 0) begin
-            `uvm_error("ATOMIC_OPS",
-                "ctrl_send: control VQ has quarantined DMA; device reset required")
+        // 任一 Function 级 recovery pending 都禁止发布新的 control 命令。control
+        // 隔离 DMA 时保留原错误文字；普通队列停队未确认时使用独立文字，便于日志
+        // 区分旧 control 缓冲与数据队列 DMA 两类不确定所有权。
+        if (ctrl_recovery_pending || queue_recovery_pending) begin
+            if (ctrl_quarantined_gpas.size() != 0)
+                `uvm_error("ATOMIC_OPS",
+                    "ctrl_send: control VQ has quarantined DMA; device reset required (verified completion required)")
+            else if (ctrl_recovery_pending)
+                `uvm_error("ATOMIC_OPS",
+                    "ctrl_send: control VQ recovery is pending; verified device reset required")
+            else
+                `uvm_error("ATOMIC_OPS",
+                    {"ctrl_send: Function queue recovery is pending; verified ",
+                     "device reset required before another control command"})
             return;
         end
 
-        // Find control queue (highest queue ID among managed queues)
-        ctrl_qid = 0;
-        begin
-            int unsigned max_qid = 0;
-            foreach (ring_iovas[qid]) begin
-                if (qid > max_qid) max_qid = qid;
-            end
-            ctrl_qid = max_qid;
+        // control VQ 身份只能来自 setup_control_queue 的成功记录。队列号不能从“最大
+        // qid”推断：动态 MQ、稀疏设备队列号和特殊队列都会使该推断选择错误队列。
+        if (!ctrl_queue_id_valid) begin
+            `uvm_error("ATOMIC_OPS",
+                "ctrl_send: control VQ identity is not configured")
+            return;
         end
+        ctrl_qid = ctrl_queue_id_value;
 
-        ctrl_vq = vq_mgr.get_queue(ctrl_qid);
+        ctrl_vq = (vq_mgr == null) ? null : vq_mgr.get_queue(ctrl_qid);
         if (ctrl_vq == null) begin
             `uvm_error("ATOMIC_OPS",
                 $sformatf("ctrl_send: control queue %0d not found", ctrl_qid))
@@ -426,24 +430,33 @@
         end
 
         if (!got_used) begin
-            // 设备可能仍持有该请求的描述符与缓冲。经 teardown_queue 的停队确认（协商 RING_RESET
-            // 时 Q_RESET，否则标准设备无法单独停队）后按原大小/格式重建 control VQ；未确认则
-            // control VQ 保留，本次缓冲隔离（之后 release_all 为空操作），等待设备复位回收。
+            // 设备可能仍持有该请求的描述符与缓冲。经 teardown_queue 的停队确认（协商
+            // RING_RESET 时 Q_RESET，否则标准设备无法单独停队）后按原大小/格式重建
+            // control VQ；未确认则保留队列并隔离本次缓冲。无论局部恢复是否成功，命令
+            // 既已发布却没有有效完成，设备配置结果都不确定，必须由整 Function 复位收敛。
             `uvm_error("ATOMIC_OPS", "ctrl_send: timeout waiting for control VQ completion")
             ctrl_size = ctrl_vq.queue_size;
             ctrl_type = ctrl_vq.descriptor_format();
             teardown_queue(ctrl_qid);
             if (!vq_mgr.has_queue(ctrl_qid)) begin
                 setup_queue(ctrl_qid, ctrl_size, ctrl_type, requeued);
-                if (!requeued)
+                if (!requeued) begin
+                    ctrl_recovery_pending = 1;
                     `uvm_error("ATOMIC_OPS", $sformatf(
-                        "ctrl_send: control VQ %0d could not be re-enabled after reset", ctrl_qid))
+                        "ctrl_send: control VQ %0d could not be re-enabled after reset; verified device reset required",
+                        ctrl_qid))
+                end
             end else begin
+                ctrl_recovery_pending = 1;
                 dma_set.quarantine_into(ctrl_quarantined_iovas, ctrl_quarantined_gpas);
                 `uvm_error("ATOMIC_OPS", $sformatf(
-                    "ctrl_send: control VQ %0d reset did not complete; DMA is quarantined until device reset",
+                    "ctrl_send: control VQ %0d reset did not complete; DMA is quarantined until device reset; verified completion required",
                     ctrl_qid))
             end
+            // 必须在可选重建之后置位；setup_queue 本身也受此闸门保护，若提前置位会
+            // 阻止这里对已确认 Q_RESET 的 control VQ 做局部资源恢复。置位后公开入口
+            // 一律等待 verified Function reset，不能把 ACK_ERR 误作设备明确拒绝。
+            ctrl_recovery_pending = 1;
         end else begin
             // 8. Read ack status from host_mem
             mem.read_mem(dma_set.get_gpa(ack_idx), 1, ack_readback);

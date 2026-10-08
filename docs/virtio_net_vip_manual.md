@@ -1150,26 +1150,40 @@ virtio_auto_fsm   virtio_atomic_ops
 
 | 类别 | 方法 | 说明 |
 |------|------|------|
-| 设备发现 | `device_reset()` | 写 status=0, 轮询 |
+| 设备发现 | `device_reset()` | 写 status=0 并轮询，结果只通过日志报告 |
+| | `device_reset_verified(ref complete)` | 确认 Function 复位后再统一释放队列与 DMA |
 | | `set_acknowledge()` | 设置 ACKNOWLEDGE |
 | | `set_driver()` | 设置 DRIVER |
 | | `negotiate_features(supported, ref negotiated)` | Feature 协商 |
 | | `set_features_ok(ref ok)` | 设置 FEATURES_OK 并验证 |
 | | `set_driver_ok()` | 设置 DRIVER_OK |
 | | `set_failed()` | 设置 FAILED |
-| 队列管理 | `setup_queue(qid, size, type)` | 配置单个队列 |
+| 队列管理 | `setup_queue(qid, size, type)` | 配置单个队列；任一 Function/control 恢复闸门置位时拒绝 |
+| | `setup_control_queue(num_pairs, type, size)` | 建立并显式登记 control VQ；`ctrl_send` 仅使用该身份 |
 | | `setup_all_queues(num_pairs, type, size)` | 配置所有队列 |
 | | `teardown_queue(qid)` | 拆除队列 |
+| | `teardown_queue_verified(qid, output stopped)` | 仅在设备确认停队后释放 ring/DMA；失败时保留所有权 |
 | | `reset_queue(qid)` | 重置单个队列 (1.2+) |
+| | `queues_require_recovery()` | 查询批量回滚是否仍需 verified Function reset |
 | MSI-X | `setup_msix(num_queues)` | MSI-X 初始化和向量绑定 |
 | TX | `tx_submit(qid, hdr, pkt, indirect, ref desc_id)` | 提交发送报文 |
 | | `tx_complete(qid, ref pkts, budget)` | 完成回收 |
 | RX | `rx_refill(qid, count)` | 补充 RX buffer |
 | | `rx_receive(qid, ref pkts, budget)` | 接收报文 |
-| 控制 VQ | `ctrl_send(cls, cmd, data, ref ack)` | 发送控制命令 |
+| 控制 VQ | `ctrl_send(cls, cmd, data, ref ack)` | 发送控制命令；已发布命令超时后要求 verified Function reset |
+| | `get_control_queue_id(output qid)` | 读取本设备生命周期中显式登记的 control VQ 身份 |
+| | `control_vq_requires_recovery()` | 查询 control VQ 是否必须先完成 verified reset |
 | | `ctrl_set_mq_pairs(num_pairs, ref ok)` | 设置多队列对数 |
 | | `ctrl_set_rss(cfg, ref ok)` | 配置 RSS |
 | | `ctrl_announce_ack(ref ok)` | GUEST_ANNOUNCE 确认 |
+
+`ctrl_send` 的超时返回 `ACK_ERR`，但该值不能解释为设备明确拒绝：命令已经发布时，
+设备可能完成了配置写入，只是完成项没有到达 Host。control VQ 的 Q_RESET/重建只解决
+描述符和 DMA 所有权，不能消除设备配置结果的不确定性。因此超时会置
+`control_vq_requires_recovery()`，并同时阻止后续 control 命令与普通建队；只有
+`device_reset_verified()` 确认整 Function 复位后才重新开放这些入口。MQ 状态机检测到
+该状态时主动执行整 Function 复位，成功后进入 `FSM_REINIT_REQUIRED`，失败则进入
+`FSM_ERROR` 并保留仍可能被设备访问的资源。
 
 #### 4.7.3 自动状态机 (`virtio_auto_fsm`)
 

@@ -2,25 +2,22 @@
 `define VIRTIO_AUTO_FSM_SV
 
 // ============================================================================
-// virtio_auto_fsm
+// 目录层次：src/agent；virtio-net 自动驱动生命周期状态机。
 //
-// Complete lifecycle state machine for the virtio-net driver VIP.
-// Orchestrates device initialization, data plane operation, reconfiguration,
-// live migration, and error recovery using virtio_atomic_ops.
+// 职责：通过 virtio_atomic_ops 编排设备初始化、数据面、运行期 MQ 重配、迁移和
+// 错误恢复。FSM 拥有运行状态、活动队列对数与后台 worker 代次；队列和 DMA 资源
+// 仍由 atomic ops/virtqueue manager 拥有。对象由 Function/agent 创建并注入 ops，
+// 生命周期覆盖一次 Function 驱动会话。
 //
-// Critical implementation rules enforced:
-//   1. Named fork blocks only: fork : block_name ... join*; disable block_name;
-//   2. No bare #delay -- all waits use wait_pol or named fork with #(ns * 1ns)
-//   3. All background tasks check their run epoch after every wait
-//   4. start_dataplane uses fork : dataplane_tasks ... join_none
-//   5. stop_dataplane waits for an explicit completion acknowledgement from
-//      every background task before any caller may reset queue/DMA ownership
+// 并发与复位约束：
+//   1. 后台任务只使用命名 fork，便于按代次辨认和收敛；
+//   2. 所有 worker 每次等待后检查 epoch，旧代 worker 不得访问重建后的队列；
+//   3. stop_dataplane 等待全部 worker 明确退出，调用方随后才可拆队或复位 DMA；
+//   4. 运行期 MQ 先完整停止旧代 worker，成功变更后才按新队列集合启动下一代；
+//   5. 失败状态不重启数据面，避免 worker 访问半建或已销毁的队列。
 //
-// Depends on:
-//   - virtio_atomic_ops (low-level driver operations)
-//   - virtio_migration_engine (migration checksum/capture/restore steps)
-//   - virtio_net_types.sv (fsm_state_e, virtio_driver_config_t, etc.)
-//   - virtio_wait_policy (timeout/polling)
+// 主要依赖：virtio_atomic_ops、virtio_migration_engine、virtio_net_types.sv 和
+// virtio_wait_policy。裸延时被禁止，轮询和超时统一使用 wait policy。
 // ============================================================================
 
 class virtio_auto_fsm extends uvm_report_object;
@@ -136,6 +133,13 @@ class virtio_auto_fsm extends uvm_report_object;
     // 查询当前生效的 MQ 队列对上限（绑定前为模型缺省上限）。
     function int unsigned max_supported_mq_pairs();
         return max_vio_net_qpairs_per_device;
+    endfunction
+
+    // 只读返回最近一次完整提交的活动队列对数。动态重配调用方须同时检查 FSM 状态：
+    // READY/RUNNING 时该值对应可用拓扑，ERROR/REINIT_REQUIRED 时仅是恢复诊断基线。
+    // 函数无副作用，在初始化前返回构造时的缺省值 1。
+    function int unsigned active_queue_pair_count();
+        return active_num_pairs;
     endfunction
 
     // 迁移快照整体校验和（委托迁移引擎）；派生 FSM/测试改写快照后据此重算。
@@ -555,10 +559,13 @@ class virtio_auto_fsm extends uvm_report_object;
     // Reconfiguration
     // ========================================================================
 
-    // ------------------------------------------------------------------------
-    // configure_mq -- Change the number of active queue pairs
-    // ------------------------------------------------------------------------
+    // 改变活动队列对数。输入必须符合 Function 冻结的 MQ 上限和驱动协议能力；同值
+    // 请求幂等返回且不访问 control VQ。若入口为 FSM_RUNNING，本 task 先等待旧代
+    // 数据面全部退出，再执行设备命令和队列变更；只有目标对数确实生效且 FSM 仍为
+    // READY 才启动新一代 worker。设备拒绝、建队/拆队失败或错误状态均保持停机。
     task configure_mq(int unsigned num_pairs);
+        bit restart_dataplane;
+
         if ((ops != null) && (ops.protocol != null) && !ops.protocol.supports_mq()) begin
             `uvm_error("AUTO_FSM", "configure_mq: driver protocol does not support dynamic MQ")
             return;
@@ -570,19 +577,61 @@ class virtio_auto_fsm extends uvm_report_object;
                 num_pairs, max_vio_net_qpairs_per_device))
             return;
         end
+
+        // 只有已经完成初始化且拓扑仍可信的 READY/RUNNING 生命周期可以改 MQ。
+        // 状态检查必须位于同值幂等判断之前：ERROR/REINIT_REQUIRED 中保存的
+        // active_num_pairs 只是最近一次成功提交的诊断基线，不能据此把请求误判为
+        // 可接受的 no-op，也不能绕过重新初始化直接访问 control VQ。
+        if ((state != FSM_READY) && (state != FSM_RUNNING)) begin
+            `uvm_error("AUTO_FSM", $sformatf(
+                "configure_mq: requires FSM_READY or FSM_RUNNING, got %s",
+                state.name()))
+            return;
+        end
+
+        if (num_pairs == active_num_pairs) begin
+            `uvm_info("AUTO_FSM",
+                $sformatf("configure_mq: %0d pairs already active; no change needed",
+                          num_pairs), UVM_MEDIUM)
+            return;
+        end
+
+        restart_dataplane = (state == FSM_RUNNING);
+        if (restart_dataplane) begin
+            stop_dataplane();
+            if (state != FSM_READY) begin
+                `uvm_error("AUTO_FSM", $sformatf(
+                    "configure_mq: dataplane stop ended in state %s",
+                    state.name()))
+                return;
+            end
+        end
+
         do_configure_mq(num_pairs);
+
+        // active_num_pairs 是 do_configure_mq 的提交标志。仅检查 state 会把设备
+        // 拒绝（其状态仍为 READY）误当作成功，并让旧队列集合上的 worker 重新运行。
+        if (restart_dataplane && (state == FSM_READY) &&
+            (active_num_pairs == num_pairs)) begin
+            start_dataplane();
+        end
     endtask
 
     // configure_mq 的实现体：先经 ctrl VQ 向设备提交 MQ 变更，设备接受后
     // 再收敛队列——缩容拆除多余的 RX/TX 队列，扩容经 ops.setup_queue_range 按对新建
-    // （任一失败拆除本次新建的全部队列并 FSM_ERROR；新队列由 setup_queue 分配向量并在
+    // （任一失败拆除本次新建的全部队列并进入错误恢复；新队列由 setup_queue 分配向量并在
     // queue_enable 之前写入，已使能队列的向量不变），最后更新 active_num_pairs 与
     // num_total_queues。
-    // 设备拒绝时仅报错、不动现有队列。缩容要拆队，未协商 VIRTIO_F_RING_RESET 时标准设备
-    // 无法单独停队（virtio 1.2 §4.1.4.3.2），在提交 MQ 变更前拒绝。
+    // 设备明确 ACK_ERR 时仅报错、不动现有队列；命令已发布但超时则设备结果不确定，
+    // 必须执行 verified Function reset。缩容要拆队，未协商 VIRTIO_F_RING_RESET 时标准
+    // 设备无法单独停队（virtio 1.2 §4.1.4.3.2），在提交 MQ 变更前拒绝；拆到一半失败
+    // 同样执行 verified Function reset，成功进入 REINIT_REQUIRED，失败进入 ERROR 并保留 DMA。
     protected virtual task do_configure_mq(int unsigned num_pairs);
         bit success;
         bit setup_ok;
+        bit queue_stopped;
+        bit reset_ok;
+        string reset_result;
 
         if ((num_pairs < active_num_pairs) && !ops.negotiated_features[VIRTIO_F_RING_RESET]) begin
             `uvm_error("AUTO_FSM", $sformatf(
@@ -598,14 +647,64 @@ class virtio_auto_fsm extends uvm_report_object;
         ops.ctrl_set_mq_pairs(num_pairs, success);
 
         if (success) begin
-            // 缩容拆除多余队列对；任一队列未确认停止即保留并 FSM_ERROR。
+            // 缩容逐条确认设备已停队后才释放 Host 资源。一个 pair 的 RX/TX 不是
+            // 原子寄存器操作，前一条可能已成功而后一条失败；此时只能升级为 verified
+            // Function reset。复位成功表示全部旧队列已安全回收并要求重新初始化；
+            // 复位失败则保留尚未确认停止的 DMA 并进入 ERROR。两个结果都不得重启 worker。
             for (int unsigned i = num_pairs; i < active_num_pairs; i++) begin
-                ops.teardown_queue(i * 2);      // receiveq
-                ops.teardown_queue(i * 2 + 1);  // transmitq
-                if (ops.vq_mgr.has_queue(i * 2) || ops.vq_mgr.has_queue(i * 2 + 1)) begin
-                    state = FSM_ERROR;
+                ops.teardown_queue_verified(i * 2, queue_stopped);  // receiveq
+                if (!queue_stopped) begin
+                    ops.device_reset_verified(reset_ok);
+                    if (reset_ok) begin
+                        // verified reset 已经清空 ops/vq_mgr 的整个 Function 拓扑；同步
+                        // 清零 FSM 的队列总数，active_num_pairs 保留为恢复诊断基线。
+                        num_total_queues = 0;
+                        state = FSM_REINIT_REQUIRED;
+                    end else begin
+                        // 复位未确认时设备仍可能访问旧 DMA，资源所有权必须保留；但
+                        // 此前已确认停队的队列可能已经释放，因此按 manager 的实际
+                        // 剩余项更新诊断计数，不能继续声称完整旧拓扑仍然存在。
+                        num_total_queues = ops.vq_mgr.get_queue_count();
+                        state = FSM_ERROR;
+                    end
+                    // SystemVerilog 的字符串字面量三元表达式会按较长分支定宽，VCS
+                    // 因而可能把 "failed" 左侧补空格。显式赋给动态 string，保证日志
+                    // 契约稳定，也让错误捕获与外部日志分析不依赖编译器的定宽规则。
+                    if (reset_ok)
+                        reset_result = "completed";
+                    else
+                        reset_result = "failed";
                     `uvm_error("AUTO_FSM", $sformatf(
-                        "configure_mq: queue pair %0d was not stopped; retaining it", i))
+                        {"configure_mq: receive queue %0d of pair %0d was not ",
+                         "stopped; verified Function reset %s"},
+                        i * 2, i, reset_result))
+                    return;
+                end
+
+                ops.teardown_queue_verified(i * 2 + 1, queue_stopped);  // transmitq
+                if (!queue_stopped) begin
+                    ops.device_reset_verified(reset_ok);
+                    if (reset_ok) begin
+                        // RX 可能已经先被安全释放；整 Function 复位成功后其余队列也
+                        // 全部回收，FSM 必须显式记录空拓扑并要求重新初始化。
+                        num_total_queues = 0;
+                        state = FSM_REINIT_REQUIRED;
+                    end else begin
+                        // 例如 RX 已经确认释放而 TX 未停：保留 TX/其余 DMA，同时让
+                        // FSM 的诊断计数准确反映 manager 中仍由本生命周期持有的队列。
+                        num_total_queues = ops.vq_mgr.get_queue_count();
+                        state = FSM_ERROR;
+                    end
+                    // 与 RX 失败路径使用同一稳定字符串契约，避免定宽三元表达式在
+                    // "failed" 前插入空格，破坏测试与日志消费者的精确匹配。
+                    if (reset_ok)
+                        reset_result = "completed";
+                    else
+                        reset_result = "failed";
+                    `uvm_error("AUTO_FSM", $sformatf(
+                        {"configure_mq: transmit queue %0d of pair %0d was not ",
+                         "stopped; verified Function reset %s"},
+                        i * 2 + 1, i, reset_result))
                     return;
                 end
             end
@@ -616,16 +715,63 @@ class virtio_auto_fsm extends uvm_report_object;
                 ops.setup_queue_range(active_num_pairs, num_pairs - active_num_pairs,
                                       queue_format(), drv_cfg.queue_size, setup_ok);
                 if (!setup_ok) begin
-                    state = FSM_ERROR;
-                    `uvm_error("AUTO_FSM", $sformatf(
-                        "configure_mq: failed to setup queue pairs %0d..%0d",
-                        active_num_pairs, num_pairs - 1))
+                    // 设备已经接受 new_pairs，单纯窄回滚新建队列会留下“设备新对数、
+                    // Host 旧拓扑”的分叉。setup_queue_range 若尚未成功完成整 Function
+                    // 复位（包括它曾尝试但失败的情况），这里必须主动执行/重试 verified
+                    // reset。只有确认成功才可宣告空拓扑并要求重新初始化。
+                    if (ops.queue_rollback_used_function_reset() &&
+                        !ops.queues_require_recovery()) begin
+                        reset_ok = 1;
+                    end else begin
+                        ops.device_reset_verified(reset_ok);
+                    end
+
+                    if (reset_ok) begin
+                        num_total_queues = 0;
+                        state = FSM_REINIT_REQUIRED;
+                        `uvm_error("AUTO_FSM", $sformatf(
+                            {"configure_mq: failed to setup queue pairs %0d..%0d; ",
+                             "verified Function reset completed, reinitialization required"},
+                            active_num_pairs, num_pairs - 1))
+                    end else begin
+                        // reset 未确认时，本次扩容可能已有建成但未能停下的队列留在
+                        // manager 中；记录实际持有数，资源继续由 recovery 闸门保护。
+                        num_total_queues = ops.vq_mgr.get_queue_count();
+                        state = FSM_ERROR;
+                        `uvm_error("AUTO_FSM", $sformatf(
+                            {"configure_mq: failed to setup queue pairs %0d..%0d; ",
+                             "verified Function reset failed, retaining queue DMA"},
+                            active_num_pairs, num_pairs - 1))
+                    end
                     return;
                 end
             end
 
             active_num_pairs = num_pairs;
+            drv_cfg.num_queue_pairs = num_pairs;
             num_total_queues = ops.vq_mgr.get_queue_count();
+        end else if (ops.control_vq_requires_recovery()) begin
+            // control 命令已经发布但没有有效完成时，ACK_ERR 只表示 Host 没拿到结果，
+            // 不能证明设备拒绝了 new_pairs。即使 control Q_RESET/重建成功，设备可能
+            // 已经提交新值；整 Function 复位是收敛设备配置与 Host 拓扑的唯一安全边界。
+            ops.device_reset_verified(reset_ok);
+            if (reset_ok) begin
+                num_total_queues = 0;
+                state = FSM_REINIT_REQUIRED;
+                `uvm_error("AUTO_FSM", $sformatf(
+                    {"configure_mq: control command for %0d pairs completed with ",
+                     "an unknown device result; verified Function reset completed, ",
+                     "reinitialization required"}, num_pairs))
+            end else begin
+                // 复位未确认时保留全部仍可能被设备访问的队列；局部 control 恢复
+                // 可能已改变 manager 项，因此诊断计数以当前实际所有权为准。
+                num_total_queues = ops.vq_mgr.get_queue_count();
+                state = FSM_ERROR;
+                `uvm_error("AUTO_FSM", $sformatf(
+                    {"configure_mq: control command for %0d pairs completed with ",
+                     "an unknown device result; verified Function reset failed, ",
+                     "retaining queue DMA"}, num_pairs))
+            end
         end else begin
             `uvm_error("AUTO_FSM",
                 $sformatf("configure_mq: device rejected MQ change to %0d pairs", num_pairs))

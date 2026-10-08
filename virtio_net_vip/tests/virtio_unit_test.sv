@@ -278,8 +278,82 @@ class virtio_unit_exact_error_catcher extends uvm_report_catcher;
     endfunction
 endclass : virtio_unit_exact_error_catcher
 
-// 建队探针：setup_queue 只记录队列号并在 fail_qid 上失败，teardown 只记录；
-// 用于验证 setup_queue_range 的队列编号与失败回滚，不访问设备。
+// 生产 IOMMU 的映射通常不会失败；本替身只在指定的第 N 次 map 返回失败，并暴露
+// live mapping 数。其余路径完全委托生产模型，用于验证真实 ring 分配/映射的回滚。
+class virtio_unit_queue_recovery_iommu extends virtio_iommu_model;
+    `uvm_object_utils(virtio_unit_queue_recovery_iommu)
+
+    int unsigned map_attempts;
+    int unsigned fail_on_map_attempt;
+
+    // 构造故障注入 IOMMU；输入 name 仅用于 UVM 命名，计数器清零且默认不注入失败。
+    function new(string name = "virtio_unit_queue_recovery_iommu");
+        super.new(name);
+        map_attempts = 0;
+        fail_on_map_attempt = 0;
+    endfunction
+
+    // 为指定 Function 建立映射；命中 fail_on_map_attempt 时返回失败且不修改映射表，
+    // 否则使用生产分配器。输入/返回值与基类一致。
+    virtual function bit [63:0] map_for_host(
+        int unsigned host_id,
+        bit [15:0] bdf,
+        bit [63:0] gpa,
+        int unsigned size,
+        dma_dir_e dir,
+        string file = "",
+        int line = 0
+    );
+        map_attempts++;
+        if ((fail_on_map_attempt != 0) && (map_attempts == fail_on_map_attempt))
+            return '1;
+        return super.map_for_host(host_id, bdf, gpa, size, dir, file, line);
+    endfunction
+
+    // 返回当前仍有效的映射数，只供本测试断言 reset 成功释放或失败安全保留。
+    function int unsigned active_mapping_count();
+        return mapping_table.size();
+    endfunction
+endclass : virtio_unit_queue_recovery_iommu
+
+// 暴露生产 host_mem_manager 的当前分配数，只用于把 ring 的 Host 所有权与 IOMMU
+// 映射一起核对；分配/释放行为仍全部由基类实现。
+class virtio_unit_queue_recovery_mem extends host_mem_manager;
+    `uvm_object_utils(virtio_unit_queue_recovery_mem)
+
+    // 构造跟踪型 Host memory；输入 name 仅用于 UVM 命名，实际区域由测试随后初始化。
+    function new(string name = "virtio_unit_queue_recovery_mem");
+        super.new(name);
+    endfunction
+
+    // 返回尚未释放的 Host allocation 数；不改变分配器状态。
+    function int unsigned outstanding_allocations();
+        return alloc_table.size();
+    endfunction
+endclass : virtio_unit_queue_recovery_mem
+
+// 在 virtio_mock_transport 基础上统计 Q_SIZE 查询次数；其余行为完全复用 mock。
+// 重复 qid 和 recovery 门禁测试据此确认失败请求连只读配置访问都不会发出。
+class virtio_unit_counting_mock_transport extends virtio_mock_transport;
+    `uvm_object_utils(virtio_unit_counting_mock_transport)
+
+    int unsigned queue_max_read_count;
+
+    // 构造只清零观察计数，不改变 mock transport 的默认设备状态。
+    function new(string name = "virtio_unit_counting_mock_transport");
+        super.new(name);
+        queue_max_read_count = 0;
+    endfunction
+
+    // 记录一次 Q_SIZE 查询后委托基类返回可编程的 queue_num_max。
+    virtual task read_queue_num_max(ref int unsigned max_size);
+        queue_max_read_count++;
+        super.read_queue_num_max(max_size);
+    endtask
+endclass : virtio_unit_counting_mock_transport
+
+// 建队探针：setup_queue 只记录队列号并在 fail_qid 上失败，verified teardown 记录
+// 队列号并确认停止；用于验证 setup_queue_range 的编号和窄范围回滚，不访问设备。
 class virtio_unit_range_ops extends virtio_atomic_ops;
     `uvm_object_utils(virtio_unit_range_ops)
 
@@ -287,19 +361,23 @@ class virtio_unit_range_ops extends virtio_atomic_ops;
     int unsigned setup_qids[$];
     int unsigned teardown_qids[$];
 
+    // 构造范围操作探针；默认不让任何 qid 失败，记录队列由测试拥有并清理。
     function new(string name = "virtio_unit_range_ops");
         super.new(name);
         fail_qid = '1;
     endfunction
 
+    // 记录建队输入 queue_id，并在其等于 fail_qid 时返回 ok=0；其余输入不产生资源副作用。
     virtual task setup_queue(int unsigned queue_id, int unsigned queue_size,
                              virtqueue_type_e vq_type, output bit ok);
         setup_qids.push_back(queue_id);
         ok = (queue_id != fail_qid);
     endtask
 
-    virtual task teardown_queue(int unsigned queue_id);
+    // 记录回滚 queue_id 并返回 stopped=1；不访问设备或释放资源。
+    virtual task teardown_queue_verified(int unsigned queue_id, output bit stopped);
         teardown_qids.push_back(queue_id);
+        stopped = 1;
     endtask
 endclass : virtio_unit_range_ops
 
@@ -401,6 +479,8 @@ class virtio_unit_test extends uvm_test;
         test_standard_manual_kick_notifies();
         test_fabric_bar_layout_roles();
         test_setup_queue_range_rollback();
+        test_setup_queue_range_verified_recovery();
+        test_failed_reset_and_duplicate_queue_gates();
         test_dma_buffer_set();
 
         `uvm_info("UNIT_TEST", "All unit tests PASSED", UVM_NONE)
@@ -1769,6 +1849,305 @@ class virtio_unit_test extends uvm_test;
             `uvm_error("TEST", $sformatf("range rollback created %p torn down %p",
                                          ops.setup_qids, ops.teardown_qids))
         `uvm_info("UNIT_TEST", "test_setup_queue_range_rollback PASSED", UVM_LOW)
+    endtask
+
+    // 使用生产 common-config 后端、virtqueue、Host memory 与 IOMMU 验证批量建队的
+    // 失败闭环。第二条队列映射失败后，未协商 RING_RESET 的第一条队列无法单独停下，
+    // 必须升级为 verified Function reset：成功时零泄漏，失败时保留仍可能被 DMA 的
+    // 三个 ring 和显式 recovery 状态；随后成功复位才允许清理并解除恢复门禁。
+    task test_setup_queue_range_verified_recovery();
+        virtio_unit_queue_recovery_mem success_mem;
+        virtio_unit_queue_recovery_iommu success_iommu;
+        virtio_mock_transport success_transport;
+        virtio_vq_test_kit success_kit;
+        virtio_atomic_ops success_ops;
+        virtio_unit_exact_error_catcher success_map_catcher;
+        virtio_unit_exact_error_catcher success_stop_catcher;
+        virtio_unit_queue_recovery_mem failed_mem;
+        virtio_unit_queue_recovery_iommu failed_iommu;
+        virtio_mock_transport failed_transport;
+        virtio_vq_test_kit failed_kit;
+        virtio_atomic_ops failed_ops;
+        virtio_unit_exact_error_catcher failed_map_catcher;
+        virtio_unit_exact_error_catcher failed_stop_catcher;
+        virtio_unit_exact_error_catcher failed_reset_catcher;
+        virtio_unit_exact_error_catcher failed_recovery_catcher;
+        virtio_unit_exact_error_catcher blocked_setup_catcher;
+        bit ok;
+        bit reset_ok;
+
+        // reset 成功：q0 的三个 split-ring 映射与 Host allocation 全部由整设备复位回收。
+        success_mem = virtio_unit_queue_recovery_mem::type_id::create("range_recovery_success_mem");
+        success_mem.init_region(64'h7a00_0000, 64'h7a03_ffff);
+        success_iommu = virtio_unit_queue_recovery_iommu::type_id::create(
+            "range_recovery_success_iommu");
+        success_iommu.fail_on_map_attempt = 4;
+        success_transport = virtio_mock_transport::type_id::create(
+            "range_recovery_success_transport");
+        success_transport.configure_pcie_identity(
+            virtio_vq_test_kit::host0_pcie_id(16'h0136));
+        success_kit = virtio_vq_test_kit::create_kit(
+            "range_recovery_success", success_mem, success_iommu, 16'h0136);
+        success_ops = success_kit.make_ops(
+            success_transport, "range_recovery_success_ops");
+        success_map_catcher = new(
+            "range_recovery_success_map_catcher", "ATOMIC_OPS",
+            "setup_queue: failed to map queue_id=1 rings");
+        success_stop_catcher = new(
+            "range_recovery_success_stop_catcher", "ATOMIC_OPS",
+            {"teardown_queue: config backend did not confirm queue_id=0 stopped; ",
+             "retaining queue DMA"});
+        uvm_report_cb::add(null, success_map_catcher);
+        uvm_report_cb::add(null, success_stop_catcher);
+        success_ops.setup_queue_range(0, 1, VQ_SPLIT, 8, ok);
+        uvm_report_cb::delete(null, success_stop_catcher);
+        uvm_report_cb::delete(null, success_map_catcher);
+        if (ok || (success_map_catcher.caught_count != 1) ||
+            (success_stop_catcher.caught_count != 1) ||
+            (success_transport.device_reset_count != 1) ||
+            !success_ops.queue_rollback_used_function_reset() ||
+            success_ops.queues_require_recovery() ||
+            (success_kit.vq_mgr.get_queue_count() != 0) ||
+            (success_iommu.active_mapping_count() != 0) ||
+            (success_mem.outstanding_allocations() != 0)) begin
+            `uvm_error("TEST", $sformatf(
+                {"successful rollback reset left state: ok=%0b errors=%0d/%0d reset=%0d ",
+                 "recovery=%0b queues=%0d maps=%0d allocs=%0d"},
+                ok, success_map_catcher.caught_count,
+                success_stop_catcher.caught_count,
+                success_transport.device_reset_count,
+                success_ops.queues_require_recovery(),
+                success_kit.vq_mgr.get_queue_count(),
+                success_iommu.active_mapping_count(),
+                success_mem.outstanding_allocations()))
+        end
+
+        // reset 失败：q0 仍可能被设备访问，三个 ring 的映射和 Host allocation 必须
+        // 原样保留，且任何新建队尝试在访问后端之前被 recovery 门禁拒绝。
+        failed_mem = virtio_unit_queue_recovery_mem::type_id::create(
+            "range_recovery_failed_mem");
+        failed_mem.init_region(64'h7a10_0000, 64'h7a13_ffff);
+        failed_iommu = virtio_unit_queue_recovery_iommu::type_id::create(
+            "range_recovery_failed_iommu");
+        failed_iommu.fail_on_map_attempt = 4;
+        failed_transport = virtio_mock_transport::type_id::create(
+            "range_recovery_failed_transport");
+        failed_transport.configure_pcie_identity(
+            virtio_vq_test_kit::host0_pcie_id(16'h0137));
+        failed_transport.device_reset_complete = 0;
+        failed_kit = virtio_vq_test_kit::create_kit(
+            "range_recovery_failed", failed_mem, failed_iommu, 16'h0137);
+        failed_ops = failed_kit.make_ops(
+            failed_transport, "range_recovery_failed_ops");
+        failed_map_catcher = new(
+            "range_recovery_failed_map_catcher", "ATOMIC_OPS",
+            "setup_queue: failed to map queue_id=1 rings");
+        failed_stop_catcher = new(
+            "range_recovery_failed_stop_catcher", "ATOMIC_OPS",
+            {"teardown_queue: config backend did not confirm queue_id=0 stopped; ",
+             "retaining queue DMA"});
+        failed_reset_catcher = new(
+            "range_recovery_failed_reset_catcher", "ATOMIC_OPS",
+            "device_reset: transport reset did not complete; retaining PF DMA");
+        failed_recovery_catcher = new(
+            "range_recovery_failed_recovery_catcher", "ATOMIC_OPS",
+            {"rollback_created_queues: verified Function reset failed; ",
+             "retaining queue DMA and requiring recovery"});
+        uvm_report_cb::add(null, failed_map_catcher);
+        uvm_report_cb::add(null, failed_stop_catcher);
+        uvm_report_cb::add(null, failed_reset_catcher);
+        uvm_report_cb::add(null, failed_recovery_catcher);
+        failed_ops.setup_queue_range(0, 1, VQ_SPLIT, 8, ok);
+        uvm_report_cb::delete(null, failed_recovery_catcher);
+        uvm_report_cb::delete(null, failed_reset_catcher);
+        uvm_report_cb::delete(null, failed_stop_catcher);
+        uvm_report_cb::delete(null, failed_map_catcher);
+        if (ok || (failed_map_catcher.caught_count != 1) ||
+            (failed_stop_catcher.caught_count != 1) ||
+            (failed_reset_catcher.caught_count != 1) ||
+            (failed_recovery_catcher.caught_count != 1) ||
+            (failed_transport.device_reset_count != 1) ||
+            !failed_ops.queue_rollback_used_function_reset() ||
+            !failed_ops.queues_require_recovery() ||
+            (failed_kit.vq_mgr.get_queue_count() != 1) ||
+            (failed_iommu.active_mapping_count() != 3) ||
+            (failed_mem.outstanding_allocations() != 3)) begin
+            `uvm_error("TEST", $sformatf(
+                {"failed rollback reset did not retain ownership: ok=%0b errors=%0d/%0d/%0d/%0d ",
+                 "reset=%0d recovery=%0b queues=%0d maps=%0d allocs=%0d"},
+                ok, failed_map_catcher.caught_count,
+                failed_stop_catcher.caught_count,
+                failed_reset_catcher.caught_count,
+                failed_recovery_catcher.caught_count,
+                failed_transport.device_reset_count,
+                failed_ops.queues_require_recovery(),
+                failed_kit.vq_mgr.get_queue_count(),
+                failed_iommu.active_mapping_count(),
+                failed_mem.outstanding_allocations()))
+        end
+
+        blocked_setup_catcher = new(
+            "range_recovery_blocked_setup_catcher", "ATOMIC_OPS",
+            "setup_queue: verified Function reset required before creating another queue");
+        uvm_report_cb::add(null, blocked_setup_catcher);
+        failed_ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        uvm_report_cb::delete(null, blocked_setup_catcher);
+        if (ok || (blocked_setup_catcher.caught_count != 1) ||
+            (failed_kit.vq_mgr.get_queue_count() != 1) ||
+            (failed_iommu.active_mapping_count() != 3) ||
+            (failed_mem.outstanding_allocations() != 3))
+            `uvm_error("TEST", "queue recovery gate did not preserve retained DMA ownership")
+
+        failed_transport.device_reset_complete = 1;
+        failed_ops.device_reset_verified(reset_ok);
+        if (!reset_ok || failed_ops.queues_require_recovery() ||
+            (failed_transport.device_reset_count != 2) ||
+            (failed_kit.vq_mgr.get_queue_count() != 0) ||
+            (failed_iommu.active_mapping_count() != 0) ||
+            (failed_mem.outstanding_allocations() != 0))
+            `uvm_error("TEST", "successful recovery reset did not release retained queue ownership")
+
+        `uvm_info("UNIT_TEST", "test_setup_queue_range_verified_recovery PASSED", UVM_LOW)
+    endtask
+
+    // 未确认完成的 Function reset 必须保留全部旧 ring，并同时关闭普通建队与
+    // control VQ 提交入口。普通的重复 qid 请求也必须在重新分配 ring 或编程设备前
+    // 失败。后续 verified reset 成功后释放旧所有权并重新开放新生命周期入口。
+    task test_failed_reset_and_duplicate_queue_gates();
+        virtio_unit_queue_recovery_mem mem;
+        virtio_unit_queue_recovery_iommu iommu;
+        virtio_unit_counting_mock_transport transport;
+        virtio_vq_test_kit kit;
+        virtio_atomic_ops ops;
+        virtio_unit_exact_error_catcher duplicate_catcher;
+        virtio_unit_exact_error_catcher reset_catcher;
+        virtio_unit_exact_error_catcher setup_gate_catcher;
+        virtio_unit_exact_error_catcher ctrl_gate_catcher;
+        byte unsigned ctrl_data[];
+        virtio_ctrl_ack_e ack;
+        int unsigned maps_before;
+        int unsigned allocs_before;
+        int unsigned programs_before;
+        int unsigned queries_before;
+        bit ok;
+        bit reset_ok;
+
+        mem = virtio_unit_queue_recovery_mem::type_id::create(
+            "failed_reset_gate_mem");
+        mem.init_region(64'h7a20_0000, 64'h7a23_ffff);
+        iommu = virtio_unit_queue_recovery_iommu::type_id::create(
+            "failed_reset_gate_iommu");
+        transport = virtio_unit_counting_mock_transport::type_id::create(
+            "failed_reset_gate_transport");
+        transport.configure_pcie_identity(
+            virtio_vq_test_kit::host0_pcie_id(16'h0138));
+        kit = virtio_vq_test_kit::create_kit(
+            "failed_reset_gate", mem, iommu, 16'h0138);
+        ops = kit.make_ops(transport, "failed_reset_gate_ops");
+
+        ops.setup_queue(0, 8, VQ_SPLIT, ok);
+        if (!ok || (kit.vq_mgr.get_queue_count() != 1) ||
+            (iommu.active_mapping_count() != 3) ||
+            (mem.outstanding_allocations() != 3))
+            `uvm_fatal("TEST", "failed-reset gate fixture could not create queue 0")
+
+        maps_before = iommu.active_mapping_count();
+        allocs_before = mem.outstanding_allocations();
+        programs_before = transport.programmed_qids.size();
+        queries_before = transport.queue_max_read_count;
+
+        // 重复 qid 在查询、分配、映射和设备编程前拒绝，旧队列生命周期及全部
+        // 资源计数必须保持原样。
+        duplicate_catcher = new(
+            "duplicate_queue_catcher", "ATOMIC_OPS",
+            "setup_queue: queue_id=0 already exists");
+        uvm_report_cb::add(null, duplicate_catcher);
+        ops.setup_queue(0, 8, VQ_SPLIT, ok);
+        uvm_report_cb::delete(null, duplicate_catcher);
+        if (ok || (duplicate_catcher.caught_count != 1) ||
+            (kit.vq_mgr.get_queue_count() != 1) ||
+            (iommu.active_mapping_count() != maps_before) ||
+            (mem.outstanding_allocations() != allocs_before) ||
+            (transport.queue_max_read_count != queries_before) ||
+            (transport.programmed_qids.size() != programs_before))
+            `uvm_error("TEST", "duplicate queue setup changed existing ownership")
+
+        // 直接 Function reset 失败时，即使此前没有批量回滚置位恢复状态，也必须
+        // 保留 q0 并关闭两个公开入口。
+        transport.device_reset_complete = 0;
+        reset_catcher = new(
+            "direct_failed_reset_catcher", "ATOMIC_OPS",
+            "device_reset: transport reset did not complete; retaining PF DMA");
+        uvm_report_cb::add(null, reset_catcher);
+        ops.device_reset_verified(reset_ok);
+        uvm_report_cb::delete(null, reset_catcher);
+        if (reset_ok || (reset_catcher.caught_count != 1) ||
+            !ops.queues_require_recovery() ||
+            !ops.control_vq_requires_recovery() ||
+            (kit.vq_mgr.get_queue_count() != 1) ||
+            (iommu.active_mapping_count() != maps_before) ||
+            (mem.outstanding_allocations() != allocs_before) ||
+            (transport.queue_max_read_count != queries_before) ||
+            (transport.programmed_qids.size() != programs_before))
+            `uvm_error("TEST", "failed direct reset did not retain and gate queue ownership")
+
+        setup_gate_catcher = new(
+            "failed_reset_setup_gate_catcher", "ATOMIC_OPS",
+            "setup_queue: verified Function reset required before creating another queue");
+        uvm_report_cb::add(null, setup_gate_catcher);
+        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        uvm_report_cb::delete(null, setup_gate_catcher);
+        if (ok || (setup_gate_catcher.caught_count != 1) ||
+            (kit.vq_mgr.get_queue_count() != 1) ||
+            (iommu.active_mapping_count() != maps_before) ||
+            (mem.outstanding_allocations() != allocs_before) ||
+            (transport.queue_max_read_count != queries_before) ||
+            (transport.programmed_qids.size() != programs_before))
+            `uvm_error("TEST", "failed-reset queue gate had a side effect")
+
+        ctrl_data = new[0];
+        ctrl_gate_catcher = new(
+            "failed_reset_ctrl_gate_catcher", "ATOMIC_OPS",
+            "ctrl_send: control VQ recovery is pending; verified device reset required");
+        uvm_report_cb::add(null, ctrl_gate_catcher);
+        ops.ctrl_send(VIRTIO_NET_CTRL_CLS_MQ,
+                      VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
+                      ctrl_data, ack);
+        uvm_report_cb::delete(null, ctrl_gate_catcher);
+        if ((ack != VIRTIO_NET_CTRL_ACK_ERR) ||
+            (ctrl_gate_catcher.caught_count != 1) ||
+            (kit.vq_mgr.get_queue_count() != 1) ||
+            (iommu.active_mapping_count() != maps_before) ||
+            (mem.outstanding_allocations() != allocs_before) ||
+            (transport.queue_max_read_count != queries_before))
+            `uvm_error("TEST", "failed-reset control gate had a side effect")
+
+        // 只有成功的 reset 重试可以释放 q0 并重新开放两个入口。随后成功建立新 q2，
+        // 证明建队能力已恢复而不是被永久锁死。
+        transport.device_reset_complete = 1;
+        ops.device_reset_verified(reset_ok);
+        if (!reset_ok || ops.queues_require_recovery() ||
+            ops.control_vq_requires_recovery() ||
+            (transport.device_reset_count != 2) ||
+            (kit.vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("TEST", "successful reset retry did not reopen the Function lifecycle")
+
+        ops.setup_queue(2, 8, VQ_SPLIT, ok);
+        if (!ok || (kit.vq_mgr.get_queue_count() != 1) ||
+            (iommu.active_mapping_count() != 3) ||
+            (mem.outstanding_allocations() != 3) ||
+            (transport.queue_max_read_count != queries_before + 1))
+            `uvm_error("TEST", "queue setup remained blocked after verified reset retry")
+        ops.device_reset_verified(reset_ok);
+        if (!reset_ok || (kit.vq_mgr.get_queue_count() != 0) ||
+            (iommu.active_mapping_count() != 0) ||
+            (mem.outstanding_allocations() != 0))
+            `uvm_error("TEST", "failed-reset gate test leaked queue ownership")
+
+        `uvm_info("UNIT_TEST",
+                  "test_failed_reset_and_duplicate_queue_gates PASSED", UVM_LOW)
     endtask
 
     // 标准协议 MANUAL ATOMIC_KICK 必须经 ops 向设备发 doorbell（携带 ring 游标），不能只在

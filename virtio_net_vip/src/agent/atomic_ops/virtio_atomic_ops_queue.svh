@@ -5,9 +5,13 @@
     // Queue Management
     // ========================================================================
 
-    // ------------------------------------------------------------------------
-    // setup_queue -- Full queue setup: create, alloc rings, map IOMMU, enable
-    // ------------------------------------------------------------------------
+    // setup_queue -- 建立、映射、编程并使能一条队列
+    //
+    // 输入为 Function 内 queue_id、请求深度和环格式；queue_size=0 采用设备上限，成功
+    // 返回 ok=1，并由 ops/vq_mgr 分别持有 IOMMU 映射和 ring 对象。上下文不全、恢复
+    // pending、queue_id 已存在、私有深度非法、分配/映射/向量/后端编程失败均返回 0；
+    // 重复 queue_id 在任何分配和设备访问前拒绝，其余在设备尚未取得 ring 所有权的
+    // 失败点立即回收本次资源。
     virtual task setup_queue(
         int unsigned       queue_id,
         int unsigned       queue_size,
@@ -31,9 +35,35 @@
         bit                configured;
 
         ok = 0;
+        if (queue_recovery_pending || ctrl_recovery_pending) begin
+            `uvm_error("ATOMIC_OPS",
+                "setup_queue: verified Function reset required before creating another queue")
+            return;
+        end
         if ((transport == null) || (vq_mgr == null) || (iommu == null) ||
             (mem == null)) begin
             `uvm_error("ATOMIC_OPS", "setup_queue: incomplete queue context")
+            return;
+        end
+
+        // 若复用 manager 中的旧对象，会在设备仍可能拥有旧 ring 时再次分配 ring，并
+        // 覆盖 ops 保存的映射和编程记录。重复 queue_id 必须在分配资源、查询后端或
+        // 访问 MMIO 之前拒绝，旧生命周期保持原样。
+        if (vq_mgr.has_queue(queue_id)) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: queue_id=%0d already exists", queue_id))
+            return;
+        end
+
+        // 私有环的 q_depth 是 log2 编码，且 custom_virtqueue 固定保留一个槽。显式请求
+        // 在查询设备上限和“超上限裁剪”之前校验，避免 1/8192/非 2 次幂被裁成另一个
+        // 合法值后进入后端。queue_size=0 仍表示采用后端上报的已校验默认深度。
+        if ((vq_type == VQ_CUSTOM) && (queue_size != 0) &&
+            ((queue_size < 2) || (queue_size > 4096) ||
+             ((queue_size & (queue_size - 1)) != 0))) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                {"setup_queue: private queue_id=%0d size %0d is invalid; ",
+                 "expected a power of two in 2..4096"}, queue_id, queue_size))
             return;
         end
 
@@ -177,14 +207,19 @@
         ok = 1;
     endtask
 
-    // ------------------------------------------------------------------------
-    // teardown_queue -- Stop (confirmed), detach, unmap, and destroy a queue
-    // ------------------------------------------------------------------------
-    virtual task teardown_queue(int unsigned queue_id);
+    // teardown_queue_verified -- 确认停队后释放一条队列，并把确认结果返回调用方
+    //
+    // 输入 queue_id 是当前 Function 内的队列号；stopped=1 表示后端已经确认设备不再
+    // 访问该队列，且 Host ring、普通数据 DMA 和 manager 项均已释放。后端停队失败时
+    // stopped=0，全部仍归 Host 所有的资源保持原状，并置 queue_recovery_pending，要求
+    // 调用方执行 verified Function reset。该结果用于 MQ 缩容和批量建队回滚，避免靠
+    // “队列是否还存在”间接猜测硬件停队结果。
+    virtual task teardown_queue_verified(int unsigned queue_id, output bit stopped);
         virtqueue_base vq;
         uvm_object tokens[$];
         virtio_config_backend backend;
-        bit stopped;
+
+        stopped = 0;
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("teardown_queue: queue_id=%0d", queue_id), UVM_MEDIUM)
@@ -198,6 +233,7 @@
         else
             backend.disable_queue(queue_program_of(queue_id), stopped);
         if (!stopped) begin
+            queue_recovery_pending = 1;
             `uvm_error("ATOMIC_OPS", $sformatf(
                 "teardown_queue: config backend did not confirm queue_id=%0d stopped; retaining queue DMA",
                 queue_id))
@@ -239,6 +275,51 @@
                       queue_id, tokens.size()), UVM_MEDIUM)
     endtask
 
+    // teardown_queue -- 兼容 MANUAL/既有调用方的无返回值入口
+    //
+    // 输入 queue_id 与 teardown_queue_verified 相同；副作用及失败资源所有权完全委托
+    // 给 verified 版本。需要决定后续状态迁移的调用方必须直接使用 verified 接口。
+    virtual task teardown_queue(int unsigned queue_id);
+        bit stopped;
+
+        teardown_queue_verified(queue_id, stopped);
+    endtask
+
+    // rollback_created_queues -- 回滚一批刚建立、尚未交付给调用方的队列
+    //
+    // created_qids 按建立顺序传入。先逐队请求确认停 DMA；全部成功时仅释放这些队列。
+    // 任一后端不能确认（标准 common-config 未协商 RING_RESET 即属于此情况）时，执行
+    // verified Function reset，因为此时没有更窄且安全的停队手段。复位成功会统一释放
+    // 本 Function 全部队列并返回 rollback_complete=1；复位失败则保留尚未安全停止的
+    // ring/DMA，保持 recovery pending 并返回 0。
+    protected task rollback_created_queues(
+        ref int unsigned created_qids[$],
+        output bit rollback_complete
+    );
+        bit stopped;
+        bit reset_complete;
+
+        rollback_complete = 1;
+        foreach (created_qids[i]) begin
+            teardown_queue_verified(created_qids[i], stopped);
+            if (!stopped)
+                rollback_complete = 0;
+        end
+        if (rollback_complete)
+            return;
+
+        queue_recovery_pending = 1;
+        queue_rollback_function_reset_attempted = 1;
+        device_reset_verified(reset_complete);
+        if (!reset_complete) begin
+            `uvm_error("ATOMIC_OPS",
+                {"rollback_created_queues: verified Function reset failed; ",
+                 "retaining queue DMA and requiring recovery"})
+            return;
+        end
+        rollback_complete = 1;
+    endtask
+
     // ------------------------------------------------------------------------
     // reset_queue -- Per-queue reset using virtio 1.2 queue reset mechanism
     // ------------------------------------------------------------------------
@@ -266,8 +347,10 @@
     // setup_queue_range -- 建立 [first_pair, first_pair+num_pairs) 的 RX/TX 队列对
     //
     // 队列号按 virtio-net 约定：pair i 的 receiveq 为 2i、transmitq 为 2i+1。
-    // 任一队列失败时按创建顺序拆除本次已建队列并返回 ok=0，不触碰范围外队列；
-    // teardown_queue 在后端未确认停 DMA 时保留队列资源（私有后端同样适用）。
+    // 任一队列失败时按创建顺序尝试拆除本次已建队列并返回 ok=0。若单队列停队均已
+    // 确认，则不触碰范围外队列；任一停队未确认时升级为 verified Function reset，因而
+    // 整个 Function 都需要重新初始化。复位失败时安全保留尚未停止的 ring/DMA 并置
+    // recovery pending，禁止继续创建队列。
     // ------------------------------------------------------------------------
     virtual task setup_queue_range(
         int unsigned     first_pair,
@@ -278,20 +361,20 @@
     );
         int unsigned created_qids[$];
         bit queue_ok;
+        bit rollback_complete;
 
         ok = 0;
+        queue_rollback_function_reset_attempted = 0;
         for (int unsigned i = first_pair; i < first_pair + num_pairs; i++) begin
             setup_queue(i * 2, queue_size, vq_type, queue_ok);  // receiveq_i
             if (!queue_ok) begin
-                foreach (created_qids[j])
-                    teardown_queue(created_qids[j]);
+                rollback_created_queues(created_qids, rollback_complete);
                 return;
             end
             created_qids.push_back(i * 2);
             setup_queue(i * 2 + 1, queue_size, vq_type, queue_ok);  // transmitq_i
             if (!queue_ok) begin
-                foreach (created_qids[j])
-                    teardown_queue(created_qids[j]);
+                rollback_created_queues(created_qids, rollback_complete);
                 return;
             end
             created_qids.push_back(i * 2 + 1);
@@ -317,19 +400,67 @@
         end
     endtask
 
-    // ------------------------------------------------------------------------
-    // setup_all_queues -- Create all queue pairs + control queue
-    // ------------------------------------------------------------------------
+    // setup_control_queue -- 计算、建立并登记本生命周期的 control VQ
+    //
+    // 输入 num_pairs 是当前数据队列对数，vq_type/queue_size 与普通建队含义相同；ok
+    // 仅在队列完整映射、编程、使能并保存显式身份后返回 1。未协商 CTRL_VQ、已有
+    // recovery pending、设备布局改变导致队列号与既有身份冲突，或底层建队失败时不
+    // 更新身份并返回 0。成功建立的队列由 vq_mgr/ops 持有，直到拆队或整设备复位。
+    virtual task setup_control_queue(
+        int unsigned     num_pairs,
+        virtqueue_type_e vq_type,
+        int unsigned     queue_size,
+        output bit       ok
+    );
+        int unsigned ctrl_qid;
+        bit queue_ok;
+
+        ok = 0;
+        if (!negotiated_features[VIRTIO_NET_F_CTRL_VQ]) begin
+            `uvm_error("ATOMIC_OPS",
+                "setup_control_queue: VIRTIO_NET_F_CTRL_VQ was not negotiated")
+            return;
+        end
+        if (ctrl_recovery_pending) begin
+            `uvm_error("ATOMIC_OPS",
+                "setup_control_queue: verified device reset required before rebuilding control VQ")
+            return;
+        end
+
+        control_queue_id(num_pairs, ctrl_qid);
+        if (ctrl_queue_id_valid && (ctrl_queue_id_value != ctrl_qid)) begin
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_control_queue: control VQ identity changed from %0d to %0d without device reset",
+                ctrl_queue_id_value, ctrl_qid))
+            return;
+        end
+
+        setup_queue(ctrl_qid, queue_size, vq_type, queue_ok);
+        if (!queue_ok)
+            return;
+
+        ctrl_queue_id_value = ctrl_qid;
+        ctrl_queue_id_valid = 1;
+        ok = 1;
+    endtask
+
+    // setup_all_queues -- 建立全部数据队列对以及协商存在的 control VQ
+    //
+    // 输入 num_pairs/vq_type/queue_size 描述目标拓扑；成功时 ok=1，数据队列与显式登记
+    // 的 control VQ 均已编程使能。布局非法或任一建队失败时 ok=0，并通过统一回滚路径
+    // 安全释放本轮资源；后端不能确认停队时可能升级为 verified Function reset。
     virtual task setup_all_queues(
         int unsigned     num_pairs,
         virtqueue_type_e vq_type,
         int unsigned     queue_size,
         output bit        ok
     );
-        int unsigned ctrl_qid;
         bit queue_ok;
+        bit rollback_complete;
+        int unsigned data_qids[$];
 
         ok = 0;
+        queue_rollback_function_reset_attempted = 0;
 
         `uvm_info("ATOMIC_OPS",
             $sformatf("setup_all_queues: num_pairs=%0d type=%s size=%0d",
@@ -352,11 +483,11 @@
 
         // Setup control queue if CTRL_VQ negotiated.
         if (negotiated_features[VIRTIO_NET_F_CTRL_VQ]) begin
-            control_queue_id(num_pairs, ctrl_qid);
-            setup_queue(ctrl_qid, queue_size, vq_type, queue_ok);
+            setup_control_queue(num_pairs, vq_type, queue_size, queue_ok);
             if (!queue_ok) begin
                 for (int unsigned qid = 0; qid < num_pairs * 2; qid++)
-                    teardown_queue(qid);
+                    data_qids.push_back(qid);
+                rollback_created_queues(data_qids, rollback_complete);
                 return;
             end
         end

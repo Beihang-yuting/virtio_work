@@ -305,8 +305,14 @@ class virtio_dut_caps_mq_ops_spy extends virtio_atomic_ops;
         ok = 1;
     endtask
 
-    virtual task teardown_queue(int unsigned queue_id);
+    // 记录一次已确认的测试拆队；输入是 Function 内队列号，输出 stopped 恒为 1。
+    // 本探针不访问设备或释放 DMA，只用于证明上限/no-op 守卫没有越过副作用边界。
+    virtual task teardown_queue_verified(
+        int unsigned queue_id,
+        output bit stopped
+    );
         teardown_count++;
+        stopped = 1;
     endtask
 endclass
 
@@ -2211,13 +2217,15 @@ class virtio_dut_caps_test extends uvm_test;
         req.txn_type = VIO_TXN_SET_MQ;
         req.num_pairs = 1;
         mq_driver.dispatch_transaction(req);
-        if ((ops_spy.ctrl_mq_count != 1) ||
+        // 目标值等于当前活动对数时必须幂等返回，不能发送 control 命令，也不能
+        // 重建或拆除队列；这同时锁定运行期 worker 不发生无意义换代。
+        if ((ops_spy.ctrl_mq_count != 0) ||
             (ops_spy.setup_count != 0) ||
             (ops_spy.teardown_count != 0) ||
             (fsm_probe.observed_active_num_pairs() != 1) ||
             (fsm_probe.state != FSM_RUNNING)) begin
             `uvm_fatal("DUT_CAPS", $sformatf(
-                {"valid custom-cap VIO_TXN_SET_MQ dispatch was not preserved: ",
+                {"same-pair custom-cap VIO_TXN_SET_MQ was not a no-op: ",
                  "ctrl_mq=%0d setup=%0d teardown=%0d active=%0d state=%s"},
                 ops_spy.ctrl_mq_count, ops_spy.setup_count,
                 ops_spy.teardown_count,
@@ -2448,7 +2456,8 @@ class virtio_dut_caps_test extends uvm_test;
             (malicious_fsm.public_configure_count != 0) ||
             (malicious_fsm.public_full_init_count != 0) ||
             (malicious_fsm.public_restore_count != 0) ||
-            (malicious_fsm.do_configure_count != 1) ||
+            // 合法的同值 MQ 请求在强制守卫内完成 no-op，不进入派生实现钩子。
+            (malicious_fsm.do_configure_count != 0) ||
             (malicious_fsm.do_full_init_count != 1) ||
             (malicious_fsm.do_restore_count != 1) ||
             (req.success != 1) ||

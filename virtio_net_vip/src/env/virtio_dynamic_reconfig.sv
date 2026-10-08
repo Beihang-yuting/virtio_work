@@ -2,22 +2,16 @@
 `define VIRTIO_DYNAMIC_RECONFIG_SV
 
 // ============================================================================
-// virtio_dynamic_reconfig
+// 目录层次：src/env；面向 virtio-net VF 的运行期重配置协调器。
 //
-// Live reconfiguration operations for virtio-net VFs. Each method
-// encapsulates a specific reconfiguration scenario that can be performed
-// while the device is active (potentially with traffic flowing).
+// 职责：校验冻结 DUT/placement 给出的队列上限、调用方声明的旧队列数和数据面状态，
+// 再把 MQ 变更委托给该 VF 唯一的 virtio_auto_fsm。FSM 是 control VQ、队列资源和
+// worker 启停的唯一编排者；本对象只在 FSM 确认目标队列数生效后更新 VF 配置镜像，
+// 避免环境配置与实际队列拓扑分叉。
 //
-// Reconfiguration types:
-//   - MQ resize: change number of active queue pairs
-//
-// All operations work through the VF's control virtqueue and transport
-// layer. The caller is responsible for verifying that required features
-// are negotiated before invoking these methods.
-//
-// Depends on:
-//   - virtio_vf_instance (per-VF driver wrapper)
-//   - virtio_net_types.sv (virtio_ctrl_ack_e)
+// 所有权与生命周期：本对象借用 VF、driver agent 和 FSM，不拥有队列/DMA；冻结的
+// device snapshot 一次性绑定且不可改绑。设备拒绝或 FSM 进入恢复状态时，配置镜像
+// 保持原值，后续恢复由 Function 生命周期处理。
 // ============================================================================
 
 class virtio_dynamic_reconfig extends uvm_report_object;
@@ -126,25 +120,9 @@ class virtio_dynamic_reconfig extends uvm_report_object;
                (count <= max_supported_qpairs_for_vf(vf));
     endfunction
 
-    // ========================================================================
-    // live_mq_resize
-    //
-    // Change the number of active queue pairs on a VF. Optionally performed
-    // while traffic is active to stress the MQ transition path.
-    //
-    // Steps:
-    //   1. Send CTRL_MQ_VQ_PAIRS_SET with new_pairs
-    //   2. If shrinking, detach excess queues
-    //   3. If growing, set up new queues
-    //   4. Verify dataplane operates with new pair count
-    //
-    // Parameters:
-    //   vf             -- VF instance to reconfigure
-    //   old_pairs      -- current number of queue pairs
-    //   new_pairs      -- target number of queue pairs
-    //   traffic_active -- if 1, traffic may be flowing during resize
-    // ========================================================================
-
+    // 请求 VF 改变活动队列对数。old_pairs 是调用方观察值，new_pairs 是目标值，
+    // traffic_active=1 表示调用方要求验证真正的运行态路径。外层只做与具体 VF 资源
+    // 上限有关且不可被派生类绕过的校验；失败无设备或配置副作用。
     task live_mq_resize(
         virtio_vf_instance vf,
         int unsigned old_pairs,
@@ -170,74 +148,85 @@ class virtio_dynamic_reconfig extends uvm_report_object;
         do_live_mq_resize(vf, old_pairs, new_pairs, traffic_active);
     endtask
 
-    // live_mq_resize 的实现体（入参已由外层校验）：new==old 直接返回；
-    // 否则构造 2 字节小端 pair 数，经 ops.ctrl_send 下发
-    // CTRL_MQ_VQ_PAIRS_SET。设备 ACK 后更新 drv_cfg.num_queue_pairs，
-    // 缩容时 detach 超出范围的 TX/RX 队列（不销毁，可再扩容复用）；
-    // 设备拒绝或 ops 缺失仅报错、不改本地配置。
+    // live_mq_resize 的实现体（目标值已通过上限校验）：先校验 VF/FSM 接线、FSM 的
+    // 实际活动对数与 old_pairs 一致，以及 traffic_active 请求确实从 RUNNING 进入。
+    // 随后统一调用 FSM.configure_mq；FSM 负责同值 no-op、control 命令、建拆队和
+    // worker 停启。本 task 只在 accessor 确认 new_pairs 已生效、且运行态请求已经
+    // 恢复 RUNNING 后更新 vf.drv_cfg。任一失败均保留原配置镜像。
     protected virtual task do_live_mq_resize(
         virtio_vf_instance vf,
         int unsigned old_pairs,
         int unsigned new_pairs,
         bit traffic_active
     );
-        byte unsigned ctrl_data[];
-        virtio_ctrl_ack_e result;
+        virtio_auto_fsm fsm;
+        fsm_state_e     entry_state;
+        int unsigned    observed_pairs;
+
+        if (vf == null) begin
+            `uvm_error("DYN_RECONFIG", "live_mq_resize: VF is null")
+            return;
+        end
+        if ((vf.driver_agent == null) || (vf.driver_agent.fsm == null) ||
+            (vf.driver_agent.fsm.ops == null)) begin
+            `uvm_error("DYN_RECONFIG", $sformatf(
+                "live_mq_resize: VF%0d FSM/ops not available", vf.vf_index))
+            return;
+        end
+
+        fsm = vf.driver_agent.fsm;
+        entry_state = fsm.state;
+        observed_pairs = fsm.active_queue_pair_count();
 
         `uvm_info("DYN_RECONFIG",
             $sformatf("live_mq_resize: VF%0d, %0d -> %0d pairs, traffic_active=%0b",
                       vf.vf_index, old_pairs, new_pairs, traffic_active),
             UVM_LOW)
 
-        if (old_pairs == new_pairs) begin
-            `uvm_info("DYN_RECONFIG", "live_mq_resize: no change needed", UVM_MEDIUM)
+        if (observed_pairs != old_pairs) begin
+            `uvm_error("DYN_RECONFIG", $sformatf(
+                {"live_mq_resize: VF%0d old_pairs=%0d does not match ",
+                 "FSM active pairs=%0d"},
+                vf.vf_index, old_pairs, observed_pairs))
+            return;
+        end
+        if ((entry_state != FSM_READY) && (entry_state != FSM_RUNNING)) begin
+            `uvm_error("DYN_RECONFIG", $sformatf(
+                {"live_mq_resize: VF%0d requires FSM_READY or FSM_RUNNING, ",
+                 "got %s"},
+                vf.vf_index, entry_state.name()))
+            return;
+        end
+        if (traffic_active && (entry_state != FSM_RUNNING)) begin
+            `uvm_error("DYN_RECONFIG",
+                $sformatf({"live_mq_resize: VF%0d traffic_active requires ",
+                           "FSM_RUNNING, got %s"},
+                          vf.vf_index, entry_state.name()))
             return;
         end
 
-        // Build CTRL_MQ command data: 2-byte little-endian virtqueue_pairs
-        ctrl_data = new[2];
-        ctrl_data[0] = new_pairs[7:0];
-        ctrl_data[1] = new_pairs[15:8];
+        fsm.configure_mq(new_pairs);
 
-        // Send control command via atomic ops
-        if (vf.driver_agent.ops != null) begin
-            vf.driver_agent.ops.ctrl_send(
-                VIRTIO_NET_CTRL_CLS_MQ,
-                VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
-                ctrl_data,
-                result
-            );
-
-            if (result == VIRTIO_NET_CTRL_ACK_OK) begin
-                `uvm_info("DYN_RECONFIG",
-                    $sformatf("live_mq_resize: VF%0d MQ resize to %0d pairs accepted",
-                              vf.vf_index, new_pairs),
-                    UVM_MEDIUM)
-
-                // Update driver config
-                vf.drv_cfg.num_queue_pairs = new_pairs;
-
-                // Handle queue teardown for shrink
-                if (new_pairs < old_pairs) begin
-                    for (int unsigned q = new_pairs; q < old_pairs; q++) begin
-                        int unsigned tx_qid = q * 2;
-                        int unsigned rx_qid = q * 2 + 1;
-                        virtqueue_base tx_vq, rx_vq;
-                        tx_vq = vf.vq_mgr.get_queue(tx_qid);
-                        rx_vq = vf.vq_mgr.get_queue(rx_qid);
-                        if (tx_vq != null) tx_vq.detach();
-                        if (rx_vq != null) rx_vq.detach();
-                    end
-                end
-            end else begin
-                `uvm_error("DYN_RECONFIG",
-                    $sformatf("live_mq_resize: VF%0d MQ resize rejected by device",
-                              vf.vf_index))
-            end
-        end else begin
-            `uvm_error("DYN_RECONFIG",
-                $sformatf("live_mq_resize: VF%0d ops not available", vf.vf_index))
+        if (fsm.active_queue_pair_count() != new_pairs) begin
+            `uvm_error("DYN_RECONFIG", $sformatf(
+                {"live_mq_resize: VF%0d MQ resize to %0d pairs did not ",
+                 "complete; active pairs=%0d state=%s"},
+                vf.vf_index, new_pairs, fsm.active_queue_pair_count(),
+                fsm.state.name()))
+            return;
         end
+        if (traffic_active && (fsm.state != FSM_RUNNING)) begin
+            `uvm_error("DYN_RECONFIG", $sformatf(
+                {"live_mq_resize: VF%0d resized to %0d pairs but dataplane ",
+                 "did not resume; state=%s"},
+                vf.vf_index, new_pairs, fsm.state.name()))
+            return;
+        end
+
+        vf.drv_cfg.num_queue_pairs = new_pairs;
+        `uvm_info("DYN_RECONFIG",
+            $sformatf("live_mq_resize: VF%0d MQ resize to %0d pairs completed",
+                      vf.vf_index, new_pairs), UVM_MEDIUM)
     endtask
 
 endclass : virtio_dynamic_reconfig

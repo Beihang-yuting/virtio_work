@@ -78,14 +78,60 @@ class virtio_atomic_ops extends uvm_object;
     // ctrl_send 拒绝提交；只有 device_reset_verified 确认复位后才解除映射并释放。
     protected bit [63:0] ctrl_quarantined_iovas[$];
     protected bit [63:0] ctrl_quarantined_gpas[$];
+    // control VQ 不是“当前最大队列号”：MQ 下它由设备上报的最大队列对数决定，动态
+    // 扩缩容后也不移动。建队成功时显式保存身份，ctrl_send 只使用这份生命周期记录。
+    // 任一已发布命令超时都会使设备结果不确定，pending 保持到 verified device reset
+    // 成功；即使局部 Q_RESET/重建完成，普通建队或后续 control 命令也不能绕过边界。
+    protected bit          ctrl_queue_id_valid;
+    protected int unsigned ctrl_queue_id_value;
+    protected bit          ctrl_recovery_pending;
+    // 队列回滚时若后端无法确认单队列已停止，只有 verified Function reset 才能证明
+    // 设备不再访问仍受 Host 管理的 ring。复位失败后保持该标志并拒绝继续建队或发布
+    // control 命令，避免新生命周期与旧 DMA 所有权重叠；成功的整设备复位统一清零。
+    protected bit          queue_recovery_pending;
+    // 最近一次批量建队回滚是否升级为整 Function 复位。它与 recovery pending 组合
+    // 给调用方完整结果：attempted=1/pending=0 表示复位成功且全部 Function 队列已清空；
+    // attempted=1/pending=1 表示复位失败并保留 DMA；attempted=0 表示窄范围回滚。
+    protected bit          queue_rollback_function_reset_attempted;
 
-    // ========================================================================
-    // Constructor
-    // ========================================================================
-
+    // 构造 atomic ops：输入 name 仅用于 UVM 对象命名；初始化协商结果、control VQ
+    // 身份以及队列恢复闸门，不访问 transport、Host memory 或设备，因此没有外部副作用。
     function new(string name = "virtio_atomic_ops");
         super.new(name);
         negotiated_features = '0;
+        ctrl_queue_id_valid = 0;
+        ctrl_queue_id_value = 0;
+        ctrl_recovery_pending = 0;
+        queue_recovery_pending = 0;
+        queue_rollback_function_reset_attempted = 0;
+    endfunction
+
+    // 返回当前 Function 在本次设备生命周期中显式登记的 control VQ 编号。返回 1 时
+    // queue_id 有效；尚未成功建立 control VQ 或 verified reset 已清除身份时返回 0，
+    // 输出同时清零。该只读接口供诊断和测试使用，不授予队列所有权。
+    function bit get_control_queue_id(output int unsigned queue_id);
+        queue_id = ctrl_queue_id_valid ? ctrl_queue_id_value : 0;
+        return ctrl_queue_id_valid;
+    endfunction
+
+    // 报告 control VQ 是否必须先做 verified device reset。命令发布后超时意味着设备
+    // 副作用不确定，即使单队列停止和重建成功也会置位；停止失败或重建失败同样置位。
+    // 只有确认完成的整设备复位清零。
+    function bit control_vq_requires_recovery();
+        return ctrl_recovery_pending;
+    endfunction
+
+    // 只读报告普通数据队列是否仍等待 verified Function reset。返回 1 表示此前的
+    // 回滚未能确认停止全部 DMA，调用方只能重试 device_reset_verified，不能继续建队。
+    function bit queues_require_recovery();
+        return queue_recovery_pending;
+    endfunction
+
+    // 返回最近一次 setup_queue_range/setup_all_queues 失败回滚是否尝试过 verified
+    // Function reset。调用方应同时读取 queues_require_recovery() 区分成功与失败；
+    // 下一次批量建队开始时该标志清零。
+    function bit queue_rollback_used_function_reset();
+        return queue_rollback_function_reset_attempted;
     endfunction
 
     // A numeric BDF is scoped by the PCIe host domain taken from the bound

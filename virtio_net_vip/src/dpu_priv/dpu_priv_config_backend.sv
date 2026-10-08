@@ -54,6 +54,11 @@ class dpu_priv_config_backend extends virtio_config_backend;
     protected bit [2:0]              host;
     protected bit                    qid_bank;
     protected virtio_queue_program_t active[int unsigned];
+    // RX 使能时编程的 MSI-X info 属于整个 Function 生命周期，单队列
+    // disable 只停 DMA，不清除该映射。Function reset 可能在已停掉部分 RX 后失败，
+    // 因此不能仅从 active[] 推导最终需清理的向量；本表保留跨重试所有权，
+    // 只在一次完整 reset 成功后清空。键是驱动全局队列对/向量号 gq=gv。
+    protected bit                    rx_msix_info_owned[int unsigned];
 
     function new(string name = "dpu_priv_config_backend");
         super.new(name);
@@ -262,8 +267,10 @@ class dpu_priv_config_backend extends virtio_config_backend;
     endtask
 
     // Function 复位 = 驱动 dpu_down（adapter_ops.c:16–35）：先停全部 TX 再停全部 RX（#33），任一未确认停止即
-    // ok=0，调用方保留全部 DMA；全部停完后按 dpu_clear_msix_irqs_conf（interrupt.c:257）依向量升序清各 RX
-    // 队列对的中断 info（gv=gq）。AF 声明与映射表保留（对应驱动未 rmmod）。成功后影子 status 清零。
+    // ok=0，调用方保留全部 DMA 并可重试。disable_queue 会删除已停队列的 active[]，
+    // 所以成功收尾时必须按 rx_msix_info_owned 而不是本轮 order，依向量升序清掉
+    // 本生命周期编程过的全部 RX 中断 info（dpu_clear_msix_irqs_conf，gv=gq）。AF 声明
+    // 与映射表保留（对应驱动未 rmmod）；成功后释放 info 所有权并将影子 status 清零。
     virtual task reset(output bit ok);
         virtio_queue_program_t order[$];
         bit done;
@@ -282,9 +289,9 @@ class dpu_priv_config_backend extends virtio_config_backend;
                 return;
             end
         end
-        foreach (order[i])
-            if (!order[i].tx_mode)
-                wr0(MSIX_INFO_BASE + 4 * (order[i].local_qid >> 1), 32'h0);
+        foreach (rx_msix_info_owned[gq])
+            wr0(MSIX_INFO_BASE + 4 * gq, 32'h0);
+        rx_msix_info_owned.delete();
         status_shadow = 0;
     endtask
 
@@ -313,8 +320,10 @@ class dpu_priv_config_backend extends virtio_config_backend;
     endtask
 
     // 把参数表应用到新建的私有队列（方向、本地号、TX 首描述符控制）与编程参数
-    // （本地号、RX 容量、doorbell 位置）；非私有格式、表外队列或非 2 的幂深度（VTX/VRX
-    // q_depth 按 log2 编码，设备解码为 1<<depth）拒绝。
+    // （本地号、RX 容量、doorbell 位置）。VTX/VRX q_depth 只有 4 位 log2 编码，且
+    // custom_virtqueue 需要至少一个可用描述符和一个保留槽，因此深度必须是 2..4096
+    // 范围内的 2 的幂。非私有格式、表外队列或非法深度都在分配 ring、映射 IOMMU、
+    // 访问设备寄存器之前拒绝，失败不取得任何资源。
     virtual function bit prepare_queue(virtqueue_base vq, ref virtio_queue_program_t q);
         custom_virtqueue pvq;
         dpu_priv_queue_config c;
@@ -324,9 +333,11 @@ class dpu_priv_config_backend extends virtio_config_backend;
                 "prepare_queue: queue %0d 不是已配置的私有队列", q.queue_id))
             return 0;
         end
-        if ((q.queue_size & (q.queue_size - 1)) != 0) begin
+        if ((q.queue_size < 2) || (q.queue_size > 4096) ||
+            ((q.queue_size & (q.queue_size - 1)) != 0)) begin
             `uvm_error("DPU_PRIV_BACKEND", $sformatf(
-                "prepare_queue: queue %0d 深度 %0d 不是 2 的幂（q_depth 按 log2 编码）",
+                {"prepare_queue: queue %0d 深度 %0d 非法；私有队列要求 ",
+                 "2..4096 范围内的 2 的幂（q_depth 按 log2 编码）"},
                 q.queue_id, q.queue_size))
             return 0;
         end
@@ -392,6 +403,7 @@ class dpu_priv_config_backend extends virtio_config_backend;
         end else begin
             wr0(MSIX_INFO_BASE + 4 * gq, {19'h0, 1'b1, 1'b1, host, 8'h0});
             wr0(MSIX_CTRL_BASE + 16 * gq + 32'hc, 32'h0);
+            rx_msix_info_owned[gq] = 1;
         end
         ok = 1;
     endtask
