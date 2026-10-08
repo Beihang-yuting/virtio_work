@@ -6,8 +6,8 @@
 
 | 项 | 值 |
 |---|---|
-| 日期 | 2026-10-07 至 2026-10-08 |
-| VIP 分支 | `feat/cosim-driver-diff`，起点 `956001f`（基于 `6834ae6`），终点为本报告提交之前的 `ce48d92` |
+| 日期 | 2026-10-07 至 2026-10-08；优化分支最终复跑日期为 2026-10-08 |
+| VIP 分支 | `review/virtio-sdd-optimized`，优化版本快照 `5fab403`，恢复闭环提交 `bf57262`，MQ 预建/设备提交状态闭环 `aee1c5f` |
 | 设备模型 | `vdev_virtio_pci`（1af4:1041）与 `vdev_dpu_priv`（20f9:5013），D1 起建立（`d2cd0d9`），最后一次模型改动 `5e433e0` |
 | QEMU | 9.2.0，TCG，`-M q35 -smp 1 -m 512M` |
 | cosim-platform | 从 59 的 `6b99406` 工作树原样复制（含未提交改动，记于 `cosim-platform.SOURCE`），另加本地补丁（`cosim-pcie-rc`：多 BAR 64 位、MMIO 单 DW、MSI-X 消息经 BH 投递；53 `~/cosim_diff` 中的 `0dfb7d1`、`1c7c875`、`8d2a461`） |
@@ -48,7 +48,9 @@
 - `VDEV_DIFF PASS mode=std`：S1–S4 的 strict/order/review 都是 0，info 行数为 54/3/3/16，白名单 20 条全部用到。
 - `VDEV_DIFF PASS mode=priv`：S1/S2/S4 的 strict/order/review 都是 0，info 行数为 86/3/558，白名单 17 条全部用到。
 
-两次 VIP 侧运行的 UVM WARNING/ERROR/FATAL 都是 0/0/0。数据面方面，两种模式的 strict.pkt（方向、队列、长度、sha1）与完成长度都逐帧一致；std 共 2×16 帧，priv 共 16 帧。
+2026-10-08 在最终提交 `aee1c5f` 上从 build 开始复跑，build、std Linux、std VIP、std diff、priv Linux、priv VIP、priv diff 与 `vdev_diff.py selftest` 全部返回 0；CAPS 为 `100420020`。std/priv 差分报告 SHA256 分别为 `67138346cad1a8313debe7d6566e39c7f2cbc6aaff91eac2ab0854a567a7734e`、`b43f7b74b38609e91a4123fd3e82a31652c23c684703415932b1ec529fb22aa8`，selftest 输出 `vdev_diff selftest PASS`。归档同步的 175 个文件逐项一致，manifest SHA256 为 `66888b39914c46bbae7587bbf6f3dff3fdca97ba6d8ef72145c3afa33f8407a6`。
+
+两类 Linux/VIP 的四次运行中，UVM WARNING/ERROR/FATAL 都是 0/0/0。数据面方面，两种模式的 strict.pkt（方向、队列、长度、sha1）与完成长度都逐帧一致；std 共 2×16 帧，priv 共 16 帧。
 
 ## 4 差异明细
 
@@ -120,6 +122,7 @@
 | E3 | `bf69294` | 模型 | 报告 GREG vport 规格 136，私有驱动 probe 才能分配全局 Function（M-13） |
 | F2 | `3b32505` `63d001f` `678c4b2` `ef5280f` `52a5a14` `e00d9a9` `7561d1a` `811219e`（另有重构 `1c8ff9e`、`08b4fac`） | VIP/模型 | 见 §4.1 |
 | F3 | `5e433e0` `ce48d92` | 模型/VIP | 见 §4.2 |
+| 优化复审 | `bf57262` `aee1c5f` | VIP | 补全运行期 MQ、control VQ、批量回滚和私有 reset 恢复闭环；最终 cosim 发现并修正 Host 预建队列对数与设备已确认 MQ 状态混用，标准 S3 恢复逐帧一致 |
 
 ## 5 私有驱动与 reg plan 疑点清单
 
@@ -161,7 +164,8 @@
   - D2/D3：`virtio_vdev_unit_test` 的设备用例（split/packed、INDIRECT、ctrl 与 MQ、EVENT_IDX、故障复位、MSI-X 使能等）。
   - F2：`test_vip_msix_mapping_readback`、`test_vip_msix_masks_before_programming`；`virtio_ctrl_vq_test::test_full_init_binds_msix_before_enable`、`test_mq_expansion_binds_new_queue_vectors`，以及迁移子测试中的“使能后不改写”断言；`virtio_protocol_test` 的按 buffer 计信用正反例。
   - F3：`test_priv_event_field_names`；`test_priv_backend_sequence` 与 `test_priv_driver_sequence` 中 VRX 读回改为 4 DW。
-- **最终结果：** `STRICT_REGRESSION PASS tests=41`，没有非 PASS 的 STRICT_RESULT。
+  - 优化复审（`bf57262`、`aee1c5f`）：`virtio_ctrl_vq_test` 覆盖 control VQ 显式身份、命令超时后的全局恢复闸门、重建失败、运行期 MQ worker 更换、同值请求、设备拒绝、歧义超时 Function reset、扩容回滚、半个队列对缩容后的 reset 成功与失败，以及 Host 预建多队列与设备已确认 MQ 状态的区分；后者还覆盖同值首次提交、迁移恢复重新提交、迁移拒绝回滚、`DEVICE_NEEDS_RESET` 自动恢复成功与拒绝。`virtio_unit_test` 覆盖批量建队回滚、停队未确认后的 Function reset、reset 失败双门禁和重复 qid 零副作用；`virtio_vdev_unit_test` 覆盖私有队列深度边界，以及 Function reset 跨重试保存并最终清理 RX MSI-X info 所有权。
+- **最终结果（2026-10-08，`aee1c5f`）：** `STRICT_REGRESSION PASS tests=41`，41/41 PASS、0 FAIL，没有非 PASS 的 STRICT_RESULT；compile-only、strict compile、独立 `virtio_ctrl_vq_test`、独立 `virtio_migration_dirty_test` 和全部 41 项测试的 UVM WARNING/ERROR/FATAL 均为 0/0/0。总日志为 53 `~/virtio_priv_run/virtio_work/logs/mq_recovery_validation/20261008T183346+0800/strict_regression.out`，SHA256 为 `ceffb323623741d29d6c71367269fbd78d94368658c5e5808a91ec652aca3abd`；41 项测试日志集合 SHA256 为 `a299f4f91eb637c7aa3926c33a8fe30f422977c1da80777b044da77e0f3bd84b`。
 - **对比临时测试**（`vdev_diff_std_test`、`vdev_diff_priv_test`）只放在 53 `~/cosim_diff`，不进入 manifest，也不进入本仓库。
 
 ## 7 已知限制
@@ -174,7 +178,7 @@
 - **配置空间写只记 info：** marker 1 之后的配置空间读写只进入 info.access，不参与判定（plan 规定）。
 - **私有 qid map 符号化（PRIV-15）：** 表项值差异在 review 中不可见，由 strict.pkt/complete 兜底。
 - **私有中断路径未在 VIP 侧覆盖：** VIP 私有数据面轮询，CQ 中断、自屏蔽与 0x1004 补发只由 Linux 一侧和 `test_priv_driver_sequence` 覆盖。
-- **单 CPU guest：** 标准模式靠 XPS 才让 S3 走第 2 对；私有模式只有 1 个数据队列对，多队列对的建队顺序（PRIV-12）没有在对比中实际出现。
+- **单 CPU guest：** 标准模式靠 XPS 才让 S3 走第 2 对；私有模式只有 1 个数据队列对，多队列对的建队顺序（PRIV-12）没有在对比中实际出现。运行期多队列重配、停止、reset、迁移恢复和自动恢复顺序由 `bf57262`、`aee1c5f` 的聚焦单元测试覆盖。
 
 ## 8 裁决与遗留（progress.md）
 
@@ -211,8 +215,6 @@
 
 ### 遗留（parked / deferred minor）
 
-- **A1：** ctrl 重新入队失败后 ctrl_qid 失管；teardown 未确认时同样如此。
-- **A2：** 缩减或不变的重建未测；重建时在用队列的向量稳定性未断言。
 - **A3/A4：** 手动 kick 测试未断言 PRE/POST_NOTIFY 钩子。
 - **B1：** auto_fsm 的 config_change 与 admin_cmd 改道未经后端测试；pf_manager:667 的重复空检查。
 - **B2：** 注释表述过度；共享的错误前缀；缺少 null 后端拒绝与私有提交后端类型的测试。
@@ -220,7 +222,6 @@
 - **C2：** `ring_iova_of` 假定区域不重叠。
 - **C3：**
   - 私有 TX 满环改报 UVM_ERROR。
-  - 私有队列大小不再要求是 2 的幂；超过默认值时截断并告警。
   - 缺少 DMA 记录时不再 fatal。
   - 从未编程的队列在 teardown 时以合成上下文 disable。
   - `queue_programs` 回退重复。
