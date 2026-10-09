@@ -1,6 +1,6 @@
 # VIP 标准模式与 DPU 驱动 Virtio ring 对照
 
-审计日期：2026-09-30。
+审计日期：2026-09-30；真实驱动负向复跑日期：2026-10-09。
 
 驱动依据为 `ubuntu@10.11.10.53:/home/ubuntu/wn/icpu-kernel-driver`，
 分支 `lance_net_mailbox`、提交 `f2c9cd6`；检查时该驱动工作树无修改。
@@ -53,7 +53,8 @@ VIP 定位：
 
 因此，仅代入驱动自己刚写入的状态，RX 谓词就返回“已完成”，TX 条件也允许回收；
 标准设备把 used 更新成 avail 后，驱动反而判为不可回收。此处需要同驱动维护者及
-RTL 完成写回约定核实。这里复现的是 C 谓词，不是宣称已经运行内核或真实 DUT。
+RTL 完成写回约定核实。2026-09-30 的初次审计只复现 C 谓词；2026-10-09 已增加
+真实 Linux 模块负向复跑（见下文），但仍未在真实 RTL/DUT 上验证完成写回约定。
 
 ### 2. VIP 的 modern net header 长度漏掉 VERSION_1 条件
 
@@ -109,6 +110,46 @@ INFO=8、WARNING=0、ERROR=0、FATAL=0。测试明确输出上述差异；零 UV
 临时探针及日志保存在 53 的 `/tmp/virtio_work_standard_audit.2rhnhg/audit/`：
 `driver_abi_probe.log`、`standard_audit_vcs.log`、`standard_audit_run.log`。
 本轮未修改生产 SV 或远端驱动的行为，只增加审计记录。
+
+### 2026-10-09 真实驱动负向复跑
+
+为确认上述静态矛盾是否会在真实 Linux 驱动流程中出现，本轮在 53 的
+`~/cosim_diff` 临时复制 rootfs，仅把模块加载改为
+`insmod /lib/modules/extra/dpu_snd1.ko priv_ring=0`，然后执行 AF probe、link up
+和 4 个 128B 报文的回环场景。驱动、正式 guest 镜像和生产 SV 均未修改；使用的
+模块仍是 `lance_net_mailbox@f2c9cd6` 编译产物。
+
+运行结果为负向复现：
+
+- 模块加载、AF probe、netdev 创建和 link up 成功，guest 写出 marker 2，说明失败点
+  已进入 S2 数据面，而不是 PCI ID、BAR、AF 声明或建队阶段。
+- 当前 `vdev_dpu_priv` 对 `virtio_mode=1` 只告警，仍按私有环解释描述符并写私有 CQ。
+  在第一次中断前，模型能够从两种格式共有的 `addr/len/NEXT/AVAIL/USED` 位读取 4 个
+  TX 帧，并把 4 个完全相同的 128B 帧写入 RX buffer；事件记录为 4 TX、4 RX、
+  8 条 `desc_chain`、8 条 `complete` 和 1 条 IRQ。
+- 第一次 IRQ 后，驱动把尚保持发布状态的 RX 描述符判成完成，持续成批回收、补充并
+  再写 doorbell。终止前共产生 399645 条 notify，其中 q0 RX 为 399639 条；场景没有
+  输出 `VDEV_PKTGEN` 或结束 marker，`RUN_COSIM` 以 `guest_rc uvm` 失败。
+
+这个复现同时包含两个独立问题，不能把它解释为 DPU Virtio ring 已经可用：
+
+1. 设备模型尚未实现 `virtio_mode=1` 的完成路径；它不应为该模式写私有 CQ，而应按
+   packed 语义在 DMA 数据和长度写完后写回 `USED=AVAIL`。
+2. 即使模型按 packed 语义写回，未修改驱动的 RX helper 会把 `USED=AVAIL` 判成未完成，
+   TX cleaner 也会在同一条件下停止。因此不能通过让模型反向写 flags 来迎合驱动；
+   这会掩盖驱动发布/完成谓词的自相矛盾。
+
+归档位于 53 `~/cosim_diff/out/dpuvirt_baseline/scen/`。关键文件 SHA256 为：
+
+- `guest.log`：`71ad9db6a5c25562785536c783af82dfdde70b1439f312b1f374d66a856506b5`
+- `vcs.log`：`e41b6cc72f678ec2175e44c524ff49df20567bc519c2d678926484b3e7bd009b`
+- `linux.jsonl`：`028c5cd2244b12605c6c92107a51be1ae7d0eae6c6728572fda8b3bbe3fde21c`
+
+因此，`dpu_snd1.ko priv_ring=0` 当前裁决为 **FAIL / driver-blocked**。修复顺序应为：
+先由驱动与 RTL owner 确认 packed 完成约定；若采用标准约定，则把 RX 完成条件改为
+`used == avail`，把 TX 停止条件改为 `used != avail`；随后实现独立 DPU Virtio
+设备路径并重新执行 S1/S2/S4。此前的标准 `virtio_net` PASS 和
+`dpu_snd1.ko priv_ring=1` PASS 均不能替代这项验证。
 
 如果需要覆盖驱动 `priv_ring=false`，应增加单独的 DPU Virtio ring 模式：
 复用 Host/Function 隔离及 DPU 控制接口，实现原始帧数据路径和 DPU doorbell，

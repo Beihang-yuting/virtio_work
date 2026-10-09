@@ -171,6 +171,7 @@
 ## 7 已知限制
 
 - **临时环境：** cosim 环境只在 53 `~/cosim_diff`（本地 git），不随本仓库交付；`cosim-platform` 带本地补丁，未回提。
+- **`dpu_snd1.ko` 的 DPU Virtio ring 模式未通过：** 2026-10-09 用真实模块参数 `priv_ring=0` 复跑，驱动完成 probe、link up 并进入 S2，但首次 IRQ 后把尚未完成的 RX 描述符持续回收并产生 399639 次 q0 doorbell，场景失败。当前模型也尚未实现 `virtio_mode=1`，只按私有 CQ 路径处理；同时驱动 f2c9cd6 的发布状态与 TX/RX 完成谓词方向相反。该项裁决为 FAIL / driver-blocked，完整证据见 [`examples/dpu_priv_ring/STANDARD_MODE_AUDIT.md`](../examples/dpu_priv_ring/STANDARD_MODE_AUDIT.md)。既有 std PASS 使用内核 `virtio_net`，priv PASS 使用 `dpu_snd1.ko priv_ring=1`，均不覆盖该模式。
 - **只覆盖 AF 路径：** 私有设备报告 `pfvf_id=0`，驱动走 AF 路径直接写芯片表。PF/VF 经 mailbox 请求 AF 的路径没有建模，也没有对比（M-8）。
 - **mailbox 未建模：** 环寄存器只存储，不处理消息。type 131 消息因此超时，被驱动容忍（PRIV-10）。
 - **TSO 关闭：** 私有 Linux 运行前执行 `ethtool -K tso off gso off`，因为模型原样回环，大于 16383 B 的帧会被丢弃。
