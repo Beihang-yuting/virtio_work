@@ -119,6 +119,11 @@ PCIe env 前加载 `pcie_cfg`。该 fixture 另外要求 `ep_auto_response` 与�
 本仓库 fixture 和 system wrapper 已统一调用 `load_params`，使用它们时不需再次
 手动加载，以免重复采样。下方显式调用片段供自行创建 `pcie_tl_env` 的 test 使用。
 
+仅使用原生 TL 的项目可参考 [一个 env + env_cfg 集成](../integration/project/README.md)：
+大 env 继承 `uvm_env`，直接创建原有 DPU/PCIe/VIO；只下发 `pcie_tl_env_config` 的
+`cfg`，不创建 global/topology 对象。该参考的大 cfg 统一加载参数并保护重复调用，
+默认规模是 1 Host / 1 PF / 0 VF；下方 DPU 表中的 2/1/2 是参数回归示例的默认规模。
+
 ```systemverilog
 pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
 pcie_cfg.cpl_timeout_ns = 100000; // 用例原来的默认值

@@ -1,8 +1,8 @@
 // integration/project：项目级配置组合与参数构建示例。
-// 依赖 DPU/PCIe topology/TL/VIO/AIP package；由 project_env_pkg 按顺序包含。
-// cfg 拥有创建的配置对象，借用平台注入的 pool、IOMMU、VIF 和 backend factory。
+// 依赖 DPU、原生 PCIe TL、VIO 与 AIP；由 project_env_pkg 按顺序包含。
+// cfg 拥有创建的配置对象，借用平台注入的 pool、IOMMU 与 VIF。
 // load_params 只生成输入，不解析快照、不创建组件、不访问 DUT；每个对象只加载一次。
-// 默认场景为每 Host 一个 domain 和一条 RC→EP 直连；物理自定义须同时提供三张映射。
+// 每 Host 一个 segment 0 和一组 TL 接口；PF/VF 共用接口，不配置 SVT 或链路训练。
 class project_env_cfg extends uvm_object;
     `uvm_object_utils(project_env_cfg)
 
@@ -10,10 +10,8 @@ class project_env_cfg extends uvm_object;
     virtio_net_env_config	vio_cfg;
     virtio_net_env_config	vio_cfg_by_host[int unsigned];
     pcie_tl_env_config		pcie_cfg;
-    pcie_global_cfg		pcie_hw_cfg;
-    pcie_dpu_root_binding_cfg	root_bindings;
-    pcie_dpu_attachment_cfg	attachments;
-    pcie_tl_backend_factory	backend_factory;
+    // 值是配对的 RC/EP agent 下标；缺省 Host h 对应 slot h，可在 build 前覆盖。
+    int unsigned			tl_slot_by_host[int unsigned];
     // MODEL 平台只安装一个 completion adapter；实际 Virtio 设备模型由平台创建。
     virtio_tlm_completion_adapter	completion_adapter;
 
@@ -21,7 +19,7 @@ class project_env_cfg extends uvm_object;
     alloc_mode_e			host_mem_mode = MODE_BUDDY;
     int unsigned			host_mem_granule = DEFAULT_MIN_GRANULE;
     virtual pcie_tl_if			rc_vifs[int unsigned];
-    virtual pcie_tl_if			ep_vifs[string];
+    virtual pcie_tl_if			ep_vifs[int unsigned];
     virtual virtio_protocol_event_if	protocol_vifs[$];
 
     // 这是配置生成规模，不是另一套已解析拓扑；最终身份以 DPU snapshot 为准。
@@ -30,16 +28,13 @@ class project_env_cfg extends uvm_object;
     longint unsigned	vfs_per_pf = 0;
     protected bit	params_loaded = 0;
 
-    // 创建配置容器；默认 REAL_DUT，实际 HDL/后端由平台注入。
+    // 创建配置容器；默认 REAL_DUT，实际 TL 接口由平台注入。
     // new 不读取 plusargs，允许派生用例在 load_params 前修改场景默认值。
     function new(string	name = "project_env_cfg");
         super.new(name);
         dpu_cfg = dpu_device_env_config::type_id::create("dpu_cfg");
         vio_cfg = virtio_net_env_config::type_id::create("vio_cfg");
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
-        pcie_hw_cfg = pcie_global_cfg::type_id::create("pcie_hw_cfg");
-        root_bindings = pcie_dpu_root_binding_cfg::type_id::create("root_bindings");
-        attachments = pcie_dpu_attachment_cfg::type_id::create("attachments");
         vio_cfg.execution_mode = VIRTIO_EXEC_REAL_DUT;
         dpu_cfg.device_cfg.af_request.mode = DPU_AF_SELECTED;
         dpu_cfg.device_cfg.af_request.requester =
@@ -107,43 +102,58 @@ class project_env_cfg extends uvm_object;
         return f;
     endfunction
 
-    // 生成示例的直连物理图及两类显式映射。已有完整物理配置保持借用，不改写。
-    // 自定义 topology 缺 Root/attachment 时拒绝；默认映射只在本函数创建图时推导。
-    protected function void build_physical_config();
-        pcie_topology_builder	builder;
-        string			why;
+    // 验证 Host→TL slot 是完整的一一映射；不补缺项，避免错配后静默使用 Root0。
+    // 仅支持每 Host 一个 segment 0；失败返回原因，不修改输入配置或访问 DUT。
+    function bit validate_tl_mapping(output string	why);
+        bit		used_slots[int unsigned];
+        int unsigned	count;
 
-        if (pcie_hw_cfg.topology != null) begin
-            if ((root_bindings.bindings.size() == 0) ||
-                (attachments.attachments.size() == 0))
-                `uvm_fatal("PROJECT_CFG", "custom topology requires explicit Root and Function mappings")
-            return;
+        why = "";
+        count = dpu_cfg.device_cfg.hosts.size();
+        if (count == 0 || tl_slot_by_host.num() != count || vio_cfg_by_host.num() != count) begin
+            why = "each DPU Host needs exactly one VIO config and TL slot";
+            return 0;
         end
-        if ((root_bindings.bindings.size() != 0) || (attachments.attachments.size() != 0))
-            `uvm_fatal("PROJECT_CFG", "physical mappings require a matching custom topology")
-        builder = pcie_topology_builder::type_id::create("project_topology_builder");
-        for (int unsigned	h = 0; h < hosts; h++) begin
-            void'(builder.add_rc($sformatf("RC%0d", h)));
-            void'(builder.add_ep($sformatf("EP%0d", h)));
-            void'(builder.connect($sformatf("RC%0d_EP%0d", h, h),
-                $sformatf("RC%0d", h), PCIE_TOPO_PORT_RC, 0,
-                $sformatf("EP%0d", h), PCIE_TOPO_PORT_EP, 0, 16, 4));
-            if (!root_bindings.bind_domain_to_root(h, 0, h, why))
-                `uvm_fatal("PROJECT_CFG", why)
-        end
-        pcie_hw_cfg.build_default_for_topology(builder.finish());
-        foreach (dpu_cfg.device_cfg.functions[i]) begin
-            dpu_function_cfg	f;
+        foreach (dpu_cfg.device_cfg.hosts[i]) begin
+            dpu_host_cfg	host;
+            int unsigned	slot;
 
-            f = dpu_cfg.device_cfg.functions[i];
-            if (!attachments.add(f.key, $sformatf("EP%0d", f.key.host_id),
-                    $sformatf("RC%0d_EP%0d", f.key.host_id, f.key.host_id), 0, 0, why))
-                `uvm_fatal("PROJECT_CFG", why)
+            host = dpu_cfg.device_cfg.hosts[i];
+            if (host == null) begin
+                why = "DPU Host config is null";
+                return 0;
+            end
+            if (!tl_slot_by_host.exists(host.host_id) ||
+                !vio_cfg_by_host.exists(host.host_id) || vio_cfg_by_host[host.host_id] == null) begin
+                why = $sformatf("Host%0d has no VIO config or TL slot", host.host_id);
+                return 0;
+            end
+            slot = tl_slot_by_host[host.host_id];
+            if (slot >= count || used_slots.exists(slot)) begin
+                why = "TL slots must be unique and cover 0..Host_count-1";
+                return 0;
+            end
+            if (host.pcie_domains.size() != 1) begin
+                why = "native reference requires one PCIe domain per Host";
+                return 0;
+            end
+            if (host.pcie_domains[0] == null) begin
+                why = "Host PCIe domain is null";
+                return 0;
+            end
+            if (host.pcie_domains[0].key.host_id != host.host_id ||
+                host.pcie_domains[0].key.segment_id != 0) begin
+                why = "native reference requires Host-owned segment 0";
+                return 0;
+            end
+            used_slots[slot] = 1;
         end
+        return 1;
     endfunction
 
     // 唯一参数构建入口：先采样规模/模板，再创建 Host/PF/VF/placement 和 Host 行为。
-    // 再调用幂等返回，不重新采样；拒绝覆盖已存在的逻辑拓扑，复杂预建拓扑应派生本类。
+    // 再调用幂等返回，不重新采样；已有输入的项目应把加载入口合入原构造点，省去生成循环。
+    // 默认生成器拒绝覆盖非空逻辑配置，避免重复追加 Host/PF/VF 和资源请求。
     // base_test 无须逐项赋值；AIP-off 时保留默认值，但仍正常创建对象。
     virtual function void load_params();
         dpu_dut_caps			caps;
@@ -266,7 +276,10 @@ class project_env_cfg extends uvm_object;
         dpu_cfg.placement_cfg.vio_requests.push_back(request);
         dpu_cfg.placement_cfg.load_params("dpu");
         dpu_cfg.vio_policy.load_params("dpu");
-        build_physical_config();
+        if (tl_slot_by_host.num() == 0) begin
+            for (int unsigned	h = 0; h < hosts; h++) tl_slot_by_host[h] = h;
+        end
+        if (!validate_tl_mapping(why)) `uvm_fatal("PROJECT_CFG", why)
 
         execution = vio_cfg.execution_profile();
         if (execution == null) `uvm_fatal("PROJECT_CFG", "invalid execution profile")

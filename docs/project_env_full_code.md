@@ -1,19 +1,47 @@
-# 项目 env / env_cfg 完整代码
+# 项目 env / env_cfg 完整代码：直接创建 DPU、PCIe TL 和 VIO
 
-以下代码逐文件完整展开，和 `integration/project/` 源文件一致，没有省略函数体。
-具体接入顺序、参数和平台边界见 [集成说明](../integration/project/README.md)。
-默认是 REAL_DUT；`project_base_test` 是虚基类，平台必须实现其句柄注入、准备和收尾接口。
+下面逐文件完整展开参考源码，没有省略函数体。将配置文件的成员和方法合入你的
+`env_cfg`，将环境文件的成员和方法合入你的 `env`，统一替换类名、factory 宏和
+`uvm_config_db` 的类型即可。已有 env 维持自己的基类，本示例使用 `uvm_env`。
+不需要把 `project_env` 再实例化在你的 env 中，也不需要任何 DPU 派生类。
+
+```text
+你的 env extends uvm_env
+├── dpu_env : dpu_device_env
+│   ├── vio_h0 : virtio_net_env
+│   └── vio_h1 : virtio_net_env  （按 Host 数创建）
+└── pcie_env : pcie_tl_env
+```
+
+VIO 的 UVM parent 使用 `dpu_env`，这样 DPU 先发布 snapshot，VIO 后读取；
+创建动作和 `vio_envs[h]` 句柄仍放在你的大 env。PCIe 只接收 `pcie_tl_env_config`，
+不创建 global/topology 配置，不依赖 SVT 或建链。
+详细参数、生命周期、共享资源和适用范围见 [集成说明](../integration/project/README.md)。
+
+## 拷贝时需要保留的内容
+
+1. `env_cfg`：除了三个子 cfg，还要带上每 Host 的 VIO cfg、Host→slot 映射以及
+   平台句柄。`load_params()` 包含规模读取和默认 Host/PF/VF 输入生成，不能只拷贝
+   三行子配置加载调用。如果项目已有自己的输入生成，就在原位置合入参数调用。
+2. `env`：保留共享内存准备、build/connect 和 VIF/endpoint 绑定的辅助函数。
+   尤其是先安装寄存器 backend，再由 DPU 子组件 build 绑定快照。
+3. `test`：保留加载 cfg、注入平台句柄、发布 cfg、等待平台就绪、DPU 初始化、
+   AIP 命令注册及业务收尾。标量参数由 load 负责，不需要逐项赋值。
+4. `package/filelist`：只补当前工程缺少的依赖；这些文件仍是独立参考入口，
+   不加入原生产 filelist/package，也不能把被 include 的 `.sv` 再单独编译。
 
 ## 大配置与参数构造：project_env_cfg.sv
+
+默认输入为 1 Host、1 PF、0 VF。`load_params()` 只执行一次；默认生成器拒绝覆盖非空的 Host/Function/placement。
 
 [源文件](../integration/project/project_env_cfg.sv)
 
 ```systemverilog
 // integration/project：项目级配置组合与参数构建示例。
-// 依赖 DPU/PCIe topology/TL/VIO/AIP package；由 project_env_pkg 按顺序包含。
-// cfg 拥有创建的配置对象，借用平台注入的 pool、IOMMU、VIF 和 backend factory。
+// 依赖 DPU、原生 PCIe TL、VIO 与 AIP；由 project_env_pkg 按顺序包含。
+// cfg 拥有创建的配置对象，借用平台注入的 pool、IOMMU 与 VIF。
 // load_params 只生成输入，不解析快照、不创建组件、不访问 DUT；每个对象只加载一次。
-// 默认场景为每 Host 一个 domain 和一条 RC→EP 直连；物理自定义须同时提供三张映射。
+// 每 Host 一个 segment 0 和一组 TL 接口；PF/VF 共用接口，不配置 SVT 或链路训练。
 class project_env_cfg extends uvm_object;
     `uvm_object_utils(project_env_cfg)
 
@@ -21,10 +49,8 @@ class project_env_cfg extends uvm_object;
     virtio_net_env_config	vio_cfg;
     virtio_net_env_config	vio_cfg_by_host[int unsigned];
     pcie_tl_env_config		pcie_cfg;
-    pcie_global_cfg		pcie_hw_cfg;
-    pcie_dpu_root_binding_cfg	root_bindings;
-    pcie_dpu_attachment_cfg	attachments;
-    pcie_tl_backend_factory	backend_factory;
+    // 值是配对的 RC/EP agent 下标；缺省 Host h 对应 slot h，可在 build 前覆盖。
+    int unsigned			tl_slot_by_host[int unsigned];
     // MODEL 平台只安装一个 completion adapter；实际 Virtio 设备模型由平台创建。
     virtio_tlm_completion_adapter	completion_adapter;
 
@@ -32,7 +58,7 @@ class project_env_cfg extends uvm_object;
     alloc_mode_e			host_mem_mode = MODE_BUDDY;
     int unsigned			host_mem_granule = DEFAULT_MIN_GRANULE;
     virtual pcie_tl_if			rc_vifs[int unsigned];
-    virtual pcie_tl_if			ep_vifs[string];
+    virtual pcie_tl_if			ep_vifs[int unsigned];
     virtual virtio_protocol_event_if	protocol_vifs[$];
 
     // 这是配置生成规模，不是另一套已解析拓扑；最终身份以 DPU snapshot 为准。
@@ -41,16 +67,13 @@ class project_env_cfg extends uvm_object;
     longint unsigned	vfs_per_pf = 0;
     protected bit	params_loaded = 0;
 
-    // 创建配置容器；默认 REAL_DUT，实际 HDL/后端由平台注入。
+    // 创建配置容器；默认 REAL_DUT，实际 TL 接口由平台注入。
     // new 不读取 plusargs，允许派生用例在 load_params 前修改场景默认值。
     function new(string	name = "project_env_cfg");
         super.new(name);
         dpu_cfg = dpu_device_env_config::type_id::create("dpu_cfg");
         vio_cfg = virtio_net_env_config::type_id::create("vio_cfg");
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
-        pcie_hw_cfg = pcie_global_cfg::type_id::create("pcie_hw_cfg");
-        root_bindings = pcie_dpu_root_binding_cfg::type_id::create("root_bindings");
-        attachments = pcie_dpu_attachment_cfg::type_id::create("attachments");
         vio_cfg.execution_mode = VIRTIO_EXEC_REAL_DUT;
         dpu_cfg.device_cfg.af_request.mode = DPU_AF_SELECTED;
         dpu_cfg.device_cfg.af_request.requester =
@@ -118,43 +141,58 @@ class project_env_cfg extends uvm_object;
         return f;
     endfunction
 
-    // 生成示例的直连物理图及两类显式映射。已有完整物理配置保持借用，不改写。
-    // 自定义 topology 缺 Root/attachment 时拒绝；默认映射只在本函数创建图时推导。
-    protected function void build_physical_config();
-        pcie_topology_builder	builder;
-        string			why;
+    // 验证 Host→TL slot 是完整的一一映射；不补缺项，避免错配后静默使用 Root0。
+    // 仅支持每 Host 一个 segment 0；失败返回原因，不修改输入配置或访问 DUT。
+    function bit validate_tl_mapping(output string	why);
+        bit		used_slots[int unsigned];
+        int unsigned	count;
 
-        if (pcie_hw_cfg.topology != null) begin
-            if ((root_bindings.bindings.size() == 0) ||
-                (attachments.attachments.size() == 0))
-                `uvm_fatal("PROJECT_CFG", "custom topology requires explicit Root and Function mappings")
-            return;
+        why = "";
+        count = dpu_cfg.device_cfg.hosts.size();
+        if (count == 0 || tl_slot_by_host.num() != count || vio_cfg_by_host.num() != count) begin
+            why = "each DPU Host needs exactly one VIO config and TL slot";
+            return 0;
         end
-        if ((root_bindings.bindings.size() != 0) || (attachments.attachments.size() != 0))
-            `uvm_fatal("PROJECT_CFG", "physical mappings require a matching custom topology")
-        builder = pcie_topology_builder::type_id::create("project_topology_builder");
-        for (int unsigned	h = 0; h < hosts; h++) begin
-            void'(builder.add_rc($sformatf("RC%0d", h)));
-            void'(builder.add_ep($sformatf("EP%0d", h)));
-            void'(builder.connect($sformatf("RC%0d_EP%0d", h, h),
-                $sformatf("RC%0d", h), PCIE_TOPO_PORT_RC, 0,
-                $sformatf("EP%0d", h), PCIE_TOPO_PORT_EP, 0, 16, 4));
-            if (!root_bindings.bind_domain_to_root(h, 0, h, why))
-                `uvm_fatal("PROJECT_CFG", why)
-        end
-        pcie_hw_cfg.build_default_for_topology(builder.finish());
-        foreach (dpu_cfg.device_cfg.functions[i]) begin
-            dpu_function_cfg	f;
+        foreach (dpu_cfg.device_cfg.hosts[i]) begin
+            dpu_host_cfg	host;
+            int unsigned	slot;
 
-            f = dpu_cfg.device_cfg.functions[i];
-            if (!attachments.add(f.key, $sformatf("EP%0d", f.key.host_id),
-                    $sformatf("RC%0d_EP%0d", f.key.host_id, f.key.host_id), 0, 0, why))
-                `uvm_fatal("PROJECT_CFG", why)
+            host = dpu_cfg.device_cfg.hosts[i];
+            if (host == null) begin
+                why = "DPU Host config is null";
+                return 0;
+            end
+            if (!tl_slot_by_host.exists(host.host_id) ||
+                !vio_cfg_by_host.exists(host.host_id) || vio_cfg_by_host[host.host_id] == null) begin
+                why = $sformatf("Host%0d has no VIO config or TL slot", host.host_id);
+                return 0;
+            end
+            slot = tl_slot_by_host[host.host_id];
+            if (slot >= count || used_slots.exists(slot)) begin
+                why = "TL slots must be unique and cover 0..Host_count-1";
+                return 0;
+            end
+            if (host.pcie_domains.size() != 1) begin
+                why = "native reference requires one PCIe domain per Host";
+                return 0;
+            end
+            if (host.pcie_domains[0] == null) begin
+                why = "Host PCIe domain is null";
+                return 0;
+            end
+            if (host.pcie_domains[0].key.host_id != host.host_id ||
+                host.pcie_domains[0].key.segment_id != 0) begin
+                why = "native reference requires Host-owned segment 0";
+                return 0;
+            end
+            used_slots[slot] = 1;
         end
+        return 1;
     endfunction
 
     // 唯一参数构建入口：先采样规模/模板，再创建 Host/PF/VF/placement 和 Host 行为。
-    // 再调用幂等返回，不重新采样；拒绝覆盖已存在的逻辑拓扑，复杂预建拓扑应派生本类。
+    // 再调用幂等返回，不重新采样；已有输入的项目应把加载入口合入原构造点，省去生成循环。
+    // 默认生成器拒绝覆盖非空逻辑配置，避免重复追加 Host/PF/VF 和资源请求。
     // base_test 无须逐项赋值；AIP-off 时保留默认值，但仍正常创建对象。
     virtual function void load_params();
         dpu_dut_caps			caps;
@@ -277,7 +315,10 @@ class project_env_cfg extends uvm_object;
         dpu_cfg.placement_cfg.vio_requests.push_back(request);
         dpu_cfg.placement_cfg.load_params("dpu");
         dpu_cfg.vio_policy.load_params("dpu");
-        build_physical_config();
+        if (tl_slot_by_host.num() == 0) begin
+            for (int unsigned	h = 0; h < hosts; h++) tl_slot_by_host[h] = h;
+        end
+        if (!validate_tl_mapping(why)) `uvm_fatal("PROJECT_CFG", why)
 
         execution = vio_cfg.execution_profile();
         if (execution == null) `uvm_fatal("PROJECT_CFG", "invalid execution profile")
@@ -295,301 +336,25 @@ class project_env_cfg extends uvm_object;
 endclass
 ```
 
-## DPU 解析后组装 PCIe 和 VIO：project_device_env.sv
+## 你的 env 中的组合代码：project_env.sv
 
-[源文件](../integration/project/project_device_env.sv)
-
-```systemverilog
-// integration/project：DPU 解析完成后的 PCIe/VIO 组装层，由 project_env_pkg 包含。
-// 依赖 dpu_device_env、pcie_dpu_cfg_adapter、pcie_tl_env 和 virtio_net_env。
-// 本层继承 DPU 生命周期以保证 super.build_phase 先发布冻结快照，再创建消费者；
-// VIO 本身不继承 DPU，也不再次分配 Host/PF/VF、BDF、BAR 或 qpair。
-// 组件归 UVM 所有；project_cfg、共享内存、外部 VIF/backend 均为借用句柄。
-class project_device_env extends dpu_device_env;
-    `uvm_component_utils(project_device_env)
-
-    project_env_cfg	cfg;
-    pcie_global_cfg	projected_pcie_cfg;
-    pcie_tl_env		pcie_env;
-    virtio_net_env	vio_envs[int unsigned];
-    // 仅默认 executor 使用该 backend；平台注入 executor 时由平台负责连接它。
-    pcie_tl_dpu_reg_backend	reg_backend;
-
-    // 构造组件壳；配置与快照在 build 中获取，不在 new 中访问父组件。
-    function new(string	name, uvm_component	parent);
-        super.new(name, parent);
-    endfunction
-
-    // 对外汇总配置错误；保留全部适配器诊断，任一错误阻止创建 PCIe 子环境。
-    protected function void require_no_errors(string	stage, string	errors[$]);
-        string	message;
-
-        message = stage;
-        foreach (errors[i]) message = {message, "; ", errors[i]};
-        if (errors.size() != 0) `uvm_fatal("PROJECT_DEVICE", message)
-    endfunction
-
-    // 将 DPU 的冻结身份/地址/资源投影到 PCIe；只从 hw cfg 复制物理链路策略。
-    // 不使用 hw cfg 的 device images 覆盖快照；Root 内存绑定在 PCIe build 前完成。
-    protected function void project_pcie_config();
-        pcie_dpu_cfg_adapter	adapter;
-        pcie_dpu_system_cfg	policy;
-        host_mem_manager	manager;
-        string			errors[$];
-        string			why;
-
-        adapter = pcie_dpu_cfg_adapter::type_id::create("dpu_to_pcie");
-        if (!adapter.project_with_root_bindings(get_snapshot(), get_resource_snapshot(),
-                cfg.pcie_hw_cfg.topology, cfg.attachments, cfg.root_bindings,
-                projected_pcie_cfg, errors)) begin
-            require_no_errors("DPU to PCIe projection failed", errors);
-            `uvm_fatal("PROJECT_DEVICE", "DPU to PCIe projection returned no configuration")
-        end
-        policy = pcie_dpu_system_cfg::type_id::create("pcie_link_policy");
-        policy.pcie_policy = cfg.pcie_hw_cfg;
-        // 当前 helper 不复制此开关，必须在 helper 的 validate 之前显式传递。
-        projected_pcie_cfg.svt_bridge_enable = cfg.pcie_hw_cfg.svt_bridge_enable;
-        if (!policy.apply_pcie_policy(projected_pcie_cfg, errors))
-            require_no_errors("PCIe physical policy failed", errors);
-
-        foreach (cfg.root_bindings.bindings[i]) begin
-            pcie_dpu_root_binding	binding;
-
-            binding = cfg.root_bindings.bindings[i];
-            if (!cfg.host_mem_pool_binding.has_host(binding.host_id))
-                `uvm_fatal("PROJECT_DEVICE", "Root refers to a Host without shared memory")
-            manager = cfg.host_mem_pool_binding.get_host(binding.host_id);
-            if (cfg.pcie_cfg.host_mem_by_root.exists(binding.root_index)) begin
-                if ((cfg.pcie_cfg.host_mem_by_root[binding.root_index] != manager) ||
-                    !cfg.pcie_cfg.host_id_by_root.exists(binding.root_index) ||
-                    (cfg.pcie_cfg.host_id_by_root[binding.root_index] != binding.host_id))
-                    `uvm_fatal("PROJECT_DEVICE", "pre-bound PCIe memory disagrees with DPU Host owner")
-            end else if (!cfg.pcie_cfg.bind_host_memory(
-                    binding.root_index, binding.host_id, manager, why))
-                `uvm_fatal("PROJECT_DEVICE", why)
-        end
-    endfunction
-
-    // 必须先调用 DPU build：它唯一执行 resolver 并发布 device/resource/manager。
-    // 子 VIO 继承 config_db 的快照发布范围；每 Host 只收到自己的行为 cfg。
-    virtual function void build_phase(uvm_phase	phase);
-        if (!uvm_config_db#(project_env_cfg)::get(this, "", "project_cfg", cfg) || cfg == null)
-            `uvm_fatal("PROJECT_DEVICE", "project_cfg is missing")
-        super.build_phase(phase);
-        project_pcie_config();
-
-        uvm_config_db#(pcie_global_cfg)::set(this, "pcie_env", "global_cfg", projected_pcie_cfg);
-        uvm_config_db#(pcie_tl_env_config)::set(this, "pcie_env", "cfg", cfg.pcie_cfg);
-        uvm_config_db#(pcie_tl_env_config)::set(this, "pcie_env", "tl_policy_cfg", cfg.pcie_cfg);
-        if (cfg.backend_factory != null)
-            uvm_config_db#(pcie_tl_backend_factory)::set(
-                this, "pcie_env", "pcie_tl_backend_factory", cfg.backend_factory);
-        pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
-
-        foreach (cfg.vio_cfg_by_host[h]) begin
-            string	child_name;
-
-            child_name = $sformatf("vio_h%0d", h);
-            uvm_config_db#(virtio_net_env_config)::set(this, child_name, "cfg", cfg.vio_cfg_by_host[h]);
-            vio_envs[h] = virtio_net_env::type_id::create(child_name, this);
-        end
-    endfunction
-
-    // 根据规范物理节点顺序找到 EP 槽位；禁止把 Function 下标当成 EP 下标。
-    // 无对应节点返回 -1，调用者据此拒绝错误 attachment。
-    protected function int find_ep_slot(string	node_id);
-        if (pcie_env.topology_adapter == null) return -1;
-        if (pcie_env.cfg.switch_enable) begin
-            foreach (pcie_env.topology_adapter.switch_ep_node_ids[i])
-                if (pcie_env.topology_adapter.switch_ep_node_ids[i] == node_id) return i;
-        end else begin
-            foreach (pcie_env.topology_adapter.direct_ep_node_ids[i])
-                if (pcie_env.topology_adapter.direct_ep_node_ids[i] == node_id) return i;
-        end
-        return -1;
-    endfunction
-
-    // 统一数组和单 EP 的历史接口。provider 可能刻意不创建 DUT 一侧的 agent，
-    // 因而 null EP monitor 是合法的；Root driver/sequencer 则必须存在。
-    protected function pcie_tl_base_monitor ep_monitor_at(int	slot);
-        if (pcie_env.ep_agents.size() != 0) begin
-            if (slot >= 0 && slot < pcie_env.ep_agents.size() && pcie_env.ep_agents[slot] != null)
-                return pcie_env.ep_agents[slot].monitor;
-            return null;
-        end
-        if (slot == 0 && pcie_env.ep_agent != null) return pcie_env.ep_agent.monitor;
-        return null;
-    endfunction
-
-    // native SV_IF 每个方向显式注入接口；provider 自己管理 HDL/SVT 接口。
-    // 该参考实现不替平台实例化 Serial/SVT VIP，也不重连 provider-owned adapter。
-    protected function void bind_native_vifs();
-        if (pcie_env.backend_provider_active || pcie_env.cfg.if_mode != SV_IF_MODE) return;
-        foreach (pcie_env.rc_adapters[r]) begin
-            if (pcie_env.rc_adapters[r] == null) continue;
-            if (!cfg.rc_vifs.exists(r) || cfg.rc_vifs[r] == null)
-                `uvm_fatal("PROJECT_DEVICE", $sformatf("missing native RC VIF for Root%0d", r))
-            pcie_env.rc_adapters[r].vif = cfg.rc_vifs[r];
-        end
-        foreach (cfg.pcie_hw_cfg.topology.nodes[n]) begin
-            string	node_id;
-            int		slot;
-
-            if (cfg.pcie_hw_cfg.topology.nodes[n].kind != PCIE_TOPO_NODE_EP) continue;
-            node_id = cfg.pcie_hw_cfg.topology.nodes[n].node_id;
-            slot = find_ep_slot(node_id);
-            if (slot < 0) continue;
-            if (!cfg.ep_vifs.exists(node_id) || cfg.ep_vifs[node_id] == null)
-                `uvm_fatal("PROJECT_DEVICE", {"missing native EP VIF for ", node_id})
-            if (pcie_env.ep_adapters.size() != 0) begin
-                if (slot >= pcie_env.ep_adapters.size() || pcie_env.ep_adapters[slot] == null)
-                    `uvm_fatal("PROJECT_DEVICE", "physical EP has no native adapter")
-                pcie_env.ep_adapters[slot].vif = cfg.ep_vifs[node_id];
-            end else begin
-                if (slot != 0 || pcie_env.ep_adapter == null)
-                    `uvm_fatal("PROJECT_DEVICE", "single EP has no native adapter")
-                pcie_env.ep_adapter.vif = cfg.ep_vifs[node_id];
-            end
-        end
-    endfunction
-
-    // 全项目统一分配协议监测接口，并在任何 VIO bind 前检查跨 Host 句柄复用。
-    // cfg 已登记的身份优先；否则使用显式池或兼容 top 的全局 slot 池。
-    protected function void bind_protocol_vifs();
-        virtual virtio_protocol_event_if	used[$];
-        virtual virtio_protocol_event_if	vif;
-        int unsigned				slot;
-        string					why;
-
-        slot = 0;
-        foreach (vio_envs[h]) begin
-            foreach (vio_envs[h].function_instances[i]) begin
-                virtio_function_instance	f;
-
-                f = vio_envs[h].function_instances[i];
-                if (!cfg.vio_cfg_by_host[h].get_protocol_event_vif(f.pcie_id, vif)) begin
-                    if (cfg.protocol_vifs.size() != 0) begin
-                        if (slot >= cfg.protocol_vifs.size())
-                            `uvm_fatal("PROJECT_DEVICE", "protocol VIF pool is too small")
-                        vif = cfg.protocol_vifs[slot];
-                    end else if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
-                            null, "uvm_test_top", $sformatf("protocol_event_vif_%0d", slot), vif))
-                        `uvm_fatal("PROJECT_DEVICE", "global protocol VIF slot is missing")
-                    if (!cfg.vio_cfg_by_host[h].bind_protocol_event_vif(f.pcie_id, vif, why))
-                        `uvm_fatal("PROJECT_DEVICE", why)
-                end
-                foreach (used[j]) begin
-                    if (used[j] == vif)
-                        `uvm_fatal("PROJECT_DEVICE", "protocol VIF reused by distinct Functions/Hosts")
-                end
-                used.push_back(vif);
-                slot++;
-            end
-        end
-    endfunction
-
-    // 用 Function 的完整身份找到 domain→Root 与 Function→物理 EP，统一连接 VIO。
-    // child connect 已完成，故 sequencer/driver/monitor 均可使用；失败立即停止。
-    virtual function void connect_phase(uvm_phase	phase);
-        string	why;
-
-        super.connect_phase(phase);
-        bind_native_vifs();
-        bind_protocol_vifs();
-        if (reg_backend != null) begin
-            reg_backend.bind_virtual_sequencer(pcie_env.v_seqr);
-            foreach (cfg.root_bindings.bindings[i]) begin
-                pcie_dpu_root_binding	b;
-
-                b = cfg.root_bindings.bindings[i];
-                reg_backend.bind_domain_root(b.host_id, b.segment_id, b.root_index);
-            end
-        end
-        foreach (vio_envs[h]) begin
-            virtio_pcie_function_endpoint	endpoints[$];
-
-            foreach (vio_envs[h].function_instances[i]) begin
-                virtio_function_instance	f;
-                virtio_pcie_function_endpoint	endpoint;
-                int unsigned			root;
-                int				ep_slot;
-                string				node_id;
-                string				link_id;
-                bit				has_fn_num;
-                int unsigned			fn_num;
-
-                f = vio_envs[h].function_instances[i];
-                if (!cfg.root_bindings.find_root(f.pcie_id.domain.host_id,
-                        f.pcie_id.domain.segment_id, root))
-                    `uvm_fatal("PROJECT_DEVICE", "VIO domain has no Root binding")
-                if (!cfg.attachments.find_by_function(f.service_key.function_key,
-                        node_id, link_id, has_fn_num, fn_num))
-                    `uvm_fatal("PROJECT_DEVICE", "VIO Function has no physical attachment")
-                ep_slot = find_ep_slot(node_id);
-                if (ep_slot < 0 || pcie_env.configured_ep_root_index(ep_slot, -1) != int'(root))
-                    `uvm_fatal("PROJECT_DEVICE", "VIO physical EP/Root mapping disagrees")
-                if (root >= pcie_env.rc_agents.size() || pcie_env.rc_agents[root] == null)
-                    `uvm_fatal("PROJECT_DEVICE", "VIO requires a VIP-owned RC for its Root")
-                endpoint = virtio_pcie_function_endpoint::type_id::create(
-                    $sformatf("endpoint_h%0d_f%0d", h, i));
-                endpoint.configure(f.pcie_id, pcie_env.rc_agents[root].sequencer,
-                    pcie_env.rc_agents[root].rc_driver, cfg.completion_adapter,
-                    pcie_env.rc_agents[root].monitor, ep_monitor_at(ep_slot));
-                endpoints.push_back(endpoint);
-            end
-            if (!vio_envs[h].bind_pcie_endpoints(endpoints))
-                `uvm_fatal("PROJECT_DEVICE", "VIO endpoint binding failed")
-        end
-    endfunction
-
-    // 平台确认 reset/link/DMA 服务就绪后调用一次；计划已包含 bootstrap，不能
-    // 先单独 apply_bootstrap 再重复执行。失败报告保留 DPU 状态与具体操作原因。
-    task configure_device();
-        dpu_reg_plan		plan;
-        dpu_execution_report	report;
-        string			why;
-
-        if (!build_vio_register_plan(plan, why)) `uvm_fatal("PROJECT_DEVICE", why)
-        apply_vio_register_plan(plan, report);
-        if (report == null) `uvm_fatal("PROJECT_DEVICE", "DPU returned no execution report")
-        if (report.status() != DPU_CFG_STATUS_SUCCEEDED)
-            `uvm_fatal("PROJECT_DEVICE", report.reason())
-    endtask
-
-    // 所有 Host 先登记完整 service 身份，再统一注册命令；空 Host 合法，全局空拒绝。
-    // 每个仿真只调用一次；TX 提交与业务完成的区别由平台 finish/check 负责收口。
-    function void register_aip_commands();
-        int unsigned	active_hosts;
-        string		why;
-
-        active_hosts = 0;
-        foreach (vio_envs[h]) begin
-            if (vio_envs[h].function_instances.size() == 0) continue;
-            if (!virtio_aip_registry::bind_env(vio_envs[h], why))
-                `uvm_fatal("PROJECT_DEVICE", why)
-            active_hosts++;
-        end
-        if (active_hosts == 0) `uvm_fatal("PROJECT_DEVICE", "no VIO service available for AIP")
-        if (!virtio_aip_registry::register_commands(why))
-            `uvm_fatal("PROJECT_DEVICE", why)
-    endfunction
-endclass
-```
-
-## 项目 env 与公共资源：project_env.sv
+以下是完整环境，辅助函数均已展开。VIO 创建处的 `dpu_env` 参数必须保留，不能换成 `this`。
 
 [源文件](../integration/project/project_env.sv)
 
 ```systemverilog
-// integration/project：项目顶层 env；由 project_env_pkg 在 cfg、device_env 之后包含。
-// 本层拥有公共资源的创建责任和一个 DPU 组装子环境；不启动复位或业务流量。
+// integration/project：可拷入已有项目的组合式 env；只继承 uvm_env。
+// 依赖 DPU、原生 PCIe TL、VIO 与 AIP，由 project_env_pkg 在 cfg 后包含。
+// 本层直接创建 DPU/PCIe/VIO；VIO 的 parent 指向 DPU，使 UVM 自动保证快照先发布。
 // 平台已有 pool/executor/completion adapter 时只借用并校验，不能偷偷替换。
-// 默认 executor 在 DPU build 前安装 backend，确保 bind_topology 不会丢失。
+// 默认 executor 在 DPU build 前安装 backend；接口连接与初始化由 connect/run 入口负责。
 class project_env extends uvm_env;
     `uvm_component_utils(project_env)
 
     project_env_cfg		cfg;
-    project_device_env		device_env;
+    dpu_device_env		dpu_env;
+    pcie_tl_env			pcie_env;
+    virtio_net_env		vio_envs[int unsigned];
     host_mem_pool		shared_pool;
     pcie_tl_dpu_reg_backend	reg_backend;
 
@@ -644,8 +409,45 @@ class project_env extends uvm_env;
         cfg.dpu_cfg.host_mem_pool_ref = shared_pool;
     endfunction
 
-    // load_params 幂等，既支持 base_test 先加载再注入，也支持直接创建 env 的平台。
-    // 默认寄存器 backend 先接 executor，再让 DPU super.build 注入冻结 snapshot。
+    // 按显式 Host→slot 准备原生 TL cfg；只借用同一 Host manager，不复制 BDF/BAR。
+    // 既有绑定只校验不重建；Switch、多余绑定或不同 manager 都拒绝。
+    protected function void prepare_pcie_config();
+        string	why;
+
+        if (!cfg.validate_tl_mapping(why)) `uvm_fatal("PROJECT_ENV", why)
+        if (cfg.pcie_cfg.switch_enable)
+            `uvm_fatal("PROJECT_ENV", "native project reference does not create a Switch")
+        cfg.pcie_cfg.rc_agent_enable = 1;
+        cfg.pcie_cfg.ep_agent_enable = 1;
+        cfg.pcie_cfg.num_rc = cfg.tl_slot_by_host.num();
+        cfg.pcie_cfg.num_ep = cfg.tl_slot_by_host.num();
+        foreach (cfg.tl_slot_by_host[h]) begin
+            int unsigned		slot;
+            host_mem_manager	manager;
+
+            slot = cfg.tl_slot_by_host[h];
+            manager = shared_pool.get_host(h);
+            if (cfg.pcie_cfg.host_mem_by_root.exists(slot)) begin
+                if (cfg.pcie_cfg.host_mem_by_root[slot] != manager ||
+                    !cfg.pcie_cfg.host_id_by_root.exists(slot) ||
+                    cfg.pcie_cfg.host_id_by_root[slot] != h)
+                    `uvm_fatal("PROJECT_ENV", "PCIe Host memory binding disagrees with DPU owner")
+            end else if (!cfg.pcie_cfg.bind_host_memory(slot, h, manager, why))
+                `uvm_fatal("PROJECT_ENV", why)
+            if (cfg.pcie_cfg.ep_root_by_index.exists(slot)) begin
+                if (cfg.pcie_cfg.ep_root_by_index[slot] != slot)
+                    `uvm_fatal("PROJECT_ENV", "native EP/RC slots must be paired")
+            end else if (!cfg.pcie_cfg.bind_ep_root(slot, slot, why))
+                `uvm_fatal("PROJECT_ENV", why)
+        end
+        if (cfg.pcie_cfg.host_mem_by_root.num() != cfg.tl_slot_by_host.num() ||
+            cfg.pcie_cfg.ep_root_by_index.num() != cfg.tl_slot_by_host.num())
+            `uvm_fatal("PROJECT_ENV", "extra PCIe Root bindings are not part of this project")
+    endfunction
+
+    // 这里只创建组件和发布输入，不提前查询 DPU snapshot，也不手动调用子组件 build。
+    // create(..., dpu_env) 让 VIO 位于 DPU 子树；框架先 build DPU，再 build VIO。
+    // PCIe 只需要 Host 内存和 TL cfg，可以与 DPU 同级，不依赖二者遍历先后顺序。
     virtual function void build_phase(uvm_phase	phase);
         dpu_pcie_reg_executor		executor;
         virtio_execution_profile	execution;
@@ -655,13 +457,14 @@ class project_env extends uvm_env;
             `uvm_fatal("PROJECT_ENV", "project environment cfg is missing")
         cfg.load_params();
         prepare_host_memory();
+        prepare_pcie_config();
         execution = cfg.vio_cfg.execution_profile();
         if (execution.has_model_device()) begin
             if (cfg.completion_adapter == null)
                 `uvm_fatal("PROJECT_ENV", "MODEL requires the platform's shared completion adapter and device model")
             cfg.completion_adapter.install_factory_overrides();
         end else if (cfg.completion_adapter != null)
-            `uvm_fatal("PROJECT_ENV", "REAL_DUT must use native/provider Completion routing")
+            `uvm_fatal("PROJECT_ENV", "REAL_DUT must use native Completion routing")
 
         if (cfg.dpu_cfg.executor == null) begin
             reg_backend = pcie_tl_dpu_reg_backend::type_id::create("reg_backend");
@@ -669,22 +472,188 @@ class project_env extends uvm_env;
             executor.set_backend(reg_backend);
             cfg.dpu_cfg.executor = executor;
         end
-        uvm_config_db#(project_env_cfg)::set(this, "device_env", "project_cfg", cfg);
-        uvm_config_db#(dpu_device_env_config)::set(this, "device_env", "cfg", cfg.dpu_cfg);
-        device_env = project_device_env::type_id::create("device_env", this);
-        device_env.reg_backend = reg_backend;
+        uvm_config_db#(dpu_device_env_config)::set(this, "dpu_env", "cfg", cfg.dpu_cfg);
+        dpu_env = dpu_device_env::type_id::create("dpu_env", this);
+
+        uvm_config_db#(pcie_tl_env_config)::set(this, "pcie_env", "cfg", cfg.pcie_cfg);
+        pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
+
+        foreach (cfg.vio_cfg_by_host[h]) begin
+            string	child_name;
+
+            child_name = $sformatf("vio_h%0d", h);
+            uvm_config_db#(virtio_net_env_config)::set(
+                dpu_env, child_name, "cfg", cfg.vio_cfg_by_host[h]);
+            vio_envs[h] = virtio_net_env::type_id::create(child_name, dpu_env);
+        end
+    endfunction
+
+    // 单 EP 使用标量，多个 EP 使用数组；只返回已有 monitor，不创建替代观察者。
+    protected function pcie_tl_base_monitor ep_monitor_at(int unsigned	slot);
+        if (pcie_env.ep_agents.size() != 0) begin
+            if (slot < pcie_env.ep_agents.size() && pcie_env.ep_agents[slot] != null)
+                return pcie_env.ep_agents[slot].monitor;
+            return null;
+        end
+        if (slot == 0 && pcie_env.ep_agent != null) return pcie_env.ep_agent.monitor;
+        return null;
+    endfunction
+
+    // SV_IF_MODE 绑定平台实际接口；TLM 模式由模型路径接线。缺接口或跨槽位复用立即失败。
+    // 两个方向分别使用一个 VIF，避免两套 adapter 驱动同一接口。
+    protected function void bind_native_vifs();
+        virtual pcie_tl_if	used[$];
+
+        if (cfg.pcie_cfg.if_mode != SV_IF_MODE) return;
+        foreach (cfg.tl_slot_by_host[h]) begin
+            int unsigned	slot;
+
+            slot = cfg.tl_slot_by_host[h];
+            if (!cfg.rc_vifs.exists(slot) || cfg.rc_vifs[slot] == null ||
+                !cfg.ep_vifs.exists(slot) || cfg.ep_vifs[slot] == null)
+                `uvm_fatal("PROJECT_ENV", $sformatf("missing native VIF for TL slot %0d", slot))
+            if (cfg.rc_vifs[slot] == cfg.ep_vifs[slot])
+                `uvm_fatal("PROJECT_ENV", "RC and EP directions must use distinct VIFs")
+            foreach (used[i]) begin
+                if (used[i] == cfg.rc_vifs[slot] || used[i] == cfg.ep_vifs[slot])
+                    `uvm_fatal("PROJECT_ENV", "native VIF reused by distinct TL slots")
+            end
+            used.push_back(cfg.rc_vifs[slot]);
+            used.push_back(cfg.ep_vifs[slot]);
+            if (slot >= pcie_env.rc_adapters.size() || pcie_env.rc_adapters[slot] == null)
+                `uvm_fatal("PROJECT_ENV", "native RC adapter is missing")
+            pcie_env.rc_adapters[slot].vif = cfg.rc_vifs[slot];
+            if (pcie_env.ep_adapters.size() != 0) begin
+                if (slot >= pcie_env.ep_adapters.size() || pcie_env.ep_adapters[slot] == null)
+                    `uvm_fatal("PROJECT_ENV", "native EP adapter is missing")
+                pcie_env.ep_adapters[slot].vif = cfg.ep_vifs[slot];
+            end else begin
+                if (slot != 0 || pcie_env.ep_adapter == null)
+                    `uvm_fatal("PROJECT_ENV", "native scalar EP adapter is missing")
+                pcie_env.ep_adapter.vif = cfg.ep_vifs[slot];
+            end
+        end
+    endfunction
+
+    // 全项目统一分配协议 VIF；显式身份映射优先，兼容 top 的全局 VIF slot 入口。
+    // 在 Function 绑定 PCIe 前拒绝空接口和跨 Host/Function 复用，不依赖各 Host 局部计数。
+    protected function void bind_protocol_vifs();
+        virtual virtio_protocol_event_if	used[$];
+        virtual virtio_protocol_event_if	vif;
+        int unsigned				slot;
+        string					why;
+
+        slot = 0;
+        foreach (vio_envs[h]) begin
+            foreach (vio_envs[h].function_instances[i]) begin
+                virtio_function_instance	f;
+
+                f = vio_envs[h].function_instances[i];
+                if (!cfg.vio_cfg_by_host[h].get_protocol_event_vif(f.pcie_id, vif)) begin
+                    if (cfg.protocol_vifs.size() != 0) begin
+                        if (slot >= cfg.protocol_vifs.size())
+                            `uvm_fatal("PROJECT_ENV", "protocol VIF pool is too small")
+                        vif = cfg.protocol_vifs[slot];
+                    end else if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
+                            null, "uvm_test_top", $sformatf("protocol_event_vif_%0d", slot), vif))
+                        `uvm_fatal("PROJECT_ENV", "global protocol VIF slot is missing")
+                    if (!cfg.vio_cfg_by_host[h].bind_protocol_event_vif(f.pcie_id, vif, why))
+                        `uvm_fatal("PROJECT_ENV", why)
+                end
+                if (vif == null) `uvm_fatal("PROJECT_ENV", "protocol VIF is null")
+                foreach (used[j]) begin
+                    if (used[j] == vif)
+                        `uvm_fatal("PROJECT_ENV", "protocol VIF reused by distinct Functions/Hosts")
+                end
+                used.push_back(vif);
+                slot++;
+            end
+        end
+    endfunction
+
+    // connect 自底向上运行，此时 DPU 快照和 PCIe/VIO 子组件均已完成 build/connect。
+    // 从 Function 的完整身份选择 Host 对应的 TL slot；BDF/BAR 不在 PCIe 中重新分配。
+    virtual function void connect_phase(uvm_phase	phase);
+        super.connect_phase(phase);
+        if (pcie_env.global_cfg != null || pcie_env.topology_adapter != null ||
+            pcie_env.backend_provider_active || pcie_env.cfg != cfg.pcie_cfg)
+            `uvm_fatal("PROJECT_ENV", "native reference requires the direct PCIe cfg-only path")
+        bind_native_vifs();
+        bind_protocol_vifs();
+        if (reg_backend != null) begin
+            reg_backend.bind_virtual_sequencer(pcie_env.v_seqr);
+            foreach (cfg.tl_slot_by_host[h])
+                reg_backend.bind_domain_root(h, 0, cfg.tl_slot_by_host[h]);
+        end
+        foreach (vio_envs[h]) begin
+            virtio_pcie_function_endpoint	endpoints[$];
+            int unsigned				slot;
+
+            slot = cfg.tl_slot_by_host[h];
+            if (slot >= pcie_env.rc_agents.size() || pcie_env.rc_agents[slot] == null)
+                `uvm_fatal("PROJECT_ENV", "Host has no native RC agent")
+            foreach (vio_envs[h].function_instances[i]) begin
+                virtio_function_instance		f;
+                virtio_pcie_function_endpoint	endpoint;
+
+                f = vio_envs[h].function_instances[i];
+                if (f.pcie_id.domain.host_id != h || f.pcie_id.domain.segment_id != 0)
+                    `uvm_fatal("PROJECT_ENV", "Function does not belong to its Host segment 0")
+                endpoint = virtio_pcie_function_endpoint::type_id::create(
+                    $sformatf("endpoint_h%0d_f%0d", h, i));
+                endpoint.configure(f.pcie_id, pcie_env.rc_agents[slot].sequencer,
+                    pcie_env.rc_agents[slot].rc_driver, cfg.completion_adapter,
+                    pcie_env.rc_agents[slot].monitor, ep_monitor_at(slot));
+                endpoints.push_back(endpoint);
+            end
+            if (!vio_envs[h].bind_pcie_endpoints(endpoints))
+                `uvm_fatal("PROJECT_ENV", "VIO endpoint binding failed")
+        end
+    endfunction
+
+    // 平台确认复位、TL 接口和 DMA 服务就绪后调用；计划包含 bootstrap，不能重复配置。
+    // 状态管理和执行报告全部委托已创建的 dpu_env，不在项目层复制另一份执行状态。
+    task configure_device();
+        dpu_reg_plan		plan;
+        dpu_execution_report	report;
+        string			why;
+
+        if (!dpu_env.build_vio_register_plan(plan, why)) `uvm_fatal("PROJECT_ENV", why)
+        dpu_env.apply_vio_register_plan(plan, report);
+        if (report == null) `uvm_fatal("PROJECT_ENV", "DPU returned no execution report")
+        if (report.status() != DPU_CFG_STATUS_SUCCEEDED)
+            `uvm_fatal("PROJECT_ENV", report.reason())
+    endtask
+
+    // 每个仿真调用一次：按完整 service 身份登记各 Host，再注册已有 Tcl 命令。
+    // 空 Host 可跳过；全局没有 VIO service 或重复注册属于接入错误。
+    function void register_aip_commands();
+        int unsigned	active_hosts;
+        string		why;
+
+        active_hosts = 0;
+        foreach (vio_envs[h]) begin
+            if (vio_envs[h].function_instances.size() == 0) continue;
+            if (!virtio_aip_registry::bind_env(vio_envs[h], why))
+                `uvm_fatal("PROJECT_ENV", why)
+            active_hosts++;
+        end
+        if (active_hosts == 0) `uvm_fatal("PROJECT_ENV", "no VIO service available for AIP")
+        if (!virtio_aip_registry::register_commands(why)) `uvm_fatal("PROJECT_ENV", why)
     endfunction
 endclass
 ```
 
-## base test 的构建和运行顺序：project_base_test.sv
+## test 的最少接入顺序：project_base_test.sv
+
+这是可选的虚基类参考。已有 test 直接移植 build/run 中的操作，并用现有平台代码实现三个 hook；无需改变 test 的继承关系。
 
 [源文件](../integration/project/project_base_test.sv)
 
 ```systemverilog
 // integration/project：可继承的 AIP base_test，由 project_env_pkg 最后包含。
 // 依赖本目录 env/cfg 与 AIP bridge；基类拥有 objection 和统一配置/命令入口。
-// 不知道平台的 reset/link/DMA/业务完成信号，故将这三处保留为强制实现的接口，
+// 不知道平台的 reset/TL 接口/DMA/业务完成信号，故将这三处保留为强制实现的接口，
 // 防止空 hook 假装平台已准备好。派生 test 用 factory 注册，本虚类不注册 factory。
 virtual class project_base_test extends uvm_test;
     project_env_cfg	cfg;
@@ -695,11 +664,11 @@ virtual class project_base_test extends uvm_test;
         super.new(name, parent);
     endfunction
 
-    // 在 cfg 加载后、env 构建前注入平台 pool/IOMMU/VIF/backend 等句柄。
+    // 在 cfg 加载后、env 构建前注入平台 pool/IOMMU/VIF 等句柄。
     // cfg 若已由 top 完整注入，派生类可显式提供空实现；此 hook 不重新 load_params。
     pure virtual function void bind_platform_handles();
 
-    // 等待真实复位/链路就绪，准备 requester-aware DMA 和设备模型/网络检查器。
+    // 等待真实复位/TL 接口就绪，准备 requester-aware DMA 和设备模型/网络检查器。
     // 必须有平台自己的超时及错误处理；返回即授权后续 DPU 寄存器计划访问设备。
     pure virtual task prepare_platform();
 
@@ -724,8 +693,8 @@ virtual class project_base_test extends uvm_test;
     virtual task run_phase(uvm_phase	phase);
         phase.raise_objection(this);
         prepare_platform();
-        env.device_env.configure_device();
-        env.device_env.register_aip_commands();
+        env.configure_device();
+        env.register_aip_commands();
         aip_tcl_bridge::run_loop();
         finish_platform();
         phase.drop_objection(this);
@@ -733,13 +702,14 @@ virtual class project_base_test extends uvm_test;
 endclass
 ```
 
-## package 编译入口：project_env_pkg.sv
+## package 依赖与包含顺序：project_env_pkg.sv
+
 
 [源文件](../integration/project/project_env_pkg.sv)
 
 ```systemverilog
 // integration/project：项目参考组装的唯一 package 编译入口。
-// 顺序：AIP→DPU/Host memory/PCIe/VIO→PCIe-DPU/AIP glue→本包。
+// 顺序：AIP→DPU/Host memory/PCIe TL/VIO→AIP glue→本包。
 // include 的普通 .sv 不可另行编译；本包只定义类型，不创建组件或取得外部资源。
 package project_env_pkg;
     timeunit 1ns;
@@ -749,41 +719,76 @@ package project_env_pkg;
     import aip_core_pkg::*;
     import host_mem_pkg::*;
     import dpu_resource_pkg::*;
-    import pcie_topology_pkg::*;
     import pcie_tl_pkg::*;
-    import pcie_dpu_integration_pkg::*;
     import virtio_net_pkg::*;
     import virtio_aip_pkg::*;
     `include "uvm_macros.svh"
 
     `include "project_env_cfg.sv"
-    `include "project_device_env.sv"
     `include "project_env.sv"
     `include "project_base_test.sv"
 endpackage
 ```
 
-## 完整编译 filelist
+## 独立编译入口：project_integration.f
 
-[project_integration.f](../filelists/project_integration.f)
+
+[源文件](../filelists/project_integration.f)
 
 ```text
-// 完整参考集成入口。从 virtio_work 根运行；五个依赖根由调用方提供。
+// 原生 TL 参考集成入口。从 virtio_work 根运行；依赖根由调用方提供。
 // 已有统一工程 filelist 时，按此顺序增补缺失包，禁止把已有包再次编译。
 -f filelists/aip_integration.f
-+incdir+$PCIE_WORK_ROOT/pcie_dpu_integration/src
-$PCIE_WORK_ROOT/pcie_dpu_integration/src/pcie_dpu_integration_pkg.sv
 +incdir+integration/project
 integration/project/project_env_pkg.sv
 ```
 
-## 配套的 VIO 原类接口
+## 句柄注入与参数时机
 
-本次同时在原 [virtio_net_env_config.sv](../virtio_net_vip/src/env/virtio_net_env_config.sv)
-增加 `iommu_binding` 与 `bind_protocol_event_vif/get_protocol_event_vif/has_protocol_event_bindings`。
-原 [virtio_net_env.sv](../virtio_net_vip/src/env/virtio_net_env.sv) 消费这两个配置接口：
-外部 IOMMU 只校验策略、不重配；显式协议 VIF 按完整 Function 身份查询。
-复制本目录到使用旧版 VIO 的工程时，需要同步这两个原类改动。
+`project_base_test.build_phase()` 在加载参数后调用 `bind_platform_handles()`。
+平台可在该方法中填入现有的 `cfg.rc_vifs[slot]`、`cfg.ep_vifs[slot]`，并给每个
+活动 Function 分配独立的 `cfg.protocol_vifs`。也可沿用 top 的
+`protocol_event_vif_N` 注册入口。已有 Host pool 放在 `cfg.host_mem_pool_binding`，
+已有 IOMMU 放在 `cfg.vio_cfg_by_host[h].iommu_binding`。
+这些是对象句柄，不能通过 plusarg 创建 interface 或替代 HDL 连线。
 
-可运行的结构回归见 [smoke test](../integration/project/tests/project_env_smoke_test.sv)
-和 [HDL top](../integration/project/tests/project_env_tb.sv)，不包含 DUT 数据面。
+单 Host 默认 slot 为 0；多 Host 用 `tl_slot_by_host` 指定接口组，PF/VF 共用其 Host
+的接口组。真实输入、接口和注入时机可对照
+[smoke test](../integration/project/tests/project_env_smoke_test.sv)；其
+[top](../integration/project/tests/project_env_tb.sv) 仅提供空闲接口，不能代替 DUT top。
+
+例如启动参数：
+
+```text
++dpu.hosts=1 +dpu.pfs_per_host=1 +dpu.vfs_per_pf=0
++vio.pairs=1 +vio.queue_size=512
++pcie_cfg.init_ph_credit=23 +pcie_cfg.cpl_timeout_ns=200000
+```
+
+默认 PF 服务进入 AIP 后：
+
+```tcl
+set_param vio.target h0.pf0.i0
+set_param vio.tx.kind ETH_IPV4_UDP
+set_param vio.tx.len 128
+vio_init
+vio_start
+vio_tx count=100
+```
+
+DPU 寄存器计划访问 DUT，应等复位/TL/DMA 服务就绪后执行。
+计划已含 bootstrap，不要另行先执行 bootstrap。运行期 `set_param` 不会重建被冻结的
+Host/PF/BDF/BAR 或 PCIe 环境；它只影响后续会再次采样对应参数的 sequence。
+报文提交后的真正完成检查由项目 test 负责。
+
+## 与当前库接口的对应
+
+[VIO cfg](../virtio_net_vip/src/env/virtio_net_env_config.sv) 已提供 `iommu_binding` 和
+`bind_protocol_event_vif/get_protocol_event_vif/has_protocol_event_bindings`；
+[VIO env](../virtio_net_vip/src/env/virtio_net_env.sv) 消费这些接口。
+外部 IOMMU 只校验不重建，协议 VIF 按完整 Function 身份绑定。
+拷到旧版 VIO 工程时，需要同时确认这些接口已经同步。
+
+该参考依赖平台已有的 requester-aware DMA 路由和硬件数据面配置。
+它不新增 Virtio 设备模型，也不补齐额外 VTX/VRX/QSCH 配置。
+验证范围和结果见 [集成说明](../integration/project/README.md)。

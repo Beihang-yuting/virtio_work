@@ -1,5 +1,5 @@
 // integration/project/tests：参考组装层的构建/连接回归，不含 RTL 或伪造设备响应。
-// 依赖 project_env_pkg；top 提供空闲 native VIF。测试只读生产状态并验证句柄身份、
+// 依赖 project_env_pkg；top 提供空闲 native VIF。验证组合式 parent/build 顺序、句柄身份、
 // 参数消费和跨 Host 隔离，不发包、不调用寄存器计划，不把结构检查当成数据面通过。
 // 注入的 IOMMU 在 build 前已有 live mapping，用于验证共享对象不会被重配。
 package project_env_test_pkg;
@@ -9,7 +9,6 @@ package project_env_test_pkg;
     import aip_core_pkg::*;
     import host_mem_pkg::*;
     import dpu_resource_pkg::*;
-    import pcie_topology_pkg::*;
     import pcie_tl_pkg::*;
     import virtio_net_pkg::*;
     import virtio_aip_pkg::*;
@@ -33,7 +32,7 @@ package project_env_test_pkg;
         endfunction
     endclass
 
-    // 独立 UVM test 保持仅组装验证；实际项目应继承 project_base_test 驱动平台。
+    // 独立 UVM test 仅验证组装；真实平台可参考 project_base_test 的顺序合入已有 test。
     class project_env_smoke_test extends uvm_test;
         `uvm_component_utils(project_env_smoke_test)
         project_env_cfg		cfg;
@@ -71,6 +70,12 @@ package project_env_test_pkg;
             first_host = cfg.dpu_cfg.device_cfg.hosts[0];
             cfg.load_params();
             expect_true(cfg.dpu_cfg.device_cfg.hosts[0] == first_host, "load_params recreated Host input");
+            // 交换 Host 与 RC/EP slot，证明端点使用显式映射，而不是偶然相同的数组下标。
+            if ($test$plusargs("PROJECT_SWAP_SLOTS")) begin
+                if (cfg.hosts != 2) `uvm_fatal("PROJECT_TEST", "swap case requires two Hosts")
+                cfg.tl_slot_by_host[0] = 1;
+                cfg.tl_slot_by_host[1] = 0;
+            end
             injected_pool = host_mem_pool::type_id::create("platform_pool");
             cfg.host_mem_pool_binding = injected_pool;
 
@@ -102,10 +107,14 @@ package project_env_test_pkg;
                 if (!uvm_config_db#(virtual pcie_tl_if)::get(null, "uvm_test_top",
                         $sformatf("ep_vif_%0d", host.host_id), vif))
                     `uvm_fatal("PROJECT_TEST", "top has no EP VIF")
-                cfg.ep_vifs[$sformatf("EP%0d", host.host_id)] = vif;
+                cfg.ep_vifs[host.host_id] = vif;
             end
             if (negative == "iommu_policy") injected_iommu[0].strict_permission_check = !cfg.vio_cfg.iommu_strict;
-            if (negative == "missing_root") cfg.root_bindings.bindings.delete(0);
+            if (negative == "missing_root") cfg.tl_slot_by_host.delete(0);
+            if (negative == "duplicate_slot") cfg.tl_slot_by_host[1] = cfg.tl_slot_by_host[0];
+            if (negative == "invalid_slot") cfg.tl_slot_by_host[0] = cfg.hosts;
+            if (negative == "missing_native_vif") cfg.rc_vifs.delete(0);
+            if (negative == "reused_native_vif") cfg.rc_vifs[1] = cfg.rc_vifs[0];
             if (negative == "reused_vif" || negative == "null_vif") begin
                 if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(null, "uvm_test_top",
                         "protocol_event_vif_0", protocol_vif))
@@ -150,28 +159,42 @@ package project_env_test_pkg;
             active_functions = 0;
             expect_true(env.shared_pool == injected_pool, "project replaced platform pool");
             expect_true(cfg.dpu_cfg.host_mem_pool_ref == injected_pool, "DPU has a different pool");
-            expect_true(env.reg_backend.device_snapshot == env.device_env.get_snapshot(),
+            expect_true(env.reg_backend.device_snapshot == env.dpu_env.get_snapshot(),
                 "executor backend did not receive authoritative snapshot during DPU build");
-            expect_true(env.reg_backend.virtual_sequencer == env.device_env.pcie_env.v_seqr,
+            expect_true(env.reg_backend.virtual_sequencer == env.pcie_env.v_seqr,
                 "register backend has wrong virtual sequencer");
-            expect_true(env.device_env.get_state() == DPU_DEVICE_RESOLVED,
+            expect_true(env.dpu_env.get_state() == DPU_DEVICE_RESOLVED,
                 "assembly unexpectedly executed device configuration");
+            expect_true(env.dpu_env.get_type_name() == "dpu_device_env" && env.dpu_env.get_parent() == env,
+                "project did not directly create the original DPU env");
+            expect_true(env.pcie_env.cfg == cfg.pcie_cfg && env.pcie_env.global_cfg == null &&
+                env.pcie_env.topology_adapter == null && !env.pcie_env.backend_provider_active,
+                "PCIe did not use the native cfg-only path");
             if ($value$plusargs("PROJECT_EXPECT_HOSTS=%d", expected))
-                expect_true(cfg.hosts == expected && env.device_env.vio_envs.num() == expected, "dpu.hosts not consumed");
+                expect_true(cfg.hosts == expected && env.vio_envs.num() == expected, "dpu.hosts not consumed");
             if ($value$plusargs("PROJECT_EXPECT_PH=%d", expected))
-                expect_true(env.device_env.pcie_env.fc_mgrs[0].posted_header.current == expected, "PCIe credit override not consumed");
+                expect_true(env.pcie_env.fc_mgrs[0].posted_header.current == expected, "PCIe credit override not consumed");
 
-            foreach (env.device_env.vio_envs[h]) begin
+            foreach (env.vio_envs[h]) begin
                 project_vio_probe	vio;
+                int unsigned		slot;
                 bit [63:0]		gpa;
                 iommu_fault_e		fault;
 
-                if (!$cast(vio, env.device_env.vio_envs[h])) `uvm_fatal("PROJECT_TEST", "VIO probe not installed")
-                expect_true(vio.consumes(env.device_env.get_snapshot(), env.device_env.get_resource_snapshot(),
-                    env.device_env.get_resource_manager()), "VIO copied or replaced DPU snapshots");
+                if (!$cast(vio, env.vio_envs[h])) `uvm_fatal("PROJECT_TEST", "VIO probe not installed")
+                slot = cfg.tl_slot_by_host[h];
+                expect_true(vio.get_parent() == env.dpu_env, "VIO is not in the DPU snapshot publication subtree");
+                expect_true(vio.consumes(env.dpu_env.get_snapshot(), env.dpu_env.get_resource_snapshot(),
+                    env.dpu_env.get_resource_manager()), "VIO copied or replaced DPU snapshots");
                 expect_true(vio.host_mem == injected_pool.get_host(h), "VIO uses a private Host manager");
-                expect_true(env.device_env.pcie_env.cfg.host_mem_by_root[h] == vio.host_mem,
+                expect_true(env.pcie_env.cfg.host_mem_by_root[cfg.tl_slot_by_host[h]] == vio.host_mem,
                     "PCIe and VIO do not share Host memory");
+                expect_true(env.pcie_env.rc_agents[slot].rc_driver.mem == vio.host_mem,
+                    "native RC driver did not consume the matching Host memory");
+                expect_true(env.pcie_env.rc_adapters[slot].vif == cfg.rc_vifs[slot],
+                    "native RC adapter has the wrong VIF");
+                expect_true(env.reg_backend.root_by_domain[longint'(h) << 32] == slot,
+                    "register plan selects a different RC slot than VIO");
                 expect_true(vio.iommu == injected_iommu[h], "VIO replaced injected IOMMU");
                 expect_true(vio.iommu.translate_for_host(h, 16'hfffe, cfg.vio_cfg_by_host[h].iova_base,
                     64, DMA_TO_DEVICE, gpa, fault), "preexisting IOMMU mapping lost");
@@ -185,6 +208,8 @@ package project_env_test_pkg;
                     f = vio.function_instances[i];
                     active_functions++;
                     expect_true(f.pcie_id.domain.host_id == h, "Function leaked across Host scope");
+                    expect_true(f.transport.bar.pcie_rc_seqr == env.pcie_env.rc_agents[slot].sequencer,
+                        "Function selected the wrong Host RC sequencer");
                     expect_true(vio.cfg.get_protocol_event_vif(f.pcie_id, vif), "explicit protocol map missing");
                     expect_true(f.driver_agent.monitor.protocol_vif == vif, "monitor consumed a different VIF");
                     foreach (used[j]) expect_true(used[j] != vif, "monitor VIF aliases another Function/Host");
@@ -195,7 +220,7 @@ package project_env_test_pkg;
             end
             if ($value$plusargs("PROJECT_EXPECT_FUNCTIONS=%d", expected))
                 expect_true(active_functions == expected, "wrong active VIO Function count");
-            env.device_env.register_aip_commands();
+            env.register_aip_commands();
             expect_true(virtio_aip_registry::targets.num() == active_functions, "AIP omitted/aliased service targets");
             if (used.size() != 0) check_protocol_api(used[0]);
             #1ns;

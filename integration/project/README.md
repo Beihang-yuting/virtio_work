@@ -1,118 +1,140 @@
-# 项目 env / env_cfg 完整集成
+# 一个 env 和一个 env_cfg：原生 PCIe TL 集成参考
 
-这套参考代码把已经存在的 DPU、PCIe 和 VIO 能力接到一个项目环境中。
-默认 `REAL_DUT`，每 Host 一个 PCIe segment 和一条 RC→EP 链路；
-默认规模为 **1 Host、1 PF、0 VF**，因此不传规模参数也会创建一个 PF VIO 服务。
-代码可直接编译，真实 DUT 的接口、复位、链路和 DMA 服务接入现有平台。
+把 [project_env_cfg.sv](project_env_cfg.sv) 的成员和方法合入你的大 cfg，把
+[project_env.sv](project_env.sv) 的成员和方法合入你的大 env 即可。
+示例中的 `project_` 只是占位命名，可以统一换成项目自己的类名；已有 env/test
+不需要再包一层 `project_env`，也不需要继承 `dpu_device_env`。
 
-`integration/` 是可选参考目录。`project_env_pkg`、`virtio_aip_pkg` 及其测试只由
-新增的独立 filelist 显式编译，不加入原有 filelist，也不被原生产 package 导入或包含。
-原配置类中的条件式 AIP 导入仅服务于 `load_params()`，不依赖本参考组装层。
+**[完整代码展示](../../docs/project_env_full_code.md)** 按 cfg、env、test、package
+顺序展开全部函数体。实际维护的源码在本目录，二者保持一致。
 
-**逐文件、不省略函数体的代码展示：[完整集成代码](../../docs/project_env_full_code.md)。**
+默认 `REAL_DUT`，规模为 **1 Host、1 PF、0 VF**。每 Host 一个 segment 0 和一组
+原生 RC/EP TL 接口，同 Host 的 PF/VF 共用接口。项目层只创建
+`pcie_tl_env_config`，采用 PCIe TL 的 cfg-only 路径。
+不构造 PCIe global/topology 对象，不使用 SVT、Serial VIP 或链路训练。
 
-## 文件和职责
-
-| 文件 | 做什么 |
-| --- | --- |
-| [project_env_cfg.sv](project_env_cfg.sv) | 大 cfg，组合 `dpu_cfg/vio_cfg/pcie_cfg`；一个 `load_params()` 读取参数并创建 Host/PF/VF 输入 |
-| [project_device_env.sv](project_device_env.sv) | 继承 `dpu_device_env`；先解析冻结，再投影 PCIe、创建和连接每 Host 的 VIO |
-| [project_env.sv](project_env.sv) | 顶层共享 pool、默认寄存器 executor/backend 的创建与传递 |
-| [project_base_test.sv](project_base_test.sv) | base test 的 build/run 顺序，以及必须由平台实现的三个接口 |
-| [project_env_pkg.sv](project_env_pkg.sv) | 唯一 package 编译入口，不重复编译 include 源文件 |
-| [project_integration.f](../../filelists/project_integration.f) | 包括所有依赖的示例 filelist；已有工程仅补缺失项 |
-| [project_env_smoke_test.sv](tests/project_env_smoke_test.sv) | 参数、共享句柄、快照、endpoint、协议 VIF 的结构回归 |
-| [project_env_tb.sv](tests/project_env_tb.sv) | 结构回归使用的空闲接口 top，没有 DUT/数据面应答 |
-
-参数仍在原来的配置类注册：DPU 的 `dpu_device_cfg/placement_cfg`、VIO 的
-`virtio_net_env_config`、PCIe 的 `pcie_tl_env_config`。新增大 cfg 负责调用这些入口，
-只额外定义场景规模与公共内存创建策略，不复制它们的所有参数实现。
+`integration/` 始终是可选参考目录，只由独立 filelist 显式编译；原生产
+filelist/package 不导入本目录。已有工程按需合入代码和缺少的依赖，避免重复编译包。
 
 ## 组件与配置关系
 
 ```text
-project_base_test 的具体派生 test
-  cfg : project_env_cfg
+你的 test
+  cfg : 你的 env_cfg extends uvm_object
     dpu_cfg : dpu_device_env_config
       device_cfg / placement_cfg / vio_policy / executor
-    vio_cfg : virtio_net_env_config              全局行为模板
-    vio_cfg_by_host[h] : virtio_net_env_config   各 Host 独立行为对象
-    pcie_cfg : pcie_tl_env_config                PCIe TL 行为
-    pcie_hw_cfg / root_bindings / attachments   物理拓扑与显式映射
-    host_mem_pool_binding / VIF / backend       平台公共句柄
+    vio_cfg : virtio_net_env_config                全局行为模板
+    vio_cfg_by_host[h] : virtio_net_env_config     每 Host 的独立行为配置
+    pcie_cfg : pcie_tl_env_config                  原生 TL 配置
+    tl_slot_by_host[h]                            Host → RC/EP 配对接口下标
+    host_mem_pool_binding / rc_vifs / ep_vifs / protocol_vifs
 
-  env : project_env
-    shared_pool
-    device_env : project_device_env extends dpu_device_env
-      DPU device snapshot / resource snapshot / resource manager
-      pcie_env : pcie_tl_env
+  env : 你的 env extends uvm_env
+    dpu_env : dpu_device_env                      直接创建原类
       vio_h0 : virtio_net_env
-      vio_h1 : virtio_net_env                   多 Host 时创建
+      vio_h1 : virtio_net_env                     多 Host 时创建
+    pcie_env : pcie_tl_env
+    shared_pool / reg_backend
 ```
 
-`virtio_net_env` 自身保持业务环境类型。公共属性通过配置、只读快照与共享句柄取得；
-继承 DPU 的是项目的组装层 `project_device_env`，这样它能在 `super.build_phase()`
-返回后立即使用已冻结的结果，再创建消费者。不要依赖同级组件名字排序来赌 build 顺序。
+关键是 `virtio_net_env::type_id::create(child_name, dpu_env)` 的第二个参数。
+VIO 由你的大 env 创建、句柄保存在 `env.vio_envs[h]`，但在 UVM 树中属于 DPU 子树。
+DPU 会先执行 build 并向自己的子树发布快照，随后 VIO build 才读取它们。
+这利用 UVM 的父子构建顺序，不需要手动调用子组件的 `build_phase()`。
+PCIe 的 cfg-only build 只需要 TL 配置和 Host 内存，可以和 DPU 并列。
 
-| 阶段 | 顺序与效果 |
+| 文件 | 可合入现有项目的内容 |
 | --- | --- |
-| test build | 创建/获取 cfg → `cfg.load_params()` → 注入平台句柄 → 发布 cfg → 创建 env |
-| project env build | 幂等确认参数已加载 → 准备唯一 Host pool → 安装默认 executor/backend → 创建 device_env |
-| device env build | `super.build_phase()` 唯一执行 DPU resolver → 得到冻结结果 → PCIe 投影 → 创建 PCIe/VIO 子环境 |
-| child build | PCIe 创建实际 agent/manager；VIO 消费 DPU 发布的同一 snapshot/resource manager |
-| device env connect | 绑定 native VIF → 全局分配协议 VIF → 绑定寄存器 sequencer/Root → 逐 Function 绑定 PCIe endpoint |
-| test run | 平台就绪 → `configure_device()` → 注册 AIP 命令 → Tcl loop → 等待并检查业务完成 |
+| [project_env_cfg.sv](project_env_cfg.sv) | 配置成员、构造函数、Host/Function 默认输入生成、`load_params()`、Host→slot 校验 |
+| [project_env.sv](project_env.sv) | 共享内存、PCIe 配置、build/connect、VIF/endpoint 绑定、DPU 初始化、Tcl 命令注册 |
+| [project_base_test.sv](project_base_test.sv) | 可选的 test 接入顺序；已有 test 可直接移植方法内容 |
+| [project_env_pkg.sv](project_env_pkg.sv) | 所需 import 和 include 顺序 |
+| [project_integration.f](../../filelists/project_integration.f) | 独立编译入口，已有工程只补缺失项 |
+| [project_env_smoke_test.sv](tests/project_env_smoke_test.sv) | 组合结构、参数和共享对象的验证 |
+| [project_env_tb.sv](tests/project_env_tb.sv) | 结构测试 top，仅有空闲接口，没有 DUT 应答 |
 
-## 公共资源如何传递
+## 构建与运行顺序
 
-| 公共内容 | 来源 | 消费者与约束 |
-| --- | --- | --- |
-| Host/PF/VF、BDF、BAR | DPU resolver 的冻结 device snapshot | VIO 与 PCIe 投影消费同一结果；不能在 PCIe 中再分配另一套地址 |
-| qpair、MSI-X、notify 资源 | DPU resource snapshot/manager | 所有 Host 子环境共享同一组对象，各自按 Host scope 过滤服务 |
-| Host 内存 | `cfg.host_mem_pool_binding`；为空才创建 | DPU 保存中性引用；VIO 按 Host 取 manager；PCIe 按 Root 显式绑定同一个 manager |
-| IOMMU | `cfg.vio_cfg_by_host[h].iommu_binding` | 可注入已有模型；策略须与加载的 VIO cfg 一致；build 不重配已有映射 |
-| PCIe TL 策略 | `cfg.pcie_cfg` | 同一个对象同时发布为 `cfg` 与 `tl_policy_cfg`；拓扑翻译保留行为字段 |
-| PCIe native 接口 | `cfg.rc_vifs[root]`、`cfg.ep_vifs[physical_node_id]` | 各方向独立；在 parent connect 中接实际 adapter |
-| SVT/provider | `cfg.backend_factory` + `pcie_hw_cfg` 链路策略 | 创建与 HDL slot/VIF 配置沿用平台能力；不向 provider adapter 强塞 native VIF |
-| 协议监测 VIF | `cfg.protocol_vifs` 或 top 的 `protocol_event_vif_N` | 所有 Host 统一分配；按完整 `{host,segment,BDF}` 绑定，每个 Function 独占接口 |
-| 寄存器 executor | `cfg.dpu_cfg.executor` | 为空时创建现有 `dpu_pcie_reg_executor + pcie_tl_dpu_reg_backend`；已有 executor 原样保留，由平台连接其 backend |
+| 阶段 | 操作 |
+| --- | --- |
+| test build | 创建/获取 cfg → `load_params()` → 注入平台句柄 → 下发 cfg → 创建你的 env |
+| 大 env build | 准备共享内存 → 填写 PCIe slot/内存绑定 → 安装默认 executor/backend → 直接创建 DPU、PCIe、DPU 下的 VIO |
+| DPU build | resolver 解析并冻结 device/resource snapshots，发布到子树，给 executor 绑定 snapshot |
+| VIO build | 按 Host scope 消费同一份 snapshot/resource manager，创建对应 PF/VF 服务 |
+| PCIe build | 消费同一个 `pcie_cfg`，创建原生 TL agents、adapters、manager |
+| 大 env connect | 绑定 native VIF 和协议 VIF → 绑定寄存器 backend → 逐 Function 绑定 PCIe endpoint |
+| test run | 复位/TL/DMA 服务就绪 → `env.configure_device()` → 注册 AIP → Tcl loop → 业务完成检查 |
 
-外部 pool 已有 Host manager 时只校验 Host 身份、初始化状态、GPA 覆盖和分配策略，
-不再调用 `init_region()`。`dpu.mem_mode/mem_granule` 只决定新建 manager 的算法；
-不能通过构建参数改变已经初始化的外部分配器。
+DPU 和 PCIe 两个同级组件谁先 build 不影响此方案。所有 build 完成后才进入 connect，
+大 env 的 connect 又在子组件 connect 之后执行。
 
-IOMMU 对象有状态，因此不会随 `copy_defaults_from()` 复制。先加载 Host cfg，
-再在 `bind_platform_handles()` 中按 Host 注入。多个 Host 可以共享策略一致的模型，
-但当前 IOMMU requester key 是 `{host,BDF}`，本模板仅建立每 Host 一个 segment；
-同 Host 多 segment、相同 BDF 的 IOMMU 隔离需要平台额外适配。
+## 共享对象与身份映射
 
-## base_test 还需要设置什么
+| 内容 | 来源与传递 |
+| --- | --- |
+| Host/PF/VF、BDF、BAR | `dpu_cfg` 输入经 resolver 冻结；VIO 和寄存器 backend 消费同一 snapshot |
+| qpair、MSI-X、notify 资源 | 所有 Host 的 VIO 共享 DPU resource snapshot/manager，各自按 Host scope 选服务 |
+| Host 内存 | `cfg.host_mem_pool_binding` 为空才创建；DPU 保存引用，VIO 和 PCIe RC driver 使用同一 Host manager |
+| IOMMU | `cfg.vio_cfg_by_host[h].iommu_binding`；已有模型只校验策略，不重建已有映射 |
+| PCIe TL 配置 | `uvm_config_db#(pcie_tl_env_config)::set(this, "pcie_env", "cfg", cfg.pcie_cfg)` |
+| TL 接口 | `cfg.rc_vifs[slot]`、`cfg.ep_vifs[slot]`；两个方向独立，各 slot 不复用 VIF |
+| 协议观察接口 | 优先使用 Host VIO cfg 的完整身份映射；否则用 `cfg.protocol_vifs`，最后查 top 的 `protocol_event_vif_N` |
+| 寄存器 executor | `cfg.dpu_cfg.executor`；为空才创建默认 `dpu_pcie_reg_executor + pcie_tl_dpu_reg_backend` |
 
-常规标量不需要在 base test 逐个赋值。`project_base_test.build_phase()` 已经完成
-`cfg.load_params()` 和 config_db 下发；env 再调用时会幂等返回，不重复随机采样。
+`tl_slot_by_host[h]` 默认 `h → h`，可以在 load 后、env build 前交换映射。例如：
 
-以下内容属于平台的对象/时序，必须接上，不能用标量参数代替：
+```systemverilog
+cfg.load_params();
+cfg.tl_slot_by_host[0] = 1;
+cfg.tl_slot_by_host[1] = 0;
+// rc_vifs/ep_vifs 始终按接口 slot 填写，不随 Host 编号重新解释。
+```
 
-1. `bind_platform_handles()`：注入已有 pool/IOMMU、native VIF 或 backend factory。
-   top 若已把完整 `project_env_cfg` 作为 `project_cfg` 交给 test，该方法可显式为空。
-2. `prepare_platform()`：确认 reset deassert、link ready、Host DMA 路由及检查器准备完成。
-   平台提供超时和错误处理；此后才能执行 DPU 寄存器计划。
-3. `finish_platform()`：等业务完成，检查网络数据、DMA、PCIe SCB、协议断言与资源回收。
-   `vio_tx` 返回只代表提交，不能只等待 Tcl 退出就宣告业务完成。
+映射必须覆盖每个 Host，slot 唯一且恰好覆盖 `0..Host数-1`。
+同 Host 的 PF/VF 共用该 slot；不能把 Function 数量作为 `num_ep`。
+不同 Host 可以使用相同数值 BDF，路由时同时考虑 Host/segment。
+此参考限制每 Host 一个 segment 0；多 segment、Switch 或同 Host 多物理端点需要另行适配。
 
-因此基类是 **virtual class**，无 factory 注册；现有具体 test 实现上述接口后再
-使用 `uvm_component_utils` 注册。不能直接 `+UVM_TESTNAME=project_base_test`。
-结构回归使用可直接运行的 `project_env_smoke_test`，其目的和范围不同。
+REAL_DUT 下 BDF/BAR 直接来自 DPU snapshot，不必再镜像到 `pcie_cfg.device_cfgs`。
+原生 TL 库内部仍编译其公共 topology 类型，这不要求项目创建 global/topology 配置。
 
-`configure_device()` 内部调用 `build_vio_register_plan/apply_vio_register_plan`，
-计划已经包含 bootstrap。不要提前调用 `apply_bootstrap()`，否则 DPU 状态会从
-RESOLVED 进入 ACTIVE，无法再按该顺序应用 VIO 初始化计划。
+外部 pool 已有 Host manager 时，代码只校验身份、初始化状态、GPA 覆盖与分配策略，
+不会重调 `init_region()`。`dpu.mem_mode/mem_granule` 只影响新建 manager。
+IOMMU 有状态，不通过 `copy_defaults_from()` 复制；应在 load 后逐 Host 注入。
+已有 executor 的 backend 连接继续由平台负责，参考代码不会替换它。
 
-实际 DUT 若需要 QSCH/数据面额外计划，在 build 前把已有的
-`dpu_vio_dataplane_plan_extension` 放入 `cfg.dpu_cfg.vio_dataplane_extension`。
-模板不会猜测硬件的端口、QSCH 或网络拓扑。
+## 现有 test 需要保留什么
 
-## 参数示例
+常规标量由 `cfg.load_params()` 读取，base test 无须逐个设置 Host 数、queue_size、credit。
+这里的大 cfg 对 load 做了单次保护，env 再调用不会重复采样或追加 Host。
+平台对象和时序仍要接入：
+
+1. build 中在 load 后注入 RC/EP VIF、协议 VIF，以及已有 pool/IOMMU；再把大 cfg
+   以 `"cfg"` 下发给自己的 env。单 Host 默认使用 slot 0。
+2. run 中等待平台复位释放、TL 接口和 requester-aware DMA 服务就绪，并设置超时。
+3. 调用 `env.configure_device()`，随后调用 `env.register_aip_commands()`，启动一次
+   `aip_tcl_bridge::run_loop()`。
+4. Tcl 返回后等待业务真正完成，检查报文、DMA、PCIe/协议监测和资源回收，再结束 objection。
+
+[project_base_test.sv](project_base_test.sv) 把平台步骤定义成三个 pure virtual hook：
+`bind_platform_handles()`、`prepare_platform()`、`finish_platform()`。
+它是运行顺序参考，不能直接作为 `UVM_TESTNAME`；你的 test 可以保持原有继承关系，
+把这些操作合入已有 build/run，不必再继承这个示例。
+
+`configure_device()` 调用 `build_vio_register_plan/apply_vio_register_plan`，其中已经包含
+bootstrap。不要先单独调用 `apply_bootstrap()`，也不要重复初始化。
+若平台已有完整初始化流程，应在一个地方统一负责寄存器计划。
+额外 VTX/VRX/QSCH 数据面配置依然由平台适配；需要的扩展在 build 前放入
+`cfg.dpu_cfg.vio_dataplane_extension`。本次组合调整不会补齐这些硬件配置。
+
+REAL_DUT 的 IOVA→GPA DMA 路由沿用平台现有服务。多 Function 共用 RC 时，
+不能反复给同一个 `rc_driver.mem` 赋单 requester proxy；需要按 requester BDF
+选正确的 IOMMU 域。本参考不新增 DMA 路由器。
+
+## 参数与 Tcl 示例
+
+参数路径与 env 的组件名、层次无关，仍为 `dpu.*`、`vio.*`、`pcie_cfg.*`。
+注册实现保留在原配置类，大 cfg 只负责按构建顺序调用和生成场景输入。
 
 ```text
 +dpu.hosts=2
@@ -127,21 +149,19 @@ RESOLVED 进入 ACTIVE，无法再按该顺序应用 VIO 初始化计划。
 +pcie_cfg.cpl_timeout_ns=200000
 ```
 
-这个场景创建 2 个 Host，每个 Host 有 PF0 和 VF0/VF1，VIO 服务默认放在 VF 上，
-总计 4 个服务；PF 仍保留控制/AF 能力。`dpu.vfs_per_pf=0` 时服务改放 PF。
-`dpu.qpairs` 是 DPU **预留总量**，`vio.pairs` 是服务 **初始活动量**；
-后者不能增加资源，超过分配量会受现有 VIO 配置接口的上限约束。
-未传 `dpu.qpairs` 时，模板按候选数 × 各 Host 最大初始 pairs 预留。
+该场景有 2 个 Host，每个 Host 的 PF0 下有 VF0/VF1，VIO 默认放在 VF，共 4 个服务。
+`dpu.vfs_per_pf=0` 时服务放在 PF。`dpu.qpairs` 是预留总量，`vio.pairs` 是每个服务
+初始活动量；未指定前者时按候选数 × 各 Host 最大初始 pairs 预留。
+Function 级 pairs 覆盖仍受分配容量限制，增加初始量时要同时确保预留足够。
 
-路径覆盖顺序由代码实现：`vio` 模板 → `vio.hN` → `vio.hN.pfN[.vfN].iN`。
-Host 资源同样为 `dpu` 模板 → `dpu.hN`。Function 的 BDF/BAR 参数直接加载
-`dpu.hN.pfN[.vfN]`。完整字段列表见 [AIP 参数说明](../../docs/aip_parameters.md)。
+覆盖顺序为 `vio` → `vio.hN` → `vio.hN.pfN[.vfN].iN`；
+Host 输入为 `dpu` → `dpu.hN`，Function 参数在 `dpu.hN.pfN[.vfN]` 加载。
+详细字段见 [AIP 参数说明](../../docs/aip_parameters.md)。
 
-构建完成后的 `set_param dpu.*`、`set_param pcie_cfg.*` 不会自动重新解析/重配环境。
-运行期可变的是每次 sequence 重新采样的 `vio.tx.*`、`vio.rx.*` 等参数：
+平台完成 DPU 初始化、进入 AIP bridge 后，默认单 PF 场景可以执行：
 
 ```tcl
-set_param vio.target h0.pf0.vf0.i0
+set_param vio.target h0.pf0.i0
 set_param vio.tx.kind ETH_IPV4_UDP
 set_param vio.tx.len 128
 vio_init
@@ -149,42 +169,27 @@ vio_start
 vio_tx count=100
 ```
 
-在平台已完成 DPU 初始化并进入 AIP bridge 后执行上述命令；Tcl 的加载/控制入口
-沿用 `aip_core/update`，参见现有 [AIP Tcl 示例](../../examples/aip/cases/tx_smoke.tcl)。
-停止、复位前要等待实际业务完成，不能把 `count=100` 的提交完成当成设备已消费完成。
+VF 场景把 target 改成如 `h0.pf0.vf0.i0`。`vio_tx` 返回表示提交完成，设备消费和
+报文完成还要由平台等待检查。构建后的 `set_param dpu.*`、`vio.queue_size`、
+`pcie_cfg.*` 不自动重建环境；运行期只更新下一条 sequence 会重新采样的参数。
 
-## 沿用现有物理拓扑 / 已有逻辑配置
+## 已经有 Host/PF/VF 输入的项目
 
-默认 `load_params()` 自动建立直连图。自定义物理图时，在 load 前同时提供：
+示例 `load_params()` 默认负责创建一套 `hosts/functions/placement`。
+若你的 cfg 已经建立这些对象，应把原配置类的 `load_params()` 调用合入已有的
+输入构造代码，省去示例的重复生成循环。不要先填满 DPU 输入再调用这个默认生成器，
+它会明确拒绝覆盖非空输入。保留单次加载标志、`vio_cfg_by_host`、Host→slot 映射和
+执行 profile 对 PCIe 字段的设置即可；不必为此增加一个 cfg 派生层。
 
-- `pcie_hw_cfg.topology` 及其 link/backend policy；
-- `root_bindings`：明确 `{host,segment} → Root`；
-- `attachments`：明确 `{host,pf,kind,vf} → physical EP node/link`。
+默认 REAL_DUT 对应 `SV_IF_MODE`、RC active、EP passive、`ep_auto_response=0`。
+保留的 MODEL 入口需要平台提供真实 Virtio 模型和共享 completion adapter；
+普通 EP 自动应答不等价于 Virtio 设备模型。
 
-这些映射保留原样，随后由 snapshot adapter 验证。也可在 load 后、env build 前
-整体替换三者，但不能只改其中一张表。native VIF 的 EP key 是物理节点 ID，
-不是 Function 下标。provider 需为被测试 Host 提供 VIP-owned RC sequencer；
-只有真实 DUT RC、没有模拟 Host RC 的拓扑不能运行这套 Guest driver。
+## 编译与验证
 
-已由项目完整构建 DPU `hosts/functions/placement` 时，派生 `project_env_cfg`
-并覆盖 `load_params()`，在项目自己的 authoring 点调用原类加载入口。默认模板
-会拒绝覆盖非空逻辑配置，避免重复追加 Host/PF/VF。派生实现也应保持单次加载，
-并填好 `vio_cfg_by_host`、物理映射和 PCIe 行为策略。
-
-MODEL 模式还需要真正的 Virtio 设备模型和一个共享 `completion_adapter`。
-模板在 PCIe build 前安装该 adapter 的 factory overrides；设备模型/EP port
-由平台根据冻结快照准备。普通 PCIe EP 自动应答不等价于 Virtio 设备。
-
-REAL_DUT 的 IOVA→GPA DMA 路由沿用平台现有服务。多 Function 共用 Root 时，
-不能反复把单 requester 的 `virtio_pcie_iova_host_mem_proxy` 赋给同一个 `rc_driver.mem`；
-这样最后一次会覆盖前面的配置。必须由平台按 requester BDF 路由到对应的 IOMMU 域。
-
-## 编译和结构验证
-
-在 `10.11.10.53` 加载 VCS 环境，从 virtio_work 根目录运行，设置五个依赖根：
-`AIP_CORE_ROOT`、`DPU_COMMON_ROOT`、`NET_PACKET_ROOT`、`HOST_MEM_ROOT`、`PCIE_WORK_ROOT`。
-AIP 必须是 update 分支含 `src/sv` 的布局；本地旧 flat layout 不匹配。
-已有大工程按 filelist 顺序补包即可，不能重复编译 UVM/Host memory/PCIe/VIO package。
+在 `10.11.10.53` 的 VCS 环境运行；从仓库根目录使用独立 filelist。
+设置五个依赖根：`AIP_CORE_ROOT`、`DPU_COMMON_ROOT`、`NET_PACKET_ROOT`、
+`HOST_MEM_ROOT`、`PCIE_WORK_ROOT`。AIP 使用含 `src/sv` 的 update 分支布局。
 
 ```bash
 mkdir -p build/project
@@ -198,25 +203,20 @@ vcs -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps \
   -l build/project/smoke.log
 ```
 
-这个测试不执行寄存器计划、不发送数据；它验证环境已正确组装。
-真实用例应切换到已有平台 top 和 `project_base_test` 的具体派生 test。
+结构测试不执行 DUT 寄存器计划、不发送报文；它检查对象构建、参数、接口和身份绑定。
+真实收发使用项目自己的 top、DUT、DMA 服务和 test 收尾检查。
 
-## 本次验证结果（2026-11-06）
-
-在 `10.11.10.53` 使用 VCS W-2024.09-SP1 验证，未在本机运行仿真。
-最终结构回归和既有 AIP 回归编译均无 VCS warning/error。
+2026-11-06 在 `10.11.10.53` 的组合式参考结构回归结果：
 
 | 场景 | 结果 |
 | --- | --- |
-| 默认 1 Host / 1 PF 服务 | 25 项检查通过 |
-| 2 Host / 各 2 VF 服务，queue=512、PH credit=23 | 52 项检查通过，共 4 个活动服务 |
-| 2 Host / 各 1 PF 服务 | 36 项检查通过 |
-| IOMMU 策略不匹配、缺 Root 映射、空 VIF、跨 Host 复用 VIF | 各自命中预期生产 fatal，无 timeout |
-| 既有 `virtio_aip_params_test` | 34 项检查通过 |
-| 既有 `virtio_aip_command_test` | 通过 |
-| 既有 MODEL `virtio_aip_driver_test` + Tcl `tx_smoke` | init/start/tx4/stop/reset 通过；PCIe matched/completions=111/111，pending/trackers/dedup=0 |
+| 默认 1 Host / 1 PF 服务 | 32 项检查通过 |
+| 2 Host / 每 Host 2 VF 服务，queue=512、PH credit=23 | 66 项检查通过 |
+| 2 Host / 每 Host 2 PF 服务 | 61 项检查通过 |
+| 2 Host 使用同值 BDF、交换 RC/EP slot | 48 项检查通过 |
+| IOMMU 策略冲突、缺 Host 映射、重复/越界 slot、缺/复用 native VIF、空/复用协议 VIF | 8 个负例均命中预期生产 fatal，无超时 |
+| 既有 AIP 参数 / command 兼容测试 | 参数 34 项检查通过；命令测试通过 |
 
-所有正例的 UVM warning/error/fatal 均为 0，严格日志检查通过。
-MODEL 兼容回归复用原有 fixture，用于确认旧 IOMMU 创建和协议 VIF slot 路径继续可用；
-它不是新项目组装层连接真实 RTL 的证明。本次未验证平台真实 RTL、Serial/SVT 链路、
-多 requester DMA 数据面及项目业务检查器。
+项目和 AIP 编译均通过，VCS warning/error 为 0；所有正例和兼容测试的 UVM
+warning/error/fatal 均为 0。检查包含快照和共享内存句柄、
+原生 cfg-only 路径、实际 RC sequencer/VIF、Host 隔离以及 AIP 目标注册。

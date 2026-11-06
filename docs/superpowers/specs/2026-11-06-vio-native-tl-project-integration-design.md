@@ -2,7 +2,9 @@
 
 日期：2026-11-06
 
-状态：待用户审阅；本文件描述拟实施结构，源码尚未按本方案修改。
+状态：已按用户补充的“不要继承 dpu_device_env，直接创建”更新结构并实现参考代码。
+完整源码见 `integration/project/`；本文件取代最初的 DPU 继承方案。
+组合结构与 AIP 定向 VCS 回归已通过，结果见 `integration/project/README.md`。
 
 ## 1. 用户需求与范围
 
@@ -21,25 +23,24 @@
 
 ## 2. 结构选择
 
-采用 `project_env extends dpu_device_env`，将现有 `project_env` 与
-`project_device_env` 合并。父类负责 DPU 资源解析，项目类负责共享资源准备、
-PCIe/VIO 创建和连接。继承不会额外产生一个 `device_env` 子组件。
+采用 `project_env extends uvm_env`，由它直接创建原有 `dpu_device_env`、
+`pcie_tl_env` 和 `virtio_net_env`。用户可以将成员和方法合入已有 env，
+无需改变现有继承关系或另包一层项目 env。
 
-不采用以下两种方式：
-
-- 仅把 `global_cfg` 隐藏在项目 env 内部：仍然保留本项目不需要的图转换链路。
-- 将 DPU、PCIe、VIO 分成三个并列子 env 后依赖 build 名字顺序：父组件 build
-  返回时子组件尚未全部构建，无法保证创建 PCIe/VIO 前已取得 DPU 冻结快照。
+VIO 创建时使用 `parent=dpu_env`：UVM 先执行 DPU build，向其子树发布冻结快照，
+再执行 VIO build。项目 env 保留 VIO 句柄并在 connect 中完成跨组件连接。
+这同时满足直接创建与快照发布时间要求，不依赖同级名字顺序、不手调子组件 build，
+也不增加 DPU 子类或修改 DPU 库 API。
 
 目标组件结构：
 
 ```text
 现有 test
-└── 现有大 env（可以直接采用下述项目 env，也可以包含它）
-    └── project_env extends dpu_device_env
-        ├── pcie_env : pcie_tl_env
-        ├── vio_envs[host_id] : virtio_net_env
-        └── shared_pool / reg_backend
+└── 现有大 env extends uvm_env（合入 project_env 的成员和方法）
+    ├── dpu_env : dpu_device_env
+    │   └── vio_hN : virtio_net_env（句柄保存在大 env 的 vio_envs[host_id]）
+    ├── pcie_env : pcie_tl_env
+    └── shared_pool / reg_backend
 ```
 
 `project_base_test` 继续是可选运行顺序参考；已有 test 不必改变继承关系。
@@ -68,7 +69,7 @@ package、base_test 和 HDL top 仍是各自的编译/运行入口，“一个 e
 - `root_bindings`、`attachments` 两个复杂映射对象，以及图节点/链路 ID 查找。
 - `backend_factory`、SVT/provider 选择、HDL slot/Serial bridge 相关分支。
 - `build_physical_config()`、`project_pcie_config()` 和 topology adapter 依赖。
-- `project_device_env` 类及 `env.device_env` 这一层访问路径。
+- 项目自定义的 `project_device_env` 类；改用原有 `dpu_device_env` 的 `env.dpu_env` 句柄。
 
 `tl_slot_by_host` 缺省按参考场景的 Host 编号绑定；用户可在子 env 构建前整体覆盖。
 校验要求：每个 Host 有且只有一个 slot，slot 为连续的 `0..hosts-1` 且不重复。
@@ -99,14 +100,18 @@ package、base_test 和 HDL top 仍是各自的编译/运行入口，“一个 e
 
 1. 获取 `project_env_cfg`，幂等执行 `load_params()`。
 2. 准备或借用唯一 Host pool；注入每 Host VIO 配置，校验已存在 manager 的范围和策略。
-3. 准备默认 `dpu_pcie_reg_executor + pcie_tl_dpu_reg_backend`，或保留平台 executor。
-   必须先安装 backend，再让 DPU 父类绑定 snapshot。
-4. 将 `cfg.dpu_cfg` 发布到本组件供父类读取，调用 `super.build_phase()`。
-   DPU resolver 只运行一次，发布同一份 device/resource snapshot 与 resource manager。
-5. 校验 Host→slot 映射，给 `pcie_cfg` 填入 TL 组件数量、Root 内存及 EP→Root 绑定。
+3. 校验 Host→slot 映射，给 `pcie_cfg` 填入 TL 组件数量、Root 内存及 EP→Root 绑定。
+4. 准备默认 `dpu_pcie_reg_executor + pcie_tl_dpu_reg_backend`，或保留平台 executor。
+   必须先安装 backend，后续 DPU 子组件 build 才能给它绑定 snapshot。
+5. 将 `cfg.dpu_cfg` 发布到 `"dpu_env"`，直接创建原类 `dpu_device_env`。
 6. 只用 `uvm_config_db#(pcie_tl_env_config)` 的 `"cfg"` 入口创建 `pcie_env`。
    不下发 `global_cfg`、`topology_cfg` 或 `tl_policy_cfg`。
-7. 创建每 Host 的 VIO 子环境，共享父类已经发布的快照与资源管理器。
+7. 给 `dpu_env` 下的 `vio_hN` 发布各 Host VIO cfg，并以 `dpu_env` 为 parent 创建 VIO。
+
+项目 env 的 `super.build_phase()` 仅调用 UVM 基类；返回后不代表 DPU 子组件已构建。
+项目 build 不查询 snapshot。UVM 随后执行 DPU build，resolver 唯一解析一次并发布
+device/resource snapshot 和 manager，VIO 子组件在自己的 build 中消费这些对象。
+PCIe build 不需要该快照，因此与 DPU 并列不会引入构建顺序依赖。
 
 `project_env.connect_phase()`：
 
@@ -148,7 +153,7 @@ aip_tcl_bridge::run_loop()
 
 | 文件 | 调整 |
 | --- | --- |
-| `integration/project/project_env.sv` | 合并共享资源准备、DPU 派生、PCIe/VIO 构建连接及运行方法 |
+| `integration/project/project_env.sv` | 组合共享资源、原有 DPU、PCIe/VIO 构建连接及运行方法，仅继承 uvm_env |
 | `integration/project/project_env_cfg.sv` | 删除 global/topology/provider 配置，增加简单 Host→slot 映射 |
 | `integration/project/project_device_env.sv` | 职责合并后删除 |
 | `integration/project/project_base_test.sv` | 使用直接 env 方法，更新平台准备说明 |
@@ -171,6 +176,7 @@ aip_tcl_bridge::run_loop()
 - 增加或调整 Host→slot 交换的验证：同 Host 多 PF/VF 共用一组接口，两个 Host
   使用相同数值 BDF 时仍各自选择正确 sequencer、Host memory 和 IOMMU 域。
 - 验证 DPU resolver 结果只产生一次，VIO 与寄存器 backend 使用相同 snapshot。
+- 验证直接创建的 DPU 类型和父组件，VIO 位于 DPU 快照发布子树。
 - 验证原生 cfg-only 生效：没有 global/topology/provider 活动对象；保留用户
   `pcie_cfg` 行为设置，尤其 SCB、Completion timeout 和信用配置。
 - 缺 Host 映射、重复/越界 slot、缺 native VIF、协议 VIF 复用和 IOMMU 策略不匹配

@@ -1,6 +1,6 @@
 // integration/project：可继承的 AIP base_test，由 project_env_pkg 最后包含。
 // 依赖本目录 env/cfg 与 AIP bridge；基类拥有 objection 和统一配置/命令入口。
-// 不知道平台的 reset/link/DMA/业务完成信号，故将这三处保留为强制实现的接口，
+// 不知道平台的 reset/TL 接口/DMA/业务完成信号，故将这三处保留为强制实现的接口，
 // 防止空 hook 假装平台已准备好。派生 test 用 factory 注册，本虚类不注册 factory。
 virtual class project_base_test extends uvm_test;
     project_env_cfg	cfg;
@@ -11,11 +11,11 @@ virtual class project_base_test extends uvm_test;
         super.new(name, parent);
     endfunction
 
-    // 在 cfg 加载后、env 构建前注入平台 pool/IOMMU/VIF/backend 等句柄。
+    // 在 cfg 加载后、env 构建前注入平台 pool/IOMMU/VIF 等句柄。
     // cfg 若已由 top 完整注入，派生类可显式提供空实现；此 hook 不重新 load_params。
     pure virtual function void bind_platform_handles();
 
-    // 等待真实复位/链路就绪，准备 requester-aware DMA 和设备模型/网络检查器。
+    // 等待真实复位/TL 接口就绪，准备 requester-aware DMA 和设备模型/网络检查器。
     // 必须有平台自己的超时及错误处理；返回即授权后续 DPU 寄存器计划访问设备。
     pure virtual task prepare_platform();
 
@@ -40,8 +40,8 @@ virtual class project_base_test extends uvm_test;
     virtual task run_phase(uvm_phase	phase);
         phase.raise_objection(this);
         prepare_platform();
-        env.device_env.configure_device();
-        env.device_env.register_aip_commands();
+        env.configure_device();
+        env.register_aip_commands();
         aip_tcl_bridge::run_loop();
         finish_platform();
         phase.drop_objection(this);
