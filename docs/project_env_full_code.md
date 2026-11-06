@@ -5,6 +5,10 @@
 `uvm_config_db` 的类型即可。已有 env 维持自己的基类，本示例使用 `uvm_env`。
 不需要把 `project_env` 再实例化在你的 env 中，也不需要任何 DPU 派生类。
 
+env 和 env_cfg 的方法全部采用类内 `extern` 声明、类外实现，仍放在各自同一个
+`.sv` 文件中。合入时要同时保留声明与实现，并把类外 `project_env::` /
+`project_env_cfg::` 同步改为你的类名；方法实现放在类外、同一个 package 作用域内。
+
 ```text
 你的 env extends uvm_env
 ├── dpu_env : dpu_device_env
@@ -58,6 +62,7 @@ Intel cfg/VIF 在 `prepare_intel_bindings()` 中、PCIe 子组件 build 之前�
 ```systemverilog
 // integration/project：项目级配置组合与参数构建示例。
 // 依赖 DPU、PCIe TL、Intel adapter、VIO 与 AIP；由 project_env_pkg 按顺序包含。
+// 类内集中声明配置成员和 extern 方法；全部实现在本文件类外展开，无额外编译入口。
 // cfg 拥有创建的配置对象，借用平台注入的 pool、IOMMU 与 VIF。
 // load_params 只生成输入，不解析快照、不创建组件、不访问 DUT；每个对象只加载一次。
 // 每 Host 一个 segment 0 和一组 TL 接口；PF/VF 共用接口，不配置 SVT 或链路训练。
@@ -65,319 +70,515 @@ Intel cfg/VIF 在 `prepare_intel_bindings()` 中、PCIe 子组件 build 之前�
 class project_env_cfg extends uvm_object;
     `uvm_object_utils(project_env_cfg)
 
+    // 三类子配置由本对象创建；每个 Host 的 VIO 配置在加载参数后独立生成。
     dpu_device_env_config	dpu_cfg;
     virtio_net_env_config	vio_cfg;
     virtio_net_env_config	vio_cfg_by_host[int unsigned];
     pcie_tl_env_config		pcie_cfg;
-    // 值是 RC agent 下标；EP 由真实 DUT 提供。缺省 h→h，PF/VF 共用 Host 的 slot。
-    int unsigned			tl_slot_by_host[int unsigned];
 
-    host_mem_pool			host_mem_pool_binding;
-    alloc_mode_e			host_mem_mode = MODE_BUDDY;
-    int unsigned			host_mem_granule = DEFAULT_MIN_GRANULE;
+    // 值是 RC agent 下标；EP 由真实 DUT 提供。缺省 h→h，PF/VF 共用 Host 的 slot。
+    int unsigned	tl_slot_by_host[int unsigned];
+
+    // 借用平台已有 pool；分配模式和粒度只作用于需要新建的 Host manager。
+    host_mem_pool	host_mem_pool_binding;
+    alloc_mode_e	host_mem_mode    = MODE_BUDDY;
+    int unsigned	host_mem_granule = DEFAULT_MIN_GRANULE;
 
     // 按物理 RC slot 索引，不是按 PF/VF 索引；同一 Host 的 Function 共用端口。
     // 平台可注入句柄，或由 bind wrapper 向实际 adapter 路径发布；env 会复用并校验。
     // Intel cfg 没有 load_params；这里不宣称 pcie_cfg.intel.* 已自动注册。
     intel_pcie_adapter_config	intel_cfg_by_slot[int unsigned];
-    intel_pcie_vif_t			intel_rc_vifs[int unsigned];
+    intel_pcie_vif_t		intel_rc_vifs[int unsigned];
 
     virtual virtio_protocol_event_if	protocol_vifs[$];
 
     // 这是配置生成规模，不是另一套已解析拓扑；最终身份以 DPU snapshot 为准。
-    longint unsigned	hosts = 1;
-    longint unsigned	pfs_per_host = 1;
-    longint unsigned	vfs_per_pf = 0;
+    longint unsigned	hosts         = 1;
+    longint unsigned	pfs_per_host  = 1;
+    longint unsigned	vfs_per_pf    = 0;
     protected bit	params_loaded = 0;
 
-    // 创建配置容器；固定 REAL_DUT，实际 Intel 接口由 bind wrapper 或平台注入。
-    // new 不读取 plusargs，允许派生用例在 load_params 前修改场景默认值。
-    function new(string	name = "project_env_cfg");
-        super.new(name);
-        dpu_cfg = dpu_device_env_config::type_id::create("dpu_cfg");
-        vio_cfg = virtio_net_env_config::type_id::create("vio_cfg");
-        pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
-        vio_cfg.execution_mode = VIRTIO_EXEC_REAL_DUT;
-        dpu_cfg.device_cfg.af_request.mode = DPU_AF_SELECTED;
-        dpu_cfg.device_cfg.af_request.requester =
-            '{host_id:0, pf_id:0, kind:DPU_FUNCTION_PF, vf_id:0};
-    endfunction
-
-    // 构造全局 Host 模板；GPA 和 MMIO 分开，BDF 范围覆盖默认 PF/VF 规模。
-    // 每 Host 的 identity 和参数覆盖由 load_params 设置，不在这里解析实际地址。
-    protected function dpu_host_cfg make_host_template();
-        dpu_host_cfg		host;
-        dpu_pcie_domain_cfg	domain;
-        dpu_mmio_window_cfg	window;
-        dpu_bdf_range_t		bdf_range;
-
-        host = dpu_host_cfg::type_id::create("host_template");
-        host.has_gpa_aperture = 1;
-        host.gpa_base = 64'h0000_1000_0000_0000;
-        host.gpa_limit = host.gpa_base + 64'h1000_0000;
-        domain = dpu_pcie_domain_cfg::type_id::create("domain_template");
-        domain.key = '{host_id:0, segment_id:0};
-        bdf_range = '{first_bdf:16'h0010, last_bdf:16'h0fff};
-        domain.bdf_ranges.push_back(bdf_range);
-        window = dpu_mmio_window_cfg::type_id::create("mmio_template");
-        window.base = 64'h0000_0020_0000_0000;
-        window.limit = window.base + 64'h0000_0001_0000_0000;
-        window.allowed_roles = '{DPU_BAR_DEVICE_MEMORY, DPU_BAR_MAILBOX, DPU_BAR_MSIX};
-        domain.mmio_windows.push_back(window);
-        domain.bar_placement_policy = DPU_BAR_PLACEMENT_RANDOM;
-        host.pcie_domains.push_back(domain);
-        return host;
-    endfunction
-
-    // 按 Host/PF/VF 身份创建 Function，并从 DUT caps 取得 BAR 规格。
-    // 全部 BAR/BDF 均由 resolver 最终放置；未知规格立即 fatal，不能制造设备能力。
-    protected function dpu_function_cfg make_function(
-        int unsigned	host_id,
-        int unsigned	pf_id,
-        dpu_function_kind_e	kind,
-        int unsigned	vf_id
+    // 创建默认子 cfg，不读取参数；默认构造名字只在此声明，类外实现沿用该接口。
+    extern function	new(
+        string	name = "project_env_cfg"
     );
-        dpu_function_cfg	f;
-        dpu_bar_role_e		roles[3] = '{DPU_BAR_DEVICE_MEMORY, DPU_BAR_MAILBOX, DPU_BAR_MSIX};
-        string			why;
 
-        f = dpu_function_cfg::type_id::create(
-            $sformatf("fn_h%0d_pf%0d_%0d_vf%0d", host_id, pf_id, kind, vf_id));
-        f.key = '{host_id:host_id, pf_id:pf_id, kind:kind, vf_id:vf_id};
-        f.domain_key = '{host_id:host_id, segment_id:0};
-        f.bdf_mode = DPU_ALLOC_AUTO;
-        f.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
-        foreach (roles[i]) begin
-            dpu_bar_profile_t	profile;
-            dpu_bar_request	bar;
+    // 仅首次调用加载参数并生成 Host/PF/VF 输入，拒绝覆盖已有拓扑或越过硬件容量。
+    extern virtual function void	load_params();
 
-            if (!dpu_cfg.device_cfg.dut_caps.lookup_bar_profile(kind, roles[i], profile, why))
-                `uvm_fatal("PROJECT_CFG", why)
-            bar = dpu_bar_request::type_id::create($sformatf("bar_%0d", i));
-            bar.role = profile.role;
-            bar.even_bar_id = profile.even_bar_id;
-            bar.size = profile.size;
-            bar.alignment = profile.alignment;
-            bar.placement = DPU_ALLOC_AUTO;
-            f.bars.push_back(bar);
+    // 只读校验 Host→slot 的完整一一映射，失败通过 why 返回原因，不修补配置。
+    extern function bit	validate_tl_mapping(
+        output string	why
+    );
+
+    // 创建未解析的 Host 地址模板；调用者后续填写身份并加载 Host 级参数。
+    extern protected function dpu_host_cfg	make_host_template();
+
+    // 按完整身份和 DUT BAR 能力生成一个 Function；能力缺失时立即报告 fatal。
+    extern protected function dpu_function_cfg	make_function(
+        int unsigned		host_id,
+        int unsigned		pf_id,
+        dpu_function_kind_e	kind,
+        int unsigned		vf_id
+    );
+endclass
+
+
+// 创建配置容器；固定 REAL_DUT，实际 Intel 接口由 bind wrapper 或平台注入。
+// new 不读取 plusargs，允许派生用例在 load_params 前修改场景默认值。
+function	project_env_cfg::new(
+    string	name
+);
+    super.new(name);
+
+    dpu_cfg  = dpu_device_env_config::type_id::create("dpu_cfg");
+    vio_cfg  = virtio_net_env_config::type_id::create("vio_cfg");
+    pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
+
+    vio_cfg.execution_mode = VIRTIO_EXEC_REAL_DUT;
+
+    dpu_cfg.device_cfg.af_request.mode      = DPU_AF_SELECTED;
+    dpu_cfg.device_cfg.af_request.requester = '{
+        host_id: 0,
+        pf_id:   0,
+        kind:    DPU_FUNCTION_PF,
+        vf_id:   0
+    };
+endfunction
+
+
+// 构造全局 Host 模板；GPA 和 MMIO 分开，BDF 范围覆盖默认 PF/VF 规模。
+// 每 Host 的 identity 和参数覆盖由 load_params 设置，不在这里解析实际地址。
+function dpu_host_cfg	project_env_cfg::make_host_template();
+    dpu_host_cfg	host;
+    dpu_pcie_domain_cfg	domain;
+    dpu_mmio_window_cfg	window;
+    dpu_bdf_range_t	bdf_range;
+
+    host = dpu_host_cfg::type_id::create("host_template");
+
+    host.has_gpa_aperture = 1;
+    host.gpa_base         = 64'h0000_1000_0000_0000;
+    host.gpa_limit        = host.gpa_base + 64'h1000_0000;
+
+    domain     = dpu_pcie_domain_cfg::type_id::create("domain_template");
+    domain.key = '{
+        host_id:    0,
+        segment_id: 0
+    };
+
+    bdf_range = '{
+        first_bdf: 16'h0010,
+        last_bdf:  16'h0fff
+    };
+
+    domain.bdf_ranges.push_back(bdf_range);
+
+    window = dpu_mmio_window_cfg::type_id::create("mmio_template");
+
+    window.base          = 64'h0000_0020_0000_0000;
+    window.limit         = window.base + 64'h0000_0001_0000_0000;
+    window.allowed_roles = '{
+        DPU_BAR_DEVICE_MEMORY,
+        DPU_BAR_MAILBOX,
+        DPU_BAR_MSIX
+    };
+
+    domain.mmio_windows.push_back(window);
+    domain.bar_placement_policy = DPU_BAR_PLACEMENT_RANDOM;
+
+    host.pcie_domains.push_back(domain);
+
+    return host;
+endfunction
+
+
+// 按 Host/PF/VF 身份创建 Function，并从 DUT caps 取得 BAR 规格。
+// 全部 BAR/BDF 均由 resolver 最终放置；未知规格立即 fatal，不能制造设备能力。
+function dpu_function_cfg	project_env_cfg::make_function(
+    int unsigned	host_id,
+    int unsigned	pf_id,
+    dpu_function_kind_e	kind,
+    int unsigned	vf_id
+);
+    dpu_function_cfg	f;
+    dpu_bar_role_e	roles[3] = '{
+        DPU_BAR_DEVICE_MEMORY,
+        DPU_BAR_MAILBOX,
+        DPU_BAR_MSIX
+    };
+    string	why;
+
+    f = dpu_function_cfg::type_id::create(
+        $sformatf(
+            "fn_h%0d_pf%0d_%0d_vf%0d",
+            host_id,
+            pf_id,
+            kind,
+            vf_id
+        )
+    );
+
+    f.key = '{
+        host_id: host_id,
+        pf_id:   pf_id,
+        kind:    kind,
+        vf_id:   vf_id
+    };
+
+    f.domain_key = '{
+        host_id:    host_id,
+        segment_id: 0
+    };
+
+    f.bdf_mode = DPU_ALLOC_AUTO;
+    f.eligible_service_kinds.push_back(DPU_SERVICE_VIO_NET);
+
+    foreach (roles[i]) begin
+        dpu_bar_profile_t	profile;
+        dpu_bar_request		bar;
+
+        if (!dpu_cfg.device_cfg.dut_caps.lookup_bar_profile(
+            kind,
+            roles[i],
+            profile,
+            why
+        )) begin
+            `uvm_fatal("PROJECT_CFG", why)
         end
-        return f;
-    endfunction
 
-    // 验证 Host→TL slot 是完整的一一映射；不补缺项，避免错配后静默使用 Root0。
-    // 仅支持每 Host 一个 segment 0；失败返回原因，不修改输入配置或访问 DUT。
-    function bit validate_tl_mapping(output string	why);
-        bit		used_slots[int unsigned];
-        int unsigned	count;
+        bar = dpu_bar_request::type_id::create($sformatf("bar_%0d", i));
 
-        why = "";
-        count = dpu_cfg.device_cfg.hosts.size();
-        if (count == 0 || tl_slot_by_host.num() != count || vio_cfg_by_host.num() != count) begin
-            why = "each DPU Host needs exactly one VIO config and TL slot";
+        bar.role        = profile.role;
+        bar.even_bar_id = profile.even_bar_id;
+        bar.size        = profile.size;
+        bar.alignment   = profile.alignment;
+        bar.placement   = DPU_ALLOC_AUTO;
+
+        f.bars.push_back(bar);
+    end
+
+    return f;
+endfunction
+
+
+// 验证 Host→TL slot 是完整的一一映射；不补缺项，避免错配后静默使用 Root0。
+// 仅支持每 Host 一个 segment 0；失败返回原因，不修改输入配置或访问 DUT。
+function bit	project_env_cfg::validate_tl_mapping(
+    output string	why
+);
+    bit			used_slots[int unsigned];
+    int unsigned	count;
+
+    why   = "";
+    count = dpu_cfg.device_cfg.hosts.size();
+
+    if (
+        count == 0 ||
+        tl_slot_by_host.num() != count ||
+        vio_cfg_by_host.num() != count
+    ) begin
+        why = "each DPU Host needs exactly one VIO config and TL slot";
+        return 0;
+    end
+
+    foreach (dpu_cfg.device_cfg.hosts[i]) begin
+        dpu_host_cfg	host;
+        int unsigned	slot;
+
+        host = dpu_cfg.device_cfg.hosts[i];
+
+        if (host == null) begin
+            why = "DPU Host config is null";
             return 0;
         end
-        foreach (dpu_cfg.device_cfg.hosts[i]) begin
-            dpu_host_cfg	host;
-            int unsigned	slot;
 
-            host = dpu_cfg.device_cfg.hosts[i];
-            if (host == null) begin
-                why = "DPU Host config is null";
-                return 0;
-            end
-            if (!tl_slot_by_host.exists(host.host_id) ||
-                !vio_cfg_by_host.exists(host.host_id) || vio_cfg_by_host[host.host_id] == null) begin
-                why = $sformatf("Host%0d has no VIO config or TL slot", host.host_id);
-                return 0;
-            end
-            slot = tl_slot_by_host[host.host_id];
-            if (slot >= count || used_slots.exists(slot)) begin
-                why = "TL slots must be unique and cover 0..Host_count-1";
-                return 0;
-            end
-            if (host.pcie_domains.size() != 1) begin
-                why = "Intel project requires one PCIe domain per Host";
-                return 0;
-            end
-            if (host.pcie_domains[0] == null) begin
-                why = "Host PCIe domain is null";
-                return 0;
-            end
-            if (host.pcie_domains[0].key.host_id != host.host_id ||
-                host.pcie_domains[0].key.segment_id != 0) begin
-                why = "Intel project requires Host-owned segment 0";
-                return 0;
-            end
-            used_slots[slot] = 1;
+        if (
+            !tl_slot_by_host.exists(host.host_id) ||
+            !vio_cfg_by_host.exists(host.host_id) ||
+            vio_cfg_by_host[host.host_id] == null
+        ) begin
+            why = $sformatf("Host%0d has no VIO config or TL slot", host.host_id);
+            return 0;
         end
-        return 1;
-    endfunction
 
-    // 唯一参数构建入口：先采样规模/模板，再创建 Host/PF/VF/placement 和 Host 行为。
-    // 再调用幂等返回，不重新采样；已有输入的项目应把加载入口合入原构造点，省去生成循环。
-    // 默认生成器拒绝覆盖非空逻辑配置，避免重复追加 Host/PF/VF 和资源请求。
-    // base_test 无须逐项赋值；AIP-off 时保留默认值，但仍正常创建对象。
-    virtual function void load_params();
-        dpu_dut_caps			caps;
-        dpu_host_cfg			host_template;
-        dpu_resource_pool_config_t	profile;
-        dpu_vio_placement_request	request;
-        int unsigned			max_initial_pairs;
-        string				why;
+        slot = tl_slot_by_host[host.host_id];
 
-        if (params_loaded) return;
-        if ((dpu_cfg.device_cfg.hosts.size() != 0) ||
-            (dpu_cfg.device_cfg.functions.size() != 0) ||
-            (dpu_cfg.placement_cfg.vio_requests.size() != 0) ||
-            (dpu_cfg.placement_cfg.profiles.size() != 0))
-            `uvm_fatal("PROJECT_CFG", "default authoring cannot overwrite an existing DPU topology")
-        dpu_cfg.device_cfg.load_params("dpu");
-        caps = dpu_cfg.device_cfg.dut_caps;
-        if (!caps.validate(why)) `uvm_fatal("PROJECT_CFG", why)
+        if (slot >= count || used_slots.exists(slot)) begin
+            why = "TL slots must be unique and cover 0..Host_count-1";
+            return 0;
+        end
+
+        if (host.pcie_domains.size() != 1) begin
+            why = "Intel project requires one PCIe domain per Host";
+            return 0;
+        end
+
+        if (host.pcie_domains[0] == null) begin
+            why = "Host PCIe domain is null";
+            return 0;
+        end
+
+        if (
+            host.pcie_domains[0].key.host_id != host.host_id ||
+            host.pcie_domains[0].key.segment_id != 0
+        ) begin
+            why = "Intel project requires Host-owned segment 0";
+            return 0;
+        end
+
+        used_slots[slot] = 1;
+    end
+
+    return 1;
+endfunction
+
+
+// 唯一参数构建入口：先采样规模/模板，再创建 Host/PF/VF/placement 和 Host 行为。
+// 再调用幂等返回，不重新采样；已有输入的项目应把加载入口合入原构造点，省去生成循环。
+// 默认生成器拒绝覆盖非空逻辑配置，避免重复追加 Host/PF/VF 和资源请求。
+// base_test 无须逐项赋值；AIP-off 时保留默认值，但仍正常创建对象。
+function void	project_env_cfg::load_params();
+    dpu_dut_caps		caps;
+    dpu_host_cfg		host_template;
+    dpu_resource_pool_config_t	profile;
+    dpu_vio_placement_request	request;
+    int unsigned		max_initial_pairs;
+    string			why;
+
+    if (params_loaded) begin
+        return;
+    end
+
+    if (
+        (dpu_cfg.device_cfg.hosts.size() != 0) ||
+        (dpu_cfg.device_cfg.functions.size() != 0) ||
+        (dpu_cfg.placement_cfg.vio_requests.size() != 0) ||
+        (dpu_cfg.placement_cfg.profiles.size() != 0)
+    ) begin
+        `uvm_fatal(
+            "PROJECT_CFG",
+            "default authoring cannot overwrite an existing DPU topology"
+        )
+    end
+
+    dpu_cfg.device_cfg.load_params("dpu");
+    caps = dpu_cfg.device_cfg.dut_caps;
+
+    if (!caps.validate(why)) begin
+        `uvm_fatal("PROJECT_CFG", why)
+    end
+
 `ifdef AIP_CMDLINE_SV
-        `DPU_AIP_UINT("dpu", longint unsigned, hosts, this.hosts)
-        `DPU_AIP_UINT("dpu", longint unsigned, pfs_per_host, this.pfs_per_host)
-        `DPU_AIP_UINT("dpu", longint unsigned, vfs_per_pf, this.vfs_per_pf)
-        begin
-            alloc_mode_e		mem_mode;
-            host_mem_alloc_policy_e	mem_policy;
-            longint unsigned		mem_granule;
+    `DPU_AIP_UINT("dpu", longint unsigned, hosts, this.hosts)
+    `DPU_AIP_UINT("dpu", longint unsigned, pfs_per_host, this.pfs_per_host)
+    `DPU_AIP_UINT("dpu", longint unsigned, vfs_per_pf, this.vfs_per_pf)
 
-            `aip_enum("dpu", alloc_mode_e, mem_mode, host_mem_mode)
-            `aip_enum("dpu", host_mem_alloc_policy_e, mem_policy, vio_cfg.host_mem_policy)
-            `DPU_AIP_UINT("dpu", longint unsigned, mem_granule, host_mem_granule)
-            if ((mem_granule == 0) || (mem_granule > 64) ||
-                ((mem_granule & (mem_granule - 1)) != 0))
-                `uvm_fatal("PROJECT_CFG", "dpu.mem_granule must be a power of two in 1..64")
-            host_mem_mode = mem_mode;
-            host_mem_granule = int'(mem_granule);
-            vio_cfg.host_mem_policy = mem_policy;
+    begin
+        alloc_mode_e		mem_mode;
+        host_mem_alloc_policy_e	mem_policy;
+        longint unsigned	mem_granule;
+
+        `aip_enum("dpu", alloc_mode_e, mem_mode, host_mem_mode)
+        `aip_enum("dpu", host_mem_alloc_policy_e, mem_policy, vio_cfg.host_mem_policy)
+        `DPU_AIP_UINT("dpu", longint unsigned, mem_granule, host_mem_granule)
+
+        if (
+            (mem_granule == 0) ||
+            (mem_granule > 64) ||
+            ((mem_granule & (mem_granule - 1)) != 0)
+        ) begin
+            `uvm_fatal("PROJECT_CFG", "dpu.mem_granule must be a power of two in 1..64")
         end
+
+        host_mem_mode           = mem_mode;
+        host_mem_granule        = int'(mem_granule);
+        vio_cfg.host_mem_policy = mem_policy;
+    end
 `endif
-        if ((hosts == 0) || (hosts > caps.max_hosts) ||
-            (pfs_per_host == 0) || (pfs_per_host > caps.max_pfs_per_host) ||
-            (pfs_per_host > 4) || (vfs_per_pf > caps.max_vfs_per_pf))
-            `uvm_fatal("PROJECT_CFG", "Host/PF/VF counts exceed DUT or VIO source-id capacity")
-        if ((hosts * pfs_per_host * (1 + vfs_per_pf)) > caps.max_functions)
-            `uvm_fatal("PROJECT_CFG", "total Function count exceeds DUT capability")
 
-        vio_cfg.load_params("vio");
-        if (vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT)
-            `uvm_fatal("PROJECT_INTEL", "Intel reference requires REAL_DUT EP application logic")
-        host_template = make_host_template();
-        host_template.load_params("dpu");
-        profile.name = "virtio.qpair";
-        profile.class_id = '0;
-        profile.kind = DPU_RESOURCE_KIND_QUEUE;
-        profile.capacity = caps.vio_global_qpair_count;
-        profile.max_per_function = caps.max_vio_net_qpairs_per_device;
-        dpu_cfg.placement_cfg.profiles.push_back(profile);
-        request = dpu_vio_placement_request::type_id::create("vio_request");
-        request.request_id = 0;
-        request.candidate_kind = (vfs_per_pf == 0) ? DPU_VIO_CANDIDATE_PF_ONLY : DPU_VIO_CANDIDATE_VF_ONLY;
-        request.device_policy = DPU_VIO_DEVICE_FIXED;
-        max_initial_pairs = 0;
+    if (
+        (hosts == 0) ||
+        (hosts > caps.max_hosts) ||
+        (pfs_per_host == 0) ||
+        (pfs_per_host > caps.max_pfs_per_host) ||
+        (pfs_per_host > 4) ||
+        (vfs_per_pf > caps.max_vfs_per_pf)
+    ) begin
+        `uvm_fatal("PROJECT_CFG", "Host/PF/VF counts exceed DUT or VIO source-id capacity")
+    end
 
-        for (int unsigned	h = 0; h < hosts; h++) begin
-            dpu_host_cfg		host;
-            virtio_net_env_config	host_vio;
-            bit [64:0]			base;
-            bit [64:0]			limit;
+    if ((hosts * pfs_per_host * (1 + vfs_per_pf)) > caps.max_functions) begin
+        `uvm_fatal("PROJECT_CFG", "total Function count exceeds DUT capability")
+    end
 
-            host = dpu_host_cfg::type_id::create($sformatf("host_%0d", h));
-            host.copy_from(host_template);
-            host.host_id = h;
-            host.pcie_domains[0].key.host_id = h;
-            base = {1'b0, host.gpa_base} + h * 65'h0000_0100_0000_0000;
-            limit = {1'b0, host.gpa_limit} + h * 65'h0000_0100_0000_0000;
-            if (base[64] || limit[64]) `uvm_fatal("PROJECT_CFG", "Host GPA stride overflows")
-            host.gpa_base = base[63:0];
-            host.gpa_limit = limit[63:0];
-            base = {1'b0, host.pcie_domains[0].mmio_windows[0].base} + h * 65'h0000_0010_0000_0000;
-            limit = {1'b0, host.pcie_domains[0].mmio_windows[0].limit} + h * 65'h0000_0010_0000_0000;
-            if (base[64] || limit[64]) `uvm_fatal("PROJECT_CFG", "Host MMIO stride overflows")
-            host.pcie_domains[0].mmio_windows[0].base = base[63:0];
-            host.pcie_domains[0].mmio_windows[0].limit = limit[63:0];
-            host.load_params($sformatf("dpu.h%0d", h));
-            dpu_cfg.device_cfg.hosts.push_back(host);
+    vio_cfg.load_params("vio");
 
-            host_vio = virtio_net_env_config::type_id::create($sformatf("vio_cfg_h%0d", h));
-            host_vio.copy_defaults_from(vio_cfg);
-            host_vio.host_id = h;
-            host_vio.host_scope_enable = 1;
-            host_vio.host_scope_id = h;
-            host_vio.load_params($sformatf("vio.h%0d", h));
-            host_vio.enable_service_params("vio");
-            if (host_vio.execution_mode != vio_cfg.execution_mode)
-                `uvm_fatal("PROJECT_CFG", "one PCIe environment requires consistent VIO execution modes")
-            vio_cfg_by_host[h] = host_vio;
-            if (host_vio.default_num_pairs > max_initial_pairs)
-                max_initial_pairs = host_vio.default_num_pairs;
+    if (vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT) begin
+        `uvm_fatal("PROJECT_INTEL", "Intel reference requires REAL_DUT EP application logic")
+    end
 
-            for (int unsigned	pf = 0; pf < pfs_per_host; pf++) begin
-                dpu_function_cfg	f;
-                string			path;
+    host_template = make_host_template();
+    host_template.load_params("dpu");
 
-                path = $sformatf("dpu.h%0d.pf%0d", h, pf);
-                f = make_function(h, pf, DPU_FUNCTION_PF, 0);
-                f.load_params(path);
+    profile.name             = "virtio.qpair";
+    profile.class_id         = '0;
+    profile.kind             = DPU_RESOURCE_KIND_QUEUE;
+    profile.capacity         = caps.vio_global_qpair_count;
+    profile.max_per_function = caps.max_vio_net_qpairs_per_device;
+
+    dpu_cfg.placement_cfg.profiles.push_back(profile);
+
+    request = dpu_vio_placement_request::type_id::create("vio_request");
+
+    request.request_id     = 0;
+    request.candidate_kind = (vfs_per_pf == 0)
+        ? DPU_VIO_CANDIDATE_PF_ONLY
+        : DPU_VIO_CANDIDATE_VF_ONLY;
+    request.device_policy = DPU_VIO_DEVICE_FIXED;
+    max_initial_pairs     = 0;
+
+    for (int unsigned	h = 0; h < hosts; h++) begin
+        dpu_host_cfg		host;
+        virtio_net_env_config	host_vio;
+        bit [64:0]		base;
+        bit [64:0]		limit;
+
+        host = dpu_host_cfg::type_id::create($sformatf("host_%0d", h));
+        host.copy_from(host_template);
+
+        host.host_id                     = h;
+        host.pcie_domains[0].key.host_id = h;
+
+        base  = {1'b0, host.gpa_base} + h * 65'h0000_0100_0000_0000;
+        limit = {1'b0, host.gpa_limit} + h * 65'h0000_0100_0000_0000;
+
+        if (base[64] || limit[64]) begin
+            `uvm_fatal("PROJECT_CFG", "Host GPA stride overflows")
+        end
+
+        host.gpa_base  = base[63:0];
+        host.gpa_limit = limit[63:0];
+
+        base  = {1'b0, host.pcie_domains[0].mmio_windows[0].base} + h * 65'h0000_0010_0000_0000;
+        limit = {1'b0, host.pcie_domains[0].mmio_windows[0].limit} + h * 65'h0000_0010_0000_0000;
+
+        if (base[64] || limit[64]) begin
+            `uvm_fatal("PROJECT_CFG", "Host MMIO stride overflows")
+        end
+
+        host.pcie_domains[0].mmio_windows[0].base  = base[63:0];
+        host.pcie_domains[0].mmio_windows[0].limit = limit[63:0];
+
+        host.load_params($sformatf("dpu.h%0d", h));
+        dpu_cfg.device_cfg.hosts.push_back(host);
+
+        host_vio = virtio_net_env_config::type_id::create($sformatf("vio_cfg_h%0d", h));
+        host_vio.copy_defaults_from(vio_cfg);
+
+        host_vio.host_id           = h;
+        host_vio.host_scope_enable = 1;
+        host_vio.host_scope_id     = h;
+
+        host_vio.load_params($sformatf("vio.h%0d", h));
+        host_vio.enable_service_params("vio");
+
+        if (host_vio.execution_mode != vio_cfg.execution_mode) begin
+            `uvm_fatal(
+                "PROJECT_CFG",
+                "one PCIe environment requires consistent VIO execution modes"
+            )
+        end
+
+        vio_cfg_by_host[h] = host_vio;
+
+        if (host_vio.default_num_pairs > max_initial_pairs) begin
+            max_initial_pairs = host_vio.default_num_pairs;
+        end
+
+        for (int unsigned	pf = 0; pf < pfs_per_host; pf++) begin
+            dpu_function_cfg	f;
+            string		path;
+
+            path = $sformatf("dpu.h%0d.pf%0d", h, pf);
+            f    = make_function(h, pf, DPU_FUNCTION_PF, 0);
+
+            f.load_params(path);
+            dpu_cfg.device_cfg.functions.push_back(f);
+
+            if (vfs_per_pf == 0) begin
+                request.fixed_devices.push_back(f.key);
+            end
+
+            for (int unsigned	vf = 0; vf < vfs_per_pf; vf++) begin
+                f = make_function(h, pf, DPU_FUNCTION_VF, vf);
+                f.load_params($sformatf("%s.vf%0d", path, vf));
+
                 dpu_cfg.device_cfg.functions.push_back(f);
-                if (vfs_per_pf == 0) begin
-                    request.fixed_devices.push_back(f.key);
-                end
-                for (int unsigned	vf = 0; vf < vfs_per_pf; vf++) begin
-                    f = make_function(h, pf, DPU_FUNCTION_VF, vf);
-                    f.load_params($sformatf("%s.vf%0d", path, vf));
-                    dpu_cfg.device_cfg.functions.push_back(f);
-                    request.fixed_devices.push_back(f.key);
-                end
+                request.fixed_devices.push_back(f.key);
             end
         end
-        // 单个 placement request 在候选间分配资源；按最大初始 pairs 预留，
-        // 保证 Host 行为覆盖不会因为全局平均分配而缺容量。用户仍可覆盖 qpairs。
-        request.total_qpairs = request.fixed_devices.size() * max_initial_pairs;
-        dpu_cfg.placement_cfg.vio_requests.push_back(request);
-        dpu_cfg.placement_cfg.load_params("dpu");
-        dpu_cfg.vio_policy.load_params("dpu");
-        if (tl_slot_by_host.num() == 0) begin
-            for (int unsigned	h = 0; h < hosts; h++) tl_slot_by_host[h] = h;
-        end
-        if (!validate_tl_mapping(why)) `uvm_fatal("PROJECT_CFG", why)
+    end
 
-        // Intel 的接口选择由下面的固定模式和 env 的 instance override 完成，
-        // 无需额外选择宏。标量参数仍加载，但不能绕过真实 DUT 的方向与信用约束。
-        pcie_cfg.if_mode = SV_IF_MODE;
-        pcie_cfg.rc_is_active = UVM_ACTIVE;
-        pcie_cfg.ep_auto_response = 0;
-        pcie_cfg.use_unified_mem = 1;
-        pcie_cfg.mem_access_mode = PCIE_TL_MEM_PER_BUFFER;
-        // 真实 EP 应用逻辑由 DUT 提供；Intel adapter 即使放在 passive agent 旁也会驱动
-        // 引脚，因此必须关闭 EP 组件，而不是仅将 EP 标成 UVM_PASSIVE。
-        pcie_cfg.rc_agent_enable = 1;
-        pcie_cfg.ep_agent_enable = 0;
-        pcie_cfg.num_rc = tl_slot_by_host.num();
-        pcie_cfg.num_ep = 0;
-        // 公共 FC 不门控；每端口有限 AVST credit 由 intel_cfg 独立管理。
-        pcie_cfg.infinite_credit = 1;
-        pcie_cfg.load_params("pcie_cfg");
-        if (pcie_cfg.ep_auto_response)
-            `uvm_fatal("PROJECT_CFG", "real EP DUT must provide its own responses")
-        if (!pcie_cfg.infinite_credit)
-            `uvm_fatal("PROJECT_INTEL", "pcie_cfg.infinite_credit must be 1; Intel owns AVST credits")
-        params_loaded = 1;
-    endfunction
-endclass
+    // 单个 placement request 在候选间分配资源；按最大初始 pairs 预留，
+    // 保证 Host 行为覆盖不会因为全局平均分配而缺容量。用户仍可覆盖 qpairs。
+    request.total_qpairs = request.fixed_devices.size() * max_initial_pairs;
+
+    dpu_cfg.placement_cfg.vio_requests.push_back(request);
+    dpu_cfg.placement_cfg.load_params("dpu");
+    dpu_cfg.vio_policy.load_params("dpu");
+
+    if (tl_slot_by_host.num() == 0) begin
+        for (int unsigned	h = 0; h < hosts; h++) begin
+            tl_slot_by_host[h] = h;
+        end
+    end
+
+    if (!validate_tl_mapping(why)) begin
+        `uvm_fatal("PROJECT_CFG", why)
+    end
+
+    // Intel 的接口选择由下面的固定模式和 env 的 instance override 完成，
+    // 无需额外选择宏。标量参数仍加载，但不能绕过真实 DUT 的方向与信用约束。
+    pcie_cfg.if_mode          = SV_IF_MODE;
+    pcie_cfg.rc_is_active     = UVM_ACTIVE;
+    pcie_cfg.ep_auto_response = 0;
+    pcie_cfg.use_unified_mem  = 1;
+    pcie_cfg.mem_access_mode  = PCIE_TL_MEM_PER_BUFFER;
+
+    // 真实 EP 应用逻辑由 DUT 提供；Intel adapter 即使放在 passive agent 旁也会驱动
+    // 引脚，因此必须关闭 EP 组件，而不是仅将 EP 标成 UVM_PASSIVE。
+    pcie_cfg.rc_agent_enable = 1;
+    pcie_cfg.ep_agent_enable = 0;
+    pcie_cfg.num_rc          = tl_slot_by_host.num();
+    pcie_cfg.num_ep          = 0;
+
+    // 公共 FC 不门控；每端口有限 AVST credit 由 intel_cfg 独立管理。
+    pcie_cfg.infinite_credit = 1;
+    pcie_cfg.load_params("pcie_cfg");
+
+    if (pcie_cfg.ep_auto_response) begin
+        `uvm_fatal("PROJECT_CFG", "real EP DUT must provide its own responses")
+    end
+
+    if (!pcie_cfg.infinite_credit) begin
+        `uvm_fatal("PROJECT_INTEL", "pcie_cfg.infinite_credit must be 1; Intel owns AVST credits")
+    end
+
+    params_loaded = 1;
+endfunction
 ```
 
 ## 你的 env 中的组合代码：project_env.sv
 
-以下是完整环境，辅助函数均已展开。VIO 创建处的 `dpu_env` 参数必须保留，不能换成 `this`。
+以下包含类内接口声明和全部类外实现。VIO 创建处的 `dpu_env` 参数必须保留，不能换成 `this`。
 
 [源文件](../integration/project/project_env.sv)
 
 ```systemverilog
 // integration/project：可拷入已有项目的组合式 env；只继承 uvm_env。
 // 依赖 DPU、PCIe TL、Intel adapter、VIO 与 AIP，由 project_env_pkg 在 cfg 后包含。
+// 类内集中声明成员和 extern 方法；全部实现在本文件类外展开，仍属于同一个 package。
 // 本层直接创建 DPU/PCIe/VIO；VIO 的 parent 指向 DPU，使 UVM 自动保证快照先发布。
 // 平台已有 pool/executor 时只借用并校验，不能偷偷替换。
 // 默认 executor 在 DPU build 前安装 backend；接口连接与初始化由 connect/run 入口负责。
@@ -385,333 +586,642 @@ endclass
 class project_env extends uvm_env;
     `uvm_component_utils(project_env)
 
-    project_env_cfg		cfg;
-    dpu_device_env		dpu_env;
-    pcie_tl_env			pcie_env;
-    virtio_net_env		vio_envs[int unsigned];
+    // 大 cfg 由 test 下发；DPU、PCIe 和各 Host VIO 由本层创建，VIO 的 parent 为 dpu_env。
+    project_env_cfg	cfg;
+    dpu_device_env	dpu_env;
+    pcie_tl_env		pcie_env;
+    virtio_net_env	vio_envs[int unsigned];
+
+    // pool 可借用平台对象；reg_backend 仅在本层创建默认 executor 时持有。
     host_mem_pool		shared_pool;
     pcie_tl_dpu_reg_backend	reg_backend;
 
-    // 构造项目组件壳；资源创建延迟到 build，以允许 test 注入已有平台对象。
-    function new(string	name, uvm_component	parent);
-        super.new(name, parent);
-    endfunction
+    // 构造组件壳；配置与共享资源延迟到 build，允许 test 先注入平台对象。
+    extern function	new(
+        string		name,
+        uvm_component	parent
+    );
 
-    // 为每个 Host 准备唯一 manager；DPU 的 GPA limit 是开区间，pool end 是闭区间。
-    // 已有 manager 必须覆盖声明 aperture 且策略一致，不重置已有分配/数据。
-    protected function void prepare_host_memory();
-        host_mem_pool	dpu_pool;
+    // 按 UVM 顺序建立 DPU、PCIe 和 VIO；缺 cfg 或绑定冲突立即报错。
+    extern virtual function void	build_phase(
+        uvm_phase	phase
+    );
 
-        shared_pool = cfg.host_mem_pool_binding;
-        if (cfg.dpu_cfg.host_mem_pool_ref != null) begin
-            if (!$cast(dpu_pool, cfg.dpu_cfg.host_mem_pool_ref))
-                `uvm_fatal("PROJECT_ENV", "DPU memory owner is not a host_mem_pool")
-            if (shared_pool != null && shared_pool != dpu_pool)
-                `uvm_fatal("PROJECT_ENV", "project and DPU specify distinct Host pools")
-            shared_pool = dpu_pool;
-        end
-        if (shared_pool == null) shared_pool = host_mem_pool::type_id::create("shared_pool");
-        foreach (cfg.dpu_cfg.device_cfg.hosts[i]) begin
-            dpu_host_cfg		host;
-            virtio_net_env_config	vio;
-            host_mem_manager		manager;
+    // 子环境构建完毕后绑定快照、协议接口和 Function endpoint；拒绝跨 Host 错配。
+    extern virtual function void	connect_phase(
+        uvm_phase	phase
+    );
 
-            host = cfg.dpu_cfg.device_cfg.hosts[i];
-            if (host == null || !host.has_gpa_aperture || host.gpa_limit <= host.gpa_base)
-                `uvm_fatal("PROJECT_ENV", "each Host requires a nonempty GPA aperture")
-            if (!cfg.vio_cfg_by_host.exists(host.host_id))
-                `uvm_fatal("PROJECT_ENV", "Host has no VIO behavior configuration")
-            vio = cfg.vio_cfg_by_host[host.host_id];
-            if (!shared_pool.has_host(host.host_id)) begin
-                if (!shared_pool.create_host(host.host_id, host.gpa_base, host.gpa_limit - 1,
-                        cfg.host_mem_mode, cfg.host_mem_granule, vio.host_mem_policy))
-                    `uvm_fatal("PROJECT_ENV", "could not initialize Host memory")
-            end
-            manager = shared_pool.get_host(host.host_id);
-            if (!manager.is_initialized() || manager.get_host_id() != host.host_id ||
-                !manager.contains_range(host.gpa_base, host.gpa_limit - host.gpa_base) ||
-                manager.get_alloc_policy() != vio.host_mem_policy)
-                `uvm_fatal("PROJECT_ENV", "existing Host memory disagrees with configured aperture/policy")
-            if (vio.host_mem_binding != null ||
-                (vio.host_mem_pool_binding != null && vio.host_mem_pool_binding != shared_pool))
-                `uvm_fatal("PROJECT_ENV", "Host VIO cfg must borrow the project-owned pool")
-            vio.host_mem_pool_binding = shared_pool;
-            vio.mem_base = host.gpa_base;
-            vio.mem_end = host.gpa_limit - 1;
-        end
-        cfg.host_mem_pool_binding = shared_pool;
-        cfg.dpu_cfg.host_mem_pool_ref = shared_pool;
-    endfunction
+    // 平台就绪后执行 DPU 的 VIO 寄存器计划；执行失败报告 fatal，不能重复初始化。
+    extern task	configure_device();
 
-    // 按显式 Host→slot 准备 TL cfg；只借用同一 Host manager，不复制 BDF/BAR。
-    // 每 Host 只保留一个 RC，EP 和配置空间/MMIO 响应来自真实 DUT。
-    // 既有绑定只校验不重建；Switch、多余绑定或不同 manager 都拒绝。
-    protected function void prepare_pcie_config();
-        string	why;
+    // 每次仿真登记一次各 Host 的 VIO 服务及 Tcl 命令；空服务或重复注册会报错。
+    extern function void	register_aip_commands();
 
-        if (!cfg.validate_tl_mapping(why)) `uvm_fatal("PROJECT_ENV", why)
-        if (cfg.pcie_cfg.switch_enable)
-            `uvm_fatal("PROJECT_ENV", "Intel project reference does not create a Switch")
-        cfg.pcie_cfg.rc_agent_enable = 1;
-        cfg.pcie_cfg.num_rc = cfg.tl_slot_by_host.num();
-        if (cfg.vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT ||
-            cfg.pcie_cfg.if_mode != SV_IF_MODE || !cfg.pcie_cfg.infinite_credit ||
-            cfg.pcie_cfg.rc_is_active != UVM_ACTIVE || cfg.pcie_cfg.ep_auto_response ||
-            !cfg.pcie_cfg.use_unified_mem)
-            `uvm_fatal("PROJECT_INTEL", "Intel requires REAL_DUT, SV_IF_MODE, active RC, unified memory and infinite public FC")
-        cfg.pcie_cfg.ep_agent_enable = 0;
-        cfg.pcie_cfg.num_ep = 0;
-        if (cfg.pcie_cfg.ep_root_by_index.num() != 0)
-            `uvm_fatal("PROJECT_INTEL", "real EP DUT must not have VIP EP-to-Root bindings")
-        foreach (cfg.tl_slot_by_host[h]) begin
-            int unsigned		slot;
-            host_mem_manager	manager;
+    // 准备或借用各 Host 的共享内存，校验已有 manager 的身份、范围与分配策略。
+    extern protected function void	prepare_host_memory();
 
-            slot = cfg.tl_slot_by_host[h];
-            manager = shared_pool.get_host(h);
-            if (cfg.pcie_cfg.host_mem_by_root.exists(slot)) begin
-                if (cfg.pcie_cfg.host_mem_by_root[slot] != manager ||
-                    !cfg.pcie_cfg.host_id_by_root.exists(slot) ||
-                    cfg.pcie_cfg.host_id_by_root[slot] != h)
-                    `uvm_fatal("PROJECT_ENV", "PCIe Host memory binding disagrees with DPU owner")
-            end else if (!cfg.pcie_cfg.bind_host_memory(slot, h, manager, why))
-                `uvm_fatal("PROJECT_ENV", why)
-        end
-        if (cfg.pcie_cfg.host_mem_by_root.num() != cfg.tl_slot_by_host.num())
-            `uvm_fatal("PROJECT_ENV", "extra PCIe Root bindings are not part of this project")
-    endfunction
+    // 根据 Host→slot 映射设置 RC 数量和内存绑定，校验 Intel 真实 DUT 接入约束。
+    extern protected function void	prepare_pcie_config();
 
-    // 在 pcie_env::create 前解析每个端口的配置和 VIF：cfg 显式句柄与 wrapper 发布值
-    // 必须相同；只缺配置时可创建 HARD_IP 默认对象，缺 HDL 接口则不能自动补造。
-    // 复用 wrapper 对象以保留端口压力/信用设置，拒绝跨端口共享可变 cfg 或物理 VIF。
-    protected function void prepare_intel_bindings();
-        intel_pcie_adapter_config	used_cfgs[$];
-        intel_pcie_vif_t			used_vifs[$];
+    // 在 PCIe build 前解析各端口的 cfg/VIF，借用 wrapper 对象并拒绝缺失或复用。
+    extern protected function void	prepare_intel_bindings();
 
-        foreach (cfg.tl_slot_by_host[h]) begin
-            int unsigned			slot;
-            string				path;
-            intel_pcie_adapter_config	port_cfg;
-            intel_pcie_adapter_config	published_cfg;
-            intel_pcie_vif_t			vif;
-            intel_pcie_vif_t			published_vif;
+    // 连接阶段核对实际 adapter、cfg/VIF 句柄及 RC-only 组件树，不再补绑接口。
+    extern protected function void	check_intel_bindings();
 
-            slot = cfg.tl_slot_by_host[h];
-            path = $sformatf("pcie_env.rc_adapter_%0d", slot);
-            port_cfg = null;
-            published_cfg = null;
-            vif = null;
-            published_vif = null;
-            if (cfg.intel_cfg_by_slot.exists(slot)) begin
-                port_cfg = cfg.intel_cfg_by_slot[slot];
-                if (port_cfg == null) `uvm_fatal("PROJECT_INTEL", "explicit Intel cfg is null")
-            end
-            if (uvm_config_db#(intel_pcie_adapter_config)::get(this, path, "intel_cfg", published_cfg)) begin
-                if (published_cfg == null || (port_cfg != null && port_cfg != published_cfg))
-                    `uvm_fatal("PROJECT_INTEL", "project and wrapper publish different Intel cfg handles")
-                port_cfg = published_cfg;
-            end
-            if (port_cfg == null) begin
-                port_cfg = intel_pcie_adapter_config::type_id::create($sformatf("intel_cfg_%0d", slot));
-                port_cfg.side = INTEL_PCIE_HARD_IP;
-            end
-            if (port_cfg.side != INTEL_PCIE_HARD_IP)
-                `uvm_fatal("PROJECT_INTEL", "EP application DUT requires explicit INTEL_PCIE_HARD_IP side")
-            port_cfg.validate();
-
-            if (cfg.intel_rc_vifs.exists(slot)) begin
-                vif = cfg.intel_rc_vifs[slot];
-                if (vif == null) `uvm_fatal("PROJECT_INTEL", "explicit Intel VIF is null")
-            end
-            if (uvm_config_db#(intel_pcie_vif_t)::get(this, path, "vif", published_vif)) begin
-                if (published_vif == null || (vif != null && vif != published_vif))
-                    `uvm_fatal("PROJECT_INTEL", "project and wrapper publish different Intel VIFs")
-                vif = published_vif;
-            end
-            if (vif == null)
-                `uvm_fatal("PROJECT_INTEL", $sformatf("missing Intel VIF at %s.%s", get_full_name(), path))
-            foreach (used_cfgs[i]) begin
-                if (used_cfgs[i] == port_cfg || used_vifs[i] == vif)
-                    `uvm_fatal("PROJECT_INTEL", "Intel cfg or VIF reused by distinct TL slots")
-            end
-            used_cfgs.push_back(port_cfg);
-            used_vifs.push_back(vif);
-            cfg.intel_cfg_by_slot[slot] = port_cfg;
-            cfg.intel_rc_vifs[slot] = vif;
-            uvm_config_db#(intel_pcie_adapter_config)::set(this, path, "intel_cfg", port_cfg);
-            uvm_config_db#(intel_pcie_vif_t)::set(this, path, "vif", vif);
-        end
-        if (cfg.intel_cfg_by_slot.num() != cfg.tl_slot_by_host.num() ||
-            cfg.intel_rc_vifs.num() != cfg.tl_slot_by_host.num())
-            `uvm_fatal("PROJECT_INTEL", "Intel bindings contain an unused TL slot")
-    endfunction
-
-    // connect 时只校验实际创建的 adapter，不再补绑接口；否则 adapter build 早已失败。
-    // 确认 instance override 和 bridge 生效，防止接口配置看似存在却仍走公共 TLM 回环。
-    protected function void check_intel_bindings();
-        if (!pcie_env.bridge_required || pcie_env.ep_agent != null ||
-            pcie_env.ep_agents.size() != 0 || pcie_env.ep_adapter != null ||
-            pcie_env.ep_adapters.size() != 0)
-            `uvm_fatal("PROJECT_INTEL", "Intel needs the external-pin bridge and RC-only component tree")
-        foreach (cfg.intel_cfg_by_slot[slot]) begin
-            intel_pcie_if_adapter	adapter;
-
-            if (slot >= pcie_env.rc_adapters.size())
-                `uvm_fatal("PROJECT_INTEL", "Intel RC adapter slot is missing")
-            if (!$cast(adapter, pcie_env.rc_adapters[slot]) || adapter == null)
-                `uvm_fatal("PROJECT_INTEL", "Intel instance factory override did not take effect")
-            if (adapter.cfg != cfg.intel_cfg_by_slot[slot] ||
-                adapter.avst_vif != cfg.intel_rc_vifs[slot])
-                `uvm_fatal("PROJECT_INTEL", "Intel adapter consumed different cfg/VIF handles")
-        end
-    endfunction
-
-    // 这里只创建组件和发布输入，不提前查询 DPU snapshot，也不手动调用子组件 build。
-    // create(..., dpu_env) 让 VIO 位于 DPU 子树；框架先 build DPU，再 build VIO。
-    // PCIe 只需要 Host 内存和 TL cfg，可以与 DPU 同级，不依赖二者遍历先后顺序。
-    virtual function void build_phase(uvm_phase	phase);
-        dpu_pcie_reg_executor		executor;
-
-        super.build_phase(phase);
-        if (!uvm_config_db#(project_env_cfg)::get(this, "", "cfg", cfg) || cfg == null)
-            `uvm_fatal("PROJECT_ENV", "project environment cfg is missing")
-        cfg.load_params();
-        prepare_host_memory();
-        prepare_pcie_config();
-
-        if (cfg.dpu_cfg.executor == null) begin
-            reg_backend = pcie_tl_dpu_reg_backend::type_id::create("reg_backend");
-            executor = dpu_pcie_reg_executor::type_id::create("reg_executor");
-            executor.set_backend(reg_backend);
-            cfg.dpu_cfg.executor = executor;
-        end
-        uvm_config_db#(dpu_device_env_config)::set(this, "dpu_env", "cfg", cfg.dpu_cfg);
-        dpu_env = dpu_device_env::type_id::create("dpu_env", this);
-
-        prepare_intel_bindings();
-        // bridge 的历史字段名含 svt，但这里只开启外部引脚传输，不创建 SVT/provider。
-        intel_pcie_configure_env(this, cfg.pcie_cfg, "pcie_env");
-        pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
-
-        foreach (cfg.vio_cfg_by_host[h]) begin
-            string	child_name;
-
-            child_name = $sformatf("vio_h%0d", h);
-            uvm_config_db#(virtio_net_env_config)::set(
-                dpu_env, child_name, "cfg", cfg.vio_cfg_by_host[h]);
-            vio_envs[h] = virtio_net_env::type_id::create(child_name, dpu_env);
-        end
-    endfunction
-
-    // 全项目统一分配协议 VIF；显式身份映射优先，兼容 top 的全局 VIF slot 入口。
-    // 在 Function 绑定 PCIe 前拒绝空接口和跨 Host/Function 复用，不依赖各 Host 局部计数。
-    protected function void bind_protocol_vifs();
-        virtual virtio_protocol_event_if	used[$];
-        virtual virtio_protocol_event_if	vif;
-        int unsigned				slot;
-        string					why;
-
-        slot = 0;
-        foreach (vio_envs[h]) begin
-            foreach (vio_envs[h].function_instances[i]) begin
-                virtio_function_instance	f;
-
-                f = vio_envs[h].function_instances[i];
-                if (!cfg.vio_cfg_by_host[h].get_protocol_event_vif(f.pcie_id, vif)) begin
-                    if (cfg.protocol_vifs.size() != 0) begin
-                        if (slot >= cfg.protocol_vifs.size())
-                            `uvm_fatal("PROJECT_ENV", "protocol VIF pool is too small")
-                        vif = cfg.protocol_vifs[slot];
-                    end else if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
-                            null, "uvm_test_top", $sformatf("protocol_event_vif_%0d", slot), vif))
-                        `uvm_fatal("PROJECT_ENV", "global protocol VIF slot is missing")
-                    if (!cfg.vio_cfg_by_host[h].bind_protocol_event_vif(f.pcie_id, vif, why))
-                        `uvm_fatal("PROJECT_ENV", why)
-                end
-                if (vif == null) `uvm_fatal("PROJECT_ENV", "protocol VIF is null")
-                foreach (used[j]) begin
-                    if (used[j] == vif)
-                        `uvm_fatal("PROJECT_ENV", "protocol VIF reused by distinct Functions/Hosts")
-                end
-                used.push_back(vif);
-                slot++;
-            end
-        end
-    endfunction
-
-    // connect 自底向上运行，此时 DPU 快照和 PCIe/VIO 子组件均已完成 build/connect。
-    // 从 Function 的完整身份选择 Host 对应的 TL slot；BDF/BAR 不在 PCIe 中重新分配。
-    virtual function void connect_phase(uvm_phase	phase);
-        super.connect_phase(phase);
-        if (pcie_env.global_cfg != null || pcie_env.topology_adapter != null ||
-            pcie_env.backend_provider_active || pcie_env.cfg != cfg.pcie_cfg)
-            `uvm_fatal("PROJECT_ENV", "Intel project requires the direct PCIe cfg-only path")
-        check_intel_bindings();
-        bind_protocol_vifs();
-        if (reg_backend != null) begin
-            reg_backend.bind_virtual_sequencer(pcie_env.v_seqr);
-            foreach (cfg.tl_slot_by_host[h])
-                reg_backend.bind_domain_root(h, 0, cfg.tl_slot_by_host[h]);
-        end
-        foreach (vio_envs[h]) begin
-            virtio_pcie_function_endpoint	endpoints[$];
-            int unsigned				slot;
-
-            slot = cfg.tl_slot_by_host[h];
-            if (slot >= pcie_env.rc_agents.size() || pcie_env.rc_agents[slot] == null)
-                `uvm_fatal("PROJECT_ENV", "Host has no native RC agent")
-            foreach (vio_envs[h].function_instances[i]) begin
-                virtio_function_instance		f;
-                virtio_pcie_function_endpoint	endpoint;
-
-                f = vio_envs[h].function_instances[i];
-                if (f.pcie_id.domain.host_id != h || f.pcie_id.domain.segment_id != 0)
-                    `uvm_fatal("PROJECT_ENV", "Function does not belong to its Host segment 0")
-                endpoint = virtio_pcie_function_endpoint::type_id::create(
-                    $sformatf("endpoint_h%0d_f%0d", h, i));
-                // Completion 由 PCIe RC driver 接收；无模型 completion adapter 或 EP monitor。
-                // 同 Host 的所有 Function 共用该 RC，完整身份仍由 endpoint 保留。
-                endpoint.configure(f.pcie_id, pcie_env.rc_agents[slot].sequencer,
-                    pcie_env.rc_agents[slot].rc_driver, null,
-                    pcie_env.rc_agents[slot].monitor, null);
-                endpoints.push_back(endpoint);
-            end
-            if (!vio_envs[h].bind_pcie_endpoints(endpoints))
-                `uvm_fatal("PROJECT_ENV", "VIO endpoint binding failed")
-        end
-    endfunction
-
-    // 平台确认复位、TL 接口和 DMA 服务就绪后调用；计划包含 bootstrap，不能重复配置。
-    // 状态管理和执行报告全部委托已创建的 dpu_env，不在项目层复制另一份执行状态。
-    task configure_device();
-        dpu_reg_plan		plan;
-        dpu_execution_report	report;
-        string			why;
-
-        if (!dpu_env.build_vio_register_plan(plan, why)) `uvm_fatal("PROJECT_ENV", why)
-        dpu_env.apply_vio_register_plan(plan, report);
-        if (report == null) `uvm_fatal("PROJECT_ENV", "DPU returned no execution report")
-        if (report.status() != DPU_CFG_STATUS_SUCCEEDED)
-            `uvm_fatal("PROJECT_ENV", report.reason())
-    endtask
-
-    // 每个仿真调用一次：按完整 service 身份登记各 Host，再注册已有 Tcl 命令。
-    // 空 Host 可跳过；全局没有 VIO service 或重复注册属于接入错误。
-    function void register_aip_commands();
-        int unsigned	active_hosts;
-        string		why;
-
-        active_hosts = 0;
-        foreach (vio_envs[h]) begin
-            if (vio_envs[h].function_instances.size() == 0) continue;
-            if (!virtio_aip_registry::bind_env(vio_envs[h], why))
-                `uvm_fatal("PROJECT_ENV", why)
-            active_hosts++;
-        end
-        if (active_hosts == 0) `uvm_fatal("PROJECT_ENV", "no VIO service available for AIP")
-        if (!virtio_aip_registry::register_commands(why)) `uvm_fatal("PROJECT_ENV", why)
-    endfunction
+    // 按完整 Function 身份分配协议 VIF，拒绝空接口以及跨 Host/Function 复用。
+    extern protected function void	bind_protocol_vifs();
 endclass
+
+
+// 构造项目组件壳；资源创建延迟到 build，以允许 test 注入已有平台对象。
+function	project_env::new(
+    string		name,
+    uvm_component	parent
+);
+    super.new(name, parent);
+endfunction
+
+
+// 为每个 Host 准备唯一 manager；DPU 的 GPA limit 是开区间，pool end 是闭区间。
+// 已有 manager 必须覆盖声明 aperture 且策略一致，不重置已有分配/数据。
+function void	project_env::prepare_host_memory();
+    host_mem_pool	dpu_pool;
+
+    shared_pool = cfg.host_mem_pool_binding;
+
+    if (cfg.dpu_cfg.host_mem_pool_ref != null) begin
+        if (!$cast(dpu_pool, cfg.dpu_cfg.host_mem_pool_ref)) begin
+            `uvm_fatal(
+                "PROJECT_ENV",
+                "DPU memory owner is not a host_mem_pool"
+            )
+        end
+
+        if (shared_pool != null && shared_pool != dpu_pool) begin
+            `uvm_fatal(
+                "PROJECT_ENV",
+                "project and DPU specify distinct Host pools"
+            )
+        end
+
+        shared_pool = dpu_pool;
+    end
+
+    if (shared_pool == null) begin
+        shared_pool = host_mem_pool::type_id::create("shared_pool");
+    end
+
+    foreach (cfg.dpu_cfg.device_cfg.hosts[i]) begin
+        dpu_host_cfg		host;
+        virtio_net_env_config	vio;
+        host_mem_manager	manager;
+
+        host = cfg.dpu_cfg.device_cfg.hosts[i];
+
+        if (
+            host == null ||
+            !host.has_gpa_aperture ||
+            host.gpa_limit <= host.gpa_base
+        ) begin
+            `uvm_fatal(
+                "PROJECT_ENV",
+                "each Host requires a nonempty GPA aperture"
+            )
+        end
+
+        if (!cfg.vio_cfg_by_host.exists(host.host_id)) begin
+            `uvm_fatal("PROJECT_ENV", "Host has no VIO behavior configuration")
+        end
+
+        vio = cfg.vio_cfg_by_host[host.host_id];
+
+        if (!shared_pool.has_host(host.host_id)) begin
+            if (!shared_pool.create_host(
+                host.host_id,
+                host.gpa_base,
+                host.gpa_limit - 1,
+                cfg.host_mem_mode,
+                cfg.host_mem_granule,
+                vio.host_mem_policy
+            )) begin
+                `uvm_fatal("PROJECT_ENV", "could not initialize Host memory")
+            end
+        end
+
+        manager = shared_pool.get_host(host.host_id);
+
+        if (
+            !manager.is_initialized() ||
+            manager.get_host_id() != host.host_id ||
+            !manager.contains_range(host.gpa_base, host.gpa_limit - host.gpa_base) ||
+            manager.get_alloc_policy() != vio.host_mem_policy
+        ) begin
+            `uvm_fatal(
+                "PROJECT_ENV",
+                "existing Host memory disagrees with configured aperture/policy"
+            )
+        end
+
+        if (
+            vio.host_mem_binding != null ||
+            (vio.host_mem_pool_binding != null && vio.host_mem_pool_binding != shared_pool)
+        ) begin
+            `uvm_fatal("PROJECT_ENV", "Host VIO cfg must borrow the project-owned pool")
+        end
+
+        vio.host_mem_pool_binding = shared_pool;
+        vio.mem_base              = host.gpa_base;
+        vio.mem_end               = host.gpa_limit - 1;
+    end
+
+    cfg.host_mem_pool_binding     = shared_pool;
+    cfg.dpu_cfg.host_mem_pool_ref = shared_pool;
+endfunction
+
+
+// 按显式 Host→slot 准备 TL cfg；只借用同一 Host manager，不复制 BDF/BAR。
+// 每 Host 只保留一个 RC，EP 和配置空间/MMIO 响应来自真实 DUT。
+// 既有绑定只校验不重建；Switch、多余绑定或不同 manager 都拒绝。
+function void	project_env::prepare_pcie_config();
+    string	why;
+
+    if (!cfg.validate_tl_mapping(why)) begin
+        `uvm_fatal("PROJECT_ENV", why)
+    end
+
+    if (cfg.pcie_cfg.switch_enable) begin
+        `uvm_fatal("PROJECT_ENV", "Intel project reference does not create a Switch")
+    end
+
+    cfg.pcie_cfg.rc_agent_enable = 1;
+    cfg.pcie_cfg.num_rc          = cfg.tl_slot_by_host.num();
+
+    if (
+        cfg.vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT ||
+        cfg.pcie_cfg.if_mode != SV_IF_MODE ||
+        !cfg.pcie_cfg.infinite_credit ||
+        cfg.pcie_cfg.rc_is_active != UVM_ACTIVE ||
+        cfg.pcie_cfg.ep_auto_response ||
+        !cfg.pcie_cfg.use_unified_mem
+    ) begin
+        `uvm_fatal(
+            "PROJECT_INTEL",
+            "Intel requires REAL_DUT, SV_IF_MODE, active RC, unified memory and infinite public FC"
+        )
+    end
+
+    cfg.pcie_cfg.ep_agent_enable = 0;
+    cfg.pcie_cfg.num_ep          = 0;
+
+    if (cfg.pcie_cfg.ep_root_by_index.num() != 0) begin
+        `uvm_fatal("PROJECT_INTEL", "real EP DUT must not have VIP EP-to-Root bindings")
+    end
+
+    foreach (cfg.tl_slot_by_host[h]) begin
+        int unsigned		slot;
+        host_mem_manager	manager;
+
+        slot    = cfg.tl_slot_by_host[h];
+        manager = shared_pool.get_host(h);
+
+        if (cfg.pcie_cfg.host_mem_by_root.exists(slot)) begin
+            if (
+                cfg.pcie_cfg.host_mem_by_root[slot] != manager ||
+                !cfg.pcie_cfg.host_id_by_root.exists(slot) ||
+                cfg.pcie_cfg.host_id_by_root[slot] != h
+            ) begin
+                `uvm_fatal(
+                    "PROJECT_ENV",
+                    "PCIe Host memory binding disagrees with DPU owner"
+                )
+            end
+        end else if (!cfg.pcie_cfg.bind_host_memory(slot, h, manager, why)) begin
+            `uvm_fatal("PROJECT_ENV", why)
+        end
+    end
+
+    if (cfg.pcie_cfg.host_mem_by_root.num() != cfg.tl_slot_by_host.num()) begin
+        `uvm_fatal("PROJECT_ENV", "extra PCIe Root bindings are not part of this project")
+    end
+endfunction
+
+
+// 在 pcie_env::create 前解析每个端口的配置和 VIF：cfg 显式句柄与 wrapper 发布值
+// 必须相同；只缺配置时可创建 HARD_IP 默认对象，缺 HDL 接口则不能自动补造。
+// 复用 wrapper 对象以保留端口压力/信用设置，拒绝跨端口共享可变 cfg 或物理 VIF。
+function void	project_env::prepare_intel_bindings();
+    intel_pcie_adapter_config	used_cfgs[$];
+    intel_pcie_vif_t		used_vifs[$];
+
+    foreach (cfg.tl_slot_by_host[h]) begin
+        int unsigned			slot;
+        string				path;
+        intel_pcie_adapter_config	port_cfg;
+        intel_pcie_adapter_config	published_cfg;
+        intel_pcie_vif_t		vif;
+        intel_pcie_vif_t		published_vif;
+
+        slot          = cfg.tl_slot_by_host[h];
+        path          = $sformatf("pcie_env.rc_adapter_%0d", slot);
+        port_cfg      = null;
+        published_cfg = null;
+        vif           = null;
+        published_vif = null;
+
+        if (cfg.intel_cfg_by_slot.exists(slot)) begin
+            port_cfg = cfg.intel_cfg_by_slot[slot];
+
+            if (port_cfg == null) begin
+                `uvm_fatal("PROJECT_INTEL", "explicit Intel cfg is null")
+            end
+        end
+
+        if (uvm_config_db#(intel_pcie_adapter_config)::get(
+            this,
+            path,
+            "intel_cfg",
+            published_cfg
+        )) begin
+            if (
+                published_cfg == null ||
+                (port_cfg != null && port_cfg != published_cfg)
+            ) begin
+                `uvm_fatal(
+                    "PROJECT_INTEL",
+                    "project and wrapper publish different Intel cfg handles"
+                )
+            end
+
+            port_cfg = published_cfg;
+        end
+
+        if (port_cfg == null) begin
+            port_cfg = intel_pcie_adapter_config::type_id::create(
+                $sformatf("intel_cfg_%0d", slot)
+            );
+
+            port_cfg.side = INTEL_PCIE_HARD_IP;
+        end
+
+        if (port_cfg.side != INTEL_PCIE_HARD_IP) begin
+            `uvm_fatal(
+                "PROJECT_INTEL",
+                "EP application DUT requires explicit INTEL_PCIE_HARD_IP side"
+            )
+        end
+
+        port_cfg.validate();
+
+        if (cfg.intel_rc_vifs.exists(slot)) begin
+            vif = cfg.intel_rc_vifs[slot];
+
+            if (vif == null) begin
+                `uvm_fatal("PROJECT_INTEL", "explicit Intel VIF is null")
+            end
+        end
+
+        if (uvm_config_db#(intel_pcie_vif_t)::get(
+            this,
+            path,
+            "vif",
+            published_vif
+        )) begin
+            if (
+                published_vif == null ||
+                (vif != null && vif != published_vif)
+            ) begin
+                `uvm_fatal(
+                    "PROJECT_INTEL",
+                    "project and wrapper publish different Intel VIFs"
+                )
+            end
+
+            vif = published_vif;
+        end
+
+        if (vif == null) begin
+            `uvm_fatal(
+                "PROJECT_INTEL",
+                $sformatf("missing Intel VIF at %s.%s", get_full_name(), path)
+            )
+        end
+
+        foreach (used_cfgs[i]) begin
+            if (used_cfgs[i] == port_cfg || used_vifs[i] == vif) begin
+                `uvm_fatal(
+                    "PROJECT_INTEL",
+                    "Intel cfg or VIF reused by distinct TL slots"
+                )
+            end
+        end
+
+        used_cfgs.push_back(port_cfg);
+        used_vifs.push_back(vif);
+
+        cfg.intel_cfg_by_slot[slot] = port_cfg;
+        cfg.intel_rc_vifs[slot]     = vif;
+
+        uvm_config_db#(intel_pcie_adapter_config)::set(
+            this,
+            path,
+            "intel_cfg",
+            port_cfg
+        );
+
+        uvm_config_db#(intel_pcie_vif_t)::set(
+            this,
+            path,
+            "vif",
+            vif
+        );
+    end
+
+    if (
+        cfg.intel_cfg_by_slot.num() != cfg.tl_slot_by_host.num() ||
+        cfg.intel_rc_vifs.num() != cfg.tl_slot_by_host.num()
+    ) begin
+        `uvm_fatal("PROJECT_INTEL", "Intel bindings contain an unused TL slot")
+    end
+endfunction
+
+
+// connect 时只校验实际创建的 adapter，不再补绑接口；否则 adapter build 早已失败。
+// 确认 instance override 和 bridge 生效，防止接口配置看似存在却仍走公共 TLM 回环。
+function void	project_env::check_intel_bindings();
+    if (
+        !pcie_env.bridge_required ||
+        pcie_env.ep_agent != null ||
+        pcie_env.ep_agents.size() != 0 ||
+        pcie_env.ep_adapter != null ||
+        pcie_env.ep_adapters.size() != 0
+    ) begin
+        `uvm_fatal(
+            "PROJECT_INTEL",
+            "Intel needs the external-pin bridge and RC-only component tree"
+        )
+    end
+
+    foreach (cfg.intel_cfg_by_slot[slot]) begin
+        intel_pcie_if_adapter	adapter;
+
+        if (slot >= pcie_env.rc_adapters.size()) begin
+            `uvm_fatal("PROJECT_INTEL", "Intel RC adapter slot is missing")
+        end
+
+        if (!$cast(adapter, pcie_env.rc_adapters[slot]) || adapter == null) begin
+            `uvm_fatal("PROJECT_INTEL", "Intel instance factory override did not take effect")
+        end
+
+        if (
+            adapter.cfg != cfg.intel_cfg_by_slot[slot] ||
+            adapter.avst_vif != cfg.intel_rc_vifs[slot]
+        ) begin
+            `uvm_fatal("PROJECT_INTEL", "Intel adapter consumed different cfg/VIF handles")
+        end
+    end
+endfunction
+
+
+// 这里只创建组件和发布输入，不提前查询 DPU snapshot，也不手动调用子组件 build。
+// create(..., dpu_env) 让 VIO 位于 DPU 子树；框架先 build DPU，再 build VIO。
+// PCIe 只需要 Host 内存和 TL cfg，可以与 DPU 同级，不依赖二者遍历先后顺序。
+function void	project_env::build_phase(
+    uvm_phase	phase
+);
+    dpu_pcie_reg_executor	executor;
+
+    super.build_phase(phase);
+
+    if (
+        !uvm_config_db#(project_env_cfg)::get(this, "", "cfg", cfg) ||
+        cfg == null
+    ) begin
+        `uvm_fatal("PROJECT_ENV", "project environment cfg is missing")
+    end
+
+    cfg.load_params();
+    prepare_host_memory();
+    prepare_pcie_config();
+
+    if (cfg.dpu_cfg.executor == null) begin
+        reg_backend = pcie_tl_dpu_reg_backend::type_id::create("reg_backend");
+        executor    = dpu_pcie_reg_executor::type_id::create("reg_executor");
+
+        executor.set_backend(reg_backend);
+        cfg.dpu_cfg.executor = executor;
+    end
+
+    uvm_config_db#(dpu_device_env_config)::set(
+        this,
+        "dpu_env",
+        "cfg",
+        cfg.dpu_cfg
+    );
+
+    dpu_env = dpu_device_env::type_id::create("dpu_env", this);
+
+    prepare_intel_bindings();
+
+    // bridge 的历史字段名含 svt，但这里只开启外部引脚传输，不创建 SVT/provider。
+    intel_pcie_configure_env(this, cfg.pcie_cfg, "pcie_env");
+    pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
+
+    foreach (cfg.vio_cfg_by_host[h]) begin
+        string	child_name;
+
+        child_name = $sformatf("vio_h%0d", h);
+
+        uvm_config_db#(virtio_net_env_config)::set(
+            dpu_env,
+            child_name,
+            "cfg",
+            cfg.vio_cfg_by_host[h]
+        );
+
+        vio_envs[h] = virtio_net_env::type_id::create(child_name, dpu_env);
+    end
+endfunction
+
+
+// 全项目统一分配协议 VIF；显式身份映射优先，兼容 top 的全局 VIF slot 入口。
+// 在 Function 绑定 PCIe 前拒绝空接口和跨 Host/Function 复用，不依赖各 Host 局部计数。
+function void	project_env::bind_protocol_vifs();
+    virtual virtio_protocol_event_if	used[$];
+    virtual virtio_protocol_event_if	vif;
+    int unsigned			slot;
+    string				why;
+
+    slot = 0;
+
+    foreach (vio_envs[h]) begin
+        foreach (vio_envs[h].function_instances[i]) begin
+            virtio_function_instance	f;
+
+            f = vio_envs[h].function_instances[i];
+
+            if (!cfg.vio_cfg_by_host[h].get_protocol_event_vif(f.pcie_id, vif)) begin
+                if (cfg.protocol_vifs.size() != 0) begin
+                    if (slot >= cfg.protocol_vifs.size()) begin
+                        `uvm_fatal("PROJECT_ENV", "protocol VIF pool is too small")
+                    end
+
+                    vif = cfg.protocol_vifs[slot];
+                end else if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
+                    null,
+                    "uvm_test_top",
+                    $sformatf("protocol_event_vif_%0d", slot),
+                    vif
+                )) begin
+                    `uvm_fatal("PROJECT_ENV", "global protocol VIF slot is missing")
+                end
+
+                if (!cfg.vio_cfg_by_host[h].bind_protocol_event_vif(f.pcie_id, vif, why)) begin
+                    `uvm_fatal("PROJECT_ENV", why)
+                end
+            end
+
+            if (vif == null) begin
+                `uvm_fatal("PROJECT_ENV", "protocol VIF is null")
+            end
+
+            foreach (used[j]) begin
+                if (used[j] == vif) begin
+                    `uvm_fatal("PROJECT_ENV", "protocol VIF reused by distinct Functions/Hosts")
+                end
+            end
+
+            used.push_back(vif);
+            slot++;
+        end
+    end
+endfunction
+
+
+// connect 自底向上运行，此时 DPU 快照和 PCIe/VIO 子组件均已完成 build/connect。
+// 从 Function 的完整身份选择 Host 对应的 TL slot；BDF/BAR 不在 PCIe 中重新分配。
+function void	project_env::connect_phase(
+    uvm_phase	phase
+);
+    super.connect_phase(phase);
+
+    if (
+        pcie_env.global_cfg != null ||
+        pcie_env.topology_adapter != null ||
+        pcie_env.backend_provider_active ||
+        pcie_env.cfg != cfg.pcie_cfg
+    ) begin
+        `uvm_fatal("PROJECT_ENV", "Intel project requires the direct PCIe cfg-only path")
+    end
+
+    check_intel_bindings();
+    bind_protocol_vifs();
+
+    if (reg_backend != null) begin
+        reg_backend.bind_virtual_sequencer(pcie_env.v_seqr);
+
+        foreach (cfg.tl_slot_by_host[h]) begin
+            reg_backend.bind_domain_root(h, 0, cfg.tl_slot_by_host[h]);
+        end
+    end
+
+    foreach (vio_envs[h]) begin
+        virtio_pcie_function_endpoint	endpoints[$];
+        int unsigned			slot;
+
+        slot = cfg.tl_slot_by_host[h];
+
+        if (slot >= pcie_env.rc_agents.size() || pcie_env.rc_agents[slot] == null) begin
+            `uvm_fatal("PROJECT_ENV", "Host has no native RC agent")
+        end
+
+        foreach (vio_envs[h].function_instances[i]) begin
+            virtio_function_instance		f;
+            virtio_pcie_function_endpoint	endpoint;
+
+            f = vio_envs[h].function_instances[i];
+
+            if (f.pcie_id.domain.host_id != h || f.pcie_id.domain.segment_id != 0) begin
+                `uvm_fatal("PROJECT_ENV", "Function does not belong to its Host segment 0")
+            end
+
+            endpoint = virtio_pcie_function_endpoint::type_id::create(
+                $sformatf("endpoint_h%0d_f%0d", h, i)
+            );
+
+            // Completion 由 PCIe RC driver 接收；无模型 completion adapter 或 EP monitor。
+            // 同 Host 的所有 Function 共用该 RC，完整身份仍由 endpoint 保留。
+            endpoint.configure(
+                f.pcie_id,
+                pcie_env.rc_agents[slot].sequencer,
+                pcie_env.rc_agents[slot].rc_driver,
+                null,
+                pcie_env.rc_agents[slot].monitor,
+                null
+            );
+
+            endpoints.push_back(endpoint);
+        end
+
+        if (!vio_envs[h].bind_pcie_endpoints(endpoints)) begin
+            `uvm_fatal("PROJECT_ENV", "VIO endpoint binding failed")
+        end
+    end
+endfunction
+
+
+// 平台确认复位、TL 接口和 DMA 服务就绪后调用；计划包含 bootstrap，不能重复配置。
+// 状态管理和执行报告全部委托已创建的 dpu_env，不在项目层复制另一份执行状态。
+task	project_env::configure_device();
+    dpu_reg_plan		plan;
+    dpu_execution_report	report;
+    string			why;
+
+    if (!dpu_env.build_vio_register_plan(plan, why)) begin
+        `uvm_fatal("PROJECT_ENV", why)
+    end
+
+    dpu_env.apply_vio_register_plan(plan, report);
+
+    if (report == null) begin
+        `uvm_fatal("PROJECT_ENV", "DPU returned no execution report")
+    end
+
+    if (report.status() != DPU_CFG_STATUS_SUCCEEDED) begin
+        `uvm_fatal("PROJECT_ENV", report.reason())
+    end
+endtask
+
+
+// 每个仿真调用一次：按完整 service 身份登记各 Host，再注册已有 Tcl 命令。
+// 空 Host 可跳过；全局没有 VIO service 或重复注册属于接入错误。
+function void	project_env::register_aip_commands();
+    int unsigned	active_hosts;
+    string		why;
+
+    active_hosts = 0;
+
+    foreach (vio_envs[h]) begin
+        if (vio_envs[h].function_instances.size() == 0) begin
+            continue;
+        end
+
+        if (!virtio_aip_registry::bind_env(vio_envs[h], why)) begin
+            `uvm_fatal("PROJECT_ENV", why)
+        end
+
+        active_hosts++;
+    end
+
+    if (active_hosts == 0) begin
+        `uvm_fatal("PROJECT_ENV", "no VIO service available for AIP")
+    end
+
+    if (!virtio_aip_registry::register_commands(why)) begin
+        `uvm_fatal("PROJECT_ENV", why)
+    end
+endfunction
 ```
 
 ## test 的最少接入顺序：project_base_test.sv

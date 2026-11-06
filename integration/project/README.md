@@ -8,6 +8,10 @@
 **[完整代码展示](../../docs/project_env_full_code.md)** 按 cfg、env、test、package
 顺序展开全部函数体。实际维护的源码在本目录，二者保持一致。
 
+env 和 env_cfg 均采用类内 `extern` 声明、类外实现；实现在各自同一个 `.sv` 文件中，
+编译入口不变。合入已有工程时，声明与实现要一起保留；修改类名时，也要同步修改
+类外实现的 `project_env::` / `project_env_cfg::` 限定名。
+
 固定使用 Intel PCIe 和 `REAL_DUT`，默认规模为 **1 Host、1 PF、0 VF**。
 每 Host 一个 PCIe segment 0，同 Host 的 PF/VF 共用物理端口。
 **真实 DUT 为 EP 应用逻辑，每 Host 只创建一个 RC，接口方向为 `HARD_IP`。** 项目层只创建
@@ -422,3 +426,8 @@ vcs -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps \
 
 所有正例的仿真及严格日志检查返回码均为 0；负例均为单个预期 fatal，warning/error 为 0。
 结构 top 在 1ns 结束；真实 bind 使用空闲应用端口，未验证用户实际 RTL 的报文与寄存器响应。
+
+同日对 env/env_cfg 的 extern 格式调整另做一次结构编译和小范围回归：默认单 Host，
+以及双 Host、每 PF 两个 VF、交换 slot、借用 wrapper 句柄的两个正例均通过；
+缺失 Intel VIF、跨 slot 复用 Intel cfg 的两个负例均命中预期生产 fatal。
+本次回归覆盖类外实现语法、对象装配与错误诊断，未重新执行真实 HDL bind 或报文测试。
