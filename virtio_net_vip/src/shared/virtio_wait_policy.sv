@@ -5,6 +5,8 @@
 // virtio_wait_policy
 //
 // Unified timeout and polling object for the virtio_net VIP.
+// 所属层次：src/shared；依赖 UVM，可选 AIP。test/config 持有策略数值，
+// env 在 build 阶段复制后供所有 Function 共用；等待线程由调用者拥有。
 // ALL waits in this VIP must go through this class -- no bare #delay allowed.
 //
 // Rules enforced throughout:
@@ -53,13 +55,97 @@ class virtio_wait_policy extends uvm_object;
         super.new(name);
     endfunction
 
-    // ------------------------------------------------------------------
-    // effective_timeout
-    //
-    // Returns base_ns * timeout_multiplier, saturating at 32-bit max to
-    // avoid overflow.  A multiplier of 0 is treated as 1 so that stress
-    // tests cannot accidentally reduce timeouts to zero.
-    // ------------------------------------------------------------------
+    // 参数归属：vio.wait.*；只开放有生产消费点的字段，所有时间单位为 ns。
+    // 在 build 前读取一次；缺省保留当前值，先检查范围再提交，非法值立即 fatal。
+    // AIP 未编译时为空操作；运行中的等待不会因 Tcl set_param 自动改变。
+    function void	load_params(string	path = "vio.wait");
+`ifdef AIP_CMDLINE_SV
+        longint unsigned	poll_ns;
+        longint unsigned	timeout_ns;
+        longint unsigned	reset_ns;
+        longint unsigned	queue_reset_ns;
+        longint unsigned	vf_ready_ns;
+        longint unsigned	flr_ns;
+        longint unsigned	multiplier;
+        longint unsigned	max_polls;
+
+        `DPU_AIP_UINT(path, longint unsigned, poll_ns, default_poll_interval_ns);
+        `DPU_AIP_UINT(path, longint unsigned, timeout_ns, default_timeout_ns);
+        `DPU_AIP_UINT(path, longint unsigned, reset_ns, reset_timeout_ns);
+        `DPU_AIP_UINT(path, longint unsigned, queue_reset_ns, queue_reset_timeout_ns);
+        `DPU_AIP_UINT(path, longint unsigned, vf_ready_ns, vf_ready_timeout_ns);
+        `DPU_AIP_UINT(path, longint unsigned, flr_ns, flr_timeout_ns);
+        `DPU_AIP_UINT(path, longint unsigned, multiplier, timeout_multiplier);
+        `DPU_AIP_UINT(path, longint unsigned, max_polls, max_poll_attempts);
+
+        if ((poll_ns == 0) || (poll_ns > 64'hffff_ffff)) begin
+            `uvm_fatal("VIO_PARAM", {path, ".poll_ns 必须为 1..2^32-1"})
+            return;
+        end
+        if ((timeout_ns == 0) || (timeout_ns > 64'hffff_ffff)) begin
+            `uvm_fatal("VIO_PARAM", {path, ".timeout_ns 必须为 1..2^32-1"})
+            return;
+        end
+        if ((reset_ns == 0) || (reset_ns > 64'hffff_ffff)) begin
+            `uvm_fatal("VIO_PARAM", {path, ".reset_ns 必须为 1..2^32-1"})
+            return;
+        end
+        if ((queue_reset_ns == 0) || (queue_reset_ns > 64'hffff_ffff)) begin
+            `uvm_fatal("VIO_PARAM", {path, ".queue_reset_ns 必须为 1..2^32-1"})
+            return;
+        end
+        if ((vf_ready_ns == 0) || (vf_ready_ns > 64'hffff_ffff)) begin
+            `uvm_fatal("VIO_PARAM", {path, ".vf_ready_ns 必须为 1..2^32-1"})
+            return;
+        end
+        if ((flr_ns == 0) || (flr_ns > 64'hffff_ffff)) begin
+            `uvm_fatal("VIO_PARAM", {path, ".flr_ns 必须为 1..2^32-1"})
+            return;
+        end
+        if ((multiplier == 0) || (multiplier > 64'hffff_ffff)) begin
+            `uvm_fatal("VIO_PARAM", {path, ".multiplier 必须为 1..2^32-1"})
+            return;
+        end
+        if ((max_polls == 0) || (max_polls > 64'hffff_ffff)) begin
+            `uvm_fatal("VIO_PARAM", {path, ".max_polls 必须为 1..2^32-1"})
+            return;
+        end
+        default_poll_interval_ns = int'(poll_ns);
+        default_timeout_ns = int'(timeout_ns);
+        reset_timeout_ns = int'(reset_ns);
+        queue_reset_timeout_ns = int'(queue_reset_ns);
+        vf_ready_timeout_ns = int'(vf_ready_ns);
+        flr_timeout_ns = int'(flr_ns);
+        timeout_multiplier = int'(multiplier);
+        max_poll_attempts = int'(max_polls);
+`endif
+    endfunction
+
+    // 复制策略数值供每个 Host 独立持有，避免全局模板与实例共享可修改对象。
+    // 不复制等待线程或事件；不兼容对象报告错误并保留当前字段。
+    virtual function void	do_copy(uvm_object	rhs);
+        virtio_wait_policy	typed_rhs;
+
+        if (!$cast(typed_rhs, rhs)) begin
+            `uvm_error("VIO_PARAM", "wait policy copy 类型不兼容")
+            return;
+        end
+        super.do_copy(rhs);
+        default_poll_interval_ns = typed_rhs.default_poll_interval_ns;
+        default_timeout_ns = typed_rhs.default_timeout_ns;
+        reset_timeout_ns = typed_rhs.reset_timeout_ns;
+        queue_reset_timeout_ns = typed_rhs.queue_reset_timeout_ns;
+        vf_ready_timeout_ns = typed_rhs.vf_ready_timeout_ns;
+        flr_timeout_ns = typed_rhs.flr_timeout_ns;
+        timeout_multiplier = typed_rhs.timeout_multiplier;
+        max_poll_attempts = typed_rhs.max_poll_attempts;
+        cpl_timeout_ns = typed_rhs.cpl_timeout_ns;
+        status_change_timeout_ns = typed_rhs.status_change_timeout_ns;
+        rx_wait_timeout_ns = typed_rhs.rx_wait_timeout_ns;
+    endfunction
+
+    // 返回基准超时乘以倍率，超过32位时饱和；程序化旧配置的0倍率按1处理。
+    // 只计算数值、不推进时间；load_params 对显式输入则要求正倍率。
     function int unsigned effective_timeout(int unsigned base_ns);
         int unsigned mult;
         mult = (timeout_multiplier == 0) ? 1 : timeout_multiplier;

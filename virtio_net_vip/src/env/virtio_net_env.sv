@@ -12,6 +12,8 @@
 // 中文说明：这是业务验证环境的装配根节点。DPU 控制面先解析出冻结的
 // device/resource snapshot，本环境只消费 snapshot，不重新分配 BDF、BAR 或 qpair；
 // 因而控制面、PCIe 传输层和 virtio 业务层的职责保持分离。
+// 平台可通过 cfg 注入共享 IOMMU 和按完整身份分配的协议 VIF；外部 IOMMU
+// 只校验不重配，协议 VIF 显式映射优先于旧的全局 slot 兼容入口。
 //
 // Creates and wires all components:
 //   - PF manager (SR-IOV orchestration)
@@ -375,16 +377,34 @@ class virtio_net_env extends uvm_env;
             return;
         end
 
-        iommu = virtio_iommu_model::type_id::create("iommu");
-        iommu.strict_permission_check = cfg.iommu_strict;
-        if (!iommu.configure_iova_aperture(
-                cfg.iova_base, cfg.iova_limit, cfg.iova_alloc_policy, why)) begin
-            configuration_valid = 0;
-            `uvm_fatal("VIRTIO_ENV", {"invalid configured IOVA aperture: ", why})
-            return;
+        if (cfg.iommu_binding != null) begin
+            iommu = cfg.iommu_binding;
+            // 外部 owner 可能已有 live mapping；只比较配置，不能调用 configure
+            // 清空游标或改变映射语义。不同 Host 可以借用策略一致的同一模型。
+            if ((iommu.iova_base != cfg.iova_base) ||
+                (iommu.iova_limit != cfg.iova_limit) ||
+                (iommu.iova_alloc_policy != cfg.iova_alloc_policy) ||
+                (iommu.strict_permission_check != cfg.iommu_strict)) begin
+                configuration_valid = 0;
+                `uvm_fatal("VIRTIO_ENV", "injected IOMMU policy disagrees with VIO configuration")
+                return;
+            end
+        end else begin
+            iommu = virtio_iommu_model::type_id::create("iommu");
+            iommu.strict_permission_check = cfg.iommu_strict;
+            if (!iommu.configure_iova_aperture(
+                    cfg.iova_base, cfg.iova_limit, cfg.iova_alloc_policy, why)) begin
+                configuration_valid = 0;
+                `uvm_fatal("VIRTIO_ENV", {"invalid configured IOVA aperture: ", why})
+                return;
+            end
         end
 
         wait_pol = virtio_wait_policy::type_id::create("wait_pol");
+        // test 在 build 前加载的 vio.wait.* 进入实际被 Function/ops 使用的策略。
+        // env 持有独立副本，后续修改配置模板不会悄悄改写已运行的等待过程。
+        if (cfg.wait_policy_cfg != null)
+            wait_pol.copy(cfg.wait_policy_cfg);
         barrier  = virtio_memory_barrier_model::type_id::create("barrier");
         err_inj  = virtqueue_error_injector::type_id::create("err_inj");
 
@@ -889,8 +909,9 @@ class virtio_net_env extends uvm_env;
     endfunction
 
     // 解析第 slot_index 个协议接口槽位：先确认槽位池未耗尽；staged_protocol_vif
-    // 非空时沿用预检结果，否则从 config_db 读取 protocol_event_vif_<slot>。
-    // 失败时 UVM_FATAL 并返回 0。
+    // 非空时沿用预检结果；否则先查 cfg 的完整身份绑定。只有未启用显式绑定时，
+    // 才从 config_db 读取旧 protocol_event_vif_<slot>；缺项不能静默跨域回退。
+    // 失败时 UVM_FATAL 并返回 0，不改变接口所有权。
     protected function bit resolve_protocol_vif(
         input virtio_function_instance function_instance,
         input int unsigned slot_index,
@@ -906,6 +927,14 @@ class virtio_net_env extends uvm_env;
         end
         if (protocol_vif != null)
             return 1;
+        if (cfg.has_protocol_event_bindings()) begin
+            if (!cfg.get_protocol_event_vif(function_instance.pcie_id, protocol_vif)) begin
+                `uvm_fatal("VIRTIO_ENV", {"No explicit protocol event interface for ",
+                    dpu_pcie_function_id_name(function_instance.pcie_id)})
+                return 0;
+            end
+            return 1;
+        end
         if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(
                 null, "uvm_test_top",
                 $sformatf("protocol_event_vif_%0d", slot_index), protocol_vif) ||

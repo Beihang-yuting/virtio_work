@@ -21,6 +21,12 @@ package virtio_net_pkg;
   import pcie_tl_pkg::*;
   import dpu_resource_pkg::*;
 
+  // 可选参数接口：AIP 必须先以唯一 package 编译，宏由同一编译单元可见。
+  // 未编译 AIP 时 load_params 保留为空操作，不给独立 VIP 增加强制依赖。
+`ifdef AIP_CMDLINE_SV
+  import aip_core_pkg::*;
+`endif
+
   // 既有外部测试只导入本包；复导出保持其类型名可见，类型身份仍由原包所有。
   // 新接入项目也可直接 import net_packet_pkg::* 和 host_mem_pkg::*。
   export net_packet_pkg::*;

@@ -1,3 +1,8 @@
+// 目录层次：tests；复用 DPU 快照、PCIe 传输与共享内存的驱动流程测试组件。
+// 依赖 virtio_test_device_builder、dpu_resource_pkg/pcie_tl_pkg/virtio_net_pkg。
+// UVM 拥有子组件，fixture 持有配置与内存池；Function 借用已绑定的共享资源。
+// 可选 AIP 参数在 build 中、行为配置复制之前加载；pcie_cfg策略在Host绑定和
+// PCIe子env创建前采样。运行阶段不重读参数，执行主体仍由MODEL/REAL_DUT profile决定。
 `ifndef VIRTIO_REAL_DRIVER_FLOW_FIXTURE_SV
 `define VIRTIO_REAL_DRIVER_FLOW_FIXTURE_SV
 
@@ -33,6 +38,8 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     // 需要多个 Function 共享同一 PCIe EP 模型的测试，在 create 之后、本组件
     // build_phase 之前设置；PF 0 始终是 AF。
     int unsigned                vio_pf_count;
+    // 示例可选择首次启动的活动对数；资源仍预留每 PF 两对，不能用它扩容。
+    int unsigned	initial_num_pairs;
     // PCIe completion 超时（ns）。默认值与原 fixture 相同；会长时间推进仿真
     // 时间的测试可在 build_phase 之前放宽。
     int                         pcie_cpl_timeout_ns;
@@ -78,6 +85,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     // pcie_work API has no such field, and silently accepting one interface
     // would lose endpoint-originated DMA/completion traffic.
 
+    // 初始化测试选择与绑定状态；默认预留每PF两对，尚未建立PCIe/DMA资源。
     function new(string name, uvm_component parent);
         super.new(name, parent);
         m_endpoint_ready = 0;
@@ -92,10 +100,13 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         m_profile = null;
         real_dut_host_mem_responder_enable = 0;
         vio_pf_count = 1;
+        initial_num_pairs = 2;
         pcie_cpl_timeout_ns = 100000;
         device_features = 64'h0000_0001_0000_0001;
     endfunction
 
+    // 先构造资源与行为配置，再合并旧plusargs和可选vio/pcie_cfg参数，随后创建子环境。
+    // 拓扑与参数非法立即fatal；REAL_DUT必须另外提供完整物理接口和内存服务。
     virtual function void build_phase(uvm_phase phase);
         dpu_function_cfg pf_cfg;
         dpu_function_cfg af_cfg;
@@ -131,7 +142,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         device_builder.select_af(af_cfg);
 
         virtio_cfg = virtio_net_env_config::type_id::create("virtio_cfg");
-        virtio_cfg.default_num_pairs = 2;
+        virtio_cfg.default_num_pairs = initial_num_pairs;
         virtio_cfg.default_queue_size = 256;
         virtio_cfg.default_vq_type = VQ_SPLIT;
         virtio_cfg.default_driver_features = '1;
@@ -152,6 +163,16 @@ class virtio_real_driver_flow_fixture extends uvm_component;
                 return;
             end
         end
+        // AIP 路径在旧 execution plusargs 之后加载，明确短路径覆盖优先级。
+        // 此 fixture 固定预留每 PF 两对；大拓扑使用 system_env 的参数构建入口。
+`ifdef AIP_CMDLINE_SV
+        virtio_cfg.load_params("vio");
+        virtio_cfg.enable_service_params("vio");
+        if (virtio_cfg.default_num_pairs > 2) begin
+            `uvm_fatal("REAL_FLOW", "此 fixture 仅预留每 PF 两对，vio.pairs 不能超过 2")
+            return;
+        end
+`endif
         m_profile = virtio_cfg.execution_profile();
         if (m_profile == null) begin
             `uvm_fatal("REAL_FLOW", "virtio execution mode has no execution profile")
@@ -237,6 +258,14 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         pcie_cfg.cpl_timeout_ns = pcie_cpl_timeout_ns;
         pcie_cfg.use_unified_mem = 1;
         pcie_cfg.mem_access_mode = PCIE_TL_MEM_PER_BUFFER;
+        // 原配置类只加载已消费的PCIe行为策略，不改变profile决定的接口、agent
+        // 或Root映射。此参考fixture固定设备执行主体；禁止参数让REAL_DUT产生
+        // 主动EP应答，也禁止关闭MODEL已选择的应答路径。普通系统层不施加此约束。
+        pcie_cfg.load_params("pcie_cfg");
+        if (pcie_cfg.ep_auto_response != m_profile.ep_auto_response()) begin
+            `uvm_fatal("REAL_FLOW", "pcie_cfg.ep_auto_response conflicts with this fixture's MODEL/REAL_DUT execution profile")
+            return;
+        end
         begin
             string mem_why;
             host_mem_manager root_mem;

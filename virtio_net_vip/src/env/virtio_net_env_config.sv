@@ -9,7 +9,9 @@
 // 中文说明：本对象只描述 virtio 驱动行为、内存和验证策略；Host/PF/VF/BDF/BAR
 // 拓扑以及 qpair 归属必须由全局 dpu_common snapshot 提供。
 // 主要依赖：virtio_net_types、dpu_resource_pkg 的 service key/snapshot，
-// 以及 host_mem_pool。test 持有配置对象；环境在 build/connect 阶段借用，
+// 以及 host_mem_pool、virtio_iommu_model 和协议事件接口；可选 AIP 读取在本类
+// load_params 中显式发生。公共 IOMMU/VIF 只借用，不作为普通参数复制或重建。
+// test 持有配置对象；环境在 build/connect 阶段借用，
 // 不接管其生命周期，也不改写冻结的控制面快照。
 // Provides VIO service behavior, memory regions, IOMMU policy, performance
 // limits, and verification component enables. Device topology and placement
@@ -32,6 +34,12 @@ class virtio_net_env_config extends uvm_object;
     } service_config_entry_t;
 
     protected service_config_entry_t m_service_configs[string];
+
+    // 仅在顶层显式启用后，为实际解析出的 service 加载并缓存一次参数副本。
+    // 与显式配置表分开，避免改变私有协议“是否显式设置队列大小”的判断。
+    protected bit	aip_service_params_enabled = 0;
+    protected string	aip_service_root = "vio";
+    protected virtio_driver_config_t	m_param_service_configs[string];
 
     // 私有驱动按完整 service key 选择，避免全局 factory override 影响标准 PF/VF。
     // 配置由上层持有；Function 在 PCIe 绑定时冻结队列配置副本。
@@ -84,6 +92,62 @@ class virtio_net_env_config extends uvm_object;
     // every service environment bound to the same Host.
     host_mem_pool        host_mem_pool_binding = null;
 
+    // 平台可注入已有 IOMMU；env 只校验策略一致性，不能清空外部映射表。
+    // null 保持原来的 env 自建行为；copy_defaults_from 不复制公共资源句柄。
+    virtio_iommu_model	iommu_binding = null;
+
+    // 协议断言接口按完整 PCIe 身份登记，避免多个 Host env 都使用全局 slot 0。
+    // 空表兼容原来的 protocol_event_vif_<slot>；非空表要求覆盖全部 active Function。
+    protected virtual virtio_protocol_event_if	protocol_vifs[string];
+
+    // 登记已解析 Function 的独立协议接口；拒绝空接口、重复身份和同表接口复用。
+    // 平台负责跨 env 唯一分配；本方法不读取参数，也不改写 Function 身份。
+    function bit bind_protocol_event_vif(
+        dpu_pcie_function_id_t	function_id,
+        virtual virtio_protocol_event_if	vif,
+        output string	why
+    );
+        string	key;
+
+        why = "";
+        key = dpu_pcie_function_id_name(function_id);
+        if (vif == null) begin
+            why = {"null protocol event interface for ", key};
+            return 0;
+        end
+        if (protocol_vifs.exists(key)) begin
+            why = {"duplicate protocol event binding for ", key};
+            return 0;
+        end
+        foreach (protocol_vifs[other]) begin
+            if (protocol_vifs[other] == vif) begin
+                why = {"protocol event interface already belongs to ", other};
+                return 0;
+            end
+        end
+        protocol_vifs[key] = vif;
+        return 1;
+    endfunction
+
+    // 查询是否启用完整身份映射；启用后禁止退回全局 slot，避免部分配置串接。
+    function bit has_protocol_event_bindings();
+        return protocol_vifs.num() != 0;
+    endfunction
+
+    // 只读取得指定 Function 的接口；未命中返回 0 并清空输出，不分配候选接口。
+    function bit get_protocol_event_vif(
+        dpu_pcie_function_id_t	function_id,
+        output virtual virtio_protocol_event_if	vif
+    );
+        string	key;
+
+        key = dpu_pcie_function_id_name(function_id);
+        vif = null;
+        if (!protocol_vifs.exists(key)) return 0;
+        vif = protocol_vifs[key];
+        return vif != null;
+    endfunction
+
     // ===== IOMMU =====
     // IOVA 属于设备可见地址空间，与 GPA/BAR 数值空间独立；随机策略用于压力
     // 验证，FIRST_FIT 仅用于需要稳定布局的调试场景。
@@ -104,14 +168,202 @@ class virtio_net_env_config extends uvm_object;
     bit                  scb_enable = 1;
     bit                  cov_enable = 0;
 
+    // 配置拥有等待策略模板；env 在 build 时复制，运行时不再读取全局参数表。
+    virtio_wait_policy	wait_policy_cfg;
+
     // ========================================================================
     // Constructor
     // ========================================================================
 
-    // 仅初始化 UVM 配置对象；默认字段在声明处设定，构造函数不创建外部资源。
+    // 初始化默认字段及自有等待策略模板；不读取参数或创建外部内存/DMA资源。
     function new(string name = "virtio_net_env_config");
         super.new(name);
+        wait_policy_cfg = virtio_wait_policy::type_id::create({name, "_wait_policy"});
     endfunction
+
+    // 参数归属：vio.* 默认值、vio.hN.* Host 覆盖；service 级仅开放驱动行为。
+    // 解析与字段放在同一个类中，短名称不泄漏 default_* 内部命名。须在 service
+    // 副本登记前显式调用；AIP 未编译时为空操作，不访问 DUT 或分配资源。
+    function void	load_params(string	path = "vio");
+`ifdef AIP_CMDLINE_SV
+        virtio_driver_config_t	behavior;
+        virtio_execution_mode_e	exec_mode;
+        virtio_completion_mode_e	completion;
+        iommu_iova_alloc_policy_e	iova_policy;
+        bit [63:0]	base;
+        bit [63:0]	iova_size;
+        longint unsigned	scb;
+        longint unsigned	coverage;
+        longint unsigned	strict;
+        string	why;
+
+        if ((m_service_configs.num() != 0) || (m_param_service_configs.num() != 0)) begin
+            `uvm_fatal("VIO_PARAM", {path, ": 必须在 add_service_config 复制配置之前加载"})
+            return;
+        end
+        if (wait_policy_cfg == null) begin
+            `uvm_fatal("VIO_PARAM", {path, ": 等待策略模板为空"})
+            return;
+        end
+        behavior = make_default_driver_config(DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE);
+        behavior.num_queue_pairs = default_num_pairs;
+        load_driver_params(path, behavior);
+        // 显式 name 参数保留公开 completion_mode/iova_base/iommu_strict 短名。
+        `aip_enum(path, virtio_execution_mode_e, exec_mode, execution_mode);
+        begin
+            virtio_completion_mode_e	completion_mode;
+            `aip_enum(path, virtio_completion_mode_e, completion_mode, this.completion_mode);
+            completion = completion_mode;
+        end
+        `aip_enum(path, iommu_iova_alloc_policy_e, iova_policy, iova_alloc_policy);
+        begin
+            bit [63:0]	iova_base;
+            `DPU_AIP_UINT(path, bit [63:0], iova_base, this.iova_base);
+            base = iova_base;
+        end
+        `DPU_AIP_UINT(path, bit [63:0], iova_size, iova_limit - this.iova_base);
+        `DPU_AIP_UINT(path, longint unsigned, scb, scb_enable);
+        `DPU_AIP_UINT(path, longint unsigned, coverage, cov_enable);
+        begin
+            longint unsigned	iommu_strict;
+            `DPU_AIP_UINT(path, longint unsigned, iommu_strict, this.iommu_strict);
+            strict = iommu_strict;
+        end
+        if ((scb > 1) || (coverage > 1) || (strict > 1)) begin
+            `uvm_fatal("VIO_PARAM", {path, ": scb/coverage/iommu_strict 必须为 0 或 1"})
+            return;
+        end
+        if ((base == 0) || (iova_size == 0) ||
+            (base > (64'hffff_ffff_ffff_ffff - iova_size)) ||
+            ((base & 64'hfff) != 0) || ((iova_size & 64'hfff) != 0)) begin
+            `uvm_fatal("VIO_PARAM", {path, ": IOVA base/size 必须 4KiB 对齐、非零且不能溢出"})
+            return;
+        end
+        default_num_pairs           = behavior.num_queue_pairs;
+        default_queue_size          = behavior.queue_size;
+        default_vq_type             = behavior.vq_type;
+        default_driver_features     = behavior.driver_features;
+        default_napi_budget         = behavior.napi_budget;
+        default_rx_refill_threshold = behavior.rx_refill_threshold;
+        execution_mode              = exec_mode;
+        this.completion_mode        = completion;
+        iova_base                   = base;
+        iova_limit                  = base + iova_size;
+        iova_alloc_policy           = iova_policy;
+        iommu_strict                = bit'(strict);
+        scb_enable                  = bit'(scb);
+        cov_enable                  = bit'(coverage);
+        wait_policy_cfg.load_params({path, ".wait"});
+        if (!validate_execution_mode(why) || !validate_local(why))
+            `uvm_fatal("VIO_PARAM", {path, ": ", why})
+`endif
+    endfunction
+
+    // 仅解析一份驱动值类型：全局默认与 service 覆盖共用同一张短名映射。
+    // 不扩容 DPU 资源，先用宽整数拒绝负值/截断/非法几何，再更新调用方副本。
+    function void	load_driver_params(string	path, ref virtio_driver_config_t	behavior);
+`ifdef AIP_CMDLINE_SV
+        longint unsigned	pairs;
+        longint unsigned	queue_size;
+        longint unsigned	napi_budget;
+        longint unsigned	rx_refill;
+        virtqueue_type_e	queue_type;
+        bit [63:0]	features;
+
+        `DPU_AIP_UINT(path, longint unsigned, pairs, behavior.num_queue_pairs);
+        `DPU_AIP_UINT(path, longint unsigned, queue_size, behavior.queue_size);
+        `DPU_AIP_UINT(path, longint unsigned, napi_budget, behavior.napi_budget);
+        `DPU_AIP_UINT(path, longint unsigned, rx_refill, behavior.rx_refill_threshold);
+        `aip_enum(path, virtqueue_type_e, queue_type, behavior.vq_type);
+        `aip_int(path, bit [63:0], features, behavior.driver_features);
+        if ((pairs == 0) || (pairs > DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE) ||
+            ((queue_size != 0) && ((queue_size < 2) || (queue_size > 32768) ||
+              ((queue_size & (queue_size - 1)) != 0))) ||
+            (napi_budget == 0) || (napi_budget > 64'hffff_ffff) ||
+            (rx_refill == 0) || (rx_refill > 64'hffff_ffff)) begin
+            `uvm_fatal("VIO_PARAM", {path, ": pairs/queue_size/napi_budget/rx_refill 超出有效范围"})
+            return;
+        end
+        behavior.num_queue_pairs = int'(pairs);
+        behavior.queue_size = int'(queue_size);
+        behavior.napi_budget = int'(napi_budget);
+        behavior.rx_refill_threshold = int'(rx_refill);
+        behavior.vq_type         = queue_type;
+        behavior.driver_features = features;
+`endif
+    endfunction
+
+    // 将身份转为稳定的公共路径；PF 不附带 VF 段，实例号始终显式保留。
+    // 只格式化输入，不把 function_instances 数组下标当作 PF/VF 身份。
+    static function string	service_param_path(dpu_service_key_t	key, string	root = "vio");
+        string	path;
+
+        path = $sformatf("%s.h%0d.pf%0d", root,
+                         key.function_key.host_id, key.function_key.pf_id);
+        if (key.function_key.kind == DPU_FUNCTION_VF)
+            path = {path, $sformatf(".vf%0d", key.function_key.vf_id)};
+        return {path, $sformatf(".i%0d", key.service_instance_id)};
+    endfunction
+
+    // 在 add_service_config 前对现有驱动副本加载精确实例路径，缺省继承该副本。
+    // 全局/Host 默认由顶层先加载；本函数不重复读取它们，也不重新采样全局随机值。
+    function void	load_service_params(
+        dpu_service_key_t	key, ref virtio_driver_config_t	behavior, string	root = "vio"
+    );
+        load_driver_params(service_param_path(key, root), behavior);
+    endfunction
+
+    // 延迟到第一次 get_service_config 时按冻结快照中的真实 service 身份读取。
+    // 适用于 AUTO placement 无法预知服务归属的顶层；缓存后禁止重新启用或改根路径。
+    function void	enable_service_params(string	root = "vio");
+        if (m_param_service_configs.num() != 0) begin
+            `uvm_fatal("VIO_PARAM", "service 参数已经加载，不能重新绑定参数根路径")
+            return;
+        end
+        aip_service_params_enabled = 1;
+        aip_service_root = root;
+    endfunction
+
+    // 从已采样的全局模板复制默认值，供各 Host 再应用自己的覆盖。
+    // 不复制 Host 身份、service 注册表或借用的内存句柄；等待策略深拷贝以免串改。
+    function void	copy_defaults_from(virtio_net_env_config	rhs);
+        if ((rhs == null) || (rhs.wait_policy_cfg == null) || (wait_policy_cfg == null)) begin
+            `uvm_fatal("VIO_PARAM", "copy_defaults_from 收到空配置或空等待模板")
+            return;
+        end
+        if ((m_service_configs.num() != 0) || (m_param_service_configs.num() != 0)) begin
+            `uvm_fatal("VIO_PARAM", "已有 service 副本，不能重新复制默认模板")
+            return;
+        end
+        default_num_pairs = rhs.default_num_pairs;
+        default_queue_size = rhs.default_queue_size;
+        default_vq_type = rhs.default_vq_type;
+        default_driver_features = rhs.default_driver_features;
+        default_rx_mode = rhs.default_rx_mode;
+        default_irq_mode = rhs.default_irq_mode;
+        default_napi_budget = rhs.default_napi_budget;
+        default_rx_buf_size = rhs.default_rx_buf_size;
+        default_rx_refill_threshold = rhs.default_rx_refill_threshold;
+        default_mtu = rhs.default_mtu;
+        default_mss = rhs.default_mss;
+        default_driver_mode = rhs.default_driver_mode;
+        execution_mode = rhs.execution_mode;
+        completion_mode = rhs.completion_mode;
+        mem_base = rhs.mem_base;
+        mem_end = rhs.mem_end;
+        host_mem_policy = rhs.host_mem_policy;
+        iommu_strict = rhs.iommu_strict;
+        iova_base = rhs.iova_base;
+        iova_limit = rhs.iova_limit;
+        iova_alloc_policy = rhs.iova_alloc_policy;
+        bw_limit_enable = rhs.bw_limit_enable;
+        bw_limit_mbps = rhs.bw_limit_mbps;
+        scb_enable = rhs.scb_enable;
+        cov_enable = rhs.cov_enable;
+        wait_policy_cfg.copy(rhs.wait_policy_cfg);
+    endfunction
+
+
 
     // 给一个 VIO service 选择 DPU 私有驱动；重复键/空配置立即拒绝，具体队列数量
     // 在 snapshot 限额解析后校验。不改拓扑、Host 内存或其他 service 的驱动类型。
@@ -121,6 +373,10 @@ class virtio_net_env_config extends uvm_object;
         string name_key;
         name_key = dpu_service_key_name(key);
         why = "";
+        if (m_param_service_configs.exists(name_key)) begin
+            why = {"service 参数副本已被消费，不能切换私有协议：", name_key};
+            return 0;
+        end
         if ((key.service_kind != DPU_SERVICE_VIO_NET) || (private_cfg == null) ||
             m_private_configs.exists(name_key)) begin
             why = "private service key 非法、配置为空或重复登记";
@@ -308,6 +564,10 @@ class virtio_net_env_config extends uvm_object;
         string service_name;
 
         service_name = dpu_service_key_name(key);
+        if (m_param_service_configs.exists(service_name)) begin
+            why = {"service 参数副本已被消费，不能再替换其配置：", service_name};
+            return 0;
+        end
         if (key.service_kind != DPU_SERVICE_VIO_NET) begin
             why = {"VIO service configuration requires VIO-net key ",
                    service_name};
@@ -360,6 +620,23 @@ class virtio_net_env_config extends uvm_object;
             driver_cfg = m_service_configs[service_name].cfg;
         else
             driver_cfg = make_default_driver_config(max_pairs);
+        // 参数覆盖只在实际请求的 service 上采样一次；不预注册未获资源的候选 VF。
+        // 私有默认环深度先合并，再允许该 service 的 queue_size 显式覆盖。
+        if (aip_service_params_enabled) begin
+            if (m_param_service_configs.exists(service_name)) begin
+                driver_cfg = m_param_service_configs[service_name];
+            end else begin
+                // 缓存保存原始意图；本次资源限额只约束返回值，不能永久截短模板。
+                if (!m_service_configs.exists(service_name))
+                    driver_cfg.num_queue_pairs = default_num_pairs;
+                if (!m_service_configs.exists(service_name) &&
+                    m_private_configs.exists(service_name) &&
+                    (m_private_configs[service_name].cfg != null))
+                    driver_cfg.queue_size = m_private_configs[service_name].cfg.default_queue_size;
+                load_service_params(key, driver_cfg, aip_service_root);
+                m_param_service_configs[service_name] = driver_cfg;
+            end
+        end
         if (driver_cfg.num_queue_pairs > max_pairs)
             driver_cfg.num_queue_pairs = max_pairs;
         driver_cfg.max_vio_net_qpairs_per_device = max_pairs;
@@ -369,7 +646,7 @@ class virtio_net_env_config extends uvm_object;
             dpu_priv_driver_config private_cfg;
             private_cfg = m_private_configs[service_name].cfg;
             if (!private_cfg.validate(driver_cfg.num_queue_pairs, why)) return 0;
-            if (!m_service_configs.exists(service_name))
+            if (!m_service_configs.exists(service_name) && !aip_service_params_enabled)
                 driver_cfg.queue_size = private_cfg.default_queue_size;
             driver_cfg.vq_type = VQ_CUSTOM;
             driver_cfg.irq_mode = IRQ_POLLING;

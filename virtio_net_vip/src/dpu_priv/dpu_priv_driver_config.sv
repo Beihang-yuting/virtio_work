@@ -16,6 +16,97 @@ class dpu_priv_queue_config extends uvm_object;
     bit rss_lag, l3_cs, l4_cs;
     bit [1:0] fwd = 1;
 
+    // 参数归属：vio.private.* 默认控制字段或其 q<qid> 子路径覆盖。
+    // 先用 64 位数值检查位宽，避免负数/高位被窄字段静默截断；不持有运行态 ring。
+    function void	load_params(string	path = "vio.private", bit	load_local_qid = 1);
+`ifdef AIP_CMDLINE_SV
+        longint unsigned	local_qid;
+        longint unsigned	notify_bar;
+        longint unsigned	notify_offset;
+        longint unsigned	dport_info;
+        longint unsigned	dport_id;
+        longint unsigned	dport_type;
+        longint unsigned	cpu_tx_cos;
+        longint unsigned	rss_lag;
+        longint unsigned	l3_cs;
+        longint unsigned	l4_cs;
+        longint unsigned	fwd;
+        local_qid = this.local_qid;
+        if (load_local_qid) begin
+            `DPU_AIP_UINT(path, longint unsigned, local_qid, this.local_qid);
+        end
+        `DPU_AIP_UINT(path, longint unsigned, notify_bar, this.notify_bar);
+        `DPU_AIP_UINT(path, longint unsigned, notify_offset, this.notify_offset);
+        `DPU_AIP_UINT(path, longint unsigned, dport_info, this.dport_info);
+        `DPU_AIP_UINT(path, longint unsigned, dport_id, this.dport_id);
+        `DPU_AIP_UINT(path, longint unsigned, dport_type, this.dport_type);
+        `DPU_AIP_UINT(path, longint unsigned, cpu_tx_cos, this.cpu_tx_cos);
+        `DPU_AIP_UINT(path, longint unsigned, rss_lag, this.rss_lag);
+        `DPU_AIP_UINT(path, longint unsigned, l3_cs, this.l3_cs);
+        `DPU_AIP_UINT(path, longint unsigned, l4_cs, this.l4_cs);
+        `DPU_AIP_UINT(path, longint unsigned, fwd, this.fwd);
+        if (local_qid > 255) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".local_qid 超出字段范围"})
+            return;
+        end
+        if (notify_bar > 5) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".notify_bar 超出字段范围"})
+            return;
+        end
+        if (notify_offset > 64'hffff_ffff) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".notify_offset 超出字段范围"})
+            return;
+        end
+        if (dport_info > 4095) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".dport_info 超出字段范围"})
+            return;
+        end
+        if (dport_id > 1023) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".dport_id 超出字段范围"})
+            return;
+        end
+        if (dport_type > 7) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".dport_type 超出字段范围"})
+            return;
+        end
+        if (cpu_tx_cos > 7) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".cpu_tx_cos 超出字段范围"})
+            return;
+        end
+        if (rss_lag > 1) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".rss_lag 超出字段范围"})
+            return;
+        end
+        if (l3_cs > 1) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".l3_cs 超出字段范围"})
+            return;
+        end
+        if (l4_cs > 1) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".l4_cs 超出字段范围"})
+            return;
+        end
+        if (fwd > 3) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".fwd 超出字段范围"})
+            return;
+        end
+        if ((notify_offset & 3) != 0) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".notify_offset 必须 4 字节对齐"})
+            return;
+        end
+        this.local_qid = local_qid;
+        this.notify_bar = notify_bar;
+        this.notify_offset = notify_offset;
+        this.dport_info = dport_info;
+        this.dport_id = dport_id;
+        this.dport_type = dport_type;
+        this.cpu_tx_cos = cpu_tx_cos;
+        this.rss_lag = rss_lag;
+        this.l3_cs = l3_cs;
+        this.l4_cs = l4_cs;
+        this.fwd = fwd;
+`endif
+    endfunction
+
     // 创建未绑定的队列配置；调用方随后填写 local_qid，方向来自 RX偶/TX奇约定。
     function new(string name = "dpu_priv_queue_config");
         super.new(name);
@@ -31,6 +122,44 @@ class dpu_priv_driver_config extends uvm_object;
     int unsigned local_qid_base = 0;
     dpu_priv_queue_config defaults;
     dpu_priv_queue_config queues[int unsigned];
+
+    // 参数归属：vio.private.queue_size/rx_buf_size/local_qid_base 及默认控制字段。
+    // 必须在 Function bind_private 冻结副本前调用；仅覆盖已声明的 queues，
+    // qid 唯一性与方向仍由 validate(pairs, why) 联合检查，不擅自创建/扩容队列。
+    function void	load_params(string	path = "vio.private");
+`ifdef AIP_CMDLINE_SV
+        longint unsigned	queue_size;
+        longint unsigned	rx_buf_size;
+        longint unsigned	local_qid_base;
+
+        `DPU_AIP_UINT(path, longint unsigned, queue_size, default_queue_size);
+        `DPU_AIP_UINT(path, longint unsigned, rx_buf_size, this.rx_buf_size);
+        `DPU_AIP_UINT(path, longint unsigned, local_qid_base, this.local_qid_base);
+        if ((queue_size < 2) || (queue_size > 4096) ||
+            ((queue_size & (queue_size - 1)) != 0) ||
+            (rx_buf_size < 64) || (rx_buf_size > 16383) ||
+            (local_qid_base > 254) || ((local_qid_base & 1) != 0)) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ": 队列几何/本地队列起点非法"})
+            return;
+        end
+        if (defaults == null) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ": 缺少默认队列配置"})
+            return;
+        end
+        // 默认队列的 local_qid 由 local_qid_base+qid 推导；只有单队列覆盖读此字段。
+        defaults.load_params(path, 0);
+        foreach (queues[qid]) begin
+            if (queues[qid] == null) begin
+                `uvm_fatal("VIO_PRIVATE_PARAM", {path, ": 队列覆盖对象为空"})
+                return;
+            end
+            queues[qid].load_params($sformatf("%s.q%0d", path, qid));
+        end
+        default_queue_size = int'(queue_size);
+        this.rx_buf_size   = int'(rx_buf_size);
+        this.local_qid_base = int'(local_qid_base);
+`endif
+    endfunction
 
     // 创建本 Function 的默认队列配置。
     function new(string name = "dpu_priv_driver_config");

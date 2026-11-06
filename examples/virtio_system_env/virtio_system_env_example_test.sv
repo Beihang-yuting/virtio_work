@@ -4,6 +4,8 @@
 // 所有权与生命周期：测试持有配置，UVM 管理组件至仿真结束；DPU 独占拓扑解析与快照发布，
 // 系统环境持有共享内存池，池管理每个 Host 的内存管理器；外部传入的配置和池仅共享句柄。
 // 本示例不发送 PCIe 流量、不模拟复位；配置在 build 阶段完成，run 阶段只读取已冻结快照。
+// 可选PCIe策略在子env创建前从pcie_cfg采样；cfg/tl_policy_cfg共用调用方同一对象，
+// 外部global_cfg/topology_cfg仍拥有拓扑，参数加载不创建它们或改写Root映射。
 
 `ifndef VIRTIO_SYSTEM_ENV_EXAMPLE_TEST_SV
 `define VIRTIO_SYSTEM_ENV_EXAMPLE_TEST_SV
@@ -17,6 +19,9 @@ import host_mem_pkg::*;
 import pcie_tl_pkg::*;
 import dpu_resource_pkg::*;
 import virtio_net_pkg::*;
+`ifdef AIP_CMDLINE_SV
+import aip_core_pkg::*;
+`endif
 
 
 // Authoring boundary for the complete virtio verification hierarchy.
@@ -62,6 +67,29 @@ class virtio_system_env_config extends uvm_object;
             {name, "_default_vio_cfg"});
         pcie_cfg = null;
         host_mem_pool_binding = null;
+    endfunction
+
+    // 系统拥有内存池的创建策略，所以 dpu.mem_mode/granule/policy 在这里读取。
+    // GPA base/size 由 dpu_host_cfg 加载；外部已提供的 pool 不会因此重新创建。
+    // 必须在创建各 Host 行为对象前调用；非法 granule 立即拒绝，未启用 AIP 保持原值。
+    function void	load_params(string	path = "dpu");
+`ifdef AIP_CMDLINE_SV
+        alloc_mode_e	mem_mode;
+        host_mem_alloc_policy_e	mem_policy;
+        longint unsigned	mem_granule;
+
+        `aip_enum(path, alloc_mode_e, mem_mode, host_mem_mode);
+        `aip_enum(path, host_mem_alloc_policy_e, mem_policy, default_vio_cfg.host_mem_policy);
+        `DPU_AIP_UINT(path, longint unsigned, mem_granule, host_mem_granule);
+        if ((mem_granule == 0) || (mem_granule > 64) ||
+            ((mem_granule & (mem_granule - 1)) != 0)) begin
+            `uvm_fatal("SYSTEM_PARAM", "dpu.mem_granule 必须是 1..64 范围内的 2 的幂")
+            return;
+        end
+        host_mem_mode = mem_mode;
+        host_mem_granule = int'(mem_granule);
+        default_vio_cfg.host_mem_policy = mem_policy;
+`endif
     endfunction
 
     // Register a per-Host behavior configuration.  The caller retains
@@ -333,7 +361,13 @@ class virtio_system_env extends uvm_env;
         if (cfg.use_dpu_gpa_aperture && (host_cfg != null) &&
             host_cfg.has_gpa_aperture) begin
             base_addr = host_cfg.gpa_base;
-            end_addr = host_cfg.gpa_limit;
+            // DPU aperture 为半开区间，host_mem 的 end_addr 为包含末字节的地址。
+            // 明确换算使公开 mem_size 不会多分配一字节；先检查再减一防止下溢。
+            if (host_cfg.gpa_limit <= host_cfg.gpa_base) begin
+                why = $sformatf("Host %0d DPU GPA aperture is empty", host_id);
+                return 0;
+            end
+            end_addr = host_cfg.gpa_limit - 1;
         end else begin
             base_addr = host_vio_cfg.mem_base;
             end_addr = host_vio_cfg.mem_end;
@@ -454,8 +488,14 @@ class virtio_system_env extends uvm_env;
                            "create_pcie_env is set but pcie_cfg is null")
                 return;
             end
+            // 只在调用方显式选择创建PCIe时加载。native cfg路径与外部graph路径
+            // 必须消费同一策略对象；graph翻译仍独占agent数量/交换结构字段，
+            // 不能因只传cfg而使global_cfg/topology_cfg路径退回缺省policy。
+            cfg.pcie_cfg.load_params("pcie_cfg");
             uvm_config_db#(pcie_tl_env_config)::set(
                 this, "pcie_env", "cfg", cfg.pcie_cfg);
+            uvm_config_db#(pcie_tl_env_config)::set(
+                this, "pcie_env", "tl_policy_cfg", cfg.pcie_cfg);
             pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
         end
         configuration_valid = 1;
@@ -567,6 +607,9 @@ endclass : virtio_system_env
 class virtio_system_env_example_test extends uvm_test;
     `uvm_component_utils(virtio_system_env_example_test)
 
+    // 可选 AIP 路径使用一个全局 placement request；旧固定示例保持原调用合同。
+    bit	parameterized_config = 0;
+
     virtio_system_env_config system_cfg;
     virtio_system_env        system_env;
 
@@ -667,12 +710,188 @@ class virtio_system_env_example_test extends uvm_test;
         return host;
     endfunction
 
+    // AIP 顶层构建入口：数量参数属于创建对象的这一层；配置字段由原类各自加载。
+    // 全局模板只采样一次，Host 覆盖在复制后应用；service 覆盖延迟到实际资源身份
+    // 确定后由 get_service_config 首次读取并缓存。只构建输入，不读写冻结快照。
+    function void	author_param_config();
+`ifdef AIP_CMDLINE_SV
+        longint unsigned	hosts;
+        longint unsigned	pfs_per_host;
+        longint unsigned	vfs_per_pf;
+        dpu_host_cfg	host_template;
+        dpu_dut_caps	caps;
+        dpu_resource_pool_config_t	profile;
+        dpu_vio_placement_request	request;
+        string	why;
+
+        system_cfg = virtio_system_env_config::type_id::create("system_cfg");
+        system_cfg.dpu_cfg.device_cfg.af_request.mode = DPU_AF_SELECTED;
+        system_cfg.dpu_cfg.device_cfg.af_request.requester =
+            '{host_id:0, pf_id:0, kind:DPU_FUNCTION_PF, vf_id:0};
+        system_cfg.dpu_cfg.device_cfg.load_params("dpu");
+        caps = system_cfg.dpu_cfg.device_cfg.dut_caps;
+        // 能力输入先服从编译模型上限，再据其限制创建循环；防止非法caps导致
+        // 巨量对象创建或数量乘法溢出后才在resolver中被拒绝。
+        if (!caps.validate(why)) begin
+            `uvm_fatal("SYSTEM_PARAM", {"非法 DUT capability: ", why})
+            return;
+        end
+        `DPU_AIP_UINT("dpu", longint unsigned, hosts, 2);
+        `DPU_AIP_UINT("dpu", longint unsigned, pfs_per_host, 1);
+        `DPU_AIP_UINT("dpu", longint unsigned, vfs_per_pf, 2);
+        if ((hosts == 0) || (hosts > caps.max_hosts) ||
+            (pfs_per_host == 0) || (pfs_per_host > caps.max_pfs_per_host) ||
+            (pfs_per_host > 4) || (vfs_per_pf > caps.max_vfs_per_pf) ||
+            ((hosts * pfs_per_host * (1 + vfs_per_pf)) > caps.max_functions)) begin
+            `uvm_fatal("SYSTEM_PARAM", "dpu.hosts/pfs_per_host/vfs_per_pf 超出 DUT 或 VIO source-id 限制")
+            return;
+        end
+        system_cfg.load_params("dpu");
+        system_cfg.default_vio_cfg.load_params("vio");
+        host_template = make_host(0);
+        host_template.load_params("dpu");
+        profile.name             = "virtio.qpair";
+        profile.class_id         = '0;
+        profile.kind             = DPU_RESOURCE_KIND_QUEUE;
+        profile.capacity         = caps.vio_global_qpair_count;
+        profile.max_per_function = caps.max_vio_net_qpairs_per_device;
+        system_cfg.dpu_cfg.placement_cfg.profiles.push_back(profile);
+        request = dpu_vio_placement_request::type_id::create("vio_request");
+        request.request_id   = 0;
+        request.candidate_kind = (vfs_per_pf == 0) ?
+                                 DPU_VIO_CANDIDATE_PF_ONLY : DPU_VIO_CANDIDATE_VF_ONLY;
+        request.device_policy = DPU_VIO_DEVICE_FIXED;
+
+        for (int unsigned	host_id = 0; host_id < hosts; host_id++) begin
+            dpu_host_cfg	host;
+            virtio_net_env_config	host_vio_cfg;
+            bit [64:0]	new_base;
+            bit [64:0]	new_limit;
+            string	host_path;
+
+            host_path = $sformatf("dpu.h%0d", host_id);
+            host = dpu_host_cfg::type_id::create($sformatf("host_%0d", host_id));
+            host.copy_from(host_template);
+            host.host_id = host_id;
+            // 保留示例原来的每 Host GPA/MMIO 间距；实例参数可指定确切地址。
+            new_base  = {1'b0, host.gpa_base}  + host_id * 65'h0000_0100_0000_0000;
+            new_limit = {1'b0, host.gpa_limit} + host_id * 65'h0000_0100_0000_0000;
+            if (new_base[64] || new_limit[64]) begin
+                `uvm_fatal("SYSTEM_PARAM", "Host GPA 模板加实例间距溢出")
+                return;
+            end
+            host.gpa_base  = new_base[63:0];
+            host.gpa_limit = new_limit[63:0];
+            host.pcie_domains[0].key.host_id = host_id;
+            host.pcie_domains[0].key.segment_id = host_id;
+            new_base = {1'b0, host.pcie_domains[0].mmio_windows[0].base} +
+                       host_id * 65'h0000_0010_0000_0000;
+            new_limit = {1'b0, host.pcie_domains[0].mmio_windows[0].limit} +
+                        host_id * 65'h0000_0010_0000_0000;
+            if (new_base[64] || new_limit[64]) begin
+                `uvm_fatal("SYSTEM_PARAM", "Host MMIO 模板加实例间距溢出")
+                return;
+            end
+            host.pcie_domains[0].mmio_windows[0].base = new_base[63:0];
+            host.pcie_domains[0].mmio_windows[0].limit = new_limit[63:0];
+            host.load_params(host_path);
+            system_cfg.dpu_cfg.device_cfg.hosts.push_back(host);
+            host_vio_cfg = virtio_net_env_config::type_id::create(
+                $sformatf("host_vio_cfg_%0d", host_id));
+            host_vio_cfg.copy_defaults_from(system_cfg.default_vio_cfg);
+            host_vio_cfg.host_id = host_id;
+            host_vio_cfg.load_params($sformatf("vio.h%0d", host_id));
+            host_vio_cfg.enable_service_params("vio");
+            if (!system_cfg.set_host_vio_config(host_id, host_vio_cfg, why))
+                `uvm_fatal("SYSTEM_PARAM", why)
+
+            for (int unsigned	pf_id = 0; pf_id < pfs_per_host; pf_id++) begin
+                dpu_function_cfg	pf_cfg;
+                string	pf_path;
+
+                pf_path = $sformatf("%s.pf%0d", host_path, pf_id);
+                pf_cfg = make_function(caps, host_id, pf_id, DPU_FUNCTION_PF, 0);
+                pf_cfg.load_params(pf_path);
+                system_cfg.dpu_cfg.device_cfg.functions.push_back(pf_cfg);
+                if (vfs_per_pf == 0)
+                    request.fixed_devices.push_back(pf_cfg.key);
+                for (int unsigned	vf_id = 0; vf_id < vfs_per_pf; vf_id++) begin
+                    dpu_function_cfg	vf_cfg;
+
+                    vf_cfg = make_function(caps, host_id, pf_id, DPU_FUNCTION_VF, vf_id);
+                    vf_cfg.load_params($sformatf("%s.vf%0d", pf_path, vf_id));
+                    system_cfg.dpu_cfg.device_cfg.functions.push_back(vf_cfg);
+                    request.fixed_devices.push_back(vf_cfg.key);
+                end
+            end
+        end
+        request.total_qpairs = request.fixed_devices.size() *
+                               system_cfg.default_vio_cfg.default_num_pairs;
+        system_cfg.dpu_cfg.placement_cfg.vio_requests.push_back(request);
+        // 唯一全局 request 保证 dpu.qpairs 表示整个系统的分配总量。
+        system_cfg.dpu_cfg.placement_cfg.load_params("dpu");
+        system_cfg.dpu_cfg.vio_policy.load_params("dpu");
+        if (!system_cfg.validate(why))
+            `uvm_fatal("SYSTEM_PARAM", why)
+        parameterized_config = 1;
+`endif
+    endfunction
+
+    // 参数化示例只验证资源/配置接通，不宣称 DUT 流量通过。按真实配置检查各 Host
+    // 内存对象独立、等待策略副本、普通 qpair 总量及ID唯一性，不固化为双Host四VF。
+    function void	check_param_config();
+        dpu_resource_snapshot	resources;
+        dpu_vio_qpair_binding_t	bindings[$];
+        bit	seen[int unsigned];
+        host_mem_manager	memories[$];
+        int unsigned	expected_pairs;
+
+        resources = system_env.get_resource_snapshot();
+        if ((resources == null) || !resources.is_frozen())
+            `uvm_fatal("SYSTEM_PARAM", "未发布冻结资源快照")
+        resources.list_vio_bindings(bindings);
+        expected_pairs = system_cfg.dpu_cfg.placement_cfg.vio_requests[0].total_qpairs;
+        if (bindings.size() != expected_pairs)
+            `uvm_fatal("SYSTEM_PARAM", "普通 qpair 数量与 dpu.qpairs 不一致")
+        foreach (bindings[index]) begin
+            if (seen.exists(bindings[index].global_qpair_id))
+                `uvm_fatal("SYSTEM_PARAM", "出现重复的全局 qpair ID")
+            seen[bindings[index].global_qpair_id] = 1;
+        end
+        foreach (system_cfg.vio_cfg_by_host[h]) begin
+            virtio_net_env	vio_env;
+            host_mem_manager	memory;
+
+            vio_env = system_env.get_virtio_env(h);
+            memory = system_env.get_host_mem(h);
+            if ((vio_env == null) || (memory == null))
+                `uvm_fatal("SYSTEM_PARAM", "缺少 Host 环境或内存管理器")
+            foreach (memories[i])
+                if (memory == memories[i])
+                    `uvm_fatal("SYSTEM_PARAM", "多个 Host 错误共享内存管理器")
+            memories.push_back(memory);
+            if ((vio_env.wait_pol == system_cfg.vio_cfg_by_host[h].wait_policy_cfg) ||
+                (vio_env.wait_pol.default_timeout_ns !=
+                 system_cfg.vio_cfg_by_host[h].wait_policy_cfg.default_timeout_ns))
+                `uvm_fatal("SYSTEM_PARAM", "vio.wait 参数没有进入环境的独立策略副本")
+        end
+        `uvm_info("SYSTEM_PARAM", $sformatf(
+            "参数配置检查通过：%0d Hosts，%0d Functions，%0d 普通 qpairs",
+            system_cfg.dpu_cfg.device_cfg.hosts.size(),
+            system_cfg.dpu_cfg.device_cfg.functions.size(), bindings.size()), UVM_LOW)
+    endfunction
+
     // 创建并填充 system_cfg：两个 Host 各有一 PF、两 VF，共享容量 2048、单功能上限 32 的队列资源池。
     // 每个 VF 请求一对队列，驱动配置按服务键匹配，AF 指向 Host 0 PF 0；配置登记失败报告 fatal。
     function void author_config();
         dpu_dut_caps caps;
         dpu_resource_pool_config_t profile;
         string why;
+
+`ifdef AIP_CMDLINE_SV
+        author_param_config();
+        return;
+`endif
 
         system_cfg = virtio_system_env_config::type_id::create("system_cfg");
         caps = system_cfg.dpu_cfg.device_cfg.dut_caps;
@@ -774,6 +993,11 @@ class virtio_system_env_example_test extends uvm_test;
         bit qpair_profile_found;
 
         phase.raise_objection(this);
+        if (parameterized_config) begin
+            check_param_config();
+            phase.drop_objection(this);
+            return;
+        end
         host0_mem = system_env.get_host_mem(0);
         host1_mem = system_env.get_host_mem(1);
         if ((host0_mem == null) || (host1_mem == null) ||

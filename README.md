@@ -2,6 +2,14 @@
 
 面向 DPU/SmartNIC virtio 硬件加速引擎验证的 UVM virtio-net 驱动模拟组件。
 
+可选 AIP 接入见 [参数与 Tcl sequence 使用说明](docs/aip_parameters.md)：
+在原配置类加载 `dpu.*`、`vio.*` 短路径，在现有 test 统一注册运行命令。
+
+项目级 `env_cfg/env/base_test` 的完整组装代码与公共句柄传递见
+[项目集成说明](integration/project/README.md) 和 [逐文件完整代码](docs/project_env_full_code.md)。
+`integration/` 作为可选参考，使用独立 package/filelist；原有 filelist 和生产 package
+不引入这些参考代码，只有显式选择新增的 AIP/project 编译入口时才编译它们。
+
 工作在 PCIe Transaction Layer，模拟完整的 Guest OS virtio-net 驱动行为。MODEL
 模式通过 TLM 与独立设备模型完成可复现的协议与数据闭环；只有 REAL_DUT 模式才
 通过真实的 PCIe TLP 对 RTL DUT 做协议合规性和数据正确性验证。
