@@ -57,7 +57,7 @@ virtio_net_env（顶层环境）
 │
 ├── host_mem_manager（外部组件）               ← Buddy/Linear Host memory 后端
 ├── host_mem_pool                              ← 按 host-id 共享 manager 的所有权池
-├── net_packet（项目外 checkout）              ← 协议报文产生器（跟随远程 master）
+├── net_packet（项目外 checkout）              ← 协议报文产生器（跟随远程 main）
 └── pcie_tl_env（外部组件，作为子环境）         ← PCIe TL 层 VIP
 ```
 
@@ -334,7 +334,7 @@ memory 在本工程中增加了随机布局与 reservation/pool 适配层：
 |------|------|---------|
 | **pcie_work/pcie_tl_vip** | PCIe TL 层 VIP，提供 RC/EP Agent、TLM 回环、SR-IOV func_manager | `$PCIE_WORK_ROOT/pcie_tl_vip`（外部 `main`）；`pcie_tl_env`（子环境）、`uvm_sequencer #(pcie_tl_tlp)`（RC 序列器） |
 | **host_mem_manager** | Buddy Allocator 内存管理，提供分配/释放/读写/泄漏检查 | `alloc()`、`free()`、`write_mem()`、`read_mem()`、`leak_check()` |
-| **net_packet** | 项目外 `NET_PACKET_ROOT`，跟随远程 `master`；支持 L2-L4、隧道、RDMA、存储协议 | `packet_item`（UVM sequence item 封装） |
+| **net_packet** | 项目外 `NET_PACKET_ROOT`，跟随远程 `main`；支持 L2-L4、隧道、RDMA、存储协议 | `packet_item`（UVM sequence item 封装） |
 | **dpu_common** | 独立 DPU 控制面：拓扑、快照、资源解析和寄存器计划 | `$DPU_COMMON_ROOT` 外部 checkout，固定 SHA |
 
 ---
@@ -347,8 +347,8 @@ memory 在本工程中增加了随机布局与 reservation/pool 适配层：
 - 可访问外部依赖 checkout 的 Git 远端
 - 项目外 `host_mem` checkout（`HOST_MEM_ROOT`，固定提交
   `35ec087014744ec85cf6c0fe17e1f7118ee7a7b7`）
-- 项目外 `net_packet` master checkout（`NET_PACKET_ROOT`，工作树跟踪
-  `origin/master`）
+- 项目外 `net_packet` main checkout（`NET_PACKET_ROOT`，工作树跟踪
+  `origin/main`）
 - 独立的 `dpu_common` checkout（固定提交 `4d739965eb47d90b47cc048fc71fd8d7d76a77ca`）
 - 独立的 `pcie_work` `main` checkout（`PCIE_WORK_ROOT`，跟踪
   `origin/main`）
@@ -373,10 +373,11 @@ git -C "$DPU_COMMON_ROOT" checkout --detach 4d739965eb47d90b47cc048fc71fd8d7d76a
 export HOST_MEM_ROOT=/home/ryan/workspace/ryan/host_mem
 git -C "$HOST_MEM_ROOT" checkout --detach 35ec087014744ec85cf6c0fe17e1f7118ee7a7b7
 export NET_PACKET_ROOT=/home/ryan/workspace/ryan/net_packet
-git -C "$NET_PACKET_ROOT" fetch origin master
-git -C "$NET_PACKET_ROOT" switch master 2>/dev/null || \
-  git -C "$NET_PACKET_ROOT" switch --track -c master origin/master
-git -C "$NET_PACKET_ROOT" branch --set-upstream-to=origin/master master
+git -C "$NET_PACKET_ROOT" fetch origin main
+git -C "$NET_PACKET_ROOT" switch main 2>/dev/null || \
+  git -C "$NET_PACKET_ROOT" switch --track -c main origin/main
+git -C "$NET_PACKET_ROOT" branch --set-upstream-to=origin/main main
+git -C "$NET_PACKET_ROOT" merge --ff-only origin/main
 export PCIE_WORK_ROOT=/home/ryan/workspace/ryan/pcie_work
 git -C "$PCIE_WORK_ROOT" fetch origin main
 git -C "$PCIE_WORK_ROOT" switch main 2>/dev/null || \
@@ -389,7 +390,7 @@ git -C "$PCIE_WORK_ROOT" branch --set-upstream-to=origin/main main
 ```bash
 git clone https://github.com/Beihang-yuting/dpu_common.git "$DPU_COMMON_ROOT"
 git -C "$DPU_COMMON_ROOT" checkout --detach 4d739965eb47d90b47cc048fc71fd8d7d76a77ca
-git clone --branch master https://github.com/Beihang-yuting/net_packet.git "$NET_PACKET_ROOT"
+git clone --branch main https://github.com/Beihang-yuting/net_packet.git "$NET_PACKET_ROOT"
 git clone --branch main https://github.com/Beihang-yuting/pcie_work.git "$PCIE_WORK_ROOT"
 ```
 
@@ -425,8 +426,13 @@ make test TEST=virtio_unit_test
 `dpu_pcie_tl_executor_integration_test`、`dpu_priv_driver_flow_test` 和
 `dpu_priv_ring_contract_test`，共 41 项。
 `make check-deps` 会验证 `host_mem` 外部 checkout 固定 SHA、VCS 环境以及
-`dpu_common` 的固定版本；同时要求 `net_packet` 处于 `master`/`origin/master`、
+`dpu_common` 的固定版本；同时要求 `net_packet` 处于 `main`/`origin/main`、
 `pcie_work` 处于 `main`/`origin/main`，并且二者都来自指定远程。
+
+AIP 接入还要求 net_packet 含 RoCEv2 trailer API（`4dc2e08`，已合入
+`main@b8a4c14`）。遇到 `virtio_aip_pkg` 找不到 `get_all_trailers_length`，
+按 [依赖版本和编译路径排查](docs/aip_parameters.md#virtio_aip_pkgsv-找不到-get_all_trailers_length)
+核对完整 checkout 和实际参与编译的 package；不要删掉尾部长度校验。
 
 `virtio_host_mem_reclaim_test` 使用外部 `host_mem` 项目的 `host_mem_pool`，验证
 同一 Host 的 manager 共享、随机 alloc/free、队列 reset/teardown 回收以及多 Host
@@ -436,7 +442,7 @@ make test TEST=virtio_unit_test
 没有泄漏。`virtio_traffic_test` 和 `virtio_net_packet_multi_queue_test` 也从
 同一个 Host manager 分配 ring 和 packet buffer。
 
-`pcie_work/main` 和 `net_packet/master` 是项目外的滚动分支依赖，`host_mem`
+`pcie_work/main` 和 `net_packet/main` 是项目外的滚动分支依赖，`host_mem`
 固定到受支持的提交。`filelists/virtio_net.f` 先编译
 `$NET_PACKET_ROOT/src/net_packet_pkg.sv` 和 `$HOST_MEM_ROOT/src/host_mem_pkg.sv`，
 再编译 PCIe 与本地 virtio package。外部单独的 SV 文件应在使用类型的作用域中

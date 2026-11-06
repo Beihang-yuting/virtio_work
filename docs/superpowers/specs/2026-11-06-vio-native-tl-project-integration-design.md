@@ -187,3 +187,25 @@ aip_tcl_bridge::run_loop()
 结构测试不能证明真实 DUT 报文收发通过；真实数据面由用户项目的 DUT、DMA 和
 网络激励共同验证。本次简化也不补齐上一轮核对出的 VTX/VRX/QSCH 自动配置缺口，
 不改变当前私有后端支持范围或寄存器编码。
+
+
+## 9. 后续 Intel 接口需求
+
+用户随后明确选择 `pcie_intel` 接口，并要求完整 env/cfg。沿用本方案已有的一套
+组合式 env/cfg，在独立 `project_intel_integration.f` 中定义 `PROJECT_PCIE_INTEL`。
+该分支用于真实 EP 应用 DUT，每 Host 一个 HARD_IP 方向的 RC adapter；关闭
+EP agent/adapter，保留 Host→RC slot、共享内存、快照和原 AIP 参数路径。
+
+Intel 专用 cfg/VIF 必须在 adapter build 前发布。大 cfg 显式句柄与 top 的 bind
+wrapper 发布值允许指向相同对象，冲突或跨端口复用立即失败；缺 cfg 可建立默认
+HARD_IP 对象，缺 VIF 立即失败。通过 `intel_pcie_configure_env()` 安装实例覆盖，
+开启外部引脚 bridge 与公共无限 FC；本地有限 AVST credits 由 Intel cfg 管理。
+connect 只核对实际 adapter，不补绑迟到接口。
+
+没有新增项目 env/DPU 子类，没有启用 SVT/global/topology，也没有改变生产
+filelist/package。结构回归复用原测试并按宏切换空闲 VIF，覆盖 Host slot 交换、
+wrapper 句柄借用、配置冲突、缺接口/跨端口复用及普通 TL 兼容性。
+
+Intel cfg 原类尚无 `load_params()`，私有字段仍由平台在 build 前赋值。
+`cq_route`→RX BAR/PF/VF 边带、requester-aware DMA 翻译、协议观察、VTX/VRX/QSCH
+硬件设置继续由实际平台接入；env/cfg 结构测试不能替代真实 DUT 收发验证。

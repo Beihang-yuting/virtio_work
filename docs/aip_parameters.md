@@ -13,6 +13,43 @@ net_packet/host_mem/PCIe、Virtio，最后是 `integration/aip/virtio_aip_pkg.sv
 AIP，后编译各配置类。不要手工预定义这个 include guard 再编译 AIP 自身。
 不启用 AIP 时，原配置类的 `load_params()` 保留为空操作。
 
+### `virtio_aip_pkg.sv` 找不到 `get_all_trailers_length`
+
+TX 长度校验使用的正确表达式是：
+
+```systemverilog
+packet_handle.pkt.get_all_headers_length() +
+packet_handle.pkt.get_all_trailers_length()
+```
+
+成员叫 `pkt`，方法叫 `get_all_trailers_length`。`packet_item.pkt` 的类型是
+`net_packet_pkg::packet`，定义来自外部 `net_packet/src/core/packet.sv`，不是
+Intel adapter 或 `pcie_cfg`。本地检查通过的版本为 `net_packet/main@b8a4c14`，
+该方法由 `4dc2e08` 随 RoCEv2 ICRC 尾部支持引入。此前版本没有该 API。
+
+在报错工程的实际构建环境中检查：
+
+```bash
+printf '%s\n' "$NET_PACKET_ROOT"
+git -C "$NET_PACKET_ROOT" log -1 --oneline
+rg -n 'get_all_trailers_length' "$NET_PACKET_ROOT/src/core/packet.sv"
+rg -n 'get_trailer_length' "$NET_PACKET_ROOT/src/protocols/protocol_base.sv"
+rg -n 'net_packet_pkg\.sv|core/packet\.sv' compile.log
+```
+
+找不到方法时，应同步包含上述提交的**完整 net_packet checkout**。有本地修改时
+先保留修改；干净 checkout 可用 `git fetch origin main`、`git switch main`、
+`git merge --ff-only origin/main` 更新。当前远程维护分支是 main；早期文档和
+依赖脚本要求 master，现已同步更正，并在 bootstrap/check-deps 增加 trailer API 诊断。
+
+若文件中有方法而 VCS 仍报找不到，检查日志是否实际编译了另一份路径、旧的 package
+库，或 include 搜索路径先命中旧文件；用新的构建输出目录重新编译
+`net_packet_pkg` 及依赖它的 VIO/AIP package。同一构建只编译一份 package 入口，
+不同时混入旧 `net_packet/filelist.f`、旧 `packet_item.sv` 或预编译包。
+
+不要将 trailer 长度改成 0，或仅复制一个空方法：RoCEv2 的 ICRC 位于 payload 后，
+长度和打包语义必须与 `protocol_base`、`rocev2_header`、`packet::do_pack()` 一起更新。
+
 | 参数所属文件 | 加载入口与内容 |
 | --- | --- |
 | `virtio_net_vip/src/env/virtio_net_env_config.sv` | `load_params` 加载 Host 默认；`load_driver_params` 定义驱动短名映射；`load_service_params` 应用精确 service 覆盖 |
@@ -123,6 +160,12 @@ PCIe env 前加载 `pcie_cfg`。该 fixture 另外要求 `ep_auto_response` 与�
 大 env 继承 `uvm_env`，直接创建原有 DPU/PCIe/VIO；只下发 `pcie_tl_env_config` 的
 `cfg`，不创建 global/topology 对象。该参考的大 cfg 统一加载参数并保护重复调用，
 默认规模是 1 Host / 1 PF / 0 VF；下方 DPU 表中的 2/1/2 是参数回归示例的默认规模。
+
+Intel 项目使用独立的 `filelists/project_intel_integration.f`，在同一 env/cfg 中
+启用 RC-only、HARD_IP 和外部引脚 bridge。`pcie_cfg.infinite_credit` 必须保持 1；
+实际 AVST credit 由 `intel_pcie_adapter_config` 控制。Intel cfg 原类尚未提供
+`load_params()`，所以当前 `pcie_cfg.*` 不包含 Intel 私有字段。端口字段的设置和
+VIF 下发位置见 [Intel 集成说明](../integration/project/README.md#intel-配置放在哪里)。
 
 ```systemverilog
 pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");

@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root_dir="$(cd "$script_dir/.." && pwd)"
 
 # 中文说明：bootstrap 检查项目外的 dpu_common、net_packet、pcie_work、host_mem
-# 和 queue_work 是否已经位于受支持的外部 checkout；net_packet 跟随 origin/master，
+# 和 queue_work 是否已经位于受支持的外部 checkout；net_packet 跟随 origin/main，
 # pcie_work 跟随 origin/main，其余需要稳定回归的依赖固定版本；它不复制或修改
 # 项目外的控制面、报文生成器、Host memory 或 PCIe VIP 源码。
 dpu_common_revision="4d739965eb47d90b47cc048fc71fd8d7d76a77ca"
@@ -77,13 +77,22 @@ if [[ "$net_packet_origin" != "$net_packet_url" ]]; then
   exit 6
 fi
 net_packet_branch="$(git -C "$net_packet_root" symbolic-ref --short -q HEAD 2>/dev/null || true)"
-if [[ "$net_packet_branch" != "master" ]]; then
-  echo "net_packet checkout must be on remote master branch: actual ${net_packet_branch:-detached}" >&2
+if [[ "$net_packet_branch" != "main" ]]; then
+  echo "net_packet checkout must be on remote main branch: actual ${net_packet_branch:-detached}" >&2
   exit 5
 fi
 net_packet_upstream="$(git -C "$net_packet_root" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
-if [[ "$net_packet_upstream" != "origin/master" ]]; then
-  echo "net_packet master must track origin/master: actual ${net_packet_upstream:-none}" >&2
+if [[ "$net_packet_upstream" != "origin/main" ]]; then
+  echo "net_packet main must track origin/main: actual ${net_packet_upstream:-none}" >&2
+  exit 5
+fi
+# AIP 报文长度校验依赖 trailer API。早期 main/master 没有这两个方法，
+# 仅有正确分支名还不足以保证编译；报出具体路径，便于定位旧副本/include 路径。
+if ! grep -Eq 'function[[:space:]]+int[[:space:]]+get_all_trailers_length[[:space:]]*\(' \
+    "$net_packet_root/src/core/packet.sv" ||
+   ! grep -Eq 'function[[:space:]]+int[[:space:]]+get_trailer_length[[:space:]]*\(' \
+    "$net_packet_root/src/protocols/protocol_base.sv"; then
+  echo "net_packet trailer API missing: $net_packet_root; update the complete checkout to main containing 4dc2e08 (verified b8a4c14), then rebuild net_packet_pkg" >&2
   exit 5
 fi
 net_packet_actual="$(git -C "$net_packet_root" rev-parse HEAD 2>/dev/null || true)"
@@ -169,5 +178,5 @@ export HOST_MEM_ROOT="$host_mem_root"
 
 echo "dpu_common=$dpu_common_revision (external: $dpu_common_root)"
 echo "pcie_work=$pcie_work_actual (external main: $pcie_work_root)"
-echo "net_packet=$net_packet_actual (external master: $net_packet_root)"
+echo "net_packet=$net_packet_actual (external main: $net_packet_root)"
 echo "host_mem=$host_mem_revision (external: $host_mem_root)"

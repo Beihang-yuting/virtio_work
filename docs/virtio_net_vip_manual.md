@@ -114,7 +114,7 @@ disable fork;  // 杀死调用线程中的所有子进程!
 |------|------|------|----------|
 | `pcie_tl_vip` | `$PCIE_WORK_ROOT/pcie_tl_vip` | PCIe TL 子环境（RC/EP Agent, func_manager, SR-IOV） | 外部 `main` checkout，作为子环境零修改 |
 | `host_mem_manager` | `$HOST_MEM_ROOT`（项目外固定 checkout） | Buddy 分配器，用于描述符环和数据缓冲区 | 共享实例 |
-| `net_packet` | `$NET_PACKET_ROOT`（项目外 checkout） | 跟随远程 `master`；协议报文生成器（L2-L4、隧道、RDMA、存储） | `packet_item` UVM 封装 |
+| `net_packet` | `$NET_PACKET_ROOT`（项目外 checkout） | 跟随远程 `main`；协议报文生成器（L2-L4、隧道、RDMA、存储） | `packet_item` UVM 封装 |
 | `dpu_common` | `$DPU_COMMON_ROOT`（项目外 checkout） | DPU 全局拓扑、资源快照和寄存器计划 | 固定 SHA 的独立仓库 |
 
 本版本固定使用 `dpu_common@4d739965eb47d90b47cc048fc71fd8d7d76a77ca`、
@@ -1292,7 +1292,7 @@ RX 自动补充：当空闲描述符数量低于阈值（默认 `queue_size / 4`
 
 `virtio_net_packet_multi_queue_test` 使用共享的 `host_mem_manager`、IOMMU 和
 `virtqueue_manager` 创建四个 split virtqueue：q0/q2 为 RX，q1/q3 为 TX；每个
-队列提交/接收 4 个由外部 `net_packet` master 生成的 `packet_item`。TX 侧从
+队列提交/接收 4 个由外部 `net_packet` main 生成的 `packet_item`。TX 侧从
 descriptor 中取出 IOVA，经 IOMMU 翻译后校验真实报文字节；RX 侧通过
 `write_from_device_for_host()` 写入 IOVA，再由 RX engine 恢复 `packet_item`。
 测试同时检查 used ring 回收、跨队列隔离和 Host memory/IOMMU/virtqueue 无泄漏。
@@ -1640,7 +1640,7 @@ snapshot pair 保持不变。notify、MSI-X、port/route 和 scheduler builders 
 #### 6.1.1 环境准备
 
 确保以下组件已就位。`host_mem` 使用项目外的固定 checkout，`net_packet` 跟踪远程
-`master` 分支，PCIe TL VIP 跟踪 `pcie_work/main`；这些依赖都不复制到
+`main` 分支，PCIe TL VIP 跟踪 `pcie_work/main`；这些依赖都不复制到
 `virtio_work` 内：
 
 ```bash
@@ -1649,13 +1649,14 @@ export HOST_MEM_ROOT=/path/to/host_mem
 git -C "$HOST_MEM_ROOT" checkout --detach \
   35ec087014744ec85cf6c0fe17e1f7118ee7a7b7
 
-# 外部 net_packet master
+# 外部 net_packet main
 export NET_PACKET_ROOT=/path/to/net_packet
-git clone --branch master https://github.com/Beihang-yuting/net_packet.git "$NET_PACKET_ROOT"  # 首次 clone 时执行
-git -C "$NET_PACKET_ROOT" fetch origin master
-git -C "$NET_PACKET_ROOT" switch master 2>/dev/null || \
-  git -C "$NET_PACKET_ROOT" switch --track -c master origin/master
-git -C "$NET_PACKET_ROOT" branch --set-upstream-to=origin/master master
+git clone --branch main https://github.com/Beihang-yuting/net_packet.git "$NET_PACKET_ROOT"  # 首次 clone 时执行
+git -C "$NET_PACKET_ROOT" fetch origin main
+git -C "$NET_PACKET_ROOT" switch main 2>/dev/null || \
+  git -C "$NET_PACKET_ROOT" switch --track -c main origin/main
+git -C "$NET_PACKET_ROOT" branch --set-upstream-to=origin/main main
+git -C "$NET_PACKET_ROOT" merge --ff-only origin/main
 
 # 外部 pcie_work main
 export PCIE_WORK_ROOT=/path/to/pcie_work

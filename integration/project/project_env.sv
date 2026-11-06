@@ -3,6 +3,7 @@
 // 本层直接创建 DPU/PCIe/VIO；VIO 的 parent 指向 DPU，使 UVM 自动保证快照先发布。
 // 平台已有 pool/executor/completion adapter 时只借用并校验，不能偷偷替换。
 // 默认 executor 在 DPU build 前安装 backend；接口连接与初始化由 connect/run 入口负责。
+// Intel 分支必须在子组件 build 前发布专用 cfg/VIF；不创建或驱动 DUT 一侧的 EP BFM。
 class project_env extends uvm_env;
     `uvm_component_utils(project_env)
 
@@ -64,7 +65,8 @@ class project_env extends uvm_env;
         cfg.dpu_cfg.host_mem_pool_ref = shared_pool;
     endfunction
 
-    // 按显式 Host→slot 准备原生 TL cfg；只借用同一 Host manager，不复制 BDF/BAR。
+    // 按显式 Host→slot 准备 TL cfg；只借用同一 Host manager，不复制 BDF/BAR。
+    // 普通 TL 配对 RC/EP；Intel 只保留 RC，EP 和配置空间/MMIO 响应来自真实 DUT。
     // 既有绑定只校验不重建；Switch、多余绑定或不同 manager 都拒绝。
     protected function void prepare_pcie_config();
         string	why;
@@ -73,9 +75,21 @@ class project_env extends uvm_env;
         if (cfg.pcie_cfg.switch_enable)
             `uvm_fatal("PROJECT_ENV", "native project reference does not create a Switch")
         cfg.pcie_cfg.rc_agent_enable = 1;
-        cfg.pcie_cfg.ep_agent_enable = 1;
         cfg.pcie_cfg.num_rc = cfg.tl_slot_by_host.num();
+`ifdef PROJECT_PCIE_INTEL
+        if (cfg.vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT ||
+            cfg.pcie_cfg.if_mode != SV_IF_MODE || !cfg.pcie_cfg.infinite_credit ||
+            cfg.pcie_cfg.rc_is_active != UVM_ACTIVE || cfg.pcie_cfg.ep_auto_response ||
+            !cfg.pcie_cfg.use_unified_mem)
+            `uvm_fatal("PROJECT_INTEL", "Intel requires REAL_DUT, SV_IF_MODE, active RC, unified memory and infinite public FC")
+        cfg.pcie_cfg.ep_agent_enable = 0;
+        cfg.pcie_cfg.num_ep = 0;
+        if (cfg.pcie_cfg.ep_root_by_index.num() != 0)
+            `uvm_fatal("PROJECT_INTEL", "real EP DUT must not have VIP EP-to-Root bindings")
+`else
+        cfg.pcie_cfg.ep_agent_enable = 1;
         cfg.pcie_cfg.num_ep = cfg.tl_slot_by_host.num();
+`endif
         foreach (cfg.tl_slot_by_host[h]) begin
             int unsigned		slot;
             host_mem_manager	manager;
@@ -89,16 +103,108 @@ class project_env extends uvm_env;
                     `uvm_fatal("PROJECT_ENV", "PCIe Host memory binding disagrees with DPU owner")
             end else if (!cfg.pcie_cfg.bind_host_memory(slot, h, manager, why))
                 `uvm_fatal("PROJECT_ENV", why)
+`ifndef PROJECT_PCIE_INTEL
             if (cfg.pcie_cfg.ep_root_by_index.exists(slot)) begin
                 if (cfg.pcie_cfg.ep_root_by_index[slot] != slot)
                     `uvm_fatal("PROJECT_ENV", "native EP/RC slots must be paired")
             end else if (!cfg.pcie_cfg.bind_ep_root(slot, slot, why))
                 `uvm_fatal("PROJECT_ENV", why)
+`endif
         end
-        if (cfg.pcie_cfg.host_mem_by_root.num() != cfg.tl_slot_by_host.num() ||
-            cfg.pcie_cfg.ep_root_by_index.num() != cfg.tl_slot_by_host.num())
+        if (cfg.pcie_cfg.host_mem_by_root.num() != cfg.tl_slot_by_host.num())
             `uvm_fatal("PROJECT_ENV", "extra PCIe Root bindings are not part of this project")
+`ifndef PROJECT_PCIE_INTEL
+        if (cfg.pcie_cfg.ep_root_by_index.num() != cfg.tl_slot_by_host.num())
+            `uvm_fatal("PROJECT_ENV", "extra PCIe EP bindings are not part of this project")
+`endif
     endfunction
+
+`ifdef PROJECT_PCIE_INTEL
+    // 在 pcie_env::create 前解析每个端口的配置和 VIF：cfg 显式句柄与 wrapper 发布值
+    // 必须相同；只缺配置时可创建 HARD_IP 默认对象，缺 HDL 接口则不能自动补造。
+    // 复用 wrapper 对象以保留端口压力/信用设置，拒绝跨端口共享可变 cfg 或物理 VIF。
+    protected function void prepare_intel_bindings();
+        intel_pcie_adapter_config	used_cfgs[$];
+        intel_pcie_vif_t			used_vifs[$];
+
+        foreach (cfg.tl_slot_by_host[h]) begin
+            int unsigned			slot;
+            string				path;
+            intel_pcie_adapter_config	port_cfg;
+            intel_pcie_adapter_config	published_cfg;
+            intel_pcie_vif_t			vif;
+            intel_pcie_vif_t			published_vif;
+
+            slot = cfg.tl_slot_by_host[h];
+            path = $sformatf("pcie_env.rc_adapter_%0d", slot);
+            port_cfg = null;
+            published_cfg = null;
+            vif = null;
+            published_vif = null;
+            if (cfg.intel_cfg_by_slot.exists(slot)) begin
+                port_cfg = cfg.intel_cfg_by_slot[slot];
+                if (port_cfg == null) `uvm_fatal("PROJECT_INTEL", "explicit Intel cfg is null")
+            end
+            if (uvm_config_db#(intel_pcie_adapter_config)::get(this, path, "intel_cfg", published_cfg)) begin
+                if (published_cfg == null || (port_cfg != null && port_cfg != published_cfg))
+                    `uvm_fatal("PROJECT_INTEL", "project and wrapper publish different Intel cfg handles")
+                port_cfg = published_cfg;
+            end
+            if (port_cfg == null) begin
+                port_cfg = intel_pcie_adapter_config::type_id::create($sformatf("intel_cfg_%0d", slot));
+                port_cfg.side = INTEL_PCIE_HARD_IP;
+            end
+            if (port_cfg.side != INTEL_PCIE_HARD_IP)
+                `uvm_fatal("PROJECT_INTEL", "EP application DUT requires explicit INTEL_PCIE_HARD_IP side")
+            port_cfg.validate();
+
+            if (cfg.intel_rc_vifs.exists(slot)) begin
+                vif = cfg.intel_rc_vifs[slot];
+                if (vif == null) `uvm_fatal("PROJECT_INTEL", "explicit Intel VIF is null")
+            end
+            if (uvm_config_db#(intel_pcie_vif_t)::get(this, path, "vif", published_vif)) begin
+                if (published_vif == null || (vif != null && vif != published_vif))
+                    `uvm_fatal("PROJECT_INTEL", "project and wrapper publish different Intel VIFs")
+                vif = published_vif;
+            end
+            if (vif == null)
+                `uvm_fatal("PROJECT_INTEL", $sformatf("missing Intel VIF at %s.%s", get_full_name(), path))
+            foreach (used_cfgs[i]) begin
+                if (used_cfgs[i] == port_cfg || used_vifs[i] == vif)
+                    `uvm_fatal("PROJECT_INTEL", "Intel cfg or VIF reused by distinct TL slots")
+            end
+            used_cfgs.push_back(port_cfg);
+            used_vifs.push_back(vif);
+            cfg.intel_cfg_by_slot[slot] = port_cfg;
+            cfg.intel_rc_vifs[slot] = vif;
+            uvm_config_db#(intel_pcie_adapter_config)::set(this, path, "intel_cfg", port_cfg);
+            uvm_config_db#(intel_pcie_vif_t)::set(this, path, "vif", vif);
+        end
+        if (cfg.intel_cfg_by_slot.num() != cfg.tl_slot_by_host.num() ||
+            cfg.intel_rc_vifs.num() != cfg.tl_slot_by_host.num())
+            `uvm_fatal("PROJECT_INTEL", "Intel bindings contain an unused TL slot")
+    endfunction
+
+    // connect 时只校验实际创建的 adapter，不再补绑接口；否则 adapter build 早已失败。
+    // 确认 instance override 和 bridge 生效，防止接口配置看似存在却仍走公共 TLM 回环。
+    protected function void check_intel_bindings();
+        if (!pcie_env.bridge_required || pcie_env.ep_agent != null ||
+            pcie_env.ep_agents.size() != 0 || pcie_env.ep_adapter != null ||
+            pcie_env.ep_adapters.size() != 0)
+            `uvm_fatal("PROJECT_INTEL", "Intel needs the external-pin bridge and RC-only component tree")
+        foreach (cfg.intel_cfg_by_slot[slot]) begin
+            intel_pcie_if_adapter	adapter;
+
+            if (slot >= pcie_env.rc_adapters.size())
+                `uvm_fatal("PROJECT_INTEL", "Intel RC adapter slot is missing")
+            if (!$cast(adapter, pcie_env.rc_adapters[slot]) || adapter == null)
+                `uvm_fatal("PROJECT_INTEL", "Intel instance factory override did not take effect")
+            if (adapter.cfg != cfg.intel_cfg_by_slot[slot] ||
+                adapter.avst_vif != cfg.intel_rc_vifs[slot])
+                `uvm_fatal("PROJECT_INTEL", "Intel adapter consumed different cfg/VIF handles")
+        end
+    endfunction
+`endif
 
     // 这里只创建组件和发布输入，不提前查询 DPU snapshot，也不手动调用子组件 build。
     // create(..., dpu_env) 让 VIO 位于 DPU 子树；框架先 build DPU，再 build VIO。
@@ -130,7 +236,13 @@ class project_env extends uvm_env;
         uvm_config_db#(dpu_device_env_config)::set(this, "dpu_env", "cfg", cfg.dpu_cfg);
         dpu_env = dpu_device_env::type_id::create("dpu_env", this);
 
+`ifdef PROJECT_PCIE_INTEL
+        prepare_intel_bindings();
+        // bridge 的历史字段名含 svt，但这里只开启外部引脚传输，不创建 SVT/provider。
+        intel_pcie_configure_env(this, cfg.pcie_cfg, "pcie_env");
+`else
         uvm_config_db#(pcie_tl_env_config)::set(this, "pcie_env", "cfg", cfg.pcie_cfg);
+`endif
         pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
 
         foreach (cfg.vio_cfg_by_host[h]) begin
@@ -154,7 +266,9 @@ class project_env extends uvm_env;
         return null;
     endfunction
 
-    // SV_IF_MODE 绑定平台实际接口；TLM 模式由模型路径接线。缺接口或跨槽位复用立即失败。
+`ifndef PROJECT_PCIE_INTEL
+    // 普通 TL 的 SV_IF_MODE 在 connect 绑定平台接口；Intel 专用接口必须在 build 前下发。
+    // TLM 模式由模型路径接线。缺接口或跨槽位复用立即失败。
     // 两个方向分别使用一个 VIF，避免两套 adapter 驱动同一接口。
     protected function void bind_native_vifs();
         virtual pcie_tl_if	used[$];
@@ -189,6 +303,7 @@ class project_env extends uvm_env;
             end
         end
     endfunction
+`endif
 
     // 全项目统一分配协议 VIF；显式身份映射优先，兼容 top 的全局 VIF slot 入口。
     // 在 Function 绑定 PCIe 前拒绝空接口和跨 Host/Function 复用，不依赖各 Host 局部计数。
@@ -233,7 +348,11 @@ class project_env extends uvm_env;
         if (pcie_env.global_cfg != null || pcie_env.topology_adapter != null ||
             pcie_env.backend_provider_active || pcie_env.cfg != cfg.pcie_cfg)
             `uvm_fatal("PROJECT_ENV", "native reference requires the direct PCIe cfg-only path")
+`ifdef PROJECT_PCIE_INTEL
+        check_intel_bindings();
+`else
         bind_native_vifs();
+`endif
         bind_protocol_vifs();
         if (reg_backend != null) begin
             reg_backend.bind_virtual_sequencer(pcie_env.v_seqr);

@@ -3,6 +3,7 @@
 // cfg 拥有创建的配置对象，借用平台注入的 pool、IOMMU 与 VIF。
 // load_params 只生成输入，不解析快照、不创建组件、不访问 DUT；每个对象只加载一次。
 // 每 Host 一个 segment 0 和一组 TL 接口；PF/VF 共用接口，不配置 SVT 或链路训练。
+// PROJECT_PCIE_INTEL 选择真实 EP 应用 DUT 的 HARD_IP 接口；每 Host 仅创建一个 RC。
 class project_env_cfg extends uvm_object;
     `uvm_object_utils(project_env_cfg)
 
@@ -10,7 +11,7 @@ class project_env_cfg extends uvm_object;
     virtio_net_env_config	vio_cfg;
     virtio_net_env_config	vio_cfg_by_host[int unsigned];
     pcie_tl_env_config		pcie_cfg;
-    // 值是配对的 RC/EP agent 下标；缺省 Host h 对应 slot h，可在 build 前覆盖。
+    // 值是 RC agent 下标；普通 TL 同时配对 EP，Intel 由 DUT 提供 EP。缺省 h→h。
     int unsigned			tl_slot_by_host[int unsigned];
     // MODEL 平台只安装一个 completion adapter；实际 Virtio 设备模型由平台创建。
     virtio_tlm_completion_adapter	completion_adapter;
@@ -18,8 +19,16 @@ class project_env_cfg extends uvm_object;
     host_mem_pool			host_mem_pool_binding;
     alloc_mode_e			host_mem_mode = MODE_BUDDY;
     int unsigned			host_mem_granule = DEFAULT_MIN_GRANULE;
+`ifdef PROJECT_PCIE_INTEL
+    // 按物理 RC slot 索引，不是按 PF/VF 索引；同一 Host 的 Function 共用端口。
+    // 平台可注入句柄，或由 bind wrapper 向实际 adapter 路径发布；env 会复用并校验。
+    // Intel cfg 没有 load_params；这里不宣称 pcie_cfg.intel.* 已自动注册。
+    intel_pcie_adapter_config	intel_cfg_by_slot[int unsigned];
+    intel_pcie_vif_t			intel_rc_vifs[int unsigned];
+`else
     virtual pcie_tl_if			rc_vifs[int unsigned];
     virtual pcie_tl_if			ep_vifs[int unsigned];
+`endif
     virtual virtio_protocol_event_if	protocol_vifs[$];
 
     // 这是配置生成规模，不是另一套已解析拓扑；最终身份以 DPU snapshot 为准。
@@ -289,9 +298,25 @@ class project_env_cfg extends uvm_object;
         pcie_cfg.ep_auto_response = execution.ep_auto_response();
         pcie_cfg.use_unified_mem = 1;
         pcie_cfg.mem_access_mode = PCIE_TL_MEM_PER_BUFFER;
+`ifdef PROJECT_PCIE_INTEL
+        // 此分支对应 EP 应用逻辑 DUT；Intel adapter 即使放在 passive agent 旁也会驱动
+        // 引脚，因此必须关闭 EP 组件，而不是仅将 EP 标成 UVM_PASSIVE。
+        if (vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT)
+            `uvm_fatal("PROJECT_INTEL", "Intel reference requires REAL_DUT EP application logic")
+        pcie_cfg.rc_agent_enable = 1;
+        pcie_cfg.ep_agent_enable = 0;
+        pcie_cfg.num_rc = tl_slot_by_host.num();
+        pcie_cfg.num_ep = 0;
+        // 公共 FC 不门控；每端口有限 AVST credit 由 intel_cfg 独立管理。
+        pcie_cfg.infinite_credit = 1;
+`endif
         pcie_cfg.load_params("pcie_cfg");
         if (pcie_cfg.ep_auto_response != execution.ep_auto_response())
             `uvm_fatal("PROJECT_CFG", "EP auto response conflicts with the execution profile")
+`ifdef PROJECT_PCIE_INTEL
+        if (!pcie_cfg.infinite_credit)
+            `uvm_fatal("PROJECT_INTEL", "pcie_cfg.infinite_credit must be 1; Intel owns AVST credits")
+`endif
         params_loaded = 1;
     endfunction
 endclass

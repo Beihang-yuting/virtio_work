@@ -43,8 +43,8 @@ fi
 
 for script in "$repo_root/scripts/check_deps.sh" "$repo_root/scripts/bootstrap.sh"; do
   if ! grep -Eq 'symbolic-ref --short( -q)? HEAD|branch --show-current' "$script" ||
-     ! grep -Eq 'net_packet_branch.*master|== "master"' "$script"; then
-    echo "$(basename "$script") must require the external master branch" >&2
+     ! grep -Eq 'net_packet_branch.*main|== "main"' "$script"; then
+    echo "$(basename "$script") must require the external main branch" >&2
     exit 1
   fi
   if grep -q "$old_revision_token" "$script"; then
