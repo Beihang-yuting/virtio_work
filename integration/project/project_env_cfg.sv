@@ -1,9 +1,9 @@
 // integration/project：项目级配置组合与参数构建示例。
-// 依赖 DPU、原生 PCIe TL、VIO 与 AIP；由 project_env_pkg 按顺序包含。
+// 依赖 DPU、PCIe TL、Intel adapter、VIO 与 AIP；由 project_env_pkg 按顺序包含。
 // cfg 拥有创建的配置对象，借用平台注入的 pool、IOMMU 与 VIF。
 // load_params 只生成输入，不解析快照、不创建组件、不访问 DUT；每个对象只加载一次。
 // 每 Host 一个 segment 0 和一组 TL 接口；PF/VF 共用接口，不配置 SVT 或链路训练。
-// PROJECT_PCIE_INTEL 选择真实 EP 应用 DUT 的 HARD_IP 接口；每 Host 仅创建一个 RC。
+// 固定使用真实 EP 应用 DUT 的 Intel HARD_IP 接口；每 Host 仅创建一个 RC。
 class project_env_cfg extends uvm_object;
     `uvm_object_utils(project_env_cfg)
 
@@ -11,24 +11,19 @@ class project_env_cfg extends uvm_object;
     virtio_net_env_config	vio_cfg;
     virtio_net_env_config	vio_cfg_by_host[int unsigned];
     pcie_tl_env_config		pcie_cfg;
-    // 值是 RC agent 下标；普通 TL 同时配对 EP，Intel 由 DUT 提供 EP。缺省 h→h。
+    // 值是 RC agent 下标；EP 由真实 DUT 提供。缺省 h→h，PF/VF 共用 Host 的 slot。
     int unsigned			tl_slot_by_host[int unsigned];
-    // MODEL 平台只安装一个 completion adapter；实际 Virtio 设备模型由平台创建。
-    virtio_tlm_completion_adapter	completion_adapter;
 
     host_mem_pool			host_mem_pool_binding;
     alloc_mode_e			host_mem_mode = MODE_BUDDY;
     int unsigned			host_mem_granule = DEFAULT_MIN_GRANULE;
-`ifdef PROJECT_PCIE_INTEL
+
     // 按物理 RC slot 索引，不是按 PF/VF 索引；同一 Host 的 Function 共用端口。
     // 平台可注入句柄，或由 bind wrapper 向实际 adapter 路径发布；env 会复用并校验。
     // Intel cfg 没有 load_params；这里不宣称 pcie_cfg.intel.* 已自动注册。
     intel_pcie_adapter_config	intel_cfg_by_slot[int unsigned];
     intel_pcie_vif_t			intel_rc_vifs[int unsigned];
-`else
-    virtual pcie_tl_if			rc_vifs[int unsigned];
-    virtual pcie_tl_if			ep_vifs[int unsigned];
-`endif
+
     virtual virtio_protocol_event_if	protocol_vifs[$];
 
     // 这是配置生成规模，不是另一套已解析拓扑；最终身份以 DPU snapshot 为准。
@@ -37,7 +32,7 @@ class project_env_cfg extends uvm_object;
     longint unsigned	vfs_per_pf = 0;
     protected bit	params_loaded = 0;
 
-    // 创建配置容器；默认 REAL_DUT，实际 TL 接口由平台注入。
+    // 创建配置容器；固定 REAL_DUT，实际 Intel 接口由 bind wrapper 或平台注入。
     // new 不读取 plusargs，允许派生用例在 load_params 前修改场景默认值。
     function new(string	name = "project_env_cfg");
         super.new(name);
@@ -143,7 +138,7 @@ class project_env_cfg extends uvm_object;
                 return 0;
             end
             if (host.pcie_domains.size() != 1) begin
-                why = "native reference requires one PCIe domain per Host";
+                why = "Intel project requires one PCIe domain per Host";
                 return 0;
             end
             if (host.pcie_domains[0] == null) begin
@@ -152,7 +147,7 @@ class project_env_cfg extends uvm_object;
             end
             if (host.pcie_domains[0].key.host_id != host.host_id ||
                 host.pcie_domains[0].key.segment_id != 0) begin
-                why = "native reference requires Host-owned segment 0";
+                why = "Intel project requires Host-owned segment 0";
                 return 0;
             end
             used_slots[slot] = 1;
@@ -169,7 +164,6 @@ class project_env_cfg extends uvm_object;
         dpu_host_cfg			host_template;
         dpu_resource_pool_config_t	profile;
         dpu_vio_placement_request	request;
-        virtio_execution_profile	execution;
         int unsigned			max_initial_pairs;
         string				why;
 
@@ -210,6 +204,8 @@ class project_env_cfg extends uvm_object;
             `uvm_fatal("PROJECT_CFG", "total Function count exceeds DUT capability")
 
         vio_cfg.load_params("vio");
+        if (vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT)
+            `uvm_fatal("PROJECT_INTEL", "Intel reference requires REAL_DUT EP application logic")
         host_template = make_host_template();
         host_template.load_params("dpu");
         profile.name = "virtio.qpair";
@@ -290,33 +286,26 @@ class project_env_cfg extends uvm_object;
         end
         if (!validate_tl_mapping(why)) `uvm_fatal("PROJECT_CFG", why)
 
-        execution = vio_cfg.execution_profile();
-        if (execution == null) `uvm_fatal("PROJECT_CFG", "invalid execution profile")
-        pcie_cfg.if_mode = execution.pcie_if_mode();
+        // Intel 的接口选择由下面的固定模式和 env 的 instance override 完成，
+        // 无需额外选择宏。标量参数仍加载，但不能绕过真实 DUT 的方向与信用约束。
+        pcie_cfg.if_mode = SV_IF_MODE;
         pcie_cfg.rc_is_active = UVM_ACTIVE;
-        pcie_cfg.ep_is_active = execution.ep_is_active();
-        pcie_cfg.ep_auto_response = execution.ep_auto_response();
+        pcie_cfg.ep_auto_response = 0;
         pcie_cfg.use_unified_mem = 1;
         pcie_cfg.mem_access_mode = PCIE_TL_MEM_PER_BUFFER;
-`ifdef PROJECT_PCIE_INTEL
-        // 此分支对应 EP 应用逻辑 DUT；Intel adapter 即使放在 passive agent 旁也会驱动
+        // 真实 EP 应用逻辑由 DUT 提供；Intel adapter 即使放在 passive agent 旁也会驱动
         // 引脚，因此必须关闭 EP 组件，而不是仅将 EP 标成 UVM_PASSIVE。
-        if (vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT)
-            `uvm_fatal("PROJECT_INTEL", "Intel reference requires REAL_DUT EP application logic")
         pcie_cfg.rc_agent_enable = 1;
         pcie_cfg.ep_agent_enable = 0;
         pcie_cfg.num_rc = tl_slot_by_host.num();
         pcie_cfg.num_ep = 0;
         // 公共 FC 不门控；每端口有限 AVST credit 由 intel_cfg 独立管理。
         pcie_cfg.infinite_credit = 1;
-`endif
         pcie_cfg.load_params("pcie_cfg");
-        if (pcie_cfg.ep_auto_response != execution.ep_auto_response())
-            `uvm_fatal("PROJECT_CFG", "EP auto response conflicts with the execution profile")
-`ifdef PROJECT_PCIE_INTEL
+        if (pcie_cfg.ep_auto_response)
+            `uvm_fatal("PROJECT_CFG", "real EP DUT must provide its own responses")
         if (!pcie_cfg.infinite_credit)
             `uvm_fatal("PROJECT_INTEL", "pcie_cfg.infinite_credit must be 1; Intel owns AVST credits")
-`endif
         params_loaded = 1;
     endfunction
 endclass

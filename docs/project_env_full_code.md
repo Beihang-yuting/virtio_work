@@ -1,4 +1,4 @@
-# 项目 env / env_cfg 完整代码：DPU、PCIe TL / Intel 和 VIO
+# 项目 env / env_cfg 完整代码：DPU、Intel PCIe 和 VIO
 
 下面逐文件完整展开参考源码，没有省略函数体。将配置文件的成员和方法合入你的
 `env_cfg`，将环境文件的成员和方法合入你的 `env`，统一替换类名、factory 宏和
@@ -18,9 +18,8 @@ VIO 的 UVM parent 使用 `dpu_env`，这样 DPU 先发布 snapshot，VIO 后读
 不创建 global/topology 配置，不依赖 SVT 或建链。
 详细参数、生命周期、共享资源和适用范围见 [集成说明](../integration/project/README.md)。
 
-你当前的 Intel 场景选择 `filelists/project_intel_integration.f`，它定义
-`PROJECT_PCIE_INTEL`。以下仍完整展示同一套源文件：保留此宏即可编译 Intel 分支，
-也可只把 Intel 分支的方法/成员合入现有 env/cfg。普通 TL 入口不依赖 Intel 包。
+本参考固定使用 Intel PCIe，唯一入口为 `filelists/project_integration.f`。
+无需定义接口选择宏；普通 TL VIF、EP 配对和 MODEL completion adapter 已删除。
 Intel 使用 `SV_IF_MODE` + adapter instance override；真实 DUT 为 EP 应用逻辑，
 每 Host 仅创建 RC，`SIDE=HARD_IP`，`num_ep=0`。
 
@@ -58,11 +57,11 @@ Intel cfg/VIF 在 `prepare_intel_bindings()` 中、PCIe 子组件 build 之前�
 
 ```systemverilog
 // integration/project：项目级配置组合与参数构建示例。
-// 依赖 DPU、原生 PCIe TL、VIO 与 AIP；由 project_env_pkg 按顺序包含。
+// 依赖 DPU、PCIe TL、Intel adapter、VIO 与 AIP；由 project_env_pkg 按顺序包含。
 // cfg 拥有创建的配置对象，借用平台注入的 pool、IOMMU 与 VIF。
 // load_params 只生成输入，不解析快照、不创建组件、不访问 DUT；每个对象只加载一次。
 // 每 Host 一个 segment 0 和一组 TL 接口；PF/VF 共用接口，不配置 SVT 或链路训练。
-// PROJECT_PCIE_INTEL 选择真实 EP 应用 DUT 的 HARD_IP 接口；每 Host 仅创建一个 RC。
+// 固定使用真实 EP 应用 DUT 的 Intel HARD_IP 接口；每 Host 仅创建一个 RC。
 class project_env_cfg extends uvm_object;
     `uvm_object_utils(project_env_cfg)
 
@@ -70,24 +69,19 @@ class project_env_cfg extends uvm_object;
     virtio_net_env_config	vio_cfg;
     virtio_net_env_config	vio_cfg_by_host[int unsigned];
     pcie_tl_env_config		pcie_cfg;
-    // 值是 RC agent 下标；普通 TL 同时配对 EP，Intel 由 DUT 提供 EP。缺省 h→h。
+    // 值是 RC agent 下标；EP 由真实 DUT 提供。缺省 h→h，PF/VF 共用 Host 的 slot。
     int unsigned			tl_slot_by_host[int unsigned];
-    // MODEL 平台只安装一个 completion adapter；实际 Virtio 设备模型由平台创建。
-    virtio_tlm_completion_adapter	completion_adapter;
 
     host_mem_pool			host_mem_pool_binding;
     alloc_mode_e			host_mem_mode = MODE_BUDDY;
     int unsigned			host_mem_granule = DEFAULT_MIN_GRANULE;
-`ifdef PROJECT_PCIE_INTEL
+
     // 按物理 RC slot 索引，不是按 PF/VF 索引；同一 Host 的 Function 共用端口。
     // 平台可注入句柄，或由 bind wrapper 向实际 adapter 路径发布；env 会复用并校验。
     // Intel cfg 没有 load_params；这里不宣称 pcie_cfg.intel.* 已自动注册。
     intel_pcie_adapter_config	intel_cfg_by_slot[int unsigned];
     intel_pcie_vif_t			intel_rc_vifs[int unsigned];
-`else
-    virtual pcie_tl_if			rc_vifs[int unsigned];
-    virtual pcie_tl_if			ep_vifs[int unsigned];
-`endif
+
     virtual virtio_protocol_event_if	protocol_vifs[$];
 
     // 这是配置生成规模，不是另一套已解析拓扑；最终身份以 DPU snapshot 为准。
@@ -96,7 +90,7 @@ class project_env_cfg extends uvm_object;
     longint unsigned	vfs_per_pf = 0;
     protected bit	params_loaded = 0;
 
-    // 创建配置容器；默认 REAL_DUT，实际 TL 接口由平台注入。
+    // 创建配置容器；固定 REAL_DUT，实际 Intel 接口由 bind wrapper 或平台注入。
     // new 不读取 plusargs，允许派生用例在 load_params 前修改场景默认值。
     function new(string	name = "project_env_cfg");
         super.new(name);
@@ -202,7 +196,7 @@ class project_env_cfg extends uvm_object;
                 return 0;
             end
             if (host.pcie_domains.size() != 1) begin
-                why = "native reference requires one PCIe domain per Host";
+                why = "Intel project requires one PCIe domain per Host";
                 return 0;
             end
             if (host.pcie_domains[0] == null) begin
@@ -211,7 +205,7 @@ class project_env_cfg extends uvm_object;
             end
             if (host.pcie_domains[0].key.host_id != host.host_id ||
                 host.pcie_domains[0].key.segment_id != 0) begin
-                why = "native reference requires Host-owned segment 0";
+                why = "Intel project requires Host-owned segment 0";
                 return 0;
             end
             used_slots[slot] = 1;
@@ -228,7 +222,6 @@ class project_env_cfg extends uvm_object;
         dpu_host_cfg			host_template;
         dpu_resource_pool_config_t	profile;
         dpu_vio_placement_request	request;
-        virtio_execution_profile	execution;
         int unsigned			max_initial_pairs;
         string				why;
 
@@ -269,6 +262,8 @@ class project_env_cfg extends uvm_object;
             `uvm_fatal("PROJECT_CFG", "total Function count exceeds DUT capability")
 
         vio_cfg.load_params("vio");
+        if (vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT)
+            `uvm_fatal("PROJECT_INTEL", "Intel reference requires REAL_DUT EP application logic")
         host_template = make_host_template();
         host_template.load_params("dpu");
         profile.name = "virtio.qpair";
@@ -349,33 +344,26 @@ class project_env_cfg extends uvm_object;
         end
         if (!validate_tl_mapping(why)) `uvm_fatal("PROJECT_CFG", why)
 
-        execution = vio_cfg.execution_profile();
-        if (execution == null) `uvm_fatal("PROJECT_CFG", "invalid execution profile")
-        pcie_cfg.if_mode = execution.pcie_if_mode();
+        // Intel 的接口选择由下面的固定模式和 env 的 instance override 完成，
+        // 无需额外选择宏。标量参数仍加载，但不能绕过真实 DUT 的方向与信用约束。
+        pcie_cfg.if_mode = SV_IF_MODE;
         pcie_cfg.rc_is_active = UVM_ACTIVE;
-        pcie_cfg.ep_is_active = execution.ep_is_active();
-        pcie_cfg.ep_auto_response = execution.ep_auto_response();
+        pcie_cfg.ep_auto_response = 0;
         pcie_cfg.use_unified_mem = 1;
         pcie_cfg.mem_access_mode = PCIE_TL_MEM_PER_BUFFER;
-`ifdef PROJECT_PCIE_INTEL
-        // 此分支对应 EP 应用逻辑 DUT；Intel adapter 即使放在 passive agent 旁也会驱动
+        // 真实 EP 应用逻辑由 DUT 提供；Intel adapter 即使放在 passive agent 旁也会驱动
         // 引脚，因此必须关闭 EP 组件，而不是仅将 EP 标成 UVM_PASSIVE。
-        if (vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT)
-            `uvm_fatal("PROJECT_INTEL", "Intel reference requires REAL_DUT EP application logic")
         pcie_cfg.rc_agent_enable = 1;
         pcie_cfg.ep_agent_enable = 0;
         pcie_cfg.num_rc = tl_slot_by_host.num();
         pcie_cfg.num_ep = 0;
         // 公共 FC 不门控；每端口有限 AVST credit 由 intel_cfg 独立管理。
         pcie_cfg.infinite_credit = 1;
-`endif
         pcie_cfg.load_params("pcie_cfg");
-        if (pcie_cfg.ep_auto_response != execution.ep_auto_response())
-            `uvm_fatal("PROJECT_CFG", "EP auto response conflicts with the execution profile")
-`ifdef PROJECT_PCIE_INTEL
+        if (pcie_cfg.ep_auto_response)
+            `uvm_fatal("PROJECT_CFG", "real EP DUT must provide its own responses")
         if (!pcie_cfg.infinite_credit)
             `uvm_fatal("PROJECT_INTEL", "pcie_cfg.infinite_credit must be 1; Intel owns AVST credits")
-`endif
         params_loaded = 1;
     endfunction
 endclass
@@ -389,11 +377,11 @@ endclass
 
 ```systemverilog
 // integration/project：可拷入已有项目的组合式 env；只继承 uvm_env。
-// 依赖 DPU、原生 PCIe TL、VIO 与 AIP，由 project_env_pkg 在 cfg 后包含。
+// 依赖 DPU、PCIe TL、Intel adapter、VIO 与 AIP，由 project_env_pkg 在 cfg 后包含。
 // 本层直接创建 DPU/PCIe/VIO；VIO 的 parent 指向 DPU，使 UVM 自动保证快照先发布。
-// 平台已有 pool/executor/completion adapter 时只借用并校验，不能偷偷替换。
+// 平台已有 pool/executor 时只借用并校验，不能偷偷替换。
 // 默认 executor 在 DPU build 前安装 backend；接口连接与初始化由 connect/run 入口负责。
-// Intel 分支必须在子组件 build 前发布专用 cfg/VIF；不创建或驱动 DUT 一侧的 EP BFM。
+// 固定 Intel HARD_IP，在子组件 build 前取得或发布 cfg/VIF；EP 功能由真实 DUT 提供。
 class project_env extends uvm_env;
     `uvm_component_utils(project_env)
 
@@ -456,17 +444,16 @@ class project_env extends uvm_env;
     endfunction
 
     // 按显式 Host→slot 准备 TL cfg；只借用同一 Host manager，不复制 BDF/BAR。
-    // 普通 TL 配对 RC/EP；Intel 只保留 RC，EP 和配置空间/MMIO 响应来自真实 DUT。
+    // 每 Host 只保留一个 RC，EP 和配置空间/MMIO 响应来自真实 DUT。
     // 既有绑定只校验不重建；Switch、多余绑定或不同 manager 都拒绝。
     protected function void prepare_pcie_config();
         string	why;
 
         if (!cfg.validate_tl_mapping(why)) `uvm_fatal("PROJECT_ENV", why)
         if (cfg.pcie_cfg.switch_enable)
-            `uvm_fatal("PROJECT_ENV", "native project reference does not create a Switch")
+            `uvm_fatal("PROJECT_ENV", "Intel project reference does not create a Switch")
         cfg.pcie_cfg.rc_agent_enable = 1;
         cfg.pcie_cfg.num_rc = cfg.tl_slot_by_host.num();
-`ifdef PROJECT_PCIE_INTEL
         if (cfg.vio_cfg.execution_mode != VIRTIO_EXEC_REAL_DUT ||
             cfg.pcie_cfg.if_mode != SV_IF_MODE || !cfg.pcie_cfg.infinite_credit ||
             cfg.pcie_cfg.rc_is_active != UVM_ACTIVE || cfg.pcie_cfg.ep_auto_response ||
@@ -476,10 +463,6 @@ class project_env extends uvm_env;
         cfg.pcie_cfg.num_ep = 0;
         if (cfg.pcie_cfg.ep_root_by_index.num() != 0)
             `uvm_fatal("PROJECT_INTEL", "real EP DUT must not have VIP EP-to-Root bindings")
-`else
-        cfg.pcie_cfg.ep_agent_enable = 1;
-        cfg.pcie_cfg.num_ep = cfg.tl_slot_by_host.num();
-`endif
         foreach (cfg.tl_slot_by_host[h]) begin
             int unsigned		slot;
             host_mem_manager	manager;
@@ -493,23 +476,11 @@ class project_env extends uvm_env;
                     `uvm_fatal("PROJECT_ENV", "PCIe Host memory binding disagrees with DPU owner")
             end else if (!cfg.pcie_cfg.bind_host_memory(slot, h, manager, why))
                 `uvm_fatal("PROJECT_ENV", why)
-`ifndef PROJECT_PCIE_INTEL
-            if (cfg.pcie_cfg.ep_root_by_index.exists(slot)) begin
-                if (cfg.pcie_cfg.ep_root_by_index[slot] != slot)
-                    `uvm_fatal("PROJECT_ENV", "native EP/RC slots must be paired")
-            end else if (!cfg.pcie_cfg.bind_ep_root(slot, slot, why))
-                `uvm_fatal("PROJECT_ENV", why)
-`endif
         end
         if (cfg.pcie_cfg.host_mem_by_root.num() != cfg.tl_slot_by_host.num())
             `uvm_fatal("PROJECT_ENV", "extra PCIe Root bindings are not part of this project")
-`ifndef PROJECT_PCIE_INTEL
-        if (cfg.pcie_cfg.ep_root_by_index.num() != cfg.tl_slot_by_host.num())
-            `uvm_fatal("PROJECT_ENV", "extra PCIe EP bindings are not part of this project")
-`endif
     endfunction
 
-`ifdef PROJECT_PCIE_INTEL
     // 在 pcie_env::create 前解析每个端口的配置和 VIF：cfg 显式句柄与 wrapper 发布值
     // 必须相同；只缺配置时可创建 HARD_IP 默认对象，缺 HDL 接口则不能自动补造。
     // 复用 wrapper 对象以保留端口压力/信用设置，拒绝跨端口共享可变 cfg 或物理 VIF。
@@ -594,14 +565,12 @@ class project_env extends uvm_env;
                 `uvm_fatal("PROJECT_INTEL", "Intel adapter consumed different cfg/VIF handles")
         end
     endfunction
-`endif
 
     // 这里只创建组件和发布输入，不提前查询 DPU snapshot，也不手动调用子组件 build。
     // create(..., dpu_env) 让 VIO 位于 DPU 子树；框架先 build DPU，再 build VIO。
     // PCIe 只需要 Host 内存和 TL cfg，可以与 DPU 同级，不依赖二者遍历先后顺序。
     virtual function void build_phase(uvm_phase	phase);
         dpu_pcie_reg_executor		executor;
-        virtio_execution_profile	execution;
 
         super.build_phase(phase);
         if (!uvm_config_db#(project_env_cfg)::get(this, "", "cfg", cfg) || cfg == null)
@@ -609,13 +578,6 @@ class project_env extends uvm_env;
         cfg.load_params();
         prepare_host_memory();
         prepare_pcie_config();
-        execution = cfg.vio_cfg.execution_profile();
-        if (execution.has_model_device()) begin
-            if (cfg.completion_adapter == null)
-                `uvm_fatal("PROJECT_ENV", "MODEL requires the platform's shared completion adapter and device model")
-            cfg.completion_adapter.install_factory_overrides();
-        end else if (cfg.completion_adapter != null)
-            `uvm_fatal("PROJECT_ENV", "REAL_DUT must use native Completion routing")
 
         if (cfg.dpu_cfg.executor == null) begin
             reg_backend = pcie_tl_dpu_reg_backend::type_id::create("reg_backend");
@@ -626,13 +588,9 @@ class project_env extends uvm_env;
         uvm_config_db#(dpu_device_env_config)::set(this, "dpu_env", "cfg", cfg.dpu_cfg);
         dpu_env = dpu_device_env::type_id::create("dpu_env", this);
 
-`ifdef PROJECT_PCIE_INTEL
         prepare_intel_bindings();
         // bridge 的历史字段名含 svt，但这里只开启外部引脚传输，不创建 SVT/provider。
         intel_pcie_configure_env(this, cfg.pcie_cfg, "pcie_env");
-`else
-        uvm_config_db#(pcie_tl_env_config)::set(this, "pcie_env", "cfg", cfg.pcie_cfg);
-`endif
         pcie_env = pcie_tl_env::type_id::create("pcie_env", this);
 
         foreach (cfg.vio_cfg_by_host[h]) begin
@@ -644,56 +602,6 @@ class project_env extends uvm_env;
             vio_envs[h] = virtio_net_env::type_id::create(child_name, dpu_env);
         end
     endfunction
-
-    // 单 EP 使用标量，多个 EP 使用数组；只返回已有 monitor，不创建替代观察者。
-    protected function pcie_tl_base_monitor ep_monitor_at(int unsigned	slot);
-        if (pcie_env.ep_agents.size() != 0) begin
-            if (slot < pcie_env.ep_agents.size() && pcie_env.ep_agents[slot] != null)
-                return pcie_env.ep_agents[slot].monitor;
-            return null;
-        end
-        if (slot == 0 && pcie_env.ep_agent != null) return pcie_env.ep_agent.monitor;
-        return null;
-    endfunction
-
-`ifndef PROJECT_PCIE_INTEL
-    // 普通 TL 的 SV_IF_MODE 在 connect 绑定平台接口；Intel 专用接口必须在 build 前下发。
-    // TLM 模式由模型路径接线。缺接口或跨槽位复用立即失败。
-    // 两个方向分别使用一个 VIF，避免两套 adapter 驱动同一接口。
-    protected function void bind_native_vifs();
-        virtual pcie_tl_if	used[$];
-
-        if (cfg.pcie_cfg.if_mode != SV_IF_MODE) return;
-        foreach (cfg.tl_slot_by_host[h]) begin
-            int unsigned	slot;
-
-            slot = cfg.tl_slot_by_host[h];
-            if (!cfg.rc_vifs.exists(slot) || cfg.rc_vifs[slot] == null ||
-                !cfg.ep_vifs.exists(slot) || cfg.ep_vifs[slot] == null)
-                `uvm_fatal("PROJECT_ENV", $sformatf("missing native VIF for TL slot %0d", slot))
-            if (cfg.rc_vifs[slot] == cfg.ep_vifs[slot])
-                `uvm_fatal("PROJECT_ENV", "RC and EP directions must use distinct VIFs")
-            foreach (used[i]) begin
-                if (used[i] == cfg.rc_vifs[slot] || used[i] == cfg.ep_vifs[slot])
-                    `uvm_fatal("PROJECT_ENV", "native VIF reused by distinct TL slots")
-            end
-            used.push_back(cfg.rc_vifs[slot]);
-            used.push_back(cfg.ep_vifs[slot]);
-            if (slot >= pcie_env.rc_adapters.size() || pcie_env.rc_adapters[slot] == null)
-                `uvm_fatal("PROJECT_ENV", "native RC adapter is missing")
-            pcie_env.rc_adapters[slot].vif = cfg.rc_vifs[slot];
-            if (pcie_env.ep_adapters.size() != 0) begin
-                if (slot >= pcie_env.ep_adapters.size() || pcie_env.ep_adapters[slot] == null)
-                    `uvm_fatal("PROJECT_ENV", "native EP adapter is missing")
-                pcie_env.ep_adapters[slot].vif = cfg.ep_vifs[slot];
-            end else begin
-                if (slot != 0 || pcie_env.ep_adapter == null)
-                    `uvm_fatal("PROJECT_ENV", "native scalar EP adapter is missing")
-                pcie_env.ep_adapter.vif = cfg.ep_vifs[slot];
-            end
-        end
-    endfunction
-`endif
 
     // 全项目统一分配协议 VIF；显式身份映射优先，兼容 top 的全局 VIF slot 入口。
     // 在 Function 绑定 PCIe 前拒绝空接口和跨 Host/Function 复用，不依赖各 Host 局部计数。
@@ -737,12 +645,8 @@ class project_env extends uvm_env;
         super.connect_phase(phase);
         if (pcie_env.global_cfg != null || pcie_env.topology_adapter != null ||
             pcie_env.backend_provider_active || pcie_env.cfg != cfg.pcie_cfg)
-            `uvm_fatal("PROJECT_ENV", "native reference requires the direct PCIe cfg-only path")
-`ifdef PROJECT_PCIE_INTEL
+            `uvm_fatal("PROJECT_ENV", "Intel project requires the direct PCIe cfg-only path")
         check_intel_bindings();
-`else
-        bind_native_vifs();
-`endif
         bind_protocol_vifs();
         if (reg_backend != null) begin
             reg_backend.bind_virtual_sequencer(pcie_env.v_seqr);
@@ -765,9 +669,11 @@ class project_env extends uvm_env;
                     `uvm_fatal("PROJECT_ENV", "Function does not belong to its Host segment 0")
                 endpoint = virtio_pcie_function_endpoint::type_id::create(
                     $sformatf("endpoint_h%0d_f%0d", h, i));
+                // Completion 由 PCIe RC driver 接收；无模型 completion adapter 或 EP monitor。
+                // 同 Host 的所有 Function 共用该 RC，完整身份仍由 endpoint 保留。
                 endpoint.configure(f.pcie_id, pcie_env.rc_agents[slot].sequencer,
-                    pcie_env.rc_agents[slot].rc_driver, cfg.completion_adapter,
-                    pcie_env.rc_agents[slot].monitor, ep_monitor_at(slot));
+                    pcie_env.rc_agents[slot].rc_driver, null,
+                    pcie_env.rc_agents[slot].monitor, null);
                 endpoints.push_back(endpoint);
             end
             if (!vio_envs[h].bind_pcie_endpoints(endpoints))
@@ -832,7 +738,7 @@ virtual class project_base_test extends uvm_test;
     // cfg 若已由 top 完整注入，派生类可显式提供空实现；此 hook 不重新 load_params。
     pure virtual function void bind_platform_handles();
 
-    // 等待真实复位/TL 接口就绪，准备 requester-aware DMA 和设备模型/网络检查器。
+    // 等待真实复位/Intel 接口就绪，准备 requester-aware DMA 和平台网络检查器。
     // 必须有平台自己的超时及错误处理；返回即授权后续 DPU 寄存器计划访问设备。
     pure virtual task prepare_platform();
 
@@ -874,7 +780,7 @@ endclass
 ```systemverilog
 // integration/project：项目参考组装的唯一 package 编译入口。
 // 顺序：AIP→DPU/Host memory/PCIe TL/VIO→AIP glue→本包。
-// PROJECT_PCIE_INTEL 时，Intel interface/adapter package 也必须在本包之前编译。
+// 固定 Intel 接入；Intel interface/adapter package 必须在本包之前编译。
 // include 的普通 .sv 不可另行编译；本包只定义类型，不创建组件或取得外部资源。
 package project_env_pkg;
     timeunit 1ns;
@@ -887,9 +793,7 @@ package project_env_pkg;
     import pcie_tl_pkg::*;
     import virtio_net_pkg::*;
     import virtio_aip_pkg::*;
-`ifdef PROJECT_PCIE_INTEL
     import intel_pcie_adapter_pkg::*;
-`endif
     `include "uvm_macros.svh"
 
     `include "project_env_cfg.sv"
@@ -900,32 +804,18 @@ endpackage
 
 ## 独立编译入口：project_integration.f
 
+设置 `INTEL_PCIE_ROOT`，本入口直接编译 Intel interface 和 adapter。
+默认几何为 4×256 bit；如果 DUT 使用其他几何，须使各编译单元的参数宏保持一致。
+使用 bind 时，在自己的工程 filelist 中继续添加
+`$INTEL_PCIE_ROOT/bind/intel_pcie_bind_wrapper.sv` 和项目 bind 文件，
+不要重复添加 Intel 的整份公共库 filelist。
 
 [源文件](../filelists/project_integration.f)
 
 ```text
-// 原生 TL 参考集成入口。从 virtio_work 根运行；依赖根由调用方提供。
+// Intel HARD_IP + 真实 EP 应用 DUT 的唯一项目参考入口；从 virtio_work 根运行。
+// 依赖根由调用方提供；Intel interface、adapter 和 DUT 的接口几何必须一致。
 // 已有统一工程 filelist 时，按此顺序增补缺失包，禁止把已有包再次编译。
--f filelists/aip_integration.f
-+incdir+integration/project
-integration/project/project_env_pkg.sv
-```
-
-## Intel 独立编译入口：project_intel_integration.f
-
-与上面的普通 TL 入口二选一；需要额外设置 `INTEL_PCIE_ROOT`。
-接口几何宏在所有编译单元保持一致，默认 4×256 bit；例如命令行设置
-`+define+INTEL_PCIE_DATA_WIDTH=256 +define+INTEL_PCIE_SEGMENTS=4`。
-如使用 bind wrapper，在自己的顶层 filelist 中再添加 wrapper 和项目 bind 文件，
-不要重复编译它的整份公共库入口。
-
-[源文件](../filelists/project_intel_integration.f)
-
-```text
-// Intel HARD_IP + 真实 EP 应用 DUT 的可选项目参考入口；从 virtio_work 根运行。
-// 与 project_integration.f 二选一。复用公共依赖，不重复加入 Intel 的整份库 filelist。
-// 调用方另提供 INTEL_PCIE_ROOT；接口几何宏必须对 interface、package 和 DUT top 一致。
-+define+PROJECT_PCIE_INTEL
 -f filelists/aip_integration.f
 +incdir+$INTEL_PCIE_ROOT/src
 $INTEL_PCIE_ROOT/src/interface/intel_pcie_if.sv
@@ -937,16 +827,19 @@ integration/project/project_env_pkg.sv
 ## 句柄注入与参数时机
 
 `project_base_test.build_phase()` 在加载参数后调用 `bind_platform_handles()`。
-普通 TL 平台可在该方法中填入 `cfg.rc_vifs[slot]`、`cfg.ep_vifs[slot]`；
-Intel 平台填入 `cfg.intel_rc_vifs[slot]`、`cfg.intel_cfg_by_slot[slot]`，或由
-bind wrapper 提前发布到实际 adapter 路径，留给 env 复用。两种模式均需给每个
+使用 bind wrapper 时，由 wrapper 提前发布到实际 adapter 路径，env 直接复用，
+不需要再填充 `cfg.intel_rc_vifs[slot]`、`cfg.intel_cfg_by_slot[slot]`；平台若直接持有
+Intel interface，也可以在该 hook 中注入这两类句柄。两种方式均需给每个
 活动 Function 分配独立的 `cfg.protocol_vifs`。也可沿用 top 的
 `protocol_event_vif_N` 注册入口。已有 Host pool 放在 `cfg.host_mem_pool_binding`，
 已有 IOMMU 放在 `cfg.vio_cfg_by_host[h].iommu_binding`。
 这些是对象句柄，不能通过 plusarg 创建 interface 或替代 HDL 连线。
 
-单 Host 默认 slot 为 0；多 Host 用 `tl_slot_by_host` 指定接口组，PF/VF 共用其 Host
-的接口组。真实输入、接口和注入时机可对照
+单 Host 默认 slot 为 0，只 bind 一个 wrapper。多 Host 用 `tl_slot_by_host` 指定接口组，
+每个实际物理端口各 bind 一个 wrapper、各用独立 `rc_adapter_N` 路径；同 Host 的
+PF/VF 共用该端口。`+dpu.hosts` 不会生成 HDL bind，扩展前需添加真实端口的 bind 并重新编译。
+完整单/多 Host 示例见 [bind 接入说明](../integration/project/README.md#从一个-host-扩展到多个-host)。
+真实输入、接口和注入时机可对照
 [smoke test](../integration/project/tests/project_env_smoke_test.sv)；其
 [top](../integration/project/tests/project_env_tb.sv) 仅提供空闲接口，不能代替 DUT top。
 

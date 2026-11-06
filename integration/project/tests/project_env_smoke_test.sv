@@ -1,5 +1,5 @@
 // integration/project/tests：参考组装层的构建/连接回归，不含 RTL 或伪造设备响应。
-// 依赖 project_env_pkg；top 提供空闲普通 TL 或 Intel VIF。验证组合式 parent/build 顺序、句柄身份、
+// 依赖 project_env_pkg；top 提供 Intel VIF。验证组合式 parent/build 顺序、句柄身份、
 // 参数消费和跨 Host 隔离，不发包、不调用寄存器计划，不把结构检查当成数据面通过。
 // 注入的 IOMMU 在 build 前已有 live mapping，用于验证共享对象不会被重配。
 package project_env_test_pkg;
@@ -13,9 +13,7 @@ package project_env_test_pkg;
     import virtio_net_pkg::*;
     import virtio_aip_pkg::*;
     import project_env_pkg::*;
-`ifdef PROJECT_PCIE_INTEL
     import intel_pcie_adapter_pkg::*;
-`endif
     `include "uvm_macros.svh"
 
     // 只读探针用于比较受保护的 snapshot 句柄；不替换生产 build/connect 行为。
@@ -60,11 +58,7 @@ package project_env_test_pkg;
         // 用生产参数入口创建 cfg，再注入 top VIF 和已有 pool/IOMMU。
         // negative 分支刻意破坏一个契约，应在生产 build/connect 到达指定 fatal。
         virtual function void build_phase(uvm_phase	phase);
-`ifdef PROJECT_PCIE_INTEL
             intel_pcie_vif_t			vif;
-`else
-            virtual pcie_tl_if			vif;
-`endif
             virtual virtio_protocol_event_if	protocol_vif;
             dpu_host_cfg			first_host;
             string				why;
@@ -107,7 +101,6 @@ package project_env_test_pkg;
                 injected_iommu[host.host_id] = iommu;
                 vio.iommu_binding = iommu;
 
-`ifdef PROJECT_PCIE_INTEL
                 // 普通入口从大 cfg 注入；wrapper 场景只在 top 发布到 adapter 路径，
                 // 留空数组以检验 env 真正借用了已有句柄及非默认端口设置。
                 if (!$test$plusargs("PROJECT_INTEL_WRAPPER")) begin
@@ -123,22 +116,11 @@ package project_env_test_pkg;
                         cfg.intel_cfg_by_slot[host.host_id].check_parity = 1;
                     end
                 end
-`else
-                if (!uvm_config_db#(virtual pcie_tl_if)::get(null, "uvm_test_top",
-                        $sformatf("rc_vif_%0d", host.host_id), vif))
-                    `uvm_fatal("PROJECT_TEST", "top has no RC VIF")
-                cfg.rc_vifs[host.host_id] = vif;
-                if (!uvm_config_db#(virtual pcie_tl_if)::get(null, "uvm_test_top",
-                        $sformatf("ep_vif_%0d", host.host_id), vif))
-                    `uvm_fatal("PROJECT_TEST", "top has no EP VIF")
-                cfg.ep_vifs[host.host_id] = vif;
-`endif
             end
             if (negative == "iommu_policy") injected_iommu[0].strict_permission_check = !cfg.vio_cfg.iommu_strict;
             if (negative == "missing_root") cfg.tl_slot_by_host.delete(0);
             if (negative == "duplicate_slot") cfg.tl_slot_by_host[1] = cfg.tl_slot_by_host[0];
             if (negative == "invalid_slot") cfg.tl_slot_by_host[0] = cfg.hosts;
-`ifdef PROJECT_PCIE_INTEL
             if (negative == "missing_intel_vif") cfg.intel_rc_vifs.delete(0);
             if (negative == "reused_intel_vif") cfg.intel_rc_vifs[1] = cfg.intel_rc_vifs[0];
             if (negative == "reused_intel_cfg") cfg.intel_cfg_by_slot[1] = cfg.intel_cfg_by_slot[0];
@@ -154,10 +136,6 @@ package project_env_test_pkg;
                     `uvm_fatal("PROJECT_TEST", "top has no second Intel VIF")
                 cfg.intel_rc_vifs[0] = vif;
             end
-`else
-            if (negative == "missing_native_vif") cfg.rc_vifs.delete(0);
-            if (negative == "reused_native_vif") cfg.rc_vifs[1] = cfg.rc_vifs[0];
-`endif
             if (negative == "reused_vif" || negative == "null_vif") begin
                 if (!uvm_config_db#(virtual virtio_protocol_event_if)::get(null, "uvm_test_top",
                         "protocol_event_vif_0", protocol_vif))
@@ -213,7 +191,6 @@ package project_env_test_pkg;
             expect_true(env.pcie_env.cfg == cfg.pcie_cfg && env.pcie_env.global_cfg == null &&
                 env.pcie_env.topology_adapter == null && !env.pcie_env.backend_provider_active,
                 "PCIe did not use the native cfg-only path");
-`ifdef PROJECT_PCIE_INTEL
             expect_true(env.pcie_env.bridge_required && cfg.pcie_cfg.if_mode == SV_IF_MODE,
                 "Intel transport did not enable the external-pin bridge");
             expect_true(!cfg.pcie_cfg.ep_agent_enable && cfg.pcie_cfg.num_ep == 0 &&
@@ -224,7 +201,6 @@ package project_env_test_pkg;
                 "Intel public FC or real-DUT response ownership is incorrect");
             expect_true(cfg.pcie_cfg.ep_root_by_index.num() == 0,
                 "RC-only integration retained EP bindings");
-`endif
             if ($value$plusargs("PROJECT_EXPECT_HOSTS=%d", expected))
                 expect_true(cfg.hosts == expected && env.vio_envs.num() == expected, "dpu.hosts not consumed");
             if ($value$plusargs("PROJECT_EXPECT_PH=%d", expected))
@@ -246,7 +222,6 @@ package project_env_test_pkg;
                     "PCIe and VIO do not share Host memory");
                 expect_true(env.pcie_env.rc_agents[slot].rc_driver.mem == vio.host_mem,
                     "native RC driver did not consume the matching Host memory");
-`ifdef PROJECT_PCIE_INTEL
                 begin
                     intel_pcie_if_adapter	adapter;
                     intel_pcie_vif_t			top_vif;
@@ -274,10 +249,6 @@ package project_env_test_pkg;
                         expect_true(adapter.cfg == published_cfg, "env replaced wrapper-owned cfg");
                     end
                 end
-`else
-                expect_true(env.pcie_env.rc_adapters[slot].vif == cfg.rc_vifs[slot],
-                    "native RC adapter has the wrong VIF");
-`endif
                 expect_true(env.reg_backend.root_by_domain[longint'(h) << 32] == slot,
                     "register plan selects a different RC slot than VIO");
                 expect_true(vio.iommu == injected_iommu[h], "VIO replaced injected IOMMU");

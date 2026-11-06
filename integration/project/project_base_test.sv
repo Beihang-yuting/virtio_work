@@ -15,7 +15,7 @@ virtual class project_base_test extends uvm_test;
     // cfg 若已由 top 完整注入，派生类可显式提供空实现；此 hook 不重新 load_params。
     pure virtual function void bind_platform_handles();
 
-    // 等待真实复位/TL 接口就绪，准备 requester-aware DMA 和设备模型/网络检查器。
+    // 等待真实复位/Intel 接口就绪，准备 requester-aware DMA 和平台网络检查器。
     // 必须有平台自己的超时及错误处理；返回即授权后续 DPU 寄存器计划访问设备。
     pure virtual task prepare_platform();
 

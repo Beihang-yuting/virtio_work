@@ -1,4 +1,4 @@
-# 一个 env 和一个 env_cfg：PCIe TL / Intel 接入参考
+# 一个 env 和一个 env_cfg：Intel PCIe bind 接入参考
 
 把 [project_env_cfg.sv](project_env_cfg.sv) 的成员和方法合入你的大 cfg，把
 [project_env.sv](project_env.sv) 的成员和方法合入你的大 env 即可。
@@ -8,23 +8,19 @@
 **[完整代码展示](../../docs/project_env_full_code.md)** 按 cfg、env、test、package
 顺序展开全部函数体。实际维护的源码在本目录，二者保持一致。
 
-默认 `REAL_DUT`，规模为 **1 Host、1 PF、0 VF**。每 Host 一个 segment 0，
-同 Host 的 PF/VF 共用物理端口。普通 TL 分支使用 RC/EP 配对接口；
-**Intel 分支面向真实 EP 应用 DUT，每 Host 只创建一个 RC，接口方向为 `HARD_IP`。** 项目层只创建
+固定使用 Intel PCIe 和 `REAL_DUT`，默认规模为 **1 Host、1 PF、0 VF**。
+每 Host 一个 PCIe segment 0，同 Host 的 PF/VF 共用物理端口。
+**真实 DUT 为 EP 应用逻辑，每 Host 只创建一个 RC，接口方向为 `HARD_IP`。** 项目层只创建
 `pcie_tl_env_config`，采用 PCIe TL 的 cfg-only 路径。
 不构造 PCIe global/topology 对象，不使用 SVT、Serial VIP 或链路训练。
 
 `integration/` 始终是可选参考目录，只由独立 filelist 显式编译；原生产
 filelist/package 不导入本目录。已有工程按需合入代码和缺少的依赖，避免重复编译包。
 
-| 使用场景 | 独立入口 | VIF 成员 |
-| --- | --- | --- |
-| 普通 `pcie_tl_if` / 原有 MODEL 接入 | `filelists/project_integration.f` | `rc_vifs[slot]` / `ep_vifs[slot]` |
-| Intel R-Tile 用户接口，真实 EP 应用 DUT | `filelists/project_intel_integration.f` | `intel_rc_vifs[slot]`，每端口一个 `intel_cfg_by_slot[slot]` |
-
-两个入口二选一；Intel 入口定义 `PROJECT_PCIE_INTEL` 并编译专用 adapter。
+唯一入口是 [filelists/project_integration.f](../../filelists/project_integration.f)，
+直接编译 Intel interface 和 adapter，无需定义接口选择宏。
 `SV_IF_MODE` 表示引脚传输；Intel adapter 由 factory instance override 选择。
-合入现有工程时，保留 Intel 条件分支或直接只拷贝该分支的代码。
+env/cfg 已去掉普通 TL VIF、EP 配对和 MODEL 接入分支，可以直接参考当前代码。
 
 ## 组件与配置关系
 
@@ -38,8 +34,7 @@ filelist/package 不导入本目录。已有工程按需合入代码和缺少的
     pcie_cfg : pcie_tl_env_config                  原生 TL 配置
     tl_slot_by_host[h]                            Host → 物理 RC slot
     host_mem_pool_binding / protocol_vifs
-    rc_vifs / ep_vifs                             普通 TL 分支
-    intel_rc_vifs / intel_cfg_by_slot              Intel 分支
+    intel_rc_vifs / intel_cfg_by_slot              每个物理端口的接口和配置
 
   env : 你的 env extends uvm_env
     dpu_env : dpu_device_env                      直接创建原类
@@ -62,7 +57,6 @@ PCIe 的 cfg-only build 只需要 TL 配置和 Host 内存，可以和 DPU 并�
 | [project_base_test.sv](project_base_test.sv) | 可选的 test 接入顺序；已有 test 可直接移植方法内容 |
 | [project_env_pkg.sv](project_env_pkg.sv) | 所需 import 和 include 顺序 |
 | [project_integration.f](../../filelists/project_integration.f) | 独立编译入口，已有工程只补缺失项 |
-| [project_intel_integration.f](../../filelists/project_intel_integration.f) | Intel 独立入口，与上项二选一 |
 | [project_env_smoke_test.sv](tests/project_env_smoke_test.sv) | 组合结构、参数和共享对象的验证 |
 | [project_env_tb.sv](tests/project_env_tb.sv) | 结构测试 top，仅有空闲接口，没有 DUT 应答 |
 
@@ -71,11 +65,11 @@ PCIe 的 cfg-only build 只需要 TL 配置和 Host 内存，可以和 DPU 并�
 | 阶段 | 操作 |
 | --- | --- |
 | test build | 创建/获取 cfg → `load_params()` → 注入平台句柄 → 下发 cfg → 创建你的 env |
-| 大 env build | 准备共享内存 → 填写 PCIe slot/内存绑定 → 安装默认 executor/backend → 创建 DPU → Intel 分支发布端口 cfg/VIF 并调用 setup → 创建 PCIe、DPU 下的 VIO |
+| 大 env build | 准备共享内存 → 填写 PCIe slot/内存绑定 → 安装默认 executor/backend → 创建 DPU → 取得或发布 Intel cfg/VIF 并调用 setup → 创建 PCIe、DPU 下的 VIO |
 | DPU build | resolver 解析并冻结 device/resource snapshots，发布到子树，给 executor 绑定 snapshot |
 | VIO build | 按 Host scope 消费同一份 snapshot/resource manager，创建对应 PF/VF 服务 |
 | PCIe build | 消费同一个 `pcie_cfg`，创建原生 TL agents、adapters、manager |
-| 大 env connect | 普通 TL 绑定 VIF / Intel 校验 build 时的绑定 → 绑定协议 VIF、寄存器 backend → 逐 Function 绑定 PCIe endpoint |
+| 大 env connect | 校验 Intel build 时的绑定 → 绑定协议 VIF、寄存器 backend → 逐 Function 绑定 PCIe endpoint |
 | test run | 复位/TL/DMA 服务就绪 → `env.configure_device()` → 注册 AIP → Tcl loop → 业务完成检查 |
 
 DPU 和 PCIe 两个同级组件谁先 build 不影响此方案。所有 build 完成后才进入 connect，
@@ -89,8 +83,7 @@ DPU 和 PCIe 两个同级组件谁先 build 不影响此方案。所有 build �
 | qpair、MSI-X、notify 资源 | 所有 Host 的 VIO 共享 DPU resource snapshot/manager，各自按 Host scope 选服务 |
 | Host 内存 | `cfg.host_mem_pool_binding` 为空才创建；DPU 保存引用，VIO 和 PCIe RC driver 使用同一 Host manager |
 | IOMMU | `cfg.vio_cfg_by_host[h].iommu_binding`；已有模型只校验策略，不重建已有映射 |
-| PCIe TL 配置 | `uvm_config_db#(pcie_tl_env_config)::set(this, "pcie_env", "cfg", cfg.pcie_cfg)` |
-| TL 接口 | `cfg.rc_vifs[slot]`、`cfg.ep_vifs[slot]`；两个方向独立，各 slot 不复用 VIF |
+| PCIe TL 配置 | `intel_pcie_configure_env(this, cfg.pcie_cfg, "pcie_env")` 在创建 PCIe 前下发 |
 | Intel 接口 | `cfg.intel_rc_vifs[slot]` / `intel_cfg_by_slot[slot]`，或借用 bind wrapper 在 adapter 路径发布的相同句柄；build 前完成 |
 | 协议观察接口 | 优先使用 Host VIO cfg 的完整身份映射；否则用 `cfg.protocol_vifs`，最后查 top 的 `protocol_event_vif_N` |
 | 寄存器 executor | `cfg.dpu_cfg.executor`；为空才创建默认 `dpu_pcie_reg_executor + pcie_tl_dpu_reg_backend` |
@@ -123,8 +116,9 @@ IOMMU 有状态，不通过 `copy_defaults_from()` 复制；应在 load 后逐 H
 这里的大 cfg 对 load 做了单次保护，env 再调用不会重复采样或追加 Host。
 平台对象和时序仍要接入：
 
-1. build 中在 load 后注入所选接口分支的 VIF、协议 VIF，以及已有 pool/IOMMU；再把大 cfg
-   以 `"cfg"` 下发给自己的 env。单 Host 默认使用 slot 0。
+1. build 中在 load 后接入 Intel VIF、协议 VIF，以及已有 pool/IOMMU；再把大 cfg
+   以 `"cfg"` 下发给自己的 env。使用 bind 时 Intel cfg/VIF 已由 wrapper 发布，
+   不需要再创建一套。单 Host 默认使用 slot 0。
 2. run 中等待平台复位释放、TL 接口和 requester-aware DMA 服务就绪，并设置超时。
 3. 调用 `env.configure_device()`，随后调用 `env.register_aip_commands()`，启动一次
    `aip_tcl_bridge::run_loop()`。
@@ -147,7 +141,7 @@ REAL_DUT 的 IOVA→GPA DMA 路由沿用平台现有服务。多 Function 共用
 
 ## Intel 配置放在哪里
 
-Intel 分支使用同一份 env/cfg。`cfg.load_params()` 和
+参考 env/cfg 直接使用 Intel。`cfg.load_params()` 和
 `env.prepare_pcie_config()` 设置的关键组合为：
 
 ```systemverilog
@@ -192,11 +186,15 @@ bridge，不会创建 SVT、global_cfg、topology adapter 或链路训练。
 ### 已经使用 Intel bind wrapper
 
 沿用 `pcie_intel/bind/intel_pcie_bind_wrapper.sv` 的
-`intel_pcie_bind_wrapper_inout`，参数设为：
+`intel_pcie_bind_wrapper_inout`。当前一个 Host 时只绑定一个物理端口，例如：
 
 ```systemverilog
-.ADAPTER_PATH("uvm_test_top.env.pcie_env.rc_adapter_0"),
-.SIDE("HARD_IP")
+// 放在项目自己的 bind 文件中；路径替换成实际 DUT 实例。
+// .* 仅适用于绑定点包含与 wrapper 同名、同宽度的全部 wire/tri 网络。
+bind tb_top.u_dut.u_pcie0 intel_pcie_bind_wrapper_inout #(
+    .ADAPTER_PATH("uvm_test_top.env.pcie_env.rc_adapter_0"),
+    .SIDE("HARD_IP")
+) u_pcie_bind (.*);
 ```
 
 wrapper 在 time-0 已发布 cfg/VIF；大 cfg 中可以留空 `intel_cfg_by_slot` 和
@@ -208,17 +206,61 @@ top 需在 wrapper 初始化之后调用一次 `run_test()`：
 ```systemverilog
 initial begin
     #0;
-    // u_pcie_bind 是已有 wrapper 的实际 HDL 路径；修改它持有的同一 cfg。
-    u_pcie_bind.cfg.check_parity = 1;
-    u_pcie_bind.cfg.rx_gap_cycles = 0;
+    // 本 initial 位于 tb_top；可选地修改 wrapper 持有的同一 cfg。
+    // 不修改 cfg.side：引脚方向已由 bind 参数 SIDE 在展开时决定。
+    u_dut.u_pcie0.u_pcie_bind.cfg.check_parity = 1;
+    u_dut.u_pcie0.u_pcie_bind.cfg.rx_gap_cycles = 0;
     run_test();
 end
 ```
 
 完整 pin 连接和每个信号方向见外部
 [Intel bind 文档](https://github.com/Beihang-yuting/pcie_intel/blob/main/docs/integration/bind.md)。
-wrapper 的 inout actual 必须是 `wire/tri` net；对接 `logic` 变量时应先提供明确的
-方向连线。`HARD_IP` 驱 RX、TX ready/credit，采样 DUT 的 TX；它与 RC/EP 协议角色分开。
+wrapper 的 inout actual 必须是 `wire/tri` net；DUT 内部为 `logic` 变量时，可选取父层
+实际连接 DUT 端口的网络作为绑定点。`HARD_IP` 驱 RX、TX ready/credit，采样 DUT 的 TX；
+它与 RC/EP 协议角色分开。wrapper 自带的默认 ADAPTER_PATH 少了本项目的 `pcie_env`
+一层，必须显式填写完整路径；ADAPTER_NAME 仅影响 cfg 对象名，无须另设。
+
+### 从一个 Host 扩展到多个 Host
+
+本参考采用一 Host 一物理端口，因此 Host、RC adapter 和 wrapper 数量一致；
+增加同一 Host 内的 PF/VF 不增加 wrapper。默认映射如下：
+
+| DPU Host | TL slot | 物理绑定点示例 | ADAPTER_PATH |
+| --- | --- | --- | --- |
+| Host0 | 0 | `tb_top.u_dut.u_pcie0` | `uvm_test_top.env.pcie_env.rc_adapter_0` |
+| Host1 | 1 | `tb_top.u_dut.u_pcie1` | `uvm_test_top.env.pcie_env.rc_adapter_1` |
+
+当前单 Host 仅保留上面的 port0 bind，运行参数为默认值：
+
+```text
++dpu.hosts=1 +dpu.pfs_per_host=1 +dpu.vfs_per_pf=0
+```
+
+以后接入第二个物理端口时，再将下面的实例级 bind 加入工程并重新编译，运行设
+`+dpu.hosts=2`。env/cfg 不需要新增第二套类，默认自动生成 `tl_slot_by_host[1]=1`：
+
+```systemverilog
+bind tb_top.u_dut.u_pcie1 intel_pcie_bind_wrapper_inout #(
+    .ADAPTER_PATH("uvm_test_top.env.pcie_env.rc_adapter_1"),
+    .SIDE("HARD_IP")
+) u_pcie_bind (.*);
+```
+
+每个 wrapper 独立持有一个 interface 和一个 cfg，并独立发布；不能多个端口使用同一个
+ADAPTER_PATH，也不应使用固定路径的模块类型 bind 覆盖该类型的所有 DUT 实例。
+env 会拒绝已用 slot 间复用 cfg/VIF，但不会清点所有 HDL wrapper，也无法追溯同一路径
+在 time-0 被重复发布覆盖。使用实例级 bind 和唯一完整路径可以明确对应关系。
+
+bind 的存在和数量在 elaboration 时确定；`dpu.hosts` 在 UVM build 前加载，不能生成
+HDL wrapper。只绑定一个端口却设置两个 Host，会因缺 `rc_adapter_1` 的 VIF 立即 fatal。
+也不要在当前不用的端口上预绑仍接着有效 DUT 网络的 wrapper：它持续驱动所拥有的网络，
+没有 UVM adapter 初始化的接口可能把 X 送入 DUT。按本次需要的端口选择 bind 文件即可，
+无需额外接口选择宏。
+
+需要交换 Host 与物理端口时，只在 build 前调整 `tl_slot_by_host`；wrapper 的路径始终
+表示物理 slot。接口中的 4×256 bit 是同一端口的四个 AVST segment，与 Host 数无关。
+多 Host 还需满足 DPU caps、Function 数和 queue 资源上限，并提供各活动 Function 的协议 VIF。
 
 ### 平台直接持有 Intel interface
 
@@ -268,7 +310,7 @@ PCIe VIF 替代；也可沿用 top 的 `protocol_event_vif_N` 发布方式。
 
 这些是 `intel_pcie_adapter_config` 的原有 SV 字段，目前没有 `load_params()`，
 所以 `+pcie_cfg.intel.rx_gap_cycles=...` **不会自动生效**。先在 build 前设置对象字段。
-已有 `pcie_cfg.*` 仍用于公共 TL 策略；Intel 分支要求 `infinite_credit=1`，
+已有 `pcie_cfg.*` 仍用于公共 TL 策略；Intel 接入要求 `infinite_credit=1`，
 `init_*_credit` 不控制 AVST 的有限 credit，不能用它们测试 Intel 引脚背压。
 
 ### 接通引脚以后仍由平台完成的部分
@@ -333,12 +375,8 @@ VF 场景把 target 改成如 `h0.pf0.vf0.i0`。`vio_tx` 返回表示提交完�
 若你的 cfg 已经建立这些对象，应把原配置类的 `load_params()` 调用合入已有的
 输入构造代码，省去示例的重复生成循环。不要先填满 DPU 输入再调用这个默认生成器，
 它会明确拒绝覆盖非空输入。保留单次加载标志、`vio_cfg_by_host`、Host→slot 映射和
-执行 profile 对 PCIe 字段的设置即可；不必为此增加一个 cfg 派生层。
-
-普通 TL 默认 REAL_DUT 对应 `SV_IF_MODE`、RC active、EP passive、`ep_auto_response=0`；
-Intel 分支则完全关闭 EP，并限定 REAL_DUT。
-保留的 MODEL 入口需要平台提供真实 Virtio 模型和共享 completion adapter；
-普通 EP 自动应答不等价于 Virtio 设备模型。
+Intel 的 `SV_IF_MODE`、RC active、关闭 EP 和公共无限 FC 设置即可；
+不必为此增加一个 cfg 派生层。本参考限定 REAL_DUT，不再保留 MODEL completion adapter。
 
 ## 编译与验证
 
@@ -346,7 +384,7 @@ Intel 分支则完全关闭 EP，并限定 REAL_DUT。
 设置五个依赖根：`AIP_CORE_ROOT`、`DPU_COMMON_ROOT`、`NET_PACKET_ROOT`、
 `HOST_MEM_ROOT`、`PCIE_WORK_ROOT`。AIP 使用含 `src/sv` 的 update 分支布局。
 
-Intel 另外设置 `INTEL_PCIE_ROOT`，使用下面的独立入口。默认几何为 **4×256 bit**，
+同时设置 `INTEL_PCIE_ROOT`，使用下面的独立入口。默认几何为 **4×256 bit**，
 即每段 256 bit、4 段；不同接口几何必须对 interface/package/top 使用同样的宏。
 若采用 bind wrapper，在自己的工程入口中再加入
 `$INTEL_PCIE_ROOT/bind/intel_pcie_bind_wrapper.sv` 和项目的 bind 文件；
@@ -355,8 +393,7 @@ Intel 另外设置 `INTEL_PCIE_ROOT`，使用下面的独立入口。默认几�
 ```bash
 mkdir -p build/project_intel
 vcs -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps \
-  +define+INTEL_PCIE_DATA_WIDTH=256 +define+INTEL_PCIE_SEGMENTS=4 \
-  -f filelists/project_intel_integration.f -f filelists/project_tests.f \
+  -f filelists/project_integration.f -f filelists/project_tests.f \
   -top project_env_tb -Mdir=build/project_intel/csrc -o build/project_intel/simv \
   -l build/project_intel/compile.log
 ./build/project_intel/simv -exitstatus +UVM_TESTNAME=project_env_smoke_test \
@@ -365,54 +402,23 @@ vcs -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps \
   -l build/project_intel/smoke.log
 ```
 
-普通 TL 分支仍使用原独立入口：
-
-```bash
-mkdir -p build/project
-vcs -full64 -sverilog -ntb_opts uvm-1.2 -timescale=1ns/1ps \
-  -f filelists/project_integration.f -f filelists/project_tests.f \
-  -top project_env_tb -Mdir=build/project/csrc -o build/project/simv \
-  -l build/project/compile.log
-./build/project/simv -exitstatus +UVM_TESTNAME=project_env_smoke_test \
-  +dpu.hosts=2 +dpu.vfs_per_pf=2 +vio.queue_size=512 \
-  +PROJECT_EXPECT_HOSTS=2 +PROJECT_EXPECT_FUNCTIONS=4 +PROJECT_EXPECT_QUEUE=512 \
-  -l build/project/smoke.log
-```
-
 结构测试不执行 DUT 寄存器计划、不发送报文；它检查对象构建、参数、接口和身份绑定。
 真实收发使用项目自己的 top、DUT、DMA 服务和 test 收尾检查。
 
-2026-11-06 普通 TL 组合方案引入时的验证记录（本次 Intel 改动之前，主机 `10.11.10.53`）：
+当前版本的验证覆盖两类入口：结构 top 检查 cfg/VIF 的显式注入、参数和错误诊断；
+真实 HDL bind 探针把库 wrapper 绑定到独立 wire 端口，在复位后检查接口方向、
+单/双 Host 对应关系及 slot0 ready 切换时的端口隔离。探针端口不包含真实设备响应，
+不把这些检查当作 PCIe/Virtio 报文业务验证。
 
-| 场景 | 结果 |
+2026-11-06 在 VCS 主机 `10.11.10.53` 对精简后的源码重新验证，所有编译均未定义接口选择宏：
+
+| 验证项 | 结果 |
 | --- | --- |
-| 默认 1 Host / 1 PF 服务 | 32 项检查通过 |
-| 2 Host / 每 Host 2 VF 服务，queue=512、PH credit=23 | 66 项检查通过 |
-| 2 Host / 每 Host 2 PF 服务 | 61 项检查通过 |
-| 2 Host 使用同值 BDF、交换 RC/EP slot | 48 项检查通过 |
-| IOMMU 策略冲突、缺 Host 映射、重复/越界 slot、缺/复用 native VIF、空/复用协议 VIF | 8 个负例均命中预期生产 fatal，无超时 |
-| 既有 AIP 参数 / command 兼容测试 | 参数 34 项检查通过；命令测试通过 |
+| 单端口 bind、双端口 bind、结构 top 三份独立编译 | 编译及严格日志检查全部通过 |
+| 真实 bind：单 Host 单 PF、单 Host 双 PF、单 Host 双 VF、双 Host 多 VF、双 Host 交换 slot | 5 个正例通过，运行至 80ns，覆盖复位后采样与物理引脚 ready 隔离/恢复 |
+| 只绑定一个 wrapper，却设置两个 Host | 精确报告缺 `uvm_test_top.env.pcie_env.rc_adapter_1` 的 Intel VIF |
+| 显式注入：默认、双 Host 多 VF、交换 slot、自动创建默认 Intel cfg | 4 个正例通过 |
+| 结构错误与参数冲突：缺失/复用接口、错误 SIDE、配置冲突、Host 映射、MODEL/EP 自动应答等 | 17 个负例均命中预期生产 fatal，无测试兜底 fatal 或超时 |
 
-项目和 AIP 编译均通过，VCS warning/error 为 0；所有正例和兼容测试的 UVM
-warning/error/fatal 均为 0。检查包含快照和共享内存句柄、
-原生 cfg-only 路径、实际 RC sequencer/VIF、Host 隔离以及 AIP 目标注册。
-
-本轮 Intel 分支在同一 VCS 主机的新隔离目录编译通过（23 个 module/package，
-编译与严格日志检查均通过），并完成以下结构验证：
-
-| 场景 | 结果 |
-| --- | --- |
-| 默认、双 Host 多 VF、同值 BDF 交换 slot、借用 wrapper 发布句柄、自动创建默认 Intel cfg | 5 个正例通过，分别完成 40/78/60/60/37 项检查 |
-| 缺 Intel VIF、跨端口复用 cfg/VIF、错误 SIDE、公共有限 FC、遗留 EP 绑定、与 wrapper 的 cfg/VIF 冲突 | 8 个负例均命中预期生产 fatal |
-| 缺 Host 映射、重复/越界 slot、空/复用协议 VIF、IOMMU 策略冲突 | 6 个负例均命中预期生产 fatal |
-| `+pcie_cfg.infinite_credit=0`、`+vio.exec_mode=VIRTIO_EXEC_MODEL` | 2 个参数负例在加载时明确拒绝 |
-
-5 个正例的仿真/严格检查返回码均为 0；16 个负例均只有一个预期 fatal，
-没有落入测试自身的兜底报错。wrapper 场景模拟其 config_db 发布契约，
-没有实例化实际 bind wrapper 或 DUT；接口握手和真实 PCIe/Virtio 流量不在此结构回归范围内。
-
-同一快照还重新编译并验证了普通 TL 的 default/two_vf/swap（32/66/48 项检查）、
-缺失/复用 native VIF 两个负例，以及 AIP 参数 34 项检查和 command 用例。
-三个项目编译入口的 VCS warning/error 均为 0，所有正例 UVM W/E/F 均为 0。
-外部 `net_packet/main@b8a4c14` 的既有 RoCEv2 ICRC/trailer 测试为 45 passed、0 failed；
-`virtio_aip_pkg.sv` 的 `get_all_trailers_length()` 调用也在完整编译中通过。
+所有正例的仿真及严格日志检查返回码均为 0；负例均为单个预期 fatal，warning/error 为 0。
+结构 top 在 1ns 结束；真实 bind 使用空闲应用端口，未验证用户实际 RTL 的报文与寄存器响应。
