@@ -12,13 +12,14 @@
 
 **Driver supplement:** 用户实现期间提供当前驱动，补充依据为同目录 specs 中
 `2026-11-07-current-driver-compatibility-notes.md`。Task 2 增加TX内层校验位与
-完整RX CQ解析/查询及黄金字节测试；Task 3 采用明确版本的间接端口和表布局，
-不混用驱动与截图的差异。Packed保持标准header，可显式选择DPU32通知。
+完整RX CQ解析/查询及黄金字节测试；Task 3 的配置表以图片为准，驱动只补充
+未覆盖的操作流程。Packed保持标准header，可显式选择DPU32通知。
 
 ## Global Constraints
 
 - 一个项目 env extends uvm_env、一个 env_cfg；每 Host 一个 RC/Intel HARD_IP wrapper，segment 0。
 - 项目配置只使用 Memory Read/Write；准备阶段不访问 DUT，不发现 capabilities、不协商、不复位、不自动编程。
+- 配置表以用户图片为准；notify只实现单bank逐项高DWORD先写，不实现双bank、全表搬移或bank-select/ready。未知控制地址须显式声明。
 - Packed 带标准 virtio_net_hdr；Custom 保留私有 descriptor/CQ 和无 Virtio header 的数据面。
 - integration 只在独立参考 package/filelist 编译；生产 package 只加入必要的通用 VIO 源码。
 - 参数根为 dpu.*、vio.*、pcie_cfg.*，注册留在拥有字段的配置类中。

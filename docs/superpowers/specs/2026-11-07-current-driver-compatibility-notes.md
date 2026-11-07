@@ -9,6 +9,11 @@ SHA-256：`97d8422424354c53c8ca7155a1b769e35b120c1d7a77d2be0faed642eb407ac7`。
 保留用户之前明确要求的标准 Packed `virtio_net_hdr`，不把驱动中名为 virtio 的
 设备专用路径自动认作完整标准 virtio-net 驱动。
 
+用户随后明确“以图片为准”，并要求 notify 本轮只做单 bank。因此配置表的
+字段含义、位宽、容量和图片明确给出的地址以图片为准；驱动只补充图片未覆盖的
+数据面与操作流程。图片未明确的硬件地址或控制语义必须显式声明，不能因驱动
+存在某值就自动采用。双 bank、全 bank 搬移以及 bank-select/ready 不在本轮实现范围。
+
 ## 自定义数据面
 
 | 对照项 | 当前驱动证据 | 实现要求 |
@@ -64,15 +69,19 @@ cfg选择/声明，准备阶段不会因知道地址就自动写设备。
 | MSI-X self-mask重开 | `interrupt.c:296` | 通过Function窗口offset0x1004写mask_en bit0、global vector[13:1]；该运行期写由用户task控制 |
 | MSI-X信息表 | `interrupt.c:396` | Function/Host/global vector来自真实资源；驱动显式开启self-mask，VIP不得自动代替用户重开 |
 | notify局部编码 | `common.h:517`、`af_mng.c:1718` | net条目低7位=`{pair[5],pair[4:0],1'b1}`；不要与doorbell低16位RX/TX local qid混淆 |
-| notify双bank | `register.h:185`、`:403`；`af_mng.c:1737` | 驱动明确有双bank，写完整目标bank并高DWORD先写，最后通过PCOMPLETER+0x44选择bank/ready；仅选择此版本布局时启用，截图版仍无隐式bank |
+| notify双bank | `register.h:185`、`:403`；`af_mng.c:1737` | 仅记录驱动差异。本轮只按图片的单bank表逐项高DWORD先写，不实现全bank搬移、select或ready |
 | BAR分配表 | `register.h:270`..`:386` | PF逐项、VF窗口组base/limit/size都有定义；需结合实际成员验证能否编码，不能仅按VF数量推算连续地址 |
 
 版本差异不能合并为一个自称通用的线格式：
 
-- 截图VTX bit72叫high_speed_mode，驱动成员仍叫inorder。当前普通初始化中该位为0；非零语义按所选RTL布局明确处理。
-- 截图ASIC VRX的预取地址为15位、bit127保留；驱动C成员是16位。截图profile坚持15位和容量检查，不能因C字段较宽而允许越界。
-- 驱动的notify具有显式bank/ready，而截图未说明；两种布局必须显式区分。
-- 驱动的PBA结构仍是64个DWORD，不能单凭它推断完整硬件覆盖的向量数。
+- 截图VTX bit72叫high_speed_mode，驱动成员叫inorder（`register.h:2283`附近）。实现使用图片含义，不将两者等同。
+- 截图VTX[127:112]保留；驱动[125:112]是14位mtu、[127:126]保留。这是实际字段冲突，本轮仍保留全部16位，不增加mtu字段。
+- 截图ASIC VRX的预取地址为15位、FPGA为14位，bit127保留；驱动C成员是16位。按图片对应硬件版本限制地址和容量。
+- 图片notify为512×128；驱动每bank为4096项并具有显式bank/ready。本轮采用图片容量与单bank逐项写；局部scope不搬移或清零未选中项。
+- 图片notify低7位说明仍有5位目的字段与6位来源范围的歧义；驱动给出一种明确编码，但不能替代图片中的未决含义。对应编码须显式声明并校验可表示性，不默认截断。
+- 图片QSCH Host端口跟实际ETH数量排列；驱动`qsch_g2p_dport_seq_num`固定先放8个ETH端口。实现按图片规则和实际拓扑产生Host端口，不能固定加8。
+- 图片MSI-X local索引[8:6]和info Function索引[9:7]为保留位，驱动使用完整9/10位C字段。图片布局仍检查保留位，软件成员宽度不构成硬件容量证据。
+- 图片PBA表头16×64和正文8192bit存在内部矛盾，驱动结构为64个DWORD（2048bit）。不任选其中一个当作完整硬件容量；PBA读取能力需显式给出已确认容量。
 
 ## Packed分支的边界
 
@@ -91,4 +100,4 @@ cfg选择/声明，准备阶段不会因知道地址就自动写设备。
 2. RX CQ四个DWORD黄金向量、非零低16位metadata不被当作索引、128位长度与wrap校验。
 3. 保留普通Custom 512B TX/RX、SG跨环、CQ初始值和N-1容量测试；unsupported完成不能提前回收。
 4. 显式DPU32通知的Packed和Custom分别核对编码，同时检查Packed仍带标准header。
-5. 参考间接端口写序、notify bank完整范围、MSI-X重开行为与截图profile隔离。
+5. 参考间接端口写序、notify单bank高位先写与局部scope保留、无bank-select/ready访问；MSI-X重开由用户task显式控制。

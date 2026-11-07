@@ -5,6 +5,8 @@
 状态：用户已批准，正在实现。各接口是否完成以源码和验证记录为准。
 实现中用户又提供了当前驱动；新增对照与兼容边界见
 [当前驱动核对记录](2026-11-07-current-driver-compatibility-notes.md)。
+用户最新确认：配置表以图片为准，notify 本轮仅单 bank。图片已定义的字段、
+容量和地址不被驱动覆盖；未明确的控制语义/地址须由平台显式提供。
 
 本次修订纳入后续要求：项目仅使用外部设备配置流程；导出所有身份、BAR、队列、
 中断和表项信息；逐类预留用户 task；用户 task 可直接复用 `pcie_work` 访问 DUT。
@@ -313,8 +315,8 @@ VIO ring 记录的外层 cfg 放在拟新增 `integration/project/project_vio_co
 
 公共 Function 列表覆盖 DPU 已创建的身份，并标出 AF 和实际承载 VIO 的 service。
 表项没有布局与表项需要写入 `valid=0` 是两件事：前者不能发起访问，后者仍可能
-是停用某条映射的必需写操作。只有平台声明存在 shadow bank 时才包含其清理
-语义；截图版 notify 未提供这种机制。记录必须明确区分，不能用一个 valid 位混用。
+是停用某条映射的必需写操作。本轮 notify 按用户要求只做单 bank，不引入
+shadow bank 清理或提交语义。记录必须明确区分，不能用一个 valid 位混用。
 
 BAR 基址既可由 DPU 分配，也可在解析前明确指定。按当前参数格式，固定 VF0
 BAR0 的输入为 `dpu.h0.pf0.vf0.bar0.placement=DPU_ALLOC_PINNED` 和
@@ -618,7 +620,6 @@ DPU 的分配、冻结快照及纯表项生成/寄存器编码能力继续供项
 | `enable_msix` | `user_configure_msix_function` | 每适用 Function：平台声明的 MMIO 中断使能/屏蔽；没有独立控制寄存器时按声明使用表项控制 |
 | 可选状态检查 | `user_check_msix_pba` | PBA BAR/offset、向量对应 pending bit；不是普通写表 hook |
 | `configure_vio_notify` | `user_configure_notify_entry` | 每 table slot：局部编码、Host、notify base、global qid、type；截图版无 valid 位 |
-| `configure_vio_notify` | `user_commit_notify_bank` | 仅显式声明双 bank 布局时使用；截图版不调用 |
 | `configure_qsch` | `user_initialize_qsch` | 仅明确声明的 QSCH 全局初始化；范围覆盖全部受影响消费者时才允许 |
 | `configure_qsch` | `user_configure_qsch_q2tc` | 每队列映射项：global qpair、TC、net 等逻辑值及表索引 |
 | `configure_qsch` | `user_configure_qsch_n2g` | 每唯一 N2G 项及目标地址 |
@@ -647,10 +648,10 @@ cfg 或准备前显式调用的 DPU topology generator 提供，生成结果只�
 不能另行修改与已导出队列绑定冲突的策略。
 
 notify 表中的 local pair 编码与 doorbell 的 RX/TX local virtqueue ID 分别传入。
-截图版使用 128 位表项并按高 DWORD 到低 DWORD 写，最后写 [31:0]；不执行旧
-shadow-bank/commit。旧版若仍由独立场景选择，则由其布局声明 bank 与排序约束。
-各版本都校验 notify 地址对齐、位宽及逐队列绑定的可表示性；截图中未明确的
-local 编码不能用截断来补齐。需要 bank 的版本由配置显式提供 active/target bank，
+本轮以图片为准，使用 512×128 位的单 bank 表并按高 DWORD 到低 DWORD 写，
+最后写 [31:0]；不实现双 bank、整 bank 搬移、bank-select/ready 或 commit hook。
+局部 scope 只更新选中项，不清零无关项。校验 notify 地址对齐、位宽及逐队列
+绑定的可表示性；截图中未明确的 local 编码必须显式声明，不能用截断来补齐。
 准备阶段不读 DUT 猜测。MSI-X linear 同样按图先高 32 位、再低 32 位；显式
 选择 RDMA notify 配置时也遵守该高低写序，不因它是可选入口而省略约束。
 
@@ -1024,8 +1025,8 @@ VIO 的 cfg 可以附带其依赖的只读 BDF/BAR 值，用于定位设备访�
 已运行队列依赖的 BAR/BDF/共享表变更必须先由用户停止相关 DMA；改变地址或
 身份要求新 DPU 分配快照，单独配置接口不成为运行中修改分配的旁路。
 
-独立配置仍遵守硬件实际提交粒度。仅当所选布局声明 notify shadow bank 时，
-才要求完整 bank image；本次截图版不使用该机制。存在原子分组的平台中，
+独立配置仍遵守硬件实际提交粒度。notify 本轮只做单 bank 逐项写。
+存在原子分组的平台中，
 部分 scope 不能把其他 Function 的有效项清零；平台 BAR 表若整组 VF 原子提交，
 也不能把单 VF 当成完整组。缺少已知完整映像时返回所需完整范围，调用方显式
 选择该范围后再执行；不暗中扩大 scope 或假造未选中项。所有结果与当前记录值
@@ -1186,7 +1187,8 @@ DPU 已有 `get_service_owner/get_pcie_id/get_bar` 和
     普通队列明确失败，错误指出额外资源与每 Function 容量限制。
 13. 逐类检查用户 task 收到的数据与选定布局：requester/completion BDF、PFVF、
     prefix、MSI-X linear/info/interval/table、notify、QSCH 和 VTX/VRX；仅平台
-    明确声明时验证 control/bank/commit 项。共享项去重，AF 额外项单列。
+    明确声明时验证 control 项；notify 检查单bank局部写且没有bank-select/ready。
+    共享项去重，AF 额外项单列。
     必需 hook 未填写时不能进入 READY，未提供布局不产生有效假地址。
 14. 用户 hook 经 Memory sequence 实际到达 Intel 路径；验证目标身份、Host/RC、
     BAR base+offset、4/8/12/16 字节及 mask 语义，越界/缺路由在发 TLP 前失败。
