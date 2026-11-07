@@ -36,6 +36,8 @@ class project_env extends uvm_env;
 	local project_control_cfg_t	frozen_controls[$];
 	local bit	tx_observation_bound[int unsigned];
 	local int unsigned	checked_writes_active;
+	local longint unsigned	write_revision[string];
+	local int unsigned	writes_by_key[string];
 	local project_msix_policy_t	frozen_msix_policies[string];
 
 	// 首次成功发布后才打印，重复同快照幂等，新拓扑要求 rebuild 而不留下新旧路由混合。
@@ -69,6 +71,11 @@ class project_env extends uvm_env;
 	// checked helper 是间接端口唯一锁持有层；整项预检后才允许首个 posted 写。
 	extern protected task checked_write(input project_config_record_t record,
 		input logic [127:0] value, input bit enabling, output bit ok, output string why);
+	// 已接受写入先撤销旧结果；验证只接受自身记录集合在 hook 前后未改写。
+	extern protected function void invalidate_write_result(input project_config_record_t record);
+	extern protected function bit capture_write_revisions(input project_config_record_t batch[$],
+		output longint unsigned versions[string], output string why);
+	extern protected function bit write_revisions_match(input longint unsigned versions[string], output string why);
 	extern protected task mmio(input project_bar_target_t target, input bit writing,
 		input logic [63:0] offset, input int unsigned length, input logic [127:0] data,
 		input logic [31:0] byte_skip_mask, output logic [127:0] result, output bit ok, output string why);
@@ -1508,6 +1515,42 @@ function bit project_env::remember_record(input project_config_record_t record, 
 	return 1;
 endfunction
 
+// 在任何等待/TLP 前失效，失败或旧写返回均不能恢复较新写的结果。
+function void project_env::invalidate_write_result(input project_config_record_t record);
+	string key;
+	key = record.ctx.record_key;
+	write_revision[key] = write_revision.exists(key) ? write_revision[key] + 1 : 1;
+	configured[key] = 0;
+	verified[key] = 0;
+	if (record.ctx.kind inside {PROJECT_VTX, PROJECT_VRX}) enabled[key] = 0;
+endfunction
+
+// 捕获本次实际验证集合；无关表项的并发访问不阻止此验证。
+function bit project_env::capture_write_revisions(input project_config_record_t batch[$],
+	output longint unsigned versions[string], output string why);
+	versions.delete();
+	foreach (batch[i]) begin
+		string key;
+		key = batch[i].ctx.record_key;
+		if (writes_by_key.exists(key) && writes_by_key[key] != 0) begin
+			why = {"verification overlaps table write: ", key}; return 0;
+		end
+		versions[key] = write_revision.exists(key) ? write_revision[key] : 0;
+	end
+	return 1;
+endfunction
+
+// hook 跨越任何同项写入都需要重验，即使写入已在 hook 返回前结束。
+function bit project_env::write_revisions_match(input longint unsigned versions[string], output string why);
+	foreach (versions[key]) begin
+		if ((writes_by_key.exists(key) && writes_by_key[key] != 0) ||
+			(write_revision.exists(key) ? write_revision[key] : 0) != versions[key]) begin
+			why = {"table changed during verification: ", key}; return 0;
+		end
+	end
+	return 1;
+endfunction
+
 // 任意用户副本必须与账本原件匹配；仅 enabling 可改变冻结时声明的 enable/mask 位。
 // 同端口锁在本层取得，外层调度和 hook 不持有它，避免嵌套获取造成自锁。
 task project_env::checked_write(input project_config_record_t record,
@@ -1520,6 +1563,7 @@ task project_env::checked_write(input project_config_record_t record,
 	bit [63:0]	offset;
 	logic [31:0]	control;
 	string	lock_key;
+	longint unsigned	revision;
 	ok = 0;
 	why = "checked table write has no matching frozen record";
 	if (!records.exists(record.ctx.record_key)) return;
@@ -1547,7 +1591,12 @@ task project_env::checked_write(input project_config_record_t record,
 			!bar_registry.check_range(original.ctx.target, layout.module_offset + layout.control_port, 4, address, why)) return;
 		lock_key = $sformatf("%s:%016h", original.ctx.target.canonical_name, layout.module_offset + layout.control_port);
 		if (!port_locks.exists(lock_key)) port_locks[lock_key] = new(1);
-		checked_writes_active++;
+	end
+	invalidate_write_result(original);
+	revision = write_revision[original.ctx.record_key];
+	checked_writes_active++;
+	writes_by_key[original.ctx.record_key]++;
+	if (layout.indirect) begin
 		port_locks[lock_key].get();
 		mmio(original.ctx.target, 1, offset, layout.entry_bytes, value, 0, ignored, ok, why);
 		control = layout.control_fixed | (original.ctx.table_index << layout.index_shift);
@@ -1555,17 +1604,17 @@ task project_env::checked_write(input project_config_record_t record,
 		if (ok) mmio(original.ctx.target, 1, layout.module_offset + layout.control_port, 4, 128'(control | layout.trigger_mask), 0, ignored, ok, why);
 		port_locks[lock_key].put();
 	end else if (original.ctx.kind inside {PROJECT_NOTIFY, PROJECT_MSIX_LINEAR, PROJECT_RDMA_NOTIFY}) begin
-		checked_writes_active++;
 		ok = 1;
 		for (int d = int'(layout.entry_bytes/4)-1; d >= 0; d--) begin
 			mmio(original.ctx.target, 1, original.ctx.byte_offset + 4*d, 4, 128'(value[d*32 +: 32]), 0, ignored, ok, why);
 			if (!ok) break;
 		end
 	end else begin
-		checked_writes_active++;
 		mmio(original.ctx.target, 1, original.ctx.byte_offset, layout.entry_bytes, value, 0, ignored, ok, why);
 	end
 	checked_writes_active--;
+	writes_by_key[original.ctx.record_key]--;
+	if (write_revision[original.ctx.record_key] == revision) configured[original.ctx.record_key] = ok;
 endtask
 
 // bdf typed 写入口检查全部关联，随后复用唯一序列化/锁实现。
@@ -2203,6 +2252,12 @@ function bit project_env::public_records(input project_table_kind_e kind,
 			PROJECT_PFVF: begin
 				project_pfvf_entry_t	e;
 				if (p.key.kind != DPU_FUNCTION_PF) continue;
+				// PFVF 是整族依赖；按冻结身份收集实际 VF，不推断连续编号。
+				r.consumers.delete();
+				foreach (functions[member]) begin
+					if (functions[member].key.host_id != p.key.host_id || functions[member].key.pf_id != p.key.pf_id) continue;
+					foreach (functions[member].services[service]) r.consumers.push_back(functions[member].services[service]);
+				end
 				if (p.intel_pf >= 4 || p.first_vf_offset >= 1024) begin why = "PFVF mapping exceeds screenshot fields"; return 0; end
 				e = '0;
 				e.valid = 1;
@@ -2581,8 +2636,7 @@ task project_env::configure_public(input project_table_kind_e kinds[$],
 		key = batch[i].ctx.record_key;
 		if (seen.exists(key)) continue;
 		seen[key] = 1;
-		configured[key] = 0;
-		verified[key] = 0;
+		invalidate_write_result(records[key]);
 		dispatch_record(records[key], ok, why);
 		if (!ok) begin
 			why = {key, ": ", why};
@@ -2612,8 +2666,7 @@ task project_env::configure_queues(input project_table_kind_e kinds[$],
 		key = batch[i].ctx.record_key;
 		if (seen.exists(key)) continue;
 		seen[key] = 1;
-		configured[key] = 0;
-		verified[key] = 0;
+		invalidate_write_result(records[key]);
 		dispatch_record(records[key], ok, why);
 		if (!ok) begin
 			why = {key, ": ", why};
@@ -2727,6 +2780,7 @@ task project_env::verify_dpu_configuration(input project_dpu_config_scope scope,
 	project_table_kind_e	kinds[$] = '{PROJECT_BAR, PROJECT_BDF, PROJECT_PFVF, PROJECT_COMPLETION_BDF, PROJECT_PREFIX};
 	string revoke_why;
 	bit revoked;
+	longint unsigned versions[string];
 	ok = 0;
 	configuration_lock.get();
 	if (!revoke_public(scope, 0, why)) begin configuration_lock.put(); return; end
@@ -2745,7 +2799,9 @@ task project_env::verify_dpu_configuration(input project_dpu_config_scope scope,
 	end
 	if (batch.size() == 0) begin why = "verification scope has no selected public records"; configuration_lock.put(); return; end
 	foreach (batch[i]) if (!remember_record(batch[i], why)) begin configuration_lock.put(); return; end
+	if (!capture_write_revisions(batch, versions, why)) begin configuration_lock.put(); return; end
 	user_verify_dpu_configuration(scope, ok, why);
+	if (ok) ok = write_revisions_match(versions, why);
 	foreach (batch[i]) verified[batch[i].ctx.record_key] = ok;
 	if (!ok) revoked = revoke_public(scope, 1, revoke_why);
 	configuration_lock.put();
@@ -2818,6 +2874,7 @@ task project_env::verify_vio_configuration(input project_vio_selection_t selecti
 	project_table_kind_e	kinds[$] = '{PROJECT_VTX, PROJECT_VRX, PROJECT_NOTIFY, PROJECT_Q2TC, PROJECT_N2G, PROJECT_G2P, PROJECT_SPWRR, PROJECT_TC_WEIGHT, PROJECT_QUEUE_AUX};
 	string revoke_why;
 	bit revoked;
+	longint unsigned versions[string];
 	ok = 0;
 	configuration_lock.get();
 	if (!queue_records(selection, kinds, batch, why)) begin
@@ -2828,7 +2885,9 @@ task project_env::verify_vio_configuration(input project_vio_selection_t selecti
 		revoked = revoke_vio(selection, revoke_why);
 		configuration_lock.put(); return;
 	end
+	if (!capture_write_revisions(batch, versions, why)) begin configuration_lock.put(); return; end
 	user_verify_vio_configuration(selection, ok, why);
+	if (ok) ok = write_revisions_match(versions, why);
 	if (ok) ok = preflight_vio(selection, why);
 	foreach (batch[i]) begin
 		verified[batch[i].ctx.record_key] = ok;
@@ -2888,6 +2947,8 @@ function void project_env::release_vio_resources(input project_vio_selection_t s
 		configured.delete(remove_keys[i]);
 		verified.delete(remove_keys[i]);
 		enabled.delete(remove_keys[i]);
+		write_revision.delete(remove_keys[i]);
+		writes_by_key.delete(remove_keys[i]);
 	end
 	ok = 1;
 	why = "";

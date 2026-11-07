@@ -14,6 +14,33 @@ package project_external_integration_test_pkg;
 	import project_env_pkg::*;
 	`include "uvm_macros.svh"
 
+	// 仅回归注入一次发送失败；其余访问调用真实 PCIe sequence。
+	class project_rewrite_fault_seq extends pcie_tl_reg_seq;
+		`uvm_object_utils(project_rewrite_fault_seq)
+		static int unsigned	fail_on_call;
+		static int unsigned	calls;
+		extern function new(string name = "project_rewrite_fault_seq");
+		extern virtual task body();
+	endclass
+
+	// 构造发送失败观察器，不改变正常寄存器访问参数。
+	function project_rewrite_fault_seq::new(string name = "project_rewrite_fault_seq");
+		super.new(name);
+	endfunction
+
+	// 在指定分段拒绝发送，保留之前真正发出的间接数据端口写。
+	task project_rewrite_fault_seq::body();
+		if (fail_on_call != 0) begin
+			calls++;
+			if (calls == fail_on_call) begin
+				status = PCIE_RW_ERR;
+				error_msg = "injected indirect control send failure";
+				return;
+			end
+		end
+		super.body();
+	endtask
+
 	// 只捕获明确负例的接收拒绝；其他日志保留原严重级别，不能掩盖 HOST_MEM 错误。
 	class project_dma_expected_error extends uvm_report_catcher;
 		int unsigned	count;
@@ -46,6 +73,11 @@ package project_external_integration_test_pkg;
 		int unsigned	bar_calls;
 		int unsigned	fail_vtx_call;
 		bit	fail_verify;
+		bit	hold_verify;
+		uvm_event	verify_entered = new("verify_entered");
+		uvm_event	verify_release = new("verify_release");
+		int unsigned	pfvf_calls;
+		project_pfvf_cfg_t	pfvf_items[string];
 		project_vtx_cfg_t	last_vtx;
 		project_vrx_cfg_t	last_vrx;
 		// 构造模型 hook 容器，不修改生产 build/connect。
@@ -96,6 +128,10 @@ package project_external_integration_test_pkg;
 	endtask
 	// 模型平台明确报告队列配置完成；后续核心 preflight 不能被此成功绕过。
 	task project_external_model_env::user_verify_vio_configuration(input project_vio_selection_t selection, output bit ok, output string why);
+		if (hold_verify) begin
+			verify_entered.trigger();
+			verify_release.wait_trigger();
+		end
 		ok = !fail_verify; why = ok ? "" : "injected platform verification failure";
 	endtask
 	// 使能使用唯一 checked 路径，只允许 enable 位变化。
@@ -110,6 +146,8 @@ package project_external_integration_test_pkg;
 
 	// 单项 pfvf 返回真实 helper 结果；不在 hook 中增加外围循环。
 	task project_external_model_env::user_configure_pf_vf_entry(input project_pfvf_cfg_t item, output bit ok, output string why);
+		pfvf_calls++;
+		pfvf_items[dpu_function_key_name(item.owner)] = item;
 		write_pfvf(item, ok, why);
 	endtask
 
@@ -175,12 +213,22 @@ package project_external_integration_test_pkg;
 		// 构造配置，保留生产参数生成器。
 		extern function new(string name="project_external_model_cfg");
 		// fixture 的 PF0 从 offset1 开始，Pfvf=vf_id+1；完整成员逐项检查，不要求VF连续。
+		// 在 placement 前通过同一生成/需求入口建立稀疏实际 VF。
+		extern function void add_fixture_vf(input int unsigned vf_id);
 		extern virtual function bit validate_pfvf_relationship(input project_pfvf_relationship_t family, output string why);
 	endclass
 
 	// fixture 配置仍使用产品解析和资源生成器。
 	function project_external_model_cfg::new(string name="project_external_model_cfg");
 		super.new(name);
+	endfunction
+
+	// 不改冻结快照；稀疏键和精确需求均在 env build 前加入。
+	function void project_external_model_cfg::add_fixture_vf(input int unsigned vf_id);
+		dpu_function_cfg function_cfg;
+		function_cfg = make_function(0, 0, DPU_FUNCTION_VF, vf_id);
+		dpu_cfg.device_cfg.functions.push_back(function_cfg);
+		add_service_request(function_cfg.key);
 	endfunction
 
 	// 测试专用关系规则，绝不作为产品 PFVF 默认。
@@ -239,6 +287,10 @@ package project_external_integration_test_pkg;
 		// 实际取消在发包间隔中的 AIP sequence；stop 不清取消，只有新代确认后才能复用。
 		extern task check_cancel_recovery();
 		extern task check_revoke();
+		// 原 typed 条目回写、分段失败和 verify 交错必须使旧结果失效。
+		extern task check_rewrite_guard();
+		// 整族 PFVF 依赖保护实际稀疏 VF，同时允许无关 PF 配置。
+		extern task check_pfvf_guard();
 		// typed hook 中途失败、确认/释放全 Host 预检与 AIP 取消后重准备。
 		extern virtual task run_phase(uvm_phase phase);
 	endclass
@@ -282,7 +334,10 @@ package project_external_integration_test_pkg;
 	// 配置基于真实 DPU 生成器，精确 enabled/pairs 在 placement 前解析。
 	function void project_external_integration_test::build_phase(uvm_phase phase);
 		string	why;
+		project_external_model_cfg	model_cfg;
 		super.build_phase(phase);
+		if ($test$plusargs("PROJECT_REWRITE"))
+			pcie_tl_reg_seq::type_id::set_type_override(project_rewrite_fault_seq::get_type());
 
 		no_vio = $test$plusargs("PROJECT_NO_VIO");
 		tx_only = $test$plusargs("PROJECT_TX_ONLY");
@@ -295,6 +350,12 @@ package project_external_integration_test_pkg;
 		cfg = project_external_model_cfg::type_id::create("cfg");
 		cfg.hosts = host_count;
 		cfg.vfs_per_pf = vf_count;
+		if ($test$plusargs("PROJECT_PFVF_GUARD")) begin
+			require_true(host_count == 1 && !no_vio, "PFVF guard needs one Host with VIO");
+			vf_count = $test$plusargs("PROJECT_PFVF_SINGLE") ? 1 : 2;
+			cfg.vfs_per_pf = 0;
+			cfg.pfs_per_host = 2;
+		end
 		cfg.vio_cfg.enabled = 0;
 		cfg.vio_cfg.default_num_pairs = pairs;
 		cfg.vio_cfg.default_queue_size = 512;
@@ -317,7 +378,15 @@ package project_external_integration_test_pkg;
 		// 全局调度默认与精确 service 覆盖通过真实参数解析验证。
 		aip_cmdline_override::set_val("dpu.qsch.cos", "3");
 		aip_cmdline_override::set_val("vio.h0.pf0.vf0.i0.qsch.cos", "5");
+		if ($test$plusargs("PROJECT_PFVF_GUARD")) begin
+			aip_cmdline_override::set_val("vio.h0.pf0.vf3.i0.enabled", "1");
+		end
 		cfg.load_params();
+		if ($test$plusargs("PROJECT_PFVF_GUARD")) begin
+			require_true($cast(model_cfg, cfg), "fixture cfg cast");
+			model_cfg.add_fixture_vf(0);
+			if (!$test$plusargs("PROJECT_PFVF_SINGLE")) model_cfg.add_fixture_vf(3);
+		end
 		foreach (cfg.vio_policies[name]) begin
 			dpu_function_key_t key;
 			key = cfg.vio_policies[name].service_key.function_key;
@@ -335,8 +404,8 @@ package project_external_integration_test_pkg;
 			p.intel_pf = key.pf_id;
 			p.intel_vf = key.kind == DPU_FUNCTION_VF ? int'(key.vf_id) : -1;
 			p.requester = key.kind == DPU_FUNCTION_VF ? (16'h8000 | (key.vf_id << 4) | key.pf_id) : key.pf_id;
-			p.vport = key.kind == DPU_FUNCTION_VF ? key.vf_id + 1 : 0;
-			p.pfvf = p.vport;
+			p.vport = key.pf_id*32 + (key.kind == DPU_FUNCTION_VF ? key.vf_id + 1 : 0);
+			p.pfvf = key.kind == DPU_FUNCTION_VF ? key.vf_id + 1 : 0;
 			p.first_vf_offset = 1;
 			p.bdf_index = p.vport;
 			p.completion_index = p.vport;
@@ -663,6 +732,7 @@ package project_external_integration_test_pkg;
 			require_true(posted[0].size()==posted_before,"invalid typed entry emitted TLP");
 			env.enable_vio_queues(selection,ok,why); require_true(ok,why);
 			env.verify_vio_configuration(selection,ok,why); require_true(ok,why);
+			if ($test$plusargs("PROJECT_REWRITE")) check_rewrite_guard();
 			if (host_count==2) begin
 				virtqueue_base	queue;
 				bit [63:0]	saved;
@@ -680,6 +750,7 @@ package project_external_integration_test_pkg;
 			env.commit_vio_configuration(selection,ok,why); require_true(ok,why);
 		end else require_true(selection.setups.num()==0,"no-VIO scenario prepared rings");
 		check_receive_path();
+		if ($test$plusargs("PROJECT_PFVF_GUARD")) check_pfvf_guard();
 		if ($test$plusargs("PROJECT_CANCEL")) begin
 			fork : bounded_cancel_fixture
 				check_cancel_recovery();
@@ -713,6 +784,123 @@ package project_external_integration_test_pkg;
 		`uvm_info("PROJECT_EXTERNAL_FLOW",$sformatf("PROJECT_EXTERNAL_FLOW_PASS checks=%0d hosts=%0d vfs=%0d pairs=%0d",checks,host_count,vf_count,pairs),UVM_LOW)
 		phase.drop_objection(this);
 	endtask
+	// 同一禁用条目仍合法，但每次写之后必须重新使能并验证。
+	task project_external_integration_test::check_rewrite_guard();
+		project_vtx_cfg_t tx;
+		project_vrx_cfg_t rx;
+		bit ok;
+		bit verify_ok;
+		string why;
+		string verify_why;
+		int unsigned before_posted;
+		tx = env.last_vtx;
+		rx = env.last_vrx;
+		require_true(tx.entry.queue_en == 0, "original VTX must be disabled");
+		for (int direction = 0; direction < (tx_only ? 1 : 2); direction++) begin
+			if (direction == 0) env.write_vtx(tx, ok, why);
+			else env.write_vrx(rx, ok, why);
+			require_true(ok, why);
+			env.commit_vio_configuration(selection, ok, why); require_true(!ok, "typed disabled rewrite retained old readiness");
+			env.enable_vio_queues(selection, ok, why); require_true(ok, why);
+			env.commit_vio_configuration(selection, ok, why); require_true(!ok, "enable restored stale verification");
+			env.verify_vio_configuration(selection, ok, why); require_true(ok, why);
+		end
+		#20ns;
+		before_posted = posted[tx.ctx.target.function_key.host_id].size();
+		project_rewrite_fault_seq::calls = 0;
+		project_rewrite_fault_seq::fail_on_call = 2;
+		env.write_vtx(tx, ok, why);
+		project_rewrite_fault_seq::fail_on_call = 0;
+		require_true(!ok, "partial indirect write did not fail");
+		#20ns;
+		require_true(posted[tx.ctx.target.function_key.host_id].size() == before_posted + 1, "partial write did not emit exactly its data TLP");
+		env.commit_vio_configuration(selection, ok, why); require_true(!ok, "partial write retained commit readiness");
+		env.enable_vio_queues(selection, ok, why); require_true(!ok, "partial write retained configured result");
+		env.write_vtx(tx, ok, why); require_true(ok, why);
+		env.enable_vio_queues(selection, ok, why); require_true(ok, why);
+		env.verify_vio_configuration(selection, ok, why); require_true(ok, why);
+
+		// 验证先进入真实等待；typed 写在 hook 返回前完成，旧观察不能覆盖写入失效。
+		env.verify_entered.reset();
+		env.hold_verify = 1;
+		fork
+			env.verify_vio_configuration(selection, verify_ok, verify_why);
+			begin
+				env.verify_entered.wait_on();
+				#1ns;
+				env.write_vtx(tx, ok, why); require_true(ok, why);
+				env.hold_verify = 0;
+				env.verify_release.trigger();
+			end
+		join
+		require_true(!verify_ok, "overlapping verification accepted stale observation");
+		env.commit_vio_configuration(selection, ok, why); require_true(!ok, "overlapping verify restored commit readiness");
+		env.enable_vio_queues(selection, ok, why); require_true(ok, why);
+		env.verify_vio_configuration(selection, ok, why); require_true(ok, why);
+		`uvm_info("PROJECT_REWRITE_PASS", "typed VTX/VRX rewrite, partial send failure and overlapping verify rejected stale results", UVM_LOW)
+	endtask
+
+	// PF0 无 VIO，实际 VF0/VF3 已确认并运行；PF1 保持独立。
+	task project_external_integration_test::check_pfvf_guard();
+		project_function_record_t functions[$];
+		project_dpu_config_scope scope;
+		dpu_function_key_t chosen[$];
+		int unsigned bars[$];
+		project_pfvf_cfg_t item;
+		int unsigned before_hooks;
+		int unsigned before_posted;
+		int unsigned queues_before[$];
+		bit saw_vf0;
+		bit saw_vf3;
+		bit ok;
+		string why;
+		env.dpu_setup.list_functions(functions);
+		foreach (functions[f]) begin
+			if (functions[f].key.kind == DPU_FUNCTION_VF) begin
+				require_true(functions[f].key.pf_id == 0 && functions[f].key.vf_id inside {0,3}, "fixture sparse VF membership");
+				if (functions[f].key.vf_id == 0) saw_vf0 = 1;
+				if (functions[f].key.vf_id == 3) saw_vf3 = 1;
+			end
+			if (functions[f].key.kind == DPU_FUNCTION_PF && functions[f].key.pf_id == 0) chosen.push_back(functions[f].key);
+		end
+		require_true(saw_vf0 && (saw_vf3 || $test$plusargs("PROJECT_PFVF_SINGLE")) && chosen.size() == 1, "sparse PF family missing");
+		item = env.pfvf_items[dpu_function_key_name(chosen[0])];
+		saw_vf0 = 0; saw_vf3 = 0;
+		foreach (item.consumers[c]) begin
+			require_true(item.consumers[c].function_key.pf_id == 0, "PFVF acquired unrelated family consumer");
+			if (item.consumers[c].function_key.kind != DPU_FUNCTION_VF) continue;
+			if (item.consumers[c].function_key.vf_id == 0) saw_vf0 = 1;
+			if (item.consumers[c].function_key.vf_id == 3) saw_vf3 = 1;
+		end
+		require_true(saw_vf0 && (saw_vf3 || $test$plusargs("PROJECT_PFVF_SINGLE")), "PFVF omitted actual sparse VF services");
+		foreach (env.vio_envs[0].function_instances[f]) begin
+			queues_before.push_back(env.vio_envs[0].function_instances[f].vq_mgr.get_queue_count());
+			env.vio_envs[0].function_instances[f].driver_agent.fsm.start_dataplane();
+		end
+		#30ns;
+		before_hooks = env.pfvf_calls;
+		before_posted = posted[0].size();
+		scope = new("pf0_only", env.dpu_setup, chosen, bars);
+		env.configure_pf_vf_map(scope, ok, why); require_true(!ok, "running VF allowed parent PFVF batch write");
+		env.write_pfvf(item, ok, why); require_true(!ok, "running VF allowed captured PFVF write");
+		#20ns;
+		require_true(env.pfvf_calls == before_hooks && posted[0].size() == before_posted, "rejected PFVF rewrite reached hook/TLP");
+		chosen.delete();
+		foreach (functions[f])
+			if (functions[f].key.kind == DPU_FUNCTION_PF && functions[f].key.pf_id == 1) chosen.push_back(functions[f].key);
+		scope = new("pf1_only", env.dpu_setup, chosen, bars);
+		env.configure_pf_vf_map(scope, ok, why); require_true(ok, why);
+		require_true(env.pfvf_calls == before_hooks + 1, "unrelated PF family configuration blocked");
+		foreach (env.vio_envs[0].function_instances[f]) begin
+			virtio_function_instance instance;
+			instance = env.vio_envs[0].function_instances[f];
+			require_true(instance.driver_agent.fsm.state == FSM_RUNNING && instance.driver_agent.ops.external_queue_ready(1) &&
+				instance.vq_mgr.get_queue_count() == queues_before[f], "PFVF rewrite changed VF readiness/DMA ownership");
+			instance.driver_agent.fsm.stop_dataplane();
+		end
+		`uvm_info("PROJECT_PFVF_GUARD_PASS", "sparse VF family protects parent PFVF and leaves unrelated PF writable", UVM_LOW)
+	endtask
+
 	// 已确认停止状态和损坏几何均能撤销；外来 scope 不能影响有效资源。
 	task project_external_integration_test::check_revoke();
 		project_vio_selection_t subset;
