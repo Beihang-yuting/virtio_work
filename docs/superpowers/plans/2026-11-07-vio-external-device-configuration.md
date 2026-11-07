@@ -10,6 +10,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-07-vio-external-device-configuration-design.md`；位域来源为同目录 `2026-11-07-dpu-queue-interface-image-notes.md`。
 
+**Driver supplement:** 用户实现期间提供当前驱动，补充依据为同目录 specs 中
+`2026-11-07-current-driver-compatibility-notes.md`。Task 2 增加TX内层校验位与
+完整RX CQ解析/查询及黄金字节测试；Task 3 采用明确版本的间接端口和表布局，
+不混用驱动与截图的差异。Packed保持标准header，可显式选择DPU32通知。
+
 ## Global Constraints
 
 - 一个项目 env extends uvm_env、一个 env_cfg；每 Host 一个 RC/Intel HARD_IP wrapper，segment 0。
