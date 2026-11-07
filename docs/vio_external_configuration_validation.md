@@ -353,3 +353,25 @@ I1/I2源于审查的具体源码交错分析；新catalog字段与旧fixture不�
 RED仿真，也没有加入兼容shim。未改core/worker/legacy及Task1–4广域矩阵不重复运行，
 继续保留各自原冻结身份；本波只关闭两项最终审查缺口并覆盖相邻rewrite/两Host路径。
 证据仍是模型端点与Intel VIP路径的软件合同，不认证未提供用户RTL的物理寄存器语义。
+
+## 最终审查与归档
+
+最终代码提交为 `ce223312e14f17d8e6c4b4de0aa97ffb7781a189`，编译输入与上面的
+finalfix1冻结清单完全一致。本节仅补充审查与归档记录，不修改编译输入。
+
+四项任务的独立审查均已关闭。全分支审查覆盖 `3bf18f3..f8230f68`，发现的两项
+Important问题由同一修复提交处理；随后独立审查仅复核
+`f8230f68..ce22331`。最终结论为 **规格符合性PASS、代码质量PASS，I1/I2均已解决**，
+无新增Critical、Important或Minor问题，也没有挂起或豁免的问题。
+复审独立核对151项源码、50项验证证据及完整源码导出，全部一致；没有重复仿真。
+
+本计划的完整工作记录已保存到本地归档
+`build/vio_external_config_validation/sdd_final_review_evidence.tar.gz`，SHA-256：
+`90a01ad2a34f1a4d7642b55bab08c9afe230bf7c5cc8c16e31fe0d1ac2060e85`。
+归档内153个文件逐项核对内容哈希，包括任务报告、各轮审查、差异包、源码清单、
+验证记录与三个裁决的完整原文。逐文件保存凭据为同目录
+`sdd_final_review_evidence.receipt.json`。最终审查报告在归档内的
+`2026-11-07-vio-external-device-configuration/final-r1-review.md`；全分支原审查为
+同目录`final-review.md`。临时工作目录只在归档核对成功后清理。
+
+保留本地分支 `review/virtio-sdd-optimized`，本轮没有合并或推送；本地build证据未加入Git。
