@@ -14,6 +14,9 @@
 赋值；硬件位域、资源身份和访问方式分别表达。六张截图的字段及与旧版差异见
 [截图核对记录](2026-11-07-dpu-queue-interface-image-notes.md)，其中缺失或冲突的
 规格只标为待补齐输入，不用旧版假设补出新地址或编码。
+最新平台约束：DUT 不包含真实 PCIe IP，通过 Intel HARD_IP 侧 BFM/bind 驱动
+应用接口。项目配置统一使用 Memory Read/Write；不发现 PCI capabilities，不写
+标准 PCI 配置空间 BAR/Command/MSI-X capability，也不等待相应配置 Completion。
 
 ## 1. 已确认的需求
 
@@ -148,22 +151,29 @@ VF1 时只处理它的三条租约。64 位 BAR 的高低 DWORD 属于同一条�
 只有 VF1 启用 VIO 时，仍由公共配置 scope 决定是否配置 PF0/VF0 的 BAR/BDF；
 `vio.enabled` 仅选择业务，不负责删除公共设备映射。
 
-### 3.3 BAR 地址分配与硬件写入分开
+### 3.3 BAR 地址分配与 DUT 映射表分开
 
-BAR 包括三个不同层次：DPU resolver 产生地址租约；PCI 配置空间装载 BAR；
-平台若另有地址译码/分配表，还需写该硬件表。当前公共实现已经提供租约以及
-bootstrap 的 PCI BAR 写入，不能据此宣称实现了用户 DUT 的额外地址分配表。
+本项目没有真实 PCIe IP，BAR 包括两项实际职责：DPU resolver 产生设备地址窗口
+租约；DUT 若有自己的地址译码/分配表，由用户通过 MMIO 编程。Intel BFM 依据
+同一租约产生用户接口的 BAR/PF/VF sideband，不要求先写 PCI 配置空间。
+现有库中 bootstrap 的标准 PCI BAR 写入不用于此项目。
 
-分别预留 `configure_pcie_bars()` 与 `configure_bar_table()`。两者消费相同租约，
-前者通过对应 PCI 配置位置写入，后者把逻辑 owner、BDF、global function ID、
-BAR 编号/base/size 交给用户的映射表 task。实际表索引、访问窗口和字段编码由
-平台布局声明/用户方法提供，不假定额外 BAR 表的地址或索引等于 global function ID。
+保留独立 `configure_bar_table()`，把逻辑 owner、BDF、global function ID、
+BAR 编号/base/size 交给用户的映射表 task；取消项目设计中的
+`configure_pcie_functions()`、`configure_pcie_bars()` 配置空间入口。
+实际表索引、访问窗口和字段编码由平台布局声明/用户方法提供，不假定额外
+BAR 表的地址或索引等于 global function ID。BDF 表本身同样是 DUT 的 MMIO 表，
+不是 PCI 配置空间。分配并冻结这些值不会自动写入 DUT。
 
 若硬件按 Function/BAR 一条表项，环境逐租约调用；若按父 PF 下的一组 VF 窗口
 编码，则根据平台声明的粒度生成一个包含完整成员租约列表的 cfg，再调用一次
 对应方法。不能只传 VF 个数后假定其地址连续；聚合格式有连续性、stride 或
-VF ID 约束时必须检查实际租约，无法表示则报错。标准 SR-IOV VF BAR 的配置
-目标也应按平台布局指向相应 PF capability，不盲目写每个 VF 的 Type-0 BAR。
+VF ID 约束时必须检查实际租约，无法表示则报错。无需为这种用户 DUT 映射
+伪造标准 SR-IOV capability 或 VF Type-0 配置空间。
+
+首次访问所用的管理窗口必须由平台固定译码/已知入口或用户就绪流程保证可达。
+不能要求先写一个表才能访问它自己；DPU 租约只说明预期地址，不能证明 RTL
+已经接受该地址。初始入口与正常运行后的映射关系由平台声明并验证。
 
 ### 3.4 平台布局和硬件编号必须显式绑定
 
@@ -282,7 +292,7 @@ VIO ring 记录的外层 cfg 放在拟新增 `integration/project/project_vio_co
 | 记录 | 必须导出的字段 |
 | --- | --- |
 | Function | Host、segment、PF/VF kind、PF ID、VF ID、所属 service key 集合、BDF、global function ID、source ID、RC slot |
-| BAR | Function key、角色、实际 BAR 编号、64 位 base、size、64 位 BAR 对的配置空间位置和属性 |
+| BAR | Function key、角色、实际 BAR 编号、64 位 base/size、对应 Intel sideband 和 DUT 映射表引用 |
 | Qpair | service key、virtio pair index、placement local pair、global qpair、RX/TX local qid、local/global MSI-X vector |
 | 每条 TX/RX 队列 | Function owner、service key、方向、格式、深度、实际可用槽数、desc/event/CQ 的 GPA/IOVA/长度、初始索引/wrap、RX buffer 大小、notify 信息、向量引用 |
 | 表项访问位置 | 目标 Function/Host/segment/BDF、BAR 编号和基址、字节 offset、绝对 MMIO 地址、访问宽度、表索引、布局是否已提供、本次是否必需、表项 valid 值 |
@@ -366,7 +376,7 @@ service 的 32 对业务队列，也不在没有数据面配置时给它们虚�
 
 - 轮询：按配置间隔检查 Host 的 Packed USED 或私有 CQ，不要求 DUT 发中断。
   仍导出 DPU 分配的向量与映射信息，设备是否要求配置某些内部中断字段由用户
-  task 决定；VIP 不据此宣称 PCI MSI-X 已启用。
+  task 决定；VIP 不据此宣称 DUT 已开启中断。
 - MSI-X：本地导入已声明的向量、Message Address/Data 和队列映射，用户配置
   设备表项与使能，确认后通过 Intel/PCIe monitor 捕获实际 MSI-X Memory Write
   唤醒对应队列完成处理。超时报告缺失中断，不能靠轮询兜底让中断测试通过。
@@ -375,27 +385,29 @@ service 的 32 对业务队列，也不在没有数据面配置时给它们虚�
 
 MSI-X 必须区分三种地址：
 
-1. **Table 地址**：设备 BAR base + table offset + local table slot * 16。
-   导出 address low/high、data、vector control 所在位置。
+1. **Table 地址**：设备 BAR base + table offset + 实际 table slot * 16。
+   slot 取 DUT 全局/局部表的实际映射，不默认等于 Function local vector；
+   导出 address low/high、data、mask 所在位置。
 2. **PBA 地址**：设备 BAR base + PBA offset，以及对应 pending bit/长度。
    PBA 是 pending 状态信息，不能把它当成普通初始化表让用户循环写零。
 3. **Message Address**：DUT 发往 Host 的中断目的地址，独立于设备 BAR 和 ring IOVA。
    Message Data 也显式导出，不能用它的低位重新猜测 local/global vector。
 
-平台提供 Table/PBA 的 BAR、offset、table size 和需要的 MSI-X capability 控制
-位置，因为本流程不执行 capability 发现；准备阶段只做边界/身份校验。
+平台提供 DUT 消息表/PBA 的 BAR、offset、table size，以及实际需要的 MMIO
+中断控制位置；没有 Function 级控制寄存器的平台明确声明仅采用表项控制。
+本项目不执行 MSI-X capability 发现或配置；准备阶段只做边界/身份校验。
 Message Address/Data 可以由平台逐向量设置，也可用显式 base/stride 模板生成，
 生成结果与 Host 中断接收匹配表使用同一份冻结值。
 
 公共中断输入在项目 `env_cfg` 注册为 `dpu.msix.table_bar/table_offset/table_size/`
-`pba_bar/pba_offset/cap_offset`、`dpu.msix.msg_addr_base/msg_addr_stride/`
+`pba_bar/pba_offset`、`dpu.msix.msg_addr_base/msg_addr_stride/`
 `msg_data_base/msg_data_stride` 和逐向量覆盖；支持 Host/Function 级覆盖，不要求
 存在 VIO service。VIO 仅保留 `vio.completion_mode` 并引用公共中断记录。
 平台已经有中断配置对象时可以通过 cfg 直接注入。MSI-X 模式下缺布局或
-地址/数据时失败，轮询模式下可将 PCI MSI-X 布局标为未提供。
+地址/数据时失败，轮询模式下可将消息表/PBA 布局标为未提供。
 
 `table_size` 表示实际表项数；逐向量覆盖路径为 `dpu.msix.vN.msg_addr/msg_data/masked`，
-N 是该 Function 的 local vector/table slot；精确路径为
+N 是该 Function 的 local vector，不等于全局硬件表的 slot；精确路径为
 `dpu.hH.pfP[.vfV].msix.vN.msg_addr/msg_data/masked`，无 service instance 层。
 模板按 `base + local_vector * stride` 计算，逐向量值优先；检查地址/数据位宽、
 Table/PBA 对齐与范围、占用槽位和布局重叠。同一 Function 内多个 service 的
@@ -412,10 +424,9 @@ BDF 或 Message Address/Data 必须由实际 RC/Host 域隔离。观察器按已
 消费中断状态。DPU 的 self-mask 字段照常导出；若用户启用自动屏蔽，重新使能由
 用户运行期 task/sequence 明确执行，VIP 不隐式写回，连续中断验证必须覆盖此流程。
 
-DPU AF 管理窗口中的全局 MSI-X 表与 Function 的 PCI MSI-X Table 分别保留访问
-视图。若实际 DUT 将两者映射到同一存储，平台显式声明这种对应关系，由环境
-调度入口根据该声明选择写入视图；不能默认它们独立，也不能重复写入
-相互冲突的消息或 mask。
+DPU AF 管理窗口中的全局 MSI-X 表与 Function 窗口中的消息表按实际 DUT 布局
+导出；不强制制造一个不存在的标准 PCI MSI-X Table 别名。若多个窗口映射到
+同一存储，平台显式声明对应关系，由环境选择写入视图，避免重复写入冲突值。
 
 目前私有配置路径强制 polling，标准 TX worker 也包含周期轮询，通知管理器会
 在配置和 mask/unmask 中写设备。因此 MSI-X 接入是本次必须实现并验证的完整
@@ -557,7 +568,7 @@ if (!ok) begin
 end
 ```
 
-PCI BAR、AF、MSI-X、QSCH、notify、队列使能和配置验证同样各有独立入口，见下表。
+BAR 映射表、AF、MSI-X、QSCH、notify、队列使能和配置验证各有独立入口，见下表。
 用户 test/sequence 控制需要调用的类别和先后；环境负责各类别内部的完整遍历。
 不要求经过一个包办所有表的 VIO 总入口，不新增强制 `configure_all()`。
 
@@ -581,7 +592,7 @@ DPU 的分配、冻结快照及纯表项生成/寄存器编码能力继续供项
 下表各批量入口的遍历由环境提供；build/connect 不会调用它们，运行阶段由 test
 或已注册的配置 sequence 显式调用。用户填写每类方法的单项写法即可。
 环境只调用本次 scope 内适用的 hook：未启用方向不配置
-其运行队列；轮询且未提供 PCI MSI-X 布局时不调用对应 Table hook，PBA 独立查询。
+其运行队列；轮询且未提供消息表布局时不调用对应 Table hook，PBA 独立查询。
 必需性在导出时明确检查，不能以
 空列表或未实现 hook 返回成功掩盖缺失配置。一个必需 hook 失败立即停止后续使能
 和提交，保留资源供用户停止设备后清理。
@@ -589,8 +600,6 @@ DPU 的分配、冻结快照及纯表项生成/寄存器编码能力继续供项
 | 批量入口或独立操作 | 用户 task | 单个 cfg 的配置粒度与信息 |
 | --- | --- | --- |
 | 平台准备 | `user_prepare_device` | 公共视图中的目标设备：平台复位和配置前条件 |
-| `configure_pcie_functions` | `user_configure_pcie_function` | 每 Function：BDF、PF/VF、PCI Command/平台使能；不重复写 BAR |
-| `configure_pcie_bars` | `user_configure_pcie_bar` | 一个 PCI BAR 编程单元：租约、所属 Function、实际配置目标与位置 |
 | `configure_bar_table` | `user_configure_bar_mapping_entry` | 一个平台 BAR 映射单元：相关 Function、BDF/global ID、BAR 租约及实际表目标 |
 | `configure_af` | `user_configure_af` | AF/Host：AF 身份、管理 BAR、AF 声明和 Host 选择信息 |
 | `configure_pf_vf_map` | `user_configure_pf_vf_entry` | 每选中 PF：First_vf_offset、实际 PF/VF Routing ID 关联和 Valid |
@@ -601,8 +610,8 @@ DPU 的分配、冻结快照及纯表项生成/寄存器编码能力继续供项
 | `configure_msix` | `user_configure_msix_info_entry` | 每 global vector：Host、Function、valid/self-mask、表地址 |
 | `configure_msix` | `user_configure_msix_interval_entry` | 每 global vector：中断间隔/包数策略、表地址 |
 | `configure_msix` | `user_configure_msix_control_entry` | 仅平台另行声明时使用的全局控制项；六张图未提供其完整布局 |
-| `configure_msix` | `user_configure_msix_table_entry` | 每 PCI MSI-X table slot：Message Address/Data、Vector Control、BAR/offset |
-| `enable_msix` | `user_configure_msix_function` | 每 Function：MSI-X enable、Function Mask、明确的配置空间位置及完成模式 |
+| `configure_msix` | `user_configure_msix_table_entry` | 每 DUT 消息表 slot：Message Address/Data、mask、BAR/offset |
+| `enable_msix` | `user_configure_msix_function` | 每适用 Function：平台声明的 MMIO 中断使能/屏蔽；没有独立控制寄存器时按声明使用表项控制 |
 | 可选状态检查 | `user_check_msix_pba` | PBA BAR/offset、向量对应 pending bit；不是普通写表 hook |
 | `configure_vio_notify` | `user_configure_notify_entry` | 每 table slot：局部编码、Host、notify base、global qid、type；截图版无 valid 位 |
 | `configure_vio_notify` | `user_commit_notify_bank` | 仅显式声明双 bank 布局时使用；截图版不调用 |
@@ -641,10 +650,10 @@ local 编码不能用截断来补齐。需要 bank 的版本由配置显式提�
 准备阶段不读 DUT 猜测。MSI-X linear 同样按图先高 32 位、再低 32 位；显式
 选择 RDMA notify 配置时也遵守该高低写序，不因它是可选入口而省略约束。
 
-推荐调用依赖为：平台准备→Function/BAR→AF/BDF→MSI-X/notify 映射→QSCH/
+推荐调用依赖为：平台准备与初始管理窗口可达→BAR 映射表→AF/BDF→MSI-X/notify 映射→QSCH/
 VTX/VRX/辅助上下文→设备使能→读回确认。test/sequence 组织独立入口的先后，
 环境只维护每类入口内部的顺序并检查依赖，单项 task 不承担外围循环。
-PCI MSI-X 表项修改遵循屏蔽后写地址/数据、再按目标 mask/enable 生效的顺序，
+DUT 中断表项修改遵循屏蔽后写地址/数据、再按目标 mask/enable 生效的顺序，
 最终由用户 task 执行。PBA 只作为状态位置导出，不写入通用初始化序列。
 
 ### 5.2 用户 task 直接调用 PCIe 访问能力
@@ -653,20 +662,21 @@ PCI MSI-X 表项修改遵循屏蔽后写地址/数据、再按目标 mask/enable
 
 | 接口 | 输入与底层实现 |
 | --- | --- |
-| `pcie_cfg_read/write` | 目标 Function、配置空间字节 offset、数据/byte enable；复用 `pcie_tl_cfg_rd_seq/pcie_tl_cfg_wr_seq` |
 | `pcie_bar_read/write` | 目标 Function、BAR 编号、BAR 内字节 offset、4/8/12/16 字节长度、128 位数据和字节 skip mask；复用 `pcie_tl_reg_seq` |
 | `pcie_poll_bar` | 在上述 BAR read 上执行有限次数/时间的用户条件轮询；mask/value 明确区分于字节 skip mask |
 
 所有方法返回 `ok/why`，读方法另返回数据。完整 Function key 解析出 Host、segment、
 BDF；`{Host,segment}` 选择已绑定的 RC sequencer，BAR write 使用实际
-`bar.base + offset` 形成 Memory TLP。配置空间 TLP 通过 BDF 路由；Memory TLP
-通过地址路由，不能把两种访问混为一谈。随后仍走既有 PCIe TL → Intel adapter
+`bar.base + offset` 形成 Memory TLP。Memory TLP 按地址定位；BDF 保留为模型身份
+和 DUT 映射内容，不填成这个 Memory 请求的目标配置 BDF。随后走 PCIe TL → Intel adapter
 → bind wrapper → DUT，不引入 SVT 或建链流程。
 
 地址和宽度在发包前检查 BAR 边界、64 位溢出、对齐、4KB 边界及 Host 映射。
 缺 Host/segment 路由时必须报错，不回退 Root0。`pcie_tl_reg_seq` 的 mask 是
 “1 跳过该字节”，用户接口明确命名为 `byte_skip_mask`，缺省 0 为全字节访问。
 posted MMIO write 成功表示请求已发送；用户的 verify/poll hook 负责确认 DUT 生效。
+当前项目不提供 `pcie_cfg_read/write` helper；库中既有 cfg sequence 仍供其他场景
+使用，但本项目不能通过调用它来等待不存在的 PCIe IP 返回配置 Completion。
 
 下面说明用户 task 的填入位置和调用方式，类型及 env 方法仍是拟新增接口：
 
@@ -711,6 +721,108 @@ endtask
 BAR/Mailbox/MSI-X 地址全部来自 setup，并装入对应 cfg。`cfg.binding.owner` 是
 队列所属 Function，`cfg.ctx.target` 是本项实际访问的 Function/BAR，可以是 AF；两者由
 准备阶段明确绑定，接口不偷偷重定向，也不把控制表地址当成 ring DMA 地址。
+
+#### 5.2.1 默认 PF0 与显式 BAR 地址
+
+用户确认所有 DUT 表都通过 Memory Read/Write 配置；默认使用 PF0，也允许用户
+指定其他 PF/VF 的 BAR 地址空间。因此“默认 PF0”表示默认访问目标是已选择
+Host 的 PF0 管理窗口，不表示 Memory 请求由 PF0 发出。真正 requester 是该
+Host 的 RC；同 Host 的不同 PF/VF 仍复用一个 RC sequencer 和 bind wrapper。
+跨 Host 共用的管理 AF 窗口由平台显式指定其 Host，不能按条目 owner 猜访问路径。
+
+目标选择支持两种明确输入：
+
+1. Function key + BAR 编号：从 DPU 快照查询实际 base/size；未覆盖时选择平台
+   声明的 PF0 管理 BAR，不能把“管理 BAR”自动等同于 BAR0。
+2. 明确的 Host/segment + BAR base + 字节 offset：用冻结快照反查该窗口所属
+   Function/角色及实际 BAR 编号，再形成同样的目标记录。当前参考只支持
+   segment 0，其他 segment 必须有明确映射后才允许使用。
+
+两种输入最终都归一化为相同的 `ctx.target`；同时提供身份与地址时必须一致，
+不静默让其中一个覆盖另一个。地址范围检查覆盖整个访问；BAR base 必须是真实
+窗口起点，不把 BAR 内的任意地址误当成新 base。多 Host 可有相同数值地址，
+必须先确定 Host/segment，再查归属。修改 BAR 的分配地址要在快照冻结前进行，
+不能靠写请求传入另一个地址改变分配；平台固定初始窗口也需显式登记其映射。
+
+访问身份与表项 owner 分开。例如：
+
+| 操作 | 访问目标/Intel sideband | 表项内容描述的对象 |
+| --- | --- | --- |
+| 默认通过 PF0 管理 BAR 写 VF3 的 BDF 表 | PF0 与该管理 BAR | VF3 |
+| 显式传入 VF3 自己的 BAR base | VF3 与该 BAR | 由该寄存器/表项定义决定 |
+| 通过 PF0 管理 BAR 写全局 VTX 表 | PF0 与该管理 BAR | 对应队列的真实 PF/VF owner |
+
+第二种情况下不能仍固定 PF0 sideband。用户只需要选目标窗口；公共访问层根据
+同一快照与平台编号映射生成 PF/VF/BAR 字段，不要求每个表的用户 task 重复计算。
+
+#### 5.2.2 实际发送入口与当前接入缺口
+
+已有 `pcie_work/pcie_tl_vip/src/seq/base/pcie_tl_reg_seq.sv` 能实际发送 Memory
+TLP。下面是用户 task 经公共 helper 解析并校验目标后的核心调用；`bar_lease`
+和 `target_pcie_id` 来自冻结快照，`byte_offset` 是最终 BAR 内字节偏移，
+`packed_data` 来自当前表的 entry。此片段假定 Host/slot/句柄、表访问方式及
+BAR 范围已检查，并已完成下文的 Intel route 绑定，不是可独立运行的完整 test。
+
+```systemverilog
+// task 内局部变量；每次请求创建一个 sequence，避免并发复用同一对象。
+pcie_tl_reg_seq	reg_seq;
+int unsigned	slot;
+
+slot = this.cfg.tl_slot_by_host[target_pcie_id.domain.host_id];
+
+reg_seq = pcie_tl_reg_seq::type_id::create("dut_table_write");
+
+reg_seq.is_write = 1;
+reg_seq.addr     = bar_lease.base + byte_offset;
+reg_seq.len      = width_bytes;     // 只允许 4/8/12/16 字节
+reg_seq.wdata    = packed_data;     // 小端；低 8 位对应最低地址
+reg_seq.mask     = 0;               // 所有字节均写入，1 才表示跳过
+
+reg_seq.start(pcie_env.rc_agents[slot].sequencer);
+
+ok  = (reg_seq.status == PCIE_RW_OK);
+why = reg_seq.error_msg;
+```
+
+设置 `is_write=0` 后，同一类发 Memory Read，等待 DUT 返回 Completion 并提供
+`rdata/status/error_msg`。posted 写的成功只表示发送返回，设备是否完成更新由
+用户按硬件协议读回或轮询确认。不能用固定延时或当前 backend 的空 barrier
+代替 DUT 的生效判定。
+
+实际发送链为用户 task → BAR helper → reg sequence → 对应 Host 的 RC driver
+→ Intel adapter → bind wrapper → DUT EP 应用接口。DUT 的 BAR/BDF 表都走这
+条链，不产生 Configuration TLP。32 位直接表通常每项一笔 4 字节写；VTX/VRX
+按间接端口协议发送多笔请求；notify/MSI-X linear 遵守高 DWORD 先写约束。
+
+源码核对发现一个必须补齐的连接点：`pcie_tl_reg_seq` 及其子 sequence
+`pcie_tl_rw_seq` 没有根据 DPU 快照填写 `cq_route`；而
+`intel_pcie_avst_codec.encode()` 直接使用其中的 `bar_id/pf_index/is_vf/vf_index`
+驱动 `rx_bar/rx_pfnum/rx_vfactive/rx_vfnum`。现有 route 缺省为 BAR0/PF0、
+VF inactive，当前项目 env 仅绑定 Host→RC 和 VIF，没有补齐地址到该 route 的
+转换。因此已有 sequence 能发 Memory TLP，并不等于所有 BAR/PF/VF 已正确连接。
+
+拟通过项目参考的薄 `pcie_tl_rc_driver` 派生类统一补 route；不新增 env 层次，
+不改变通用 `pcie_work`/Intel 驱动。创建 PCIe env 前对对应 RC driver 实例做
+factory override，原始类型选择 `pcie_tl_rc_driver`，相对项目 env 的路径为
+`pcie_env.rc_agent_<slot>.driver`。现有 agent 自己安装的
+`pcie_tl_base_driver → pcie_tl_rc_driver` override 保留，factory 继续解析
+`pcie_tl_rc_driver → project_pcie_rc_driver`；不提前覆盖同一路径的 base driver
+规则与 agent 冲突。connect 时检查实际 driver 可转换为项目类型，再注入该
+Host/segment 的冻结快照和平台 PF/VF
+映射。在 `send_tlp()` 调用 `super.send_tlp()` 前校验有效字节范围与 BAR 归属，
+填写 route，使观察口与实际发送一致；不能在 analysis 观察者中偷偷修改请求。
+逻辑 PF/VF 与 Intel 编号的对应关系由平台明确声明，先检查 3 位 PF/11 位 VF
+容量再编码；未知窗口或错误域直接失败，不回退到默认 PF0。
+
+这条公共路径也要覆盖 VIO notify，避免寄存器访问正确、实际 doorbell 却落到
+默认 BAR0/PF0。Host 向 DUT 返回的 DMA Completion 按原 Requester ID 和平台
+EP/SW 身份反向映射选择 Function，复用原 Tag/Completion 管理；不能按 Memory
+地址解析 Completion，也不能把普通 Memory 请求的 Requester ID 改成目的 EP BDF。
+
+运行期由 test/sequence 等待 DUT reset/interface ready 后调用用户配置入口。
+当前参考源码 `project_base_test.run_phase()` 仍调用旧 `env.configure_device()`；
+实现本设计时将其替换成用户 MMIO 配置、验证与发包编排。上述 wrapper、route
+桥接和新单项 hook 尚未落地，当前文档没有宣称已通过真实 DUT 仿真。
 
 ### 5.3 一个配置记录与各类别独立遍历
 
@@ -845,7 +957,7 @@ VIO 的 cfg 可以附带其依赖的只读 BDF/BAR 值，用于定位设备访�
 | 初始化方式 | 项目固定 | 由用户 task 配置 DUT，不增加 `vio.init_mode` 让项目回到旧主动配置流程 |
 | `vio.tx_enable`、`vio.rx_enable` | 拟新增 | 明确运行方向；两者不能同时关闭；单 VTX 用例可关闭 RX |
 | `vio.completion_mode` | 已有全局/Host 入口 | 轮询/MSI-X 显式选择，补齐精确 service 覆盖和两种格式的实际运行路径 |
-| `dpu.msix.*`，以及 `dpu.hH.pfP[.vfV].msix.*` | 拟新增到项目 env_cfg | 公共 Table/PBA/capability 位置、Message Address/Data 模板及逐向量覆盖；VIO 引用同一份记录 |
+| `dpu.msix.*`，以及 `dpu.hH.pfP[.vfV].msix.*` | 拟新增到项目 env_cfg | 公共 DUT 消息表/PBA 位置、Message Address/Data 模板及逐向量覆盖；控制寄存器通过平台布局提供，VIO 引用同一份记录 |
 | `vio.vtx.*`、`vio.vrx.*` | 拟新增到项目 env_cfg 的平台策略 | 截图版队列策略域，例如高速/预取容量/水线；queue_size、ring 地址和向量继续派生，不重复注册编码值 |
 | `dpu.qsch.*` | 拟新增到项目 env_cfg 的平台策略 | COS/net/group/端口及调度模式，独立于 VIO 队列写入口；编号按平台声明绑定 |
 | `vio.notify_bar` | 拟新增 | 实际 BAR 编号，必须存在于该 Function 的 DPU BAR 租约 |
@@ -942,6 +1054,7 @@ qid/index/wrap，不从全局 qpair 编号重新推算。
 | 拟新增 `virtio_net_vip/src/env/vio_external_setup.sv`，以及 `virtio_net_env.sv` | 仅导出 VIO service/queue 配置及公共租约引用，提供准备/确认/释放接口 |
 | 拟新增 `integration/project/project_dut_config.sv` | 公共 Function/BAR/BDF 配置记录、只读视图和选择范围；复用 DPU 快照，不依赖 VIO ring 类型 |
 | 拟新增 `integration/project/project_vio_config.sv` | 截图版 VTX/VRX/notify packed entry 与外层 cfg；结合通用 VIO binding，不污染生产 VIO/DPU 类型 |
+| 拟新增 `integration/project/project_pcie_rc_driver.sv` | 从冻结 DPU/平台映射补齐 Intel route，通过实例 override 接入原 RC 发送链；配置和 notify 共用 |
 | `integration/project/project_env_cfg.sv` | 统一消费队列需求并生成 DPU 输入，平台布局/策略与公共 MSI-X 输入；在原类注册并加载参数 |
 | `integration/project/project_env.sv`、`project_base_test.sv` | 删除旧主动配置流程；各类独立批量入口、单项用户 task、跨模块依赖检查、PCIe helper 及准备/确认/释放 |
 | `integration/aip/virtio_aip_pkg.sv` | 沿用 target/pair 发包入口，项目仅注册业务命令，正确区分两种完成模式 |
@@ -949,7 +1062,8 @@ qid/index/wrap，不从全局 qpair 编号重新推算。
 
 DPU 已有 `get_service_owner/get_pcie_id/get_bar` 和
 `list_vio_bindings_for_service/get_vio_binding_by_service_virtio_pair` 等查询接口。
-优先复用，不计划为本功能修改 DPU 分配算法或 PCIe TL/Intel 驱动。
+优先复用，不计划为本功能修改 DPU 分配算法或 PCIe TL/Intel 通用驱动。
+项目特定 route 逻辑由上述派生 driver 承担，仍使用一个 env 和一个 env_cfg。
 必要的 VIO 核心源码进入 VIO 自己的包；项目参考仍通过独立 filelist 显式选择。
 
 ## 9. 验证要求
@@ -982,9 +1096,10 @@ DPU 已有 `get_service_owner/get_pcie_id/get_bar` 和
     prefix、MSI-X linear/info/interval/table、notify、QSCH 和 VTX/VRX；仅平台
     明确声明时验证 control/bank/commit 项。共享项去重，AF 额外项单列。
     必需 hook 未填写时不能进入 READY，未提供布局不产生有效假地址。
-14. 用户 hook 经 PCIe cfg/MEM sequence 实际到达 Intel 路径；验证 BDF、Host/RC、
+14. 用户 hook 经 Memory sequence 实际到达 Intel 路径；验证目标身份、Host/RC、
     BAR base+offset、4/8/12/16 字节及 mask 语义，越界/缺路由在发 TLP 前失败。
-    验证 posted 写与读回确认的区别，配置空间 Completion 错误向上传递。
+    验证 posted 写与读回确认的区别，MMIO read Completion 错误向上传递；
+    整个项目流程不产生 CFG_RD/CFG_WR，不依赖 PCI Command/标准 BAR/MSI-X capability。
 15. Packed/Custom 分别覆盖轮询和 MSI-X。MSI-X 测试写完成状态而不发送消息时
     必须超时，发送真实匹配的 MSI-X Memory Write 后才处理完成；不得被轮询兜底。
 16. MSI-X 消息地址不在旧硬编码 APIC 区、Message Data 低位不等于向量号仍按
@@ -1007,7 +1122,7 @@ DPU 已有 `get_service_owner/get_pcie_id/get_bar` 和
     BDF、BAR 和队列均由相同 Function key 找回；`vio.enabled` 不改变公共条目数。
 23. 同一类别可分范围完成，其他类别既有确认不丢失；只确认 BAR 不能让依赖 BDF
     的 VIO 进入 READY。平台已配置项通过有范围的用户验证确认后可被 VIO 使用。
-24. PCI BAR 与平台 BAR 映射表独立调用；按租约或 VF 组生成项均携带真实成员。
+24. DPU BAR 租约查询与 DUT BAR 映射表配置分开；按租约或 VF 组生成项携带真实成员。
     分组不可表示、未知硬件布局、scope 不满足原子提交粒度时明确失败，不推测
     VF 连续地址，也不因局部重配清掉其他 Function。
 25. 所有 packed entry 以独立规格向量验证位宽和字段位置，覆盖最高有效位、
@@ -1029,6 +1144,14 @@ DPU 已有 `get_service_owner/get_pcie_id/get_bar` 和
 30. 用户按域修改准备前策略能改变对应项；导出后修改值副本不改变真实资源。
     尝试用不匹配的 qid、ring IOVA、q_depth、mode 或 vector 写入时，在发送前
     被一致性检查拒绝；使能阶段只执行明确允许的 enable/mask 转换。
+31. 默认 PF0 管理窗口与显式 PF/VF BAR base 分别验证：通过 PF0 配 VF3 表时，
+    sideband 仍指向 PF0；直接访问 VF3 BAR 时，sideband 必须匹配 VF3。
+    覆盖非 BAR0、不同 Host 相同地址、错误域、越界和身份/地址输入冲突。
+32. Intel route 同时覆盖配置和 VIO notify；DMA Completion 根据平台声明的
+    Requester ID 返回正确 Function。检查真实 `rx_bar/rx_pfnum/rx_vfactive/`
+    `rx_vfnum`，不能只检查 TLP 地址和 payload；全流程无 Configuration TLP。
+    验证 base→RC→项目 driver 的 factory 解析及原 RC cast 均正确，未安装项目
+    driver 时在配置阶段失败，不能仍用原 driver 却宣称 route 已补齐。
 
 定向模型验证证明接入合同和 VIP 行为；用户实际 DUT 的寄存器语义、QSCH 和线侧
 收发仍由项目联合测试验证，不以结构或模型测试代替真实 DUT 的验收。
