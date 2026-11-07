@@ -45,6 +45,7 @@
         int unsigned     n_out;
 
         desc_id = '1;
+        if (!external_queue_ready(queue_id)) return;
         if (use_indirect &&
             !negotiated_features[VIRTIO_F_RING_INDIRECT_DESC]) begin
             `uvm_error("ATOMIC_OPS", $sformatf(
@@ -189,13 +190,14 @@
     virtual task tx_complete(
         int unsigned     queue_id,
         ref uvm_object   completed_pkts[$],
-        int unsigned     max_budget
+        input int unsigned     max_budget
     );
         virtqueue_base   vq;
         uvm_object       token;
         int unsigned     len;
         int unsigned     count = 0;
 
+        if (!completion_permitted(queue_id)) return;
         vq = vq_mgr.get_queue(queue_id);
         if (vq == null) return;
 
@@ -224,6 +226,7 @@
         if (count > 0)
             `uvm_info("ATOMIC_OPS",
                 $sformatf("tx_complete: queue_id=%0d completed=%0d", queue_id, count), UVM_HIGH)
+        if (count == max_budget && count != 0) retain_external_completion(queue_id);
     endtask
 
     // ========================================================================
@@ -246,6 +249,7 @@
         int unsigned     filled = 0;
         virtio_dma_buffer_set dma_set;
 
+        if (!external_queue_ready(queue_id)) return;
         vq = vq_mgr.get_queue(queue_id);
         if (vq == null) return;
 
@@ -333,6 +337,7 @@
         int unsigned     count = 0;
         int unsigned     hdr_size;
 
+        if (!completion_permitted(queue_id)) return;
         vq = vq_mgr.get_queue(queue_id);
         if (vq == null) return;
 
@@ -409,6 +414,7 @@
         if (rx_dma_map.exists(queue_id) &&
             (rx_dma_map[queue_id].size() == 0))
             rx_dma_map.delete(queue_id);
+        if (count == max_budget && count != 0) retain_external_completion(queue_id);
     endtask
 
     // ------------------------------------------------------------------------
@@ -419,7 +425,7 @@
     virtual task rx_receive(
         int unsigned     queue_id,
         ref uvm_object   received_pkts[$],
-        int unsigned     max_budget
+        input int unsigned     max_budget
     );
         virtio_rx_frame_t frames[$];
 

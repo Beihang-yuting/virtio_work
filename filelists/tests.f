@@ -58,4 +58,5 @@ virtio_net_vip/tests/dpu_pcie_tl_executor_integration_test.sv
 examples/virtio_system_env/virtio_system_env_example_test.sv
 examples/dpu_priv_ring/dpu_priv_ring_contract_test.sv
 examples/dpu_priv_ring/dpu_priv_driver_flow_test.sv
+virtio_net_vip/tests/virtio_external_configuration_test.sv
 virtio_net_vip/tests/virtio_tb_top.sv

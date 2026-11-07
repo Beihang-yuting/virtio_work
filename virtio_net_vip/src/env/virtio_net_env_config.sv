@@ -28,6 +28,28 @@
 class virtio_net_env_config extends uvm_object;
     `uvm_object_utils(virtio_net_env_config)
 
+    // 项目在创建环境前固定外部协议；独立标准/私有模式缺省不变。
+    bit	external_configuration = 0;
+    logic	enabled = 1;
+    logic	tx_enable = 1;
+    logic	rx_enable = 1;
+    logic	notify_layout_valid = 0;
+    logic [31:0]	notify_bar = 0;
+    logic [63:0]	notify_base = 0;
+    logic [63:0]	notify_stride = 0;
+    vio_notify_encoding_e	notify_encoding = VIO_NOTIFY_QID16;
+    protected vio_service_requirement_t	final_requirements[string];
+
+    // 外部协议在 placement 前冻结最终需求；之后只能查询同一值，不因资源数重采样。
+    extern function bit resolve_final_service_requirement(
+        input dpu_service_key_t key, output vio_service_requirement_t requirement,
+        output string why);
+
+    // 单层参数合并保留显式零值；Host/service 覆盖只能改变业务，不重分配资源。
+    extern protected function void load_external_requirement(
+        input string path, ref vio_service_requirement_t requirement,
+        ref bit features_present);
+
     typedef struct {
         dpu_service_key_t key;
         virtio_driver_config_t cfg;
@@ -197,7 +219,7 @@ class virtio_net_env_config extends uvm_object;
         longint unsigned	strict;
         string	why;
 
-        if ((m_service_configs.num() != 0) || (m_param_service_configs.num() != 0)) begin
+        if ((m_service_configs.num() != 0) || (m_param_service_configs.num() != 0) || (final_requirements.num() != 0)) begin
             `uvm_fatal("VIO_PARAM", {path, ": 必须在 add_service_config 复制配置之前加载"})
             return;
         end
@@ -316,7 +338,7 @@ class virtio_net_env_config extends uvm_object;
     // 延迟到第一次 get_service_config 时按冻结快照中的真实 service 身份读取。
     // 适用于 AUTO placement 无法预知服务归属的顶层；缓存后禁止重新启用或改根路径。
     function void	enable_service_params(string	root = "vio");
-        if (m_param_service_configs.num() != 0) begin
+        if ((m_param_service_configs.num() != 0) || (final_requirements.num() != 0)) begin
             `uvm_fatal("VIO_PARAM", "service 参数已经加载，不能重新绑定参数根路径")
             return;
         end
@@ -331,10 +353,19 @@ class virtio_net_env_config extends uvm_object;
             `uvm_fatal("VIO_PARAM", "copy_defaults_from 收到空配置或空等待模板")
             return;
         end
-        if ((m_service_configs.num() != 0) || (m_param_service_configs.num() != 0)) begin
+        if ((m_service_configs.num() != 0) || (m_param_service_configs.num() != 0) || (final_requirements.num() != 0)) begin
             `uvm_fatal("VIO_PARAM", "已有 service 副本，不能重新复制默认模板")
             return;
         end
+        external_configuration = rhs.external_configuration;
+        enabled = rhs.enabled;
+        tx_enable = rhs.tx_enable;
+        rx_enable = rhs.rx_enable;
+        notify_layout_valid = rhs.notify_layout_valid;
+        notify_bar = rhs.notify_bar;
+        notify_base = rhs.notify_base;
+        notify_stride = rhs.notify_stride;
+        notify_encoding = rhs.notify_encoding;
         default_num_pairs = rhs.default_num_pairs;
         default_queue_size = rhs.default_queue_size;
         default_vq_type = rhs.default_vq_type;
@@ -373,7 +404,7 @@ class virtio_net_env_config extends uvm_object;
         string name_key;
         name_key = dpu_service_key_name(key);
         why = "";
-        if (m_param_service_configs.exists(name_key)) begin
+        if (m_param_service_configs.exists(name_key) || final_requirements.exists(name_key)) begin
             why = {"service 参数副本已被消费，不能切换私有协议：", name_key};
             return 0;
         end
@@ -564,7 +595,7 @@ class virtio_net_env_config extends uvm_object;
         string service_name;
 
         service_name = dpu_service_key_name(key);
-        if (m_param_service_configs.exists(service_name)) begin
+        if (m_param_service_configs.exists(service_name) || final_requirements.exists(service_name)) begin
             why = {"service 参数副本已被消费，不能再替换其配置：", service_name};
             return 0;
         end
@@ -604,6 +635,18 @@ class virtio_net_env_config extends uvm_object;
     );
         string service_name;
 
+        if (external_configuration) begin
+            vio_service_requirement_t	requirement;
+
+            if (!resolve_final_service_requirement(key, requirement, why)) return 0;
+            driver_cfg = requirement.behavior;
+            if (!requirement.enabled || driver_cfg.num_queue_pairs > max_pairs) begin
+                why = "external service disabled or exact requirement exceeds allocated qpairs";
+                return 0;
+            end
+            driver_cfg.max_vio_net_qpairs_per_device = max_pairs;
+            return 1;
+        end
         service_name = dpu_service_key_name(key);
         if (key.service_kind != DPU_SERVICE_VIO_NET) begin
             why = {"VIO service configuration requires VIO-net key ",
@@ -849,5 +892,156 @@ class virtio_net_env_config extends uvm_object;
     endfunction
 
 endclass : virtio_net_env_config
+
+// 只读取显式层的参数；默认值来自上一层，不把缺省零误当成覆盖。
+function void virtio_net_env_config::load_external_requirement(
+    input string path, ref vio_service_requirement_t requirement,
+    ref bit features_present);
+`ifdef AIP_CMDLINE_SV
+    longint unsigned	enabled;
+    longint unsigned	tx_enable;
+    longint unsigned	rx_enable;
+    longint unsigned	notify_bar;
+    bit [63:0]	notify_base;
+    bit [63:0]	notify_stride;
+    virtio_completion_mode_e	completion_mode;
+    vio_notify_encoding_e	notify_encoding;
+    bit	present;
+
+    load_driver_params(path, requirement.behavior);
+    `DPU_AIP_PRESENT(path, "features", present)
+    features_present |= present;
+    `DPU_AIP_UINT(path, longint unsigned, enabled, requirement.enabled);
+    `DPU_AIP_UINT(path, longint unsigned, tx_enable, requirement.tx_enable);
+    `DPU_AIP_UINT(path, longint unsigned, rx_enable, requirement.rx_enable);
+    `DPU_AIP_UINT(path, longint unsigned, notify_bar, requirement.notify_bar);
+    `DPU_AIP_UINT(path, bit [63:0], notify_base, requirement.notify_base);
+    `DPU_AIP_UINT(path, bit [63:0], notify_stride, requirement.notify_stride);
+    `aip_enum(path, virtio_completion_mode_e, completion_mode, requirement.completion_mode);
+    `aip_enum(path, vio_notify_encoding_e, notify_encoding, requirement.notify_encoding);
+    if (enabled > 1 || tx_enable > 1 || rx_enable > 1 || notify_bar > 5) begin
+        `uvm_fatal("VIO_PARAM", {path, ": 外部方向或通知 BAR 越界"})
+        return;
+    end
+    requirement.enabled = enabled;
+    requirement.tx_enable = tx_enable;
+    requirement.rx_enable = rx_enable;
+    requirement.notify_bar = notify_bar;
+    requirement.notify_base = notify_base;
+    requirement.notify_stride = notify_stride;
+    requirement.completion_mode = completion_mode;
+    requirement.notify_encoding = notify_encoding;
+    `DPU_AIP_PRESENT(path, "notify_base", present)
+    requirement.notify_layout_valid |= present;
+`endif
+endfunction
+
+// pre-placement 与 connect 共用这一份不可变需求；失败不缓存，便于修正 authoring。
+function bit virtio_net_env_config::resolve_final_service_requirement(
+    input dpu_service_key_t key, output vio_service_requirement_t requirement,
+    output string why);
+    string	name_key;
+    string	paths[$];
+    bit	features_present;
+    dpu_priv_driver_config	private_cfg;
+    bit [63:0]	allowed_features;
+
+    why = "";
+    name_key = dpu_service_key_name(key);
+    if (final_requirements.exists(name_key)) begin
+        requirement = final_requirements[name_key];
+        return 1;
+    end
+    if (key.service_kind != DPU_SERVICE_VIO_NET) begin
+        why = "external requirement requires VIO service key";
+        return 0;
+    end
+    requirement.enabled = enabled;
+    requirement.tx_enable = tx_enable;
+    requirement.rx_enable = rx_enable;
+    requirement.completion_mode = completion_mode;
+    requirement.notify_layout_valid = notify_layout_valid;
+    requirement.notify_bar = notify_bar;
+    requirement.notify_base = notify_base;
+    requirement.notify_stride = notify_stride;
+    requirement.notify_encoding = notify_encoding;
+    requirement.behavior = make_default_driver_config(DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE);
+    requirement.behavior.num_queue_pairs = default_num_pairs;
+    features_present = m_service_configs.exists(name_key) || (default_driver_features != '1);
+    if (m_service_configs.exists(name_key)) requirement.behavior = m_service_configs[name_key].cfg;
+    paths.push_back(aip_service_root);
+    paths.push_back($sformatf("%s.h%0d", aip_service_root, key.function_key.host_id));
+    paths.push_back(service_param_path(key, aip_service_root));
+    if (aip_service_params_enabled)
+        foreach (paths[i]) load_external_requirement(paths[i], requirement, features_present);
+    if ($isunknown({requirement.enabled, requirement.tx_enable, requirement.rx_enable,
+                    requirement.notify_layout_valid, requirement.notify_bar,
+                    requirement.notify_base, requirement.notify_stride,
+                    requirement.notify_encoding, requirement.completion_mode}) ||
+        !(requirement.completion_mode inside {VIRTIO_COMPLETION_POLLING, VIRTIO_COMPLETION_MSIX}) ||
+        !(requirement.notify_encoding inside {VIO_NOTIFY_QID16, VIO_NOTIFY_DATA32, VIO_NOTIFY_DPU32}) ||
+        (requirement.enabled && (!requirement.tx_enable && !requirement.rx_enable))) begin
+        why = "external requirement has unknown/invalid direction or completion/notify mode";
+        return 0;
+    end
+    if (!requirement.enabled) begin
+        final_requirements[name_key] = requirement;
+        return 1;
+    end
+    if (!validate_driver_behavior(requirement.behavior, name_key, why)) return 0;
+    if (requirement.behavior.num_queue_pairs > DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE ||
+        requirement.behavior.queue_size < 2 || requirement.behavior.queue_size > 32768 ||
+        (requirement.behavior.vq_type == VQ_CUSTOM && requirement.behavior.queue_size > 4096) ||
+        !(requirement.behavior.vq_type inside {VQ_PACKED, VQ_CUSTOM})) begin
+        why = "external mode requires exact nonzero Packed/Custom geometry within capacity";
+        return 0;
+    end
+    requirement.behavior.irq_mode = (requirement.completion_mode == VIRTIO_COMPLETION_POLLING) ?
+                                    IRQ_POLLING : IRQ_MSIX_SHARED;
+    if (requirement.behavior.vq_type == VQ_CUSTOM) begin
+        if (features_present && requirement.behavior.driver_features != 0) begin
+            why = "Custom external mode cannot carry explicit Virtio features";
+            return 0;
+        end
+        requirement.behavior.driver_features = 0;
+        // Custom 缺省使用 DPU32；显式参数的不同格式由 prepare 拒绝。
+        if (requirement.notify_encoding == VIO_NOTIFY_QID16 && !requirement.notify_layout_valid)
+            requirement.notify_encoding = VIO_NOTIFY_DPU32;
+        private_cfg = get_dpu_private_config(key);
+        if (private_cfg == null) begin
+            private_cfg = new({name_key, "_private"});
+            private_cfg.default_queue_size = requirement.behavior.queue_size;
+            if (aip_service_params_enabled)
+                foreach (paths[i]) private_cfg.load_params({paths[i], ".private"});
+            // 先合并三级默认控制，再为每队列复制并施加三级 qN 覆盖。
+            for (int unsigned q = 0; q < 2*requirement.behavior.num_queue_pairs; q++) begin
+                private_cfg.queues[q] = private_cfg.resolve_queue(q);
+                if (aip_service_params_enabled)
+                    foreach (paths[i]) private_cfg.queues[q].load_params($sformatf("%s.private.q%0d", paths[i], q));
+            end
+            m_private_configs[name_key] = '{key:key, cfg:private_cfg};
+        end
+        if (private_cfg.default_queue_size != requirement.behavior.queue_size) begin
+            why = "vio.queue_size disagrees with explicit private queue_size";
+            return 0;
+        end
+        if (!private_cfg.validate(requirement.behavior.num_queue_pairs, why)) return 0;
+        requirement.behavior.rx_buf_size = private_cfg.rx_buf_size;
+    end else begin
+        allowed_features = (64'h1 << VIRTIO_F_VERSION_1) | (64'h1 << VIRTIO_F_RING_PACKED) |
+                           (64'h1 << VIRTIO_F_NOTIFICATION_DATA) | (64'h1 << VIRTIO_F_IN_ORDER) |
+                           (64'h1 << VIRTIO_F_RING_EVENT_IDX) | (64'h1 << VIRTIO_F_ACCESS_PLATFORM);
+        if (!features_present)
+            requirement.behavior.driver_features = (64'h1 << VIRTIO_F_VERSION_1) | (64'h1 << VIRTIO_F_RING_PACKED);
+        if ((requirement.behavior.driver_features & ~allowed_features) != 0 ||
+            !requirement.behavior.driver_features[VIRTIO_F_VERSION_1] ||
+            !requirement.behavior.driver_features[VIRTIO_F_RING_PACKED]) begin
+            why = "external Packed feature contract requires VERSION_1/PACKED and supported data features only";
+            return 0;
+        end
+    end
+    final_requirements[name_key] = requirement;
+    return 1;
+endfunction
 
 `endif // VIRTIO_NET_ENV_CONFIG_SV

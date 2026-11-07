@@ -156,7 +156,17 @@ class virtio_pcie_observer_adapter extends uvm_subscriber #(pcie_tl_tlp);
 
             if (function_bound && decode_msi_memory_write(
                     mem, data, interrupt_vector)) begin
+                if (transport.notify_mgr.uses_external_notifications())
+                    transport.notify_mgr.on_interrupt_received(interrupt_vector);
                 monitor.observe_interrupt(interrupt_vector);
+            end
+            else if (function_bound && transport.notify_mgr.uses_external_notifications() &&
+                mem.kind == TLP_MEM_WR && transport.notify_mgr.match_external_notify(
+                    mem.addr + first_enabled_byte(mem.first_be),
+                    data[31:0] >> (8*first_enabled_byte(mem.first_be)),
+                    $countones(mem.first_be), offset)) begin
+                monitor.observe_queue_notify(offset, data[31:0] >> (8*first_enabled_byte(mem.first_be)),
+                    0, mem.addr + first_enabled_byte(mem.first_be));
             end
             else if ((mem.addr >= common_cfg_base) && (mem.addr <= common_cfg_limit)) begin
                 // PCIe memory TLP addresses are naturally DWord aligned; the
@@ -227,16 +237,20 @@ class virtio_pcie_observer_adapter extends uvm_subscriber #(pcie_tl_tlp);
 
     // MSI/MSI-X 辅助：输出匹配的 vector；地址/数据与已配置 MSI-X 表或 requester
     // 不匹配时返回 0。成功时 write() 会调用 notify_mgr sideband，不生成 Host memory 写。
-    // MSI and MSI-X are posted Memory Writes to the local APIC window.  Some
-    // PCIe monitors leave requester_id at zero for this path, so a configured
-    // MSI-X message address/data pair owns the routing decision.  Plain MSI
-    // has no table entry; its function BDF remains the safe fallback.
+    // 外部模式只按冻结 Host/address/data 接受完整 DWORD，不限制 APIC aperture。
+    // 标准模式继续先检查 APIC 窗口和 MSI-X 表；无表的普通 MSI 才回退 requester。
     protected virtual function bit decode_msi_memory_write(
         input pcie_tl_mem_tlp mem,
         input bit [63:0] data,
         output int unsigned interrupt_vector
     );
         interrupt_vector = 0;
+        if (transport != null && transport.notify_mgr.uses_external_notifications()) begin
+            if (mem.kind != TLP_MEM_WR || mem.payload.size() != 4 ||
+                mem.first_be != 4'hf || !function_pcie_id_valid) return 0;
+            return transport.notify_mgr.match_external_message(
+                function_pcie_id.domain.host_id, mem.addr, data[31:0], interrupt_vector);
+        end
         if ((mem.kind != TLP_MEM_WR) || !is_msi_address(mem.addr))
             return 0;
         if (transport != null) begin

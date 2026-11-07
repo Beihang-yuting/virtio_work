@@ -351,6 +351,8 @@ class dpu_priv_config_backend extends virtio_config_backend;
         pvq.rss_lag = c.rss_lag;
         pvq.l3_cs = c.l3_cs;
         pvq.l4_cs = c.l4_cs;
+        pvq.i_l3_cs = c.i_l3_cs;
+        pvq.i_l4_cs = c.i_l4_cs;
         pvq.fwd = c.fwd;
         q.local_qid = c.local_qid;
         q.rx_buf_size = rx_size;

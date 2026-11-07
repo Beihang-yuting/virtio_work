@@ -39,8 +39,46 @@
 //     concurrency controller、dynamic reconfig
 // ============================================================================
 
+// 具体凭据类型只承载对象身份；环境不导出实例，避免用公开代号伪造 READY。
+class vio_external_session_token extends uvm_object;
+    // 不登记 factory，也不提供状态；每次 prepare 创建独立身份。
+    extern function new(string name = "vio_external_session_token");
+endclass
+
+function vio_external_session_token::new(string name = "vio_external_session_token");
+    super.new(name);
+endfunction
+
 class virtio_net_env extends uvm_env;
     `uvm_component_utils(virtio_net_env)
+
+    // 外部本代资源只由本环境持有；live_setup 一经交付，任何失败都保持到显式释放。
+    local vio_external_setup	live_external_setup;
+    // 未导出的会话凭据，阻止调用方用已知 env 句柄/公开代号直接伪造内部 READY。
+    local vio_external_session_token	external_session_key;
+    local longint unsigned	external_generation;
+    local bit	external_confirmed[string];
+
+    // 平台在显式 prepare 时才提供 notify/MSI-X 最终绑定；不会在 connect 前抢读。
+    extern task prepare_external_configuration(
+        input vio_external_queue_binding_t bindings[$], output vio_external_setup setup,
+        output bit ok, output string why);
+
+    // 配置 task 成功由平台显式报告；本方法另外验证来源、代号、全部所选队列和 DMA。
+    extern function bit confirm_external_configuration(
+        input vio_external_setup setup, input vio_config_scope scope,
+        input logic configured, output string why);
+
+    // stop 只停止 VIP；只有平台报告 DUT quiesced 后才归还 ring/payload/DMA。
+    extern function bit release_external_resources(
+        input vio_external_setup setup, input logic dut_quiesced, output string why);
+
+    // 准备失败且尚未交付时回滚；exported 资源绝不能经过这条路径。
+    extern protected function void rollback_external_preparation();
+
+    // 查询确认账本，供 AIP/项目状态同步；修改返回副本不影响内部结果。
+    extern function bit external_service_confirmed(
+        input vio_external_setup setup, input dpu_service_key_t key);
 
     // ===== Config =====
     virtio_net_env_config cfg;
@@ -143,10 +181,20 @@ class virtio_net_env extends uvm_env;
             end
             service_keys = scoped_service_keys;
         end
+        if (cfg.external_configuration) begin
+            dpu_service_key_t	enabled_services[$];
+            vio_service_requirement_t	requirement;
+
+            foreach (service_keys[i]) begin
+                if (!cfg.resolve_final_service_requirement(service_keys[i], requirement, why)) return 0;
+                if (requirement.enabled) enabled_services.push_back(service_keys[i]);
+            end
+            service_keys = enabled_services;
+        end
         if (service_keys.size() == 0) begin
             // 作用域内可以合法地没有 VIO 参与者；保持共享基础设施但创建空函数
             // 数组。未设作用域时全局无 service 仍是配置错误，避免静默漏配置。
-            if ((cfg.service_keys.size() != 0) || cfg.host_scope_enable) begin
+            if (cfg.external_configuration || (cfg.service_keys.size() != 0) || cfg.host_scope_enable) begin
                 pf_instances = new[0];
                 function_instances = new[0];
                 vf_instances = new[0];
@@ -488,6 +536,7 @@ class virtio_net_env extends uvm_env;
                 return;
             end
             function_instances[function_index].drv_cfg = driver_cfg;
+            function_instances[function_index].external_configuration = cfg.external_configuration;
             // 每个 Function 单独选择驱动协议；私有配置在 Function 提交时冻结进私有
             // 配置后端。这里仅传配置，不在 connect 阶段执行硬件访问或分配 ring。
             function_instances[function_index].private_cfg =
@@ -1043,5 +1092,362 @@ class virtio_net_env extends uvm_env;
     endfunction
 
 endclass : virtio_net_env
+
+// 准备阶段不调用任何设备配置后端；先验证全部目标，再分配真实 ring 和本地接收规则。
+task virtio_net_env::prepare_external_configuration(
+    input vio_external_queue_binding_t bindings[$], output vio_external_setup setup,
+    output bit ok, output string why);
+    vio_queue_setup_t	records[$];
+    vio_queue_setup_t	record;
+    vio_service_requirement_t	requirement;
+    dpu_vio_qpair_binding_t	pairs[$];
+    vio_external_queue_binding_t	binding;
+    virtio_function_instance	instance;
+    virtio_external_config_backend	backend;
+    virtio_queue_program_t	program_value;
+    virtqueue_base	vq;
+    bit	found;
+    bit	step_ok;
+    bit	consumed[int unsigned];
+    int unsigned	qid;
+    int unsigned	width;
+    int unsigned	match_count;
+    dpu_priv_queue_config	private_control;
+
+    setup = null;
+    ok = 0;
+    why = "";
+    if (cfg == null || !cfg.external_configuration || !configuration_valid ||
+        live_external_setup != null || function_instances.size() == 0) begin
+        why = "external prepare requires bound nonempty environment without an exported generation";
+        return;
+    end
+    foreach (function_instances[f]) begin
+        instance = function_instances[f];
+        if (instance.driver_agent.ops == null || instance.driver_agent.fsm == null ||
+            !instance.driver_agent.ops.uses_external_configuration() ||
+            !instance.driver_agent.fsm.external_workers_stopped() ||
+            instance.driver_agent.ops.has_active_queues() ||
+            instance.driver_agent.ops.mem != host_mem || instance.driver_agent.ops.iommu != iommu) begin
+            why = "external prepare requires idle Function with exact shared memory/IOMMU binding";
+            return;
+        end
+        if (!cfg.resolve_final_service_requirement(instance.service_key, requirement, why)) return;
+        resource_snapshot.list_vio_bindings_for_service(instance.service_key, pairs);
+        if (!requirement.enabled || pairs.size() != requirement.behavior.num_queue_pairs) begin
+            why = "allocated qpair count must exactly equal frozen service requirement";
+            return;
+        end
+        foreach (pairs[p]) begin
+            if (pairs[p].virtio_pair_index >= pairs.size() ||
+                pairs[p].rx_local_virtqueue_id != 2*pairs[p].virtio_pair_index ||
+                pairs[p].tx_local_virtqueue_id != 2*pairs[p].virtio_pair_index+1) begin
+                why = "external service has invalid dense local queue mapping";
+                return;
+            end
+            for (int unsigned direction = 0; direction < 2; direction++) begin
+                if (direction ? !requirement.tx_enable : !requirement.rx_enable) continue;
+                qid = direction ? pairs[p].tx_local_virtqueue_id : pairs[p].rx_local_virtqueue_id;
+                found = 0;
+                match_count = 0;
+                foreach (bindings[b]) begin
+                    if (dpu_service_key_name(bindings[b].service_key) ==
+                        dpu_service_key_name(instance.service_key) && bindings[b].local_qid === qid) begin
+                        binding = bindings[b];
+                        consumed[b] = 1;
+                        match_count++;
+                        found = 1;
+                    end
+                end
+                if (match_count > 1) begin
+                    why = "external queue notification binding duplicated";
+                    return;
+                end
+                if (!found) begin
+                    if (!requirement.notify_layout_valid ||
+                        requirement.completion_mode == VIRTIO_COMPLETION_MSIX ||
+                        (requirement.notify_stride != 0 &&
+                         qid > (64'hffff_ffff_ffff_ffff - requirement.notify_base) / requirement.notify_stride)) begin
+                        why = "missing explicit notification/MSI-X binding or notify template overflow";
+                        return;
+                    end
+                    binding.service_key = instance.service_key;
+                    binding.local_qid = qid;
+                    binding.notify_bar = requirement.notify_bar;
+                    binding.notify_offset = requirement.notify_base + qid*requirement.notify_stride;
+                    binding.notify_encoding = requirement.notify_encoding;
+                    binding.local_vector = pairs[p].local_msix_vector_id;
+                    binding.global_vector = pairs[p].global_msix_vector_id;
+                    binding.msix_valid = 0;
+                    binding.message_address = 0;
+                    binding.message_data = 0;
+                    binding.masked = 1;
+                end
+                width = (binding.notify_encoding == VIO_NOTIFY_QID16) ? 2 : 4;
+                if ($isunknown({binding.local_qid, binding.notify_bar, binding.notify_offset,
+                    binding.notify_encoding, binding.msix_valid, binding.local_vector,
+                    binding.global_vector, binding.message_address, binding.message_data, binding.masked}) ||
+                    binding.notify_bar > 5 || binding.notify_offset > 64'hffff_ffff ||
+                    (binding.notify_offset % width) != 0 ||
+                    !(binding.notify_encoding inside {VIO_NOTIFY_QID16, VIO_NOTIFY_DATA32, VIO_NOTIFY_DPU32}) ||
+                    binding.local_vector != pairs[p].local_msix_vector_id ||
+                    binding.global_vector != pairs[p].global_msix_vector_id) begin
+                    why = "external notification contains unknown, out-of-range or mismatched identity";
+                    return;
+                end
+                if (instance.transport.bar.bar_size[binding.notify_bar] < width ||
+                    binding.notify_offset > instance.transport.bar.bar_size[binding.notify_bar] - width ||
+                    (requirement.behavior.vq_type == VQ_CUSTOM && binding.notify_encoding != VIO_NOTIFY_DPU32) ||
+                    (binding.notify_encoding == VIO_NOTIFY_DATA32 &&
+                     !requirement.behavior.driver_features[VIRTIO_F_NOTIFICATION_DATA]) ||
+                    (binding.notify_encoding == VIO_NOTIFY_QID16 &&
+                     requirement.behavior.driver_features[VIRTIO_F_NOTIFICATION_DATA]) ||
+                    (requirement.completion_mode == VIRTIO_COMPLETION_MSIX &&
+                     (!binding.msix_valid || binding.masked || binding.message_address[1:0] != 0))) begin
+                    why = "notification BAR/encoding or MSI-X message contract invalid";
+                    return;
+                end
+                if (instance.private_cfg != null) begin
+                    private_control = instance.private_cfg.resolve_queue(qid);
+                    if (private_control == null || private_control.local_qid != qid ||
+                        (private_control.notify_bar_present && private_control.notify_bar != binding.notify_bar) ||
+                        (private_control.notify_offset_present && private_control.notify_offset != binding.notify_offset)) begin
+                        why = "private local queue/explicit notification disagrees with external binding";
+                        return;
+                    end
+                end
+                foreach (records[r]) begin
+                    if (records[r].pcie_id.domain.host_id == instance.pcie_id.domain.host_id &&
+                        records[r].notification.msix_valid && binding.msix_valid &&
+                        records[r].notification.message_address == binding.message_address &&
+                        records[r].notification.message_data == binding.message_data &&
+                        (dpu_function_key_name(records[r].service_key.function_key) !=
+                         dpu_function_key_name(instance.function_key) ||
+                         records[r].notification.local_vector != binding.local_vector)) begin
+                        why = "ambiguous MSI-X address/data within Host";
+                        return;
+                    end
+                    if (dpu_service_key_name(records[r].service_key) == dpu_service_key_name(instance.service_key) &&
+                        records[r].notification.local_qid == qid) begin
+                        why = "duplicate queue in resource snapshot";
+                        return;
+                    end
+                end
+                record.service_key = instance.service_key;
+                record.pcie_id = instance.pcie_id;
+                record.qpair = pairs[p];
+                record.requirement = requirement;
+                record.private_tx_control = '0;
+                if (instance.private_cfg != null) begin
+                    record.private_tx_control.dport_info = private_control.dport_info;
+                    record.private_tx_control.dport_id = private_control.dport_id;
+                    record.private_tx_control.dport_type = private_control.dport_type;
+                    record.private_tx_control.cpu_tx_cos = private_control.cpu_tx_cos;
+                    record.private_tx_control.rss_lag = private_control.rss_lag;
+                    record.private_tx_control.l3_cs = private_control.l3_cs;
+                    record.private_tx_control.l4_cs = private_control.l4_cs;
+                    record.private_tx_control.i_l3_cs = private_control.i_l3_cs;
+                    record.private_tx_control.i_l4_cs = private_control.i_l4_cs;
+                    record.private_tx_control.fwd = private_control.fwd;
+                end
+                record.allocated_qpairs = pairs.size();
+                record.notify_bar_base = instance.transport.bar.bar_base[binding.notify_bar];
+                record.notify_bar_size = instance.transport.bar.bar_size[binding.notify_bar];
+                record.notify_address = record.notify_bar_base + binding.notify_offset;
+                record.notification = binding;
+                record.queue_type = requirement.behavior.vq_type;
+                record.completion_mode = requirement.completion_mode;
+                record.tx_mode = direction;
+                record.queue_size = requirement.behavior.queue_size;
+                record.usable_descriptors = record.queue_size - (record.queue_type == VQ_CUSTOM);
+                record.initial_index = 0;
+                record.initial_wrap = 1;
+                record.cq_bytes = (record.queue_type == VQ_CUSTOM) ? (direction ? 2 : 16*record.queue_size) : 0;
+                record.desc_bytes = 16*record.queue_size;
+                record.driver_bytes = (record.queue_type == VQ_CUSTOM) ? 0 : 4;
+                record.device_bytes = (record.queue_type == VQ_CUSTOM) ? record.cq_bytes : 4;
+                record.ring_valid_bytes = record.desc_bytes + record.driver_bytes + record.device_bytes;
+                record.initial_tx_cq = (record.queue_type == VQ_CUSTOM && direction) ? 16'h8000 : 0;
+                records.push_back(record);
+            end
+        end
+    end
+    if (consumed.num() != bindings.size()) begin
+        why = "external bindings include unknown service/queue or disabled direction";
+        return;
+    end
+    external_generation++;
+    external_session_key = new("external_session_key");
+    foreach (function_instances[f]) begin
+        instance = function_instances[f];
+        void'(cfg.resolve_final_service_requirement(instance.service_key, requirement, why));
+        if (!instance.driver_agent.ops.begin_external_session(external_session_key, external_generation, requirement, why)) begin
+            rollback_external_preparation();
+            return;
+        end
+        instance.transport.notify_mgr.begin_external_notifications(instance.pcie_id.domain.host_id);
+        instance.transport.notify_mgr.irq_mode = requirement.behavior.irq_mode;
+    end
+    foreach (records[r]) begin
+        foreach (function_instances[f]) begin
+            instance = function_instances[f];
+            if (dpu_service_key_name(instance.service_key) != dpu_service_key_name(records[r].service_key)) continue;
+            if (!$cast(backend, instance.driver_agent.ops.config_backend)) begin
+                why = "external backend missing";
+                rollback_external_preparation();
+                return;
+            end
+            void'(cfg.resolve_final_service_requirement(instance.service_key, requirement, why));
+            if (!backend.bind_queue(records[r].notification, instance.private_cfg,
+                    requirement.behavior.rx_buf_size, why) ||
+                !instance.transport.notify_mgr.register_external_queue(records[r].notification, why)) begin
+                rollback_external_preparation();
+                return;
+            end
+            program_value = virtio_empty_queue_program();
+            program_value.queue_id = records[r].notification.local_qid;
+            program_value.queue_size = records[r].queue_size;
+            program_value.vq_type = records[r].queue_type;
+            program_value.tx_mode = records[r].tx_mode;
+            program_value.msix_vector = records[r].qpair.local_msix_vector_id;
+            instance.driver_agent.ops.prepare_local_queue(program_value, step_ok);
+            if (!step_ok) begin
+                why = "local ring allocation/mapping failed before export";
+                rollback_external_preparation();
+                return;
+            end
+            vq = instance.vq_mgr.get_queue(program_value.queue_id);
+            records[r].desc_gpa = vq.desc_table_addr;
+            records[r].driver_gpa = vq.driver_ring_addr;
+            records[r].device_gpa = vq.device_ring_addr;
+            records[r].desc_iova = program_value.desc_iova;
+            records[r].driver_iova = program_value.driver_iova;
+            records[r].device_iova = program_value.device_iova;
+            records[r].ring_bytes = program_value.ring_bytes;
+            void'(instance.driver_agent.ops.get_local_ring_regions(program_value.queue_id,
+                records[r].region_gpas, records[r].region_bytes, records[r].region_iovas));
+        end
+    end
+    live_external_setup = new("external_setup", this, device_snapshot, resource_snapshot,
+                              external_generation, records);
+    external_confirmed.delete();
+    setup = live_external_setup;
+    ok = 1;
+endtask
+
+// 未交付失败只释放本环境/本代拥有的资源；导出后任何错误都不调用此路径。
+function void virtio_net_env::rollback_external_preparation();
+    virtio_external_config_backend	backend;
+    string	ignored;
+
+    if (live_external_setup != null) return;
+    foreach (function_instances[f]) begin
+        if (function_instances[f].driver_agent.ops.release_external_session(external_session_key, external_generation, ignored)) begin
+            function_instances[f].transport.notify_mgr.clear_external_notifications();
+            if ($cast(backend, function_instances[f].driver_agent.ops.config_backend)) backend.clear_bindings();
+        end
+    end
+endfunction
+
+// 所选 service 必须完整验证后才一起进入 READY；配置失败保留全部已导出资源。
+function bit virtio_net_env::confirm_external_configuration(
+    input vio_external_setup setup, input vio_config_scope scope,
+    input logic configured, output string why);
+    vio_queue_setup_t	records[$];
+    int unsigned	qids[$];
+    vio_service_requirement_t	requirement;
+    virtio_function_instance	instance;
+    iommu_mapping_t	mapping;
+
+    why = "";
+    if (configured !== 1'b1 || setup == null || setup != live_external_setup ||
+        !setup.belongs_to(this, device_snapshot, resource_snapshot, external_generation) ||
+        scope == null) begin
+        why = "external confirmation requires successful platform result and exact live setup/scope";
+        return 0;
+    end
+    if (!scope.validate(setup, why)) return 0;
+    setup.list_queues(records);
+    foreach (function_instances[f]) begin
+        instance = function_instances[f];
+        if (!scope.selects(instance.service_key)) continue;
+        qids.delete();
+        if (!instance.driver_agent.fsm.external_workers_stopped() ||
+            instance.resource_client == null || !instance.resource_client.is_bound_to_service()) begin
+            why = "cannot confirm while workers run or resource ownership is missing";
+            return 0;
+        end
+        foreach (records[r]) begin
+            if (dpu_service_key_name(records[r].service_key) != dpu_service_key_name(instance.service_key)) continue;
+            qids.push_back(records[r].notification.local_qid);
+            foreach (records[r].region_iovas[i]) begin
+                if (!iommu.get_live_mapping_for_host(instance.pcie_id.domain.host_id, instance.bdf,
+                    records[r].region_iovas[i], mapping) || mapping.gpa != records[r].region_gpas[i] ||
+                    mapping.size != records[r].region_bytes[i] || mapping.dir != DMA_BIDIRECTIONAL) begin
+                    why = "external ring DMA mapping changed since export";
+                    return 0;
+                end
+            end
+        end
+        if (!instance.driver_agent.ops.validate_external_session(external_session_key, external_generation, qids, why)) return 0;
+    end
+    foreach (function_instances[f]) begin
+        instance = function_instances[f];
+        if (!scope.selects(instance.service_key)) continue;
+        qids.delete();
+        foreach (records[r])
+            if (dpu_service_key_name(records[r].service_key) == dpu_service_key_name(instance.service_key))
+                qids.push_back(records[r].notification.local_qid);
+        void'(cfg.resolve_final_service_requirement(instance.service_key, requirement, why));
+        if (!instance.driver_agent.fsm.accept_external_configuration(external_session_key, external_generation,
+                qids, requirement.behavior, why)) return 0;
+        if (!instance.resource_client.mark_runtime_ready(why)) return 0;
+        foreach (qids[q]) instance.driver_agent.monitor.observe_queue_state(qids[q], 1, 1);
+        instance.state = VF_CONFIGURED;
+        external_confirmed[dpu_service_key_name(instance.service_key)] = 1;
+    end
+    return 1;
+endfunction
+
+// 严格区分 VIP stop 和 DUT stop；未知 quiescence、旧视图或运行中 worker 不可释放。
+function bit virtio_net_env::release_external_resources(
+    input vio_external_setup setup, input logic dut_quiesced, output string why);
+    virtio_external_config_backend	backend;
+
+    why = "";
+    if (dut_quiesced !== 1'b1 || setup == null || setup != live_external_setup ||
+        !setup.belongs_to(this, device_snapshot, resource_snapshot, external_generation)) begin
+        why = "release requires exact live setup and explicit DUT quiescence";
+        return 0;
+    end
+    foreach (function_instances[f]) begin
+        if (!function_instances[f].driver_agent.fsm.external_workers_stopped()) begin
+            why = "external workers must stop before releasing DMA";
+            return 0;
+        end
+    end
+    foreach (function_instances[f]) begin
+        if (!function_instances[f].driver_agent.ops.release_external_session(external_session_key, external_generation, why)) return 0;
+        function_instances[f].driver_agent.fsm.invalidate_external_configuration();
+        // 平台确认 quiescence 后，本代 monitor 信用也必须退休，不能污染下一代。
+        function_instances[f].driver_agent.monitor.reset_all_queue_state();
+        function_instances[f].resource_client.reset_runtime_state();
+        function_instances[f].state = VF_REINIT_REQUIRED;
+        function_instances[f].transport.notify_mgr.clear_external_notifications();
+        if ($cast(backend, function_instances[f].driver_agent.ops.config_backend)) backend.clear_bindings();
+    end
+    live_external_setup = null;
+    external_session_key = null;
+    external_confirmed.delete();
+    return 1;
+endfunction
+
+// 确认账本只承认当前环境交付的视图；释放后旧代查询立即为假。
+function bit virtio_net_env::external_service_confirmed(
+    input vio_external_setup setup, input dpu_service_key_t key);
+    return setup != null && setup == live_external_setup &&
+        external_confirmed.exists(dpu_service_key_name(key)) &&
+        external_confirmed[dpu_service_key_name(key)];
+endfunction
 
 `endif // VIRTIO_NET_ENV_SV

@@ -72,7 +72,7 @@ class virtio_atomic_ops extends uvm_object;
     // retired by every later ordinary device reset.
     protected normal_dma_record_t migration_restore_dma[$];
     protected bit [63:0]         ring_iovas[int unsigned][$];  // queue_id -> 每个 ring 区一个 IOVA
-    // 每个已编程队列的设备视角参数；拆除时原样交回后端，复位后清空。
+    // 已本地准备队列的设备视角参数；外部会话另有确认闸门，记录存在不等于设备可用。
     protected virtio_queue_program_t queue_programs[int unsigned];
     // control VQ 超时且设备未确认复位时隔离的缓冲（ctrl_send 的 dma_set 移入）。期间
     // ctrl_send 拒绝提交；只有 device_reset_verified 确认复位后才解除映射并释放。
@@ -93,6 +93,144 @@ class virtio_atomic_ops extends uvm_object;
     // 给调用方完整结果：attempted=1/pending=0 表示复位成功且全部 Function 队列已清空；
     // attempted=1/pending=1 表示复位失败并保留 DMA；attempted=0 表示窄范围回滚。
     protected bit          queue_rollback_function_reset_attempted;
+
+    // 外部会话的确认/回收权绑定来源对象与代号；未确认时 ops 自身拒绝提交和完成。
+    local uvm_object	external_owner;
+    local longint unsigned	external_generation;
+    local bit	external_active;
+    local vio_service_requirement_t	external_requirement;
+
+    // 是否由用户配置设备；协议查询避免运行路径重复类型转换。
+    function bit uses_external_configuration();
+        return (protocol != null) && protocol.is_external_configuration();
+    endfunction
+
+    // 建立尚未交付的本地会话；活动资源不允许覆盖，新代只能在释放后开始。
+    function bit begin_external_session(input uvm_object owner,
+        input longint unsigned generation, input vio_service_requirement_t requirement,
+        output string why);
+        why = "";
+        if (!uses_external_configuration() || owner == null || generation == 0 ||
+            external_owner != null || has_active_queues()) begin
+            why = "external session requires unused bound ops and a valid origin/generation";
+            return 0;
+        end
+        external_owner = owner;
+        external_generation = generation;
+        external_requirement = requirement;
+        external_active = 0;
+        negotiated_features = requirement.behavior.driver_features;
+        return 1;
+    endfunction
+
+    // 全量匹配本代实际队列与映射后才可确认；不接受只改 FSM_READY 的捷径。
+    function bit validate_external_session(input uvm_object owner,
+        input longint unsigned generation, input int unsigned qids[$], output string why);
+        bit	seen[int unsigned];
+        virtqueue_base	vq;
+        bit [63:0]	gpas[$];
+        int unsigned	sizes[$];
+        bit [63:0]	iovas[$];
+        iommu_mapping_t	mapping;
+
+        why = "";
+        if (owner == null || owner != external_owner || generation != external_generation ||
+            qids.size() != queue_programs.num()) begin
+            why = "external origin/generation or complete queue set mismatch";
+            return 0;
+        end
+        foreach (qids[i]) begin
+            if (seen.exists(qids[i]) || !queue_programs.exists(qids[i]) ||
+                !ring_iovas.exists(qids[i])) begin
+                why = "external queue mapping missing or duplicated";
+                return 0;
+            end
+            seen[qids[i]] = 1;
+            vq = vq_mgr.get_queue(qids[i]);
+            if (vq == null || vq.mem != mem || vq.iommu != iommu ||
+                vq.host_id != transport.iommu_host_id() || vq.bdf != transport.bdf ||
+                vq.queue_size != queue_programs[qids[i]].queue_size) begin
+                why = "external queue owner or geometry changed";
+                return 0;
+            end
+            if (!get_local_ring_regions(qids[i], gpas, sizes, iovas) ||
+                ring_iova_of(vq.desc_table_addr, gpas, sizes, iovas) != queue_programs[qids[i]].desc_iova ||
+                ring_iova_of(vq.driver_ring_addr, gpas, sizes, iovas) != queue_programs[qids[i]].driver_iova ||
+                ring_iova_of(vq.device_ring_addr, gpas, sizes, iovas) != queue_programs[qids[i]].device_iova) begin
+                why = "external queue addresses changed";
+                return 0;
+            end
+            foreach (iovas[r]) begin
+                if (!iommu.get_live_mapping_for_host(transport.iommu_host_id(), transport.bdf, iovas[r], mapping) ||
+                    mapping.gpa != gpas[r] || mapping.size != sizes[r] || mapping.dir != DMA_BIDIRECTIONAL) begin
+                    why = "external queue mapping no longer live";
+                    return 0;
+                end
+            end
+        end
+        return 1;
+    endfunction
+
+    // 已验证完整会话的激活入口；来源和队列再次匹配，防止准备后对象被替换。
+    function bit confirm_external_session(input uvm_object owner,
+        input longint unsigned generation, input int unsigned qids[$], output string why);
+        virtqueue_base	vq;
+
+        if (!validate_external_session(owner, generation, qids, why)) return 0;
+        foreach (qids[i]) begin
+            vq = vq_mgr.get_queue(qids[i]);
+            vq.state = VQ_ENABLED;
+            vq.queue_enable = 1;
+        end
+        external_active = 1;
+        return 1;
+    endfunction
+
+    // 环境已确认 workers 停止和 DUT quiesced 后回收；未交付失败也使用同一资源出口。
+    function bit release_external_session(input uvm_object owner,
+        input longint unsigned generation, output string why);
+        int unsigned	qids[$];
+
+        why = "";
+        if (owner == null || owner != external_owner || generation != external_generation) begin
+            why = "external release origin/generation mismatch";
+            return 0;
+        end
+        external_active = 0;
+        foreach (queue_programs[q]) qids.push_back(q);
+        foreach (qids[i]) release_local_queue(qids[i]);
+        external_owner = null;
+        external_generation = 0;
+        return 1;
+    endfunction
+
+    // FSM 和 MANUAL 共用就绪门禁；方向未启用或队列不属于本代则拒绝。
+    function bit external_queue_ready(input int unsigned qid);
+        return !uses_external_configuration() || (external_active &&
+            queue_programs.exists(qid) &&
+            (qid[0] ? external_requirement.tx_enable : external_requirement.rx_enable));
+    endfunction
+
+    // 外部完成机制固定；每队列独立消费 retained 中断许可，不存在 timeout 轮询兜底。
+    function bit completion_permitted(input int unsigned qid);
+        if (!external_queue_ready(qid)) return 0;
+        if (!uses_external_configuration() ||
+            external_requirement.completion_mode == VIRTIO_COMPLETION_POLLING) return 1;
+        return transport.notify_mgr.consume_external_pending(qid);
+    endfunction
+
+    // 公共运行策略只读查询，不将可变配置句柄传给后台 worker。
+    function bit external_direction_enabled(input bit tx);
+        return !uses_external_configuration() ||
+            (tx ? external_requirement.tx_enable : external_requirement.rx_enable);
+    endfunction
+
+    // 完成预算未耗尽时许可已消费；预算耗尽时保留下一轮 drain，直到 CQ 确认空。
+    function void retain_external_completion(input int unsigned qid);
+        if (uses_external_configuration() &&
+            external_requirement.completion_mode == VIRTIO_COMPLETION_MSIX)
+            transport.notify_mgr.retain_external_pending(qid);
+    endfunction
 
     // 构造 atomic ops：输入 name 仅用于 UVM 对象命名；初始化协商结果、control VQ
     // 身份以及队列恢复闸门，不访问 transport、Host memory 或设备，因此没有外部副作用。
@@ -193,7 +331,7 @@ class virtio_atomic_ops extends uvm_object;
         return config_backend;
     endfunction
 
-    // 只读导出已编程队列的设备视角参数（诊断/测试）；未建队返回 0 且输出空程序。
+    // 只读导出本地队列参数（诊断/测试）；准备后即可读取，但不能据此绕过确认。
     function bit get_queue_program(int unsigned queue_id,
                                    output virtio_queue_program_t q);
         q = virtio_empty_queue_program();
@@ -243,6 +381,7 @@ class virtio_atomic_ops extends uvm_object;
                                    virtio_pci_transport via = null);
         virtio_config_backend backend;
 
+        if (!external_queue_ready(qid)) return;
         void'(vq.process_error_injection(VQ_FAULT_PRE_NOTIFY));
         if (vq.prepare_notify()) begin
             if (via != null)

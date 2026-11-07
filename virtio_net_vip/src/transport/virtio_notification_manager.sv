@@ -34,6 +34,101 @@
 class virtio_notification_manager extends uvm_object;
     `uvm_object_utils(virtio_notification_manager)
 
+    // 外部接收表按本 Function 的真实消息匹配；每队列保留许可，共享向量不会互相吞消息。
+    local bit	external_mode;
+    local int unsigned	external_host;
+    local vio_external_queue_binding_t	external_bindings[int unsigned];
+    local longint unsigned	external_pending[int unsigned];
+
+    // 初始化本代接收表，必须早于项目使能 MSI-X；不写设备 mask/table。
+    function void begin_external_notifications(input int unsigned host_id);
+        external_mode = 1;
+        config_vector = 32'hffff_ffff;
+        queue_vectors = new[0];
+        external_host = host_id;
+        external_bindings.delete();
+        external_pending.delete();
+    endfunction
+
+    // 纯本地登记，向量身份与显式消息同源；拒绝一个消息被不同向量解释。
+    function bit register_external_queue(input vio_external_queue_binding_t binding,
+        output string why);
+        why = "";
+        if (!external_mode || external_bindings.exists(binding.local_qid)) begin
+            why = "external notification mode absent or queue duplicated";
+            return 0;
+        end
+        foreach (external_bindings[q]) begin
+            if (binding.msix_valid && external_bindings[q].msix_valid &&
+                binding.message_address == external_bindings[q].message_address &&
+                binding.message_data == external_bindings[q].message_data &&
+                binding.local_vector != external_bindings[q].local_vector) begin
+                why = "one MSI-X message cannot identify different local vectors";
+                return 0;
+            end
+        end
+        if (binding.local_qid >= queue_vectors.size()) begin
+            int unsigned	old_size;
+            old_size = queue_vectors.size();
+            queue_vectors = new[binding.local_qid + 1](queue_vectors);
+            for (int unsigned q = old_size; q < queue_vectors.size(); q++) queue_vectors[q] = 32'hffff;
+        end
+        queue_vectors[binding.local_qid] = binding.local_vector;
+        external_bindings[binding.local_qid] = binding;
+        external_pending[binding.local_qid] = 0;
+        return 1;
+    endfunction
+
+    // 只读匹配真实接收消息；外部不限制 APIC，也不从 data 位推算 vector。
+    function bit match_external_message(input int unsigned host_id,
+        input bit [63:0] address, input bit [31:0] data,
+        output int unsigned vector);
+        vector = 0;
+        if (!external_mode || host_id != external_host) return 0;
+        foreach (external_bindings[q]) begin
+            if (external_bindings[q].msix_valid &&
+                external_bindings[q].message_address == address &&
+                external_bindings[q].message_data == data) begin
+                vector = external_bindings[q].local_vector;
+                return 1;
+            end
+        end
+        return 0;
+    endfunction
+
+    // 被动识别外部 doorbell；BAR 地址和 qid 必须同时匹配，不借用 capability。
+    function bit match_external_notify(input bit [63:0] address,
+        input bit [31:0] data, input int unsigned width, output int unsigned qid);
+        qid = data[15:0];
+        if (!external_mode || bar == null || !external_bindings.exists(qid)) return 0;
+        return address == bar.bar_base[external_bindings[qid].notify_bar] +
+                          external_bindings[qid].notify_offset &&
+               width == ((external_bindings[qid].notify_encoding == VIO_NOTIFY_QID16) ? 2 : 4);
+    endfunction
+
+    // 每个消费者独立取一次许可；预算续读可 retain，不重新轮询无消息队列。
+    function bit consume_external_pending(input int unsigned qid);
+        if (!external_pending.exists(qid) || external_pending[qid] == 0) return 0;
+        external_pending[qid]--;
+        return 1;
+    endfunction
+
+    // 同一中断允许 drain 至 CQ 空；预算边界保留许可，保证大批完成不遗漏。
+    function void retain_external_pending(input int unsigned qid);
+        if (external_pending.exists(qid)) external_pending[qid]++;
+    endfunction
+
+    // 外部代次结束后撤销规则和早到消息；下一次准备必须显式重新登记。
+    function void clear_external_notifications();
+        external_bindings.delete();
+        external_pending.delete();
+    endfunction
+
+    // 供观察器选择严格匹配分支；释放后仍禁止回退标准 APIC 猜测。
+    function bit uses_external_notifications();
+        return external_mode;
+    endfunction
+
     // ===== Mode configuration =====
     interrupt_mode_e  irq_mode = IRQ_MSIX_PER_QUEUE;
     bit               event_idx_enable = 0;
@@ -339,6 +434,7 @@ class virtio_notification_manager extends uvm_object;
         bit [31:0] ctrl;
         bit [31:0] off;
 
+        if (external_mode) return;
         if ((bar == null) || (vector >= msix_mask.size()))
             return;
         off = msix_table_base + vector * 16 + 32'hC;
@@ -422,9 +518,18 @@ class virtio_notification_manager extends uvm_object;
     // 的顺序分类计数；不驱动任何总线行为。
     // ========================================================================
 
-    // MSI-X 中断入口：无效向量计 spurious、被屏蔽计 suppressed、config
-    // vector 转交 on_config_change_interrupt，其余只计数并打印。
+    // 外部接收已由 observer 匹配消息；共享向量向每条队列保留独立许可。
+    // 标准模式仍校验向量/mask，config vector 转交配置事件，不改变原有行为。
     virtual function void on_interrupt_received(int unsigned vector);
+        if (external_mode) begin
+            foreach (external_bindings[q]) begin
+                if (external_bindings[q].msix_valid &&
+                    external_bindings[q].local_vector == vector)
+                    external_pending[q]++;
+            end
+            total_interrupts++;
+            return;
+        end
         total_interrupts++;
 
         // Check if vector is valid

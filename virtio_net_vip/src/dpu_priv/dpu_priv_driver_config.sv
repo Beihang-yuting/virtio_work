@@ -9,17 +9,22 @@ class dpu_priv_queue_config extends uvm_object;
     `uvm_object_utils(dpu_priv_queue_config)
     int unsigned local_qid;
     int unsigned notify_bar = 0;
+    bit	notify_bar_present;
+    bit	notify_offset_present;
     bit [31:0] notify_offset = 0;
     bit [11:0] dport_info;
     bit [9:0] dport_id;
     bit [2:0] dport_type, cpu_tx_cos;
     bit rss_lag, l3_cs, l4_cs;
+    bit	i_l3_cs;
+    bit	i_l4_cs;
     bit [1:0] fwd = 1;
 
     // 参数归属：vio.private.* 默认控制字段或其 q<qid> 子路径覆盖。
     // 先用 64 位数值检查位宽，避免负数/高位被窄字段静默截断；不持有运行态 ring。
     function void	load_params(string	path = "vio.private", bit	load_local_qid = 1);
 `ifdef AIP_CMDLINE_SV
+        bit	present;
         longint unsigned	local_qid;
         longint unsigned	notify_bar;
         longint unsigned	notify_offset;
@@ -30,7 +35,13 @@ class dpu_priv_queue_config extends uvm_object;
         longint unsigned	rss_lag;
         longint unsigned	l3_cs;
         longint unsigned	l4_cs;
+        longint unsigned	i_l3_cs;
+        longint unsigned	i_l4_cs;
         longint unsigned	fwd;
+        `DPU_AIP_PRESENT(path, "notify_bar", present)
+        notify_bar_present |= present;
+        `DPU_AIP_PRESENT(path, "notify_offset", present)
+        notify_offset_present |= present;
         local_qid = this.local_qid;
         if (load_local_qid) begin
             `DPU_AIP_UINT(path, longint unsigned, local_qid, this.local_qid);
@@ -44,6 +55,8 @@ class dpu_priv_queue_config extends uvm_object;
         `DPU_AIP_UINT(path, longint unsigned, rss_lag, this.rss_lag);
         `DPU_AIP_UINT(path, longint unsigned, l3_cs, this.l3_cs);
         `DPU_AIP_UINT(path, longint unsigned, l4_cs, this.l4_cs);
+        `DPU_AIP_UINT(path, longint unsigned, i_l3_cs, this.i_l3_cs);
+        `DPU_AIP_UINT(path, longint unsigned, i_l4_cs, this.i_l4_cs);
         `DPU_AIP_UINT(path, longint unsigned, fwd, this.fwd);
         if (local_qid > 255) begin
             `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".local_qid 超出字段范围"})
@@ -85,6 +98,14 @@ class dpu_priv_queue_config extends uvm_object;
             `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".l4_cs 超出字段范围"})
             return;
         end
+        if (i_l3_cs > 1) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".i_l3_cs 超出字段范围"})
+            return;
+        end
+        if (i_l4_cs > 1) begin
+            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".i_l4_cs 超出字段范围"})
+            return;
+        end
         if (fwd > 3) begin
             `uvm_fatal("VIO_PRIVATE_PARAM", {path, ".fwd 超出字段范围"})
             return;
@@ -103,6 +124,8 @@ class dpu_priv_queue_config extends uvm_object;
         this.rss_lag = rss_lag;
         this.l3_cs = l3_cs;
         this.l4_cs = l4_cs;
+        this.i_l3_cs = i_l3_cs;
+        this.i_l4_cs = i_l4_cs;
         this.fwd = fwd;
 `endif
     endfunction
@@ -176,6 +199,8 @@ class dpu_priv_driver_config extends uvm_object;
         result = new($sformatf("private_queue_%0d_cfg", qid));
         result.local_qid = queues.exists(qid) ? source_cfg.local_qid :
                                                local_qid_base + qid;
+        result.notify_bar_present = source_cfg.notify_bar_present;
+        result.notify_offset_present = source_cfg.notify_offset_present;
         result.notify_bar = source_cfg.notify_bar;
         result.notify_offset = source_cfg.notify_offset;
         result.dport_info = source_cfg.dport_info;
@@ -185,6 +210,8 @@ class dpu_priv_driver_config extends uvm_object;
         result.rss_lag = source_cfg.rss_lag;
         result.l3_cs = source_cfg.l3_cs;
         result.l4_cs = source_cfg.l4_cs;
+        result.i_l3_cs = source_cfg.i_l3_cs;
+        result.i_l4_cs = source_cfg.i_l4_cs;
         result.fwd = source_cfg.fwd;
         return result;
     endfunction

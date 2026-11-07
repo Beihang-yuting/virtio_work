@@ -20,6 +20,11 @@ virtual class virtio_driver_protocol extends uvm_object;
         super.new(name);
     endfunction
 
+    // 外部协议覆盖本能力；标准/旧私有路径保持原生命周期。
+    virtual function bit is_external_configuration();
+        return 0;
+    endfunction
+
     // 协议名，供日志与测试。
     pure virtual function string protocol_name();
     // MANUAL 事务是否可直接读写标准 virtio status 寄存器。

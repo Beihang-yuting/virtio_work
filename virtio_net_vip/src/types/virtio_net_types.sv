@@ -396,6 +396,114 @@ typedef struct {
     bit bw_limit_enable; int unsigned bw_limit_mbps; driver_mode_e mode;
 } virtio_driver_config_t;
 
+// 外部配置仅保存值；平台表地址与硬件布局不进入通用 VIO 类型。
+typedef enum logic [1:0] {
+    VIO_NOTIFY_QID16, VIO_NOTIFY_DATA32, VIO_NOTIFY_DPU32
+} vio_notify_encoding_e;
+
+typedef struct {
+    logic	enabled;
+    logic	tx_enable;
+    logic	rx_enable;
+    virtio_completion_mode_e	completion_mode;
+    vio_notify_encoding_e	notify_encoding;
+    logic	notify_layout_valid;
+    logic [31:0]	notify_bar;
+    logic [63:0]	notify_base;
+    logic [63:0]	notify_stride;
+    virtio_driver_config_t	behavior;
+} vio_service_requirement_t;
+
+// 准备时交付的逐队列通知/消息绑定；身份和向量必须与 DPU 冻结绑定一致。
+typedef struct {
+    dpu_service_key_t	service_key;
+    logic [31:0]	local_qid;
+    logic [31:0]	notify_bar;
+    logic [63:0]	notify_offset;
+    vio_notify_encoding_e	notify_encoding;
+    logic	msix_valid;
+    logic [31:0]	local_vector;
+    logic [31:0]	global_vector;
+    logic [63:0]	message_address;
+    logic [31:0]	message_data;
+    logic	masked;
+} vio_external_queue_binding_t;
+
+// 冻结的普通 Custom TX 控制值；这是逻辑字段集合，不是完整 descriptor 线格式。
+typedef struct packed {
+    bit [11:0]	dport_info;
+    bit [9:0]	dport_id;
+    bit [2:0]	dport_type;
+    bit [2:0]	cpu_tx_cos;
+    bit	rss_lag;
+    bit	l3_cs;
+    bit	l4_cs;
+    bit	i_l3_cs;
+    bit	i_l4_cs;
+    bit [1:0]	fwd;
+} vio_private_tx_control_t;
+
+// ring 记录来自真实分配/映射；每一项是值副本，不授予 DMA 资源所有权。
+typedef struct {
+    dpu_service_key_t	service_key;
+    dpu_pcie_function_id_t	pcie_id;
+    dpu_vio_qpair_binding_t	qpair;
+    vio_service_requirement_t	requirement;
+    vio_private_tx_control_t	private_tx_control;
+    int unsigned	allocated_qpairs;
+    bit [63:0]	notify_bar_base;
+    bit [63:0]	notify_bar_size;
+    bit [63:0]	notify_address;
+    vio_external_queue_binding_t	notification;
+    virtqueue_type_e	queue_type;
+    virtio_completion_mode_e	completion_mode;
+    logic	tx_mode;
+    int unsigned	queue_size;
+    int unsigned	usable_descriptors;
+    bit [63:0]	desc_gpa;
+    bit [63:0]	driver_gpa;
+    bit [63:0]	device_gpa;
+    bit [63:0]	desc_iova;
+    bit [63:0]	driver_iova;
+    bit [63:0]	device_iova;
+    int unsigned	ring_bytes;
+    int unsigned	ring_valid_bytes;
+    int unsigned	desc_bytes;
+    int unsigned	driver_bytes;
+    int unsigned	device_bytes;
+    int unsigned	cq_bytes;
+    bit [15:0]	initial_tx_cq;
+    bit [63:0]	region_gpas[$];
+    bit [63:0]	region_iovas[$];
+    int unsigned	region_bytes[$];
+    int unsigned	initial_index;
+    bit	initial_wrap;
+} vio_queue_setup_t;
+
+// 当前 prj1_v2 驱动 txrx.h 的完整 RX CQ；声明顺序为 DW3..DW0 高位到低位。
+typedef struct packed {
+    logic [3:0]	reserved_dw3;
+    logic [11:0]	vsid;
+    logic [15:0]	offload_ovlan;
+    logic [15:0]	hash_value;
+    logic [3:0]	reserved_dw2;
+    logic [11:0]	timestamp_index;
+    logic	cq_wrapper;
+    logic	tnl_pkt_flag;
+    logic [13:0]	pkt_len;
+    logic [7:0]	pkt_head_split_len;
+    logic [1:0]	csum_check_status;
+    logic	reserved_dw1;
+    logic [4:0]	pkt_num;
+    logic [3:0]	desc_num;
+    logic [3:0]	profile;
+    logic [7:0]	ptype;
+    logic [1:0]	vlan_tpid_type;
+    logic	offload_vlan_vld;
+    logic [9:0]	sport_id;
+    logic [2:0]	sport_type;
+} dpu_priv_rx_cq_t;
+
 typedef struct {
     realtime desc_fill_time, kick_time, device_start_time, device_done_time;
     realtime interrupt_time, poll_time, complete_time;

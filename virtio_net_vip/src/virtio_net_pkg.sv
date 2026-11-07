@@ -80,6 +80,7 @@ package virtio_net_pkg;
   `include "dpu_priv/dpu_priv_driver_config.sv"
   `include "transport/virtio_config_backend.sv"
   `include "dpu_priv/dpu_priv_config_backend.sv"
+  `include "transport/virtio_external_config_backend.sv"
 
   // ---------------------------------------------------------------------------
   // 第 5 层 – 事务与驱动 agent（types/、agent/）
@@ -122,6 +123,7 @@ package virtio_net_pkg;
   `include "dataplane/virtio_net_dataplane.sv"
   // 私有驱动协议安装 dataplane 引擎参数，须在 dataplane 之后编译。
   `include "dpu_priv/dpu_priv_driver_protocol.sv"
+  `include "agent/virtio_external_driver_protocol.sv"
 
   // ---------------------------------------------------------------------------
   // 第 7 层 – SR-IOV PF/VF 编排（sriov/）
@@ -142,6 +144,7 @@ package virtio_net_pkg;
   `include "env/virtio_perf_monitor.sv"
   `include "env/virtio_concurrency_controller.sv"
   `include "env/virtio_dynamic_reconfig.sv"
+  `include "env/vio_external_setup.sv"
   `include "env/virtio_net_env.sv"
 
 endpackage : virtio_net_pkg

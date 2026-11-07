@@ -46,6 +46,7 @@ class virtio_function_instance extends uvm_component;
     virtio_driver_config_t drv_cfg;
     // 非空时该 Function 使用 DPU 私有队列协议，其他 Function 仍可用标准 Virtio。
     dpu_priv_driver_config private_cfg;
+    bit	external_configuration;
     local virtio_auto_fsm  pending_pcie_fsm;
     local virtio_atomic_ops pending_pcie_ops;
     local bit              pcie_bind_prepared;
@@ -76,7 +77,9 @@ class virtio_function_instance extends uvm_component;
     );
         dpu_priv_driver_protocol private_protocol;
 
-        if (private_cfg != null) begin
+        if (external_configuration) begin
+            pending_protocol = virtio_external_driver_protocol::type_id::create({label, "_protocol"});
+        end else if (private_cfg != null) begin
             private_protocol = dpu_priv_driver_protocol::type_id::create(
                 {label, "_protocol"});
             private_protocol.private_cfg = private_cfg;
@@ -363,6 +366,8 @@ class virtio_function_instance extends uvm_component;
     local function virtio_config_backend select_config_backend(string label);
         dpu_priv_driver_protocol private_protocol;
 
+        if (pending_protocol != null && pending_protocol.is_external_configuration())
+            return virtio_external_config_backend::type_id::create({label, "_cfg_backend"});
         if ($cast(private_protocol, pending_protocol) && (private_protocol != null))
             return dpu_priv_config_backend::type_id::create({label, "_cfg_backend"});
         return virtio_common_cfg_backend::type_id::create({label, "_cfg_backend"});

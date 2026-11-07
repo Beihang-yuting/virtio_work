@@ -1,6 +1,154 @@
     // 本文件是 virtio_atomic_ops 类体的一部分（队列建立与拆除），只由
     // agent/virtio_atomic_ops.sv 在类定义内部 `include；不得单独编译或在类外包含。
 
+    // 本地分配和映射共享入口，不查询设备、不编程、不置 ENABLE。
+    // qprog 携带明确深度和方向；失败仅回收本次未交付资源，成功由 ops 持有。
+    virtual task prepare_local_queue(ref virtio_queue_program_t qprog, output bit ok);
+        virtqueue_base	vq;
+        virtio_config_backend	backend;
+        int unsigned	queue_id;
+        int unsigned	queue_size;
+        virtqueue_type_e	vq_type;
+        bit [63:0]	region_gpas[$];
+        int unsigned	region_sizes[$];
+        bit [63:0]	region_iovas[$];
+        int unsigned	ring_bytes;
+        bit	map_failed;
+        bit [63:0]	desc_iova;
+        bit [63:0]	avail_iova;
+        bit [63:0]	used_iova;
+
+        ok = 0;
+        if (uses_external_configuration() && (external_owner == null || external_active)) return;
+        queue_id = qprog.queue_id;
+        queue_size = qprog.queue_size;
+        vq_type = qprog.vq_type;
+        if (transport == null || vq_mgr == null || mem == null || iommu == null ||
+            !transport.pcie_id_valid || vq_mgr.has_queue(queue_id) ||
+            queue_size == 0 || queue_size > 32768 ||
+            (vq_type == VQ_CUSTOM && (queue_size < 2 || queue_size > 4096 ||
+             ((queue_size & (queue_size-1)) != 0)))) return;
+        // 4. Create queue via manager
+        vq = vq_mgr.create_queue(queue_id, queue_size, vq_type);
+        if (vq == null) begin
+            `uvm_error("ATOMIC_OPS",
+                $sformatf("setup_queue: failed to create queue %0d", queue_id))
+            return;
+        end
+
+        // ring DMA 的 host 域必须是 transport 冻结 identity 的 host；vq_mgr.host_id
+        // 接线错误时拒绝建队，不得静默按另一个 host（例如 host0）做 ring DMA。
+        if (transport.pcie_id_valid && (vq.host_id != transport.iommu_host_id())) begin
+            vq_mgr.destroy_queue(queue_id);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: queue_id=%0d vq host_id=%0d does not match transport DMA host %0d",
+                queue_id, vq.host_id, transport.iommu_host_id()))
+            return;
+        end
+
+        // 4b. 编程参数基本字段；后端可按其队列参数表配置队列对象并补全参数
+        // （私有：方向、本地号、RX 容量、doorbell）。拒绝时设备未被访问。
+        backend = cfg_backend();
+        qprog.host_id = get_iommu_host_id(transport);
+        qprog.bdf = transport.bdf;
+        if (!backend.prepare_queue(vq, qprog)) begin
+            vq_mgr.destroy_queue(queue_id);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: config backend rejected queue_id=%0d", queue_id))
+            return;
+        end
+
+        // 5. Allocate ring memory
+        vq.alloc_rings();
+
+        // 6-7. 按队列格式声明的 ring 区逐区映射（split 三区、packed 描述符环加两份
+        // 4B event 结构、私有环整块 desc+CQ）。全部映射后统一判定，失败撤销已成功的
+        // 映射并销毁队列；未分配出 ring（空区表）按映射失败处理。
+        vq.get_ring_regions(region_gpas, region_sizes);
+        map_failed = (region_gpas.size() == 0);
+        foreach (region_gpas[i]) begin
+            region_iovas.push_back(iommu.map_for_host(get_iommu_host_id(transport),
+                transport.bdf, region_gpas[i], region_sizes[i], DMA_BIDIRECTIONAL));
+            if ((region_iovas[i] == '1) || (region_iovas[i] == 0))
+                map_failed = 1;
+        end
+        if (map_failed) begin
+            foreach (region_iovas[i])
+                if ((region_iovas[i] != '1) && (region_iovas[i] != 0))
+                    iommu.unmap_for_host(get_iommu_host_id(transport),
+                                         transport.bdf, region_iovas[i]);
+            vq_mgr.destroy_queue(queue_id);
+            `uvm_error("ATOMIC_OPS", $sformatf(
+                "setup_queue: failed to map queue_id=%0d rings", queue_id))
+            return;
+        end
+
+        // Track ring IOVAs for cleanup；三个设备视角地址按区内偏移换算。
+        ring_iovas[queue_id] = region_iovas;
+        desc_iova  = ring_iova_of(vq.desc_table_addr, region_gpas, region_sizes, region_iovas);
+        avail_iova = ring_iova_of(vq.driver_ring_addr, region_gpas, region_sizes, region_iovas);
+        used_iova  = ring_iova_of(vq.device_ring_addr, region_gpas, region_sizes, region_iovas);
+        ring_bytes = 0;
+        foreach (region_sizes[i])
+            ring_bytes += region_sizes[i];
+
+
+        qprog.desc_iova = desc_iova;
+        qprog.driver_iova = avail_iova;
+        qprog.device_iova = used_iova;
+        qprog.ring_bytes = ring_bytes;
+        queue_programs[queue_id] = qprog;
+        ok = 1;
+    endtask
+
+    // 只读导出实际 ring 区表；未持有该队列时返回 0，不制造 identity IOVA。
+    function bit get_local_ring_regions(input int unsigned qid,
+        output bit [63:0] gpas[$], output int unsigned sizes[$],
+        output bit [63:0] iovas[$]);
+        virtqueue_base	vq;
+
+        gpas.delete();
+        sizes.delete();
+        iovas.delete();
+        if (!queue_programs.exists(qid) || !ring_iovas.exists(qid)) return 0;
+        vq = vq_mgr.get_queue(qid);
+        if (vq == null) return 0;
+        vq.get_ring_regions(gpas, sizes);
+        iovas = ring_iovas[qid];
+        return gpas.size() == iovas.size();
+    endfunction
+
+    // 已证明设备停 DMA 或从未交付的本地资源回收；调用方负责生命周期验证。
+    // 不执行设备 reset/disable，避免外部协议误进 AF/common-config。
+    protected function void release_local_queue(input int unsigned queue_id);
+        virtqueue_base	vq;
+        uvm_object	tokens[$];
+
+        vq = vq_mgr.get_queue(queue_id);
+        if (vq != null) begin
+            vq.queue_enable = 0;
+            vq.state = VQ_RESET;
+            vq.detach_all_unused(tokens);
+        end
+        if (ring_iovas.exists(queue_id)) begin
+            foreach (ring_iovas[queue_id][i])
+                iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
+                                     ring_iovas[queue_id][i]);
+            ring_iovas.delete(queue_id);
+        end
+        if (tx_dma_map.exists(queue_id)) begin
+            retire_normal_dma_records(tx_dma_map[queue_id]);
+            tx_dma_map.delete(queue_id);
+        end
+        if (rx_dma_map.exists(queue_id)) begin
+            retire_normal_dma_records(rx_dma_map[queue_id]);
+            rx_dma_map.delete(queue_id);
+        end
+        vq_mgr.destroy_queue(queue_id);
+        queue_programs.delete(queue_id);
+    endfunction
+
+
     // ========================================================================
     // Queue Management
     // ========================================================================
@@ -92,74 +240,20 @@
             return;
         end
 
-        // 4. Create queue via manager
-        vq = vq_mgr.create_queue(queue_id, eff_size, vq_type);
-        if (vq == null) begin
-            `uvm_error("ATOMIC_OPS",
-                $sformatf("setup_queue: failed to create queue %0d", queue_id))
-            return;
-        end
-
-        // ring DMA 的 host 域必须是 transport 冻结 identity 的 host；vq_mgr.host_id
-        // 接线错误时拒绝建队，不得静默按另一个 host（例如 host0）做 ring DMA。
-        if (transport.pcie_id_valid && (vq.host_id != transport.iommu_host_id())) begin
-            vq_mgr.destroy_queue(queue_id);
-            `uvm_error("ATOMIC_OPS", $sformatf(
-                "setup_queue: queue_id=%0d vq host_id=%0d does not match transport DMA host %0d",
-                queue_id, vq.host_id, transport.iommu_host_id()))
-            return;
-        end
-
-        // 4b. 编程参数基本字段；后端可按其队列参数表配置队列对象并补全参数
-        // （私有：方向、本地号、RX 容量、doorbell）。拒绝时设备未被访问。
         qprog = virtio_empty_queue_program();
-        qprog.host_id    = get_iommu_host_id(transport);
-        qprog.bdf        = transport.bdf;
-        qprog.queue_id   = queue_id;
+        qprog.queue_id = queue_id;
         qprog.queue_size = eff_size;
-        qprog.vq_type    = vq_type;
-        qprog.local_qid  = queue_id;
-        qprog.tx_mode    = queue_id[0];
-        if (!backend.prepare_queue(vq, qprog)) begin
-            vq_mgr.destroy_queue(queue_id);
-            `uvm_error("ATOMIC_OPS", $sformatf(
-                "setup_queue: config backend rejected queue_id=%0d", queue_id))
-            return;
-        end
-
-        // 5. Allocate ring memory
-        vq.alloc_rings();
-
-        // 6-7. 按队列格式声明的 ring 区逐区映射（split 三区、packed 描述符环加两份
-        // 4B event 结构、私有环整块 desc+CQ）。全部映射后统一判定，失败撤销已成功的
-        // 映射并销毁队列；未分配出 ring（空区表）按映射失败处理。
-        vq.get_ring_regions(region_gpas, region_sizes);
-        map_failed = (region_gpas.size() == 0);
-        foreach (region_gpas[i]) begin
-            region_iovas.push_back(iommu.map_for_host(get_iommu_host_id(transport),
-                transport.bdf, region_gpas[i], region_sizes[i], DMA_BIDIRECTIONAL));
-            if ((region_iovas[i] == '1) || (region_iovas[i] == 0))
-                map_failed = 1;
-        end
-        if (map_failed) begin
-            foreach (region_iovas[i])
-                if ((region_iovas[i] != '1) && (region_iovas[i] != 0))
-                    iommu.unmap_for_host(get_iommu_host_id(transport),
-                                         transport.bdf, region_iovas[i]);
-            vq_mgr.destroy_queue(queue_id);
-            `uvm_error("ATOMIC_OPS", $sformatf(
-                "setup_queue: failed to map queue_id=%0d rings", queue_id))
-            return;
-        end
-
-        // Track ring IOVAs for cleanup；三个设备视角地址按区内偏移换算。
-        ring_iovas[queue_id] = region_iovas;
-        desc_iova  = ring_iova_of(vq.desc_table_addr, region_gpas, region_sizes, region_iovas);
-        avail_iova = ring_iova_of(vq.driver_ring_addr, region_gpas, region_sizes, region_iovas);
-        used_iova  = ring_iova_of(vq.device_ring_addr, region_gpas, region_sizes, region_iovas);
-        ring_bytes = 0;
-        foreach (region_sizes[i])
-            ring_bytes += region_sizes[i];
+        qprog.vq_type = vq_type;
+        qprog.local_qid = queue_id;
+        qprog.tx_mode = queue_id[0];
+        prepare_local_queue(qprog, configured);
+        if (!configured) return;
+        vq = vq_mgr.get_queue(queue_id);
+        region_iovas = ring_iovas[queue_id];
+        desc_iova = qprog.desc_iova;
+        avail_iova = qprog.driver_iova;
+        used_iova = qprog.device_iova;
+        ring_bytes = qprog.ring_bytes;
 
         // 8. 本队列的 MSI-X 向量：初始化已分配的直接取用；之后新建的队列（MQ 扩容）
         // 现分配一个不占用其他队列的向量。configure_queue 在 queue_enable 之前写入并回读。
@@ -169,6 +263,7 @@
                 iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
                                      region_iovas[i]);
             ring_iovas.delete(queue_id);
+            queue_programs.delete(queue_id);
             vq_mgr.destroy_queue(queue_id);
             `uvm_error("ATOMIC_OPS", $sformatf(
                 "setup_queue: no free MSI-X vector for queue_id=%0d", queue_id))
@@ -190,6 +285,7 @@
                 iommu.unmap_for_host(get_iommu_host_id(transport), transport.bdf,
                                      region_iovas[i]);
             ring_iovas.delete(queue_id);
+            queue_programs.delete(queue_id);
             vq_mgr.destroy_queue(queue_id);
             `uvm_error("ATOMIC_OPS", $sformatf(
                 "setup_queue: config backend rejected queue_id=%0d", queue_id))
@@ -240,39 +336,9 @@
             return;
         end
 
-        // 2. Detach all unused buffers
-        vq = vq_mgr.get_queue(queue_id);
-        if (vq != null)
-            vq.detach_all_unused(tokens);
-
-        // 3. Unmap ring IOVAs
-        if (ring_iovas.exists(queue_id)) begin
-            foreach (ring_iovas[queue_id][i]) begin
-                iommu.unmap_for_host(get_iommu_host_id(transport),
-                                     transport.bdf, ring_iovas[queue_id][i]);
-            end
-            ring_iovas.delete(queue_id);
-        end
-
-        // 4. Retire every still-owned normal data-DMA pair before forgetting
-        // the queue.  Completion paths pop the same records first, so this
-        // only releases buffers that remain pending at teardown.
-        if (tx_dma_map.exists(queue_id)) begin
-            retire_normal_dma_records(tx_dma_map[queue_id]);
-            tx_dma_map.delete(queue_id);
-        end
-        if (rx_dma_map.exists(queue_id)) begin
-            retire_normal_dma_records(rx_dma_map[queue_id]);
-            rx_dma_map.delete(queue_id);
-        end
-
-        // 5. Destroy queue
-        vq_mgr.destroy_queue(queue_id);
-        queue_programs.delete(queue_id);
-
-        `uvm_info("ATOMIC_OPS",
-            $sformatf("teardown_queue: queue_id=%0d complete, detached %0d tokens",
-                      queue_id, tokens.size()), UVM_MEDIUM)
+        // 设备已经确认停 DMA，标准与外部路径共用同一 Host 资源退休实现。
+        release_local_queue(queue_id);
+        `uvm_info("ATOMIC_OPS", $sformatf("teardown_queue: queue_id=%0d complete", queue_id), UVM_MEDIUM)
     endtask
 
     // teardown_queue -- 兼容 MANUAL/既有调用方的无返回值入口

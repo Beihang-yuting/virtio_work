@@ -79,6 +79,34 @@ class virtio_auto_fsm extends uvm_report_object;
         migration = virtio_migration_engine::type_id::create({name, "_migration"});
     endfunction
 
+    // 环境已冻结本代完整队列集合；确认成功后设置所有运行状态，而非只写 READY。
+    function bit accept_external_configuration(input uvm_object origin,
+        input longint unsigned generation, input int unsigned qids[$],
+        input virtio_driver_config_t behavior, output string why);
+        if (!external_workers_stopped() || ops == null ||
+            !ops.confirm_external_session(origin, generation, qids, why)) return 0;
+        drv_cfg = behavior;
+        active_num_pairs = behavior.num_queue_pairs;
+        num_total_queues = qids.size();
+        mq_pairs_committed = 1;
+        state = FSM_READY;
+        return 1;
+    endfunction
+
+    // 释放前必须所有后台 worker 已应答；state 数值本身不能证明安全停止。
+    function bit external_workers_stopped();
+        return !dataplane_running &&
+            dataplane_workers_completed == dataplane_workers_expected;
+    endfunction
+
+    // 资源释放后撤销 READY/MQ 承诺，旧 start 请求不能复活已失效的队列。
+    function void invalidate_external_configuration();
+        mq_pairs_committed = 0;
+        active_num_pairs = 0;
+        num_total_queues = 0;
+        state = FSM_REINIT_REQUIRED;
+    endfunction
+
     // 取本 function 在 IOMMU 视角下的 host id（经 transport 转发）；
     // ops/transport 尚未接入属于接线错误，直接 fatal，不默认 host0。
     protected function int unsigned iommu_host_id();
@@ -226,6 +254,10 @@ class virtio_auto_fsm extends uvm_report_object;
     endfunction
 
     task full_init();
+        if (ops != null && ops.uses_external_configuration()) begin
+            `uvm_error("VIO_EXTERNAL", "full_init is unavailable; use prepare/confirm external configuration")
+            return;
+        end
         if ($isunknown(drv_cfg.num_queue_pairs) ||
             (drv_cfg.num_queue_pairs == 0) ||
             (drv_cfg.num_queue_pairs > max_vio_net_qpairs_per_device)) begin
@@ -388,7 +420,8 @@ class virtio_auto_fsm extends uvm_report_object;
         // Pre-fill RX buffers for all receive queues (even-numbered queues)
         for (int unsigned i = 0; i < active_num_pairs; i++) begin
             int unsigned rx_qid = i * 2;
-            ops.rx_refill(rx_qid, drv_cfg.queue_size);
+            if (ops.external_direction_enabled(0))
+                ops.rx_refill(rx_qid, drv_cfg.queue_size);
         end
 
         // Fork all background tasks in a named block
@@ -397,7 +430,8 @@ class virtio_auto_fsm extends uvm_report_object;
                 for (int unsigned i = 0; i < active_num_pairs; i++) begin
                     automatic int unsigned rx_qid = i * 2;
                     fork
-                        rx_refill_loop(rx_qid, run_epoch);
+                        if (ops.external_direction_enabled(0))
+                            rx_refill_loop(rx_qid, run_epoch);
                     join_none
                 end
                 wait fork;
@@ -408,7 +442,8 @@ class virtio_auto_fsm extends uvm_report_object;
                 for (int unsigned i = 0; i < active_num_pairs; i++) begin
                     automatic int unsigned tx_qid = i * 2 + 1;
                     fork
-                        tx_complete_loop(tx_qid, run_epoch);
+                        if (ops.external_direction_enabled(1))
+                            tx_complete_loop(tx_qid, run_epoch);
                     join_none
                 end
                 wait fork;
@@ -416,19 +451,21 @@ class virtio_auto_fsm extends uvm_report_object;
             end
 
             begin
-                interrupt_handler_loop(run_epoch);
+                if (!ops.uses_external_configuration())
+                    interrupt_handler_loop(run_epoch);
                 complete_dataplane_worker(run_epoch);
             end
 
             begin : adaptive_irq_check
-                if (drv_cfg.irq_mode == IRQ_POLLING) begin
+                if (!ops.uses_external_configuration() && drv_cfg.irq_mode == IRQ_POLLING) begin
                     adaptive_irq_loop(run_epoch);
                 end
                 complete_dataplane_worker(run_epoch);
             end
 
             begin
-                config_change_handler(run_epoch);
+                if (!ops.uses_external_configuration())
+                    config_change_handler(run_epoch);
                 complete_dataplane_worker(run_epoch);
             end
         join_none

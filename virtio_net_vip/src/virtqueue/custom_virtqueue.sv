@@ -1,6 +1,6 @@
 // custom_virtqueue：实现 DPU 私有 ring 格式（16B 描述符 + 完成队列 CQ）。
 // 目录层次：virtio_net_vip/src/virtqueue；由 virtio_net_pkg 在 packed_virtqueue 之后、
-// virtqueue_manager 之前纳入。职责：icpu-kernel-driver DPU_RING_T_PRIV 的 16B TX/RX
+// virtqueue_manager 之前纳入。职责：prj1_v2 DPU_RING_T_PRIV（旧独立模型仍使用 legacy CQ metadata） 的 16B TX/RX
 // 描述符、完成队列（CQ）与通知游标，作为与 split/packed 平级的队列格式（VQ_CUSTOM）。
 // 依赖 virtqueue_base、host_mem_manager 与驱动 txrx.h、txrx.c 的小端位域布局。
 // 所有权：本队列独占连续 desc+CQ 分配，free_rings 归还；SG 地址、token、数据 DMA
@@ -18,6 +18,8 @@ class custom_virtqueue extends virtqueue_base;
     // 驱动 dpu_ring.local_qid 是 u8：RX 通常为 2*qpair，TX 为 2*qpair+1。
     // 此值属于 PF/VF 本地队列空间，不能由全局 queue_id 推断。
     bit          tx_mode;
+    // 旧独立 icpu 模型保留 desc_num=1 合同；外部 prj1_v2 使用完整 metadata。
+    bit	legacy_rx_cq = 1;
     int unsigned local_qid;
 
     // TX 首个 data desc 的路由和校验控制；后续 SG 描述符只携带数据字段。
@@ -28,6 +30,8 @@ class custom_virtqueue extends virtqueue_base;
     bit [2:0]  cpu_tx_cos;
     bit        l3_cs;
     bit        l4_cs;
+    bit	i_l3_cs;
+    bit	i_l4_cs;
     bit [1:0]  fwd;
 
     // 驱动按页对齐分配，CQ 紧随 N 个 16B 描述符。
@@ -165,37 +169,36 @@ class custom_virtqueue extends virtqueue_base;
     endfunction
 
 
-    // 解码一条 RX CQ 前两个 dword，供集成测试与设备黄金字节交叉验证。
-    // W0[31:28]=desc_num；W1[15:0]=head_idx、[29:16]=pkt_len、[31]=wrapper。
-    // 驱动实际按包长顺序消费 RX buffer，head_idx/desc_num 不参与它的取包路径；
-    // 当前实现仍检查 desc_num=1，避免把不支持的多 buffer 包错误交给上层。
-    // 非 RX、未分配或下标越界返回 0，不读内存；成功返回 1 并填全部输出。
-    function bit decode_rx_cq(int unsigned index,
+    // 读取当前驱动的完整 16B CQ；低16位是 metadata，绝不是 buffer 索引。
+    // 非 RX 或越界返回 0；查询不消费 CQ 或释放 DMA。
+    function bit query_rx_cq(input int unsigned index, output dpu_priv_rx_cq_t cq);
+        byte	data[];
+
+        cq = '0;
+        if (!ring_allocated || allocated_tx_mode || index >= allocated_queue_size)
+            return 0;
+        ring_mem.read_mem(cq_addr + index * 16, 16, data);
+        foreach (data[i]) cq[i*8 +: 8] = data[i];
+        return 1;
+    endfunction
+
+    // 旧调用兼容视图；最后输出是 DW1 原始低16位，不提供 head_idx 语义。
+    function bit decode_rx_cq(input int unsigned index,
                               output int unsigned desc_num,
                               output int unsigned pkt_len,
                               output bit wrap,
-                              output int unsigned head_idx);
-        byte data[];
-        bit [31:0] word0;
-        bit [31:0] word1;
+                              output int unsigned raw_low16);
+        dpu_priv_rx_cq_t	cq;
 
         desc_num = 0;
         pkt_len = 0;
         wrap = 0;
-        head_idx = 0;
-        if (!ring_allocated || allocated_tx_mode ||
-            (index >= allocated_queue_size)) begin
-            `uvm_error("DPU_PRIV_RING", "decode_rx_cq: 非 RX ring 或 CQ 下标越界")
-            return 0;
-        end
-
-        ring_mem.read_mem(cq_addr + index * 16, 8, data);
-        word0 = {data[3], data[2], data[1], data[0]};
-        word1 = {data[7], data[6], data[5], data[4]};
-        desc_num = word0[31:28];
-        head_idx = word1[15:0];
-        pkt_len = word1[29:16];
-        wrap = word1[31];
+        raw_low16 = 0;
+        if (!query_rx_cq(index, cq)) return 0;
+        desc_num = cq.desc_num;
+        pkt_len = cq.pkt_len;
+        wrap = cq.cq_wrapper;
+        raw_low16 = cq[47:32];
         return 1;
     endfunction
 
@@ -396,6 +399,8 @@ class custom_virtqueue extends virtqueue_base;
                         word2[17] = l3_cs;
                         word2[18] = l4_cs;
                         word2[20:19] = fwd;
+                        word2[24] = i_l3_cs;
+                        word2[25] = i_l4_cs;
                     end
                     word2[15] = 0; // DPU_DATA_DESC；扩展/TSO 描述符不在当前实现内。
                     word2[16] = allocated_tx_mode && (ordinal + 1 < needed);
@@ -427,18 +432,16 @@ class custom_virtqueue extends virtqueue_base;
 
     // TX 按 CQ head_index 回收已完整越过的 SG 包；RX 按 CQ wrapper、pkt_len
     // 回收下一条已投递 buffer。成功返回原 token 和整包字节数；无完成返回 0。
-    // TX CQ wrap 必须与 head 前进方向一致；RX 的 desc_num!=1 或包长超过
+    // TX CQ wrap 必须与 head 前进方向一致；RX head-split 或包长超过
     // posted buffer 时报告错误且不移动任何索引，避免静默丢失多 buffer 包。
     virtual function bit poll_used(ref uvm_object token,
                                    ref int unsigned len);
-        int unsigned cq_head;
-        bit cq_wrap;
-        bit expected_wrap;
-        int unsigned distance;
-        int unsigned rx_desc_num;
-        int unsigned rx_pkt_len;
-        int unsigned rx_head_idx;
-        pending_record_t record;
+        int unsigned	cq_head;
+        bit	cq_wrap;
+        bit	expected_wrap;
+        int unsigned	distance;
+        dpu_priv_rx_cq_t	rx_cq;
+        pending_record_t	record;
 
         if (!binding_ok("poll_used") || (pending.size() == 0))
             return 0;
@@ -462,16 +465,15 @@ class custom_virtqueue extends virtqueue_base;
             if (distance < pending[0].desc_count)
                 return 0;
         end else begin
-            if (!decode_rx_cq(cq_consumer_index, rx_desc_num, rx_pkt_len,
-                              cq_wrap, rx_head_idx))
+            if (!query_rx_cq(cq_consumer_index, rx_cq))
                 return 0;
-            if (cq_wrap != cq_consumer_wrap)
+            if (rx_cq.cq_wrapper != cq_consumer_wrap)
                 return 0;
-            if ((rx_desc_num != 1) || (rx_pkt_len == 0) ||
-                (rx_pkt_len > pending[0].byte_count)) begin
+            if ((legacy_rx_cq ? (rx_cq.desc_num != 1) : (rx_cq.pkt_head_split_len != 0)) || (rx_cq.pkt_len == 0) ||
+                (rx_cq.pkt_len > pending[0].byte_count)) begin
                 `uvm_error("DPU_PRIV_RING", $sformatf(
                     "poll_used: RX 仅支持单 buffer，CQ desc_num=%0d pkt_len=%0d posted_len=%0d",
-                    rx_desc_num, rx_pkt_len, pending[0].byte_count))
+                    rx_cq.desc_num, rx_cq.pkt_len, pending[0].byte_count))
                 return 0;
             end
         end
@@ -488,7 +490,7 @@ class custom_virtqueue extends virtqueue_base;
             advance_slot(cq_consumer_index, cq_consumer_wrap);
         pending_desc_count -= record.desc_count;
         token = record.token;
-        len = allocated_tx_mode ? record.byte_count : rx_pkt_len;
+        len = allocated_tx_mode ? record.byte_count : rx_cq.pkt_len;
         total_poll_used_ops++;
         return 1;
     endfunction
@@ -514,13 +516,11 @@ class custom_virtqueue extends virtqueue_base;
     // 不消耗 CQ，仅检查下一完整 TX 包或下一 RX CQ 项是否可收割。
     // last_used 是标准 VQ 参数；驱动私有 CQ 只按本地 head/wrapper 判定，故忽略它。
     virtual function bit vq_poll(int unsigned last_used);
-        int unsigned cq_head;
-        bit cq_wrap;
-        bit expected_wrap;
-        int unsigned distance;
-        int unsigned rx_desc_num;
-        int unsigned rx_pkt_len;
-        int unsigned rx_head_idx;
+        int unsigned	cq_head;
+        bit	cq_wrap;
+        bit	expected_wrap;
+        int unsigned	distance;
+        dpu_priv_rx_cq_t	rx_cq;
 
         if (!binding_ok("vq_poll") || (pending.size() == 0))
             return 0;
@@ -538,11 +538,11 @@ class custom_virtqueue extends virtqueue_base;
                    (distance >= pending[0].desc_count);
         end
 
-        if (!decode_rx_cq(cq_consumer_index, rx_desc_num, rx_pkt_len,
-                          cq_wrap, rx_head_idx))
+        if (!query_rx_cq(cq_consumer_index, rx_cq))
             return 0;
-        return (cq_wrap == cq_consumer_wrap) && (rx_desc_num == 1) &&
-               (rx_pkt_len != 0) && (rx_pkt_len <= pending[0].byte_count);
+        return (rx_cq.cq_wrapper == cq_consumer_wrap) &&
+               (legacy_rx_cq ? (rx_cq.desc_num == 1) : (rx_cq.pkt_head_split_len == 0)) &&
+               (rx_cq.pkt_len != 0) && (rx_cq.pkt_len <= pending[0].byte_count);
     endfunction
 
     // 返回已投递但未通过 poll_used 交付的包数，而不是其 SG 描述符数。
