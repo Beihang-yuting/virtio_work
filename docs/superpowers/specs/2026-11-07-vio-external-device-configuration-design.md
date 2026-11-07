@@ -259,8 +259,8 @@ VIO ring 记录的外层 cfg 放在拟新增 `integration/project/project_vio_co
 | RX CQ | 无独立 CQ | desc 后的 N 个 16 字节 CQ 项 |
 | 可用容量 | 按现有 Packed 分配规则 | N 个 descriptor 槽保留一个，最多 N-1 个在途 descriptor |
 | 深度约束 | 现有 Packed 几何检查及项目声明能力 | 2..4096 范围内的 2 次幂 |
-| 控制信息 | 标准 header 与声明的 features | `dport_info/dport_id/dport_type/cpu_tx_cos/fwd/rss_lag/l3_cs/l4_cs` 等私有字段 |
-| 通知 | 显式选择标准 16/32 位编码 | DPU 固定 32 位 `{wrap[31], tail[30:16], local_qid[15:0]}` |
+| 控制信息 | 标准 header 与声明的 features | `dport_info/dport_id/dport_type/cpu_tx_cos/fwd/rss_lag/l3_cs/l4_cs/i_l3_cs/i_l4_cs` 等私有字段 |
+| 通知 | 显式选择标准 16/32 位编码；平台也可显式选择 DPU32，header 不变 | DPU 固定 32 位 `{wrap[31], tail[30:16], local_qid[15:0]}` |
 
 自定义 TX 的有效 ring 字节数为 `16*N + 2`，RX 为 `32*N`，分配长度向上取整到
 4096 字节边界。CQ 的设备可见地址由整块 ring 的实际 IOVA 与偏移计算并导出，
@@ -1055,7 +1055,7 @@ VIO 的 cfg 可以附带其依赖的只读 BDF/BAR 值，用于定位设备访�
 | `dpu.qsch.*` | 拟新增到项目 env_cfg 的平台策略 | COS/net/group/端口及调度模式，独立于 VIO 队列写入口；编号按平台声明绑定 |
 | `vio.notify_bar` | 拟新增 | 实际 BAR 编号，必须存在于该 Function 的 DPU BAR 租约 |
 | `vio.notify_base`、`vio.notify_stride` | 拟新增 | BAR 内字节 offset 和队列步长，生成每条队列的最终 offset |
-| `vio.notify_encoding` | 拟新增 | Packed 使用 `VIO_NOTIFY_QID16` / `VIO_NOTIFY_DATA32`；自定义使用 `VIO_NOTIFY_DPU32` |
+| `vio.notify_encoding` | 拟新增 | Packed 显式使用 `VIO_NOTIFY_QID16` / `VIO_NOTIFY_DATA32` / 平台 DPU32；自定义使用 `VIO_NOTIFY_DPU32` |
 | `vio.private.*` | 已有配置类参数入口 | 复用私有 descriptor 控制、RX buffer 大小及逐队列覆盖；外部模式补齐按 service 的自动加载和绑定 |
 
 项目参考固定安装外部配置协议，支持固定轮询与 MSI-X 完成模式。
