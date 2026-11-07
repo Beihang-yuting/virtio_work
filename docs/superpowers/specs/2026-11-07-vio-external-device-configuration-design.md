@@ -7,6 +7,8 @@
 本次修订纳入后续要求：项目仅使用外部设备配置流程；导出所有身份、BAR、队列、
 中断和表项信息；逐类预留用户 task；用户 task 可直接复用 `pcie_work` 访问 DUT。
 队列数按队列对计数，32 对表示 32 条 TX 和 32 条 RX。支持显式选择轮询或 MSI-X。
+最新接口约定：每个用户 task 只接收一个完整的配置记录，用户只实现单项写法；
+环境根据冻结后的实际条目集合，统一控制遍历、配置顺序和失败处理。
 
 ## 1. 已确认的需求
 
@@ -14,6 +16,10 @@
 显式指定 VIO 的队列数量、大小和模式，并从这些分配结果获得实际 DUT 配置所需的信息。
 VIP 跳过前期与 DUT 的发现、复位、协商及寄存器配置；项目自己的 task/sequence
 取得同一份配置后，主动设置 BAR、VTX/VRX、QSCH 等，随后通过 VIO 控制发包。
+
+用户只需为每类配置编写一次通用 task。qid、BAR 基址、ring 地址、模式及中断等
+信息封装为该 task 的一个输入配置记录；环境负责为所有需要配置的项生成记录并
+逐项调用。用户无需在 test 中手写 Host/PF/VF/队列循环，也无需为每个 qid 写 task。
 
 用户已进一步确认：本次使用 **Packed ring，TX 数据包含标准 `virtio_net_hdr`
 和 Ethernet 报文**。沿用现有 SG/descriptor chain 表达 header 与 payload，
@@ -35,7 +41,7 @@ DMA 映射和 notify 完全一致；项目完成配置前不能提交报文；�
 
 ## 2. 项目仅保留外部设备配置接入
 
-项目 env 固定采用“准备→导出→用户 task 配置→确认→发包”，不再提供选择标准
+项目 env 固定采用“准备→导出→环境遍历调用用户 task→确认→发包”，不再提供选择标准
 主动初始化的项目参数。删除原项目 `configure_device()`、base_test 对它的调用、
 默认寄存器计划 executor 的安装，以及对应自动配置的 Tcl 命令入口。
 
@@ -56,7 +62,7 @@ flowchart TD
     A[dpu 参数与 vio 队列参数] --> B[dpu_common 分配并冻结身份和资源]
     B --> C[VIO 按模式准备 ring 与 DMA 映射]
     C --> D[导出绑定到本代资源的只读配置]
-    D --> E[项目 task 配置 BAR / VTX / VRX / QSCH]
+    D --> E[环境逐项传入 cfg 并调用用户配置 task]
     E --> F[项目报告成功并提交配置确认]
     F --> G[vio_start / vio_tx / 完成回收]
 ```
@@ -178,6 +184,11 @@ BAR 地址是设备的 MMIO 地址。ring 的 GPA 属于 Host 内存，IOVA 是�
 共享表项去重后单独列出：一个 BDF 项只按 Function 配置一次，一个 MSI-X 项只按
 实际向量配置一次。对 32 对队列不能盲目重复配置 64 份相同 BAR/BDF/MSI-X 项。
 
+交给用户 task 的记录同时包含它需要的共享信息值副本。例如，VTX 的单个 cfg
+包含队列 owner、实际管理寄存器访问目标、qid、BAR 基址和 ring 地址，用户无需
+再传一个 AF 对象或在 task 中按 qid 查找全局 env_cfg。附带共享字段是为了单项
+配置方便；环境仍按每类表自己的集合调度，不在每个 VTX task 中重复配置 BDF/BAR。
+
 Function 列表覆盖 DPU 已创建的身份，并标出 AF 和实际承载 VIO 的 service。
 表项没有布局与表项需要写入 `valid=0` 是两件事：前者不能发起访问，后者仍可能
 是清理 shadow bank 的必需写操作。记录必须明确区分，不能用一个 valid 位混用。
@@ -290,8 +301,9 @@ BDF 或 Message Address/Data 必须由实际 RC/Host 域隔离。观察器按已
 用户运行期 task/sequence 明确执行，VIP 不隐式写回，连续中断验证必须覆盖此流程。
 
 DPU AF 管理窗口中的全局 MSI-X 表与 Function 的 PCI MSI-X Table 分别保留访问
-视图。若实际 DUT 将两者映射到同一存储，平台显式声明这种对应关系，并由用户
-配置总入口选择写入视图；不能默认它们独立，也不能重复写入相互冲突的消息或 mask。
+视图。若实际 DUT 将两者映射到同一存储，平台显式声明这种对应关系，由环境
+调度入口根据该声明选择写入视图；不能默认它们独立，也不能重复写入
+相互冲突的消息或 mask。
 
 目前私有配置路径强制 polling，标准 TX worker 也包含周期轮询，通知管理器会
 在配置和 mask/unmask 中写设备。因此 MSI-X 接入是本次必须实现并验证的完整
@@ -311,9 +323,9 @@ if (!ok) begin
     `uvm_fatal("VIO_PREPARE", why)
 end
 
-// 拟预留给用户的总入口：从 setup 逐类获取配置，调用下面列出的用户 hook。
-// 只有 test 显式调用本入口才执行用户编写的 DUT 访问。
-env.user_configure_dut(setup, ok, why);
+// 拟新增的环境统一入口：遍历 setup 中的实际配置项，逐项调用用户 hook。
+// 用户只填写每类 hook 内部如何写 DUT；全部循环由环境实现。
+env.configure_vio_dut(setup, ok, why);
 if (!ok) begin
     `uvm_fatal("DUT_CONFIG", why)
 end
@@ -331,8 +343,9 @@ finish_platform();
 ```
 
 `setup`、`ok`、`why` 的声明属于调用 task；实际实现使用 extern 和宽松排版。
-项目也可以把 `user_configure_dut` 写成自己的 sequence，再通过已有
-AIP 机制注册。配置的具体执行位置不改变“准备→外部配置→确认→发包”的依赖。
+项目的 sequence 也可以调用同一个 `configure_vio_dut()`，再通过已有 AIP 机制
+注册；它不需要重新实现遍历。配置的具体执行位置不改变
+“准备→环境遍历调用用户方法→确认→发包”的依赖。
 
 原 `env.configure_device()` 从项目参考中删除，用户迁移后不再调用它。
 DPU 的分配、冻结快照及纯表项生成/寄存器编码能力继续供项目显式使用。
@@ -340,18 +353,20 @@ DPU 的分配、冻结快照及纯表项生成/寄存器编码能力继续供项
 ### 5.1 用户配置 task 清单
 
 以下均为拟在 `project_env.sv` 中提供的 `extern virtual task`。实现置于同文件
-类外，保持中文职责注释和宽松排版。每个 task 接收已归属到具体设备/表项的数据，
-通过 `output bit ok, output string why` 报告结果；未实现的必需 hook 默认返回失败，
-不把空 task 当作硬件配置成功。用户在自己的 env 中填入访问内容即可。
+类外，保持中文职责注释和宽松排版。每个 task 仅有一个用于配置的输入参数 cfg，
+其类型按 Function、队列或表项区分，里面包含该项所需的全部身份、地址与逻辑值。
+`output bit ok, output string why` 仅用于返回结果，不属于额外配置输入。
+未实现的必需 hook 默认返回失败，不把空 task 当作硬件配置成功。
 
-`user_configure_dut()` 提供明确的循环调用参考；build/connect/run 不会自行调用它。
-用户可以调整总入口的顺序，或直接在自己的 sequence 中逐项调用这些 task。
-参考循环只调用本次适用的 hook：未启用方向不配置其运行队列；轮询且未提供
-PCI MSI-X 布局时不调用对应 Table/PBA hook。必需性在导出时明确检查，不能以
+`configure_vio_dut()` 的完整遍历由环境提供；build/connect 不会调用它，运行阶段
+由 test 或已注册的配置 sequence 显式调用一次。用户填写下面每类方法的单项
+写法即可，不接管总入口的循环。环境只调用本次适用的 hook：未启用方向不配置
+其运行队列；轮询且未提供 PCI MSI-X 布局时不调用对应 Table/PBA hook。
+必需性在导出时明确检查，不能以
 空列表或未实现 hook 返回成功掩盖缺失配置。一个必需 hook 失败立即停止后续使能
 和提交，保留资源供用户停止设备后清理。
 
-| task | 配置粒度与传入信息 |
+| task | 单个 cfg 的配置粒度与信息 |
 | --- | --- |
 | `user_prepare_device` | 整个 setup：平台复位、必要的全局初始化及配置前条件 |
 | `user_configure_pcie_function` | 每 Function：BDF、PF/VF、BAR base/size、PCI Command 和平台要求的 Function 使能信息 |
@@ -392,7 +407,8 @@ notify 表中的 local pair 编码与 doorbell 的 RX/TX local virtqueue ID 分�
 active bank 或目标 bank 由配置输入提供，准备阶段不读 DUT 来自动猜测。
 
 推荐调用依赖为：平台准备→Function/BAR→AF/BDF→MSI-X/notify 映射→QSCH/
-VTX/VRX/辅助上下文→设备使能→读回确认。具体硬件要求通过用户总入口组织。
+VTX/VRX/辅助上下文→设备使能→读回确认。环境维护这个阶段顺序；项目有特殊
+硬件顺序时调整同一调度入口的阶段安排，单项 task 不承担外围循环。
 PCI MSI-X 表项修改遵循屏蔽后写地址/数据、再按目标 mask/enable 生效的顺序，
 最终由用户 task 执行。PBA 只作为状态位置导出，不写入通用初始化序列。
 
@@ -420,18 +436,18 @@ posted MMIO write 成功表示请求已发送；用户的 verify/poll hook 负�
 下面说明用户 task 的填入位置和调用方式，类型及 env 方法仍是拟新增接口：
 
 ```systemverilog
-// 类内声明；q 携带真实队列信息，af 为管理寄存器所在 Function。
+// 类内声明：只传一个 cfg，包含队列自身以及实际寄存器访问目标的信息。
+// 用户仅实现一个 TX 队列的配置；环境为每条启用 TX 调用本 task。
 extern virtual task user_configure_vtx_queue(
-    input vio_function_setup_t	af,
-    input vio_queue_setup_t	q,
+    input vio_queue_setup_t	cfg,
     output bit			ok,
     output string		why
 );
 
-// 类外实现；实际寄存器 offset 和编码由项目填写。
+// 类外实现：按 cfg.global_qpair_id 选择 DUT 表项，按 cfg.desc_iova 配置 DMA。
+// 实际寄存器 offset 和编码由项目填写；未填写或任一步访问失败都返回失败。
 task project_env::user_configure_vtx_queue(
-    input vio_function_setup_t	af,
-    input vio_queue_setup_t	q,
+    input vio_queue_setup_t	cfg,
     output bit			ok,
     output string		why
 );
@@ -439,15 +455,103 @@ task project_env::user_configure_vtx_queue(
     why = "请在本 task 填入项目 VTX 配置";
 
     // 填写后的典型调用为：
-    // pcie_bar_write(af.function_key, af.device_bar_id,
+    // pcie_bar_write(cfg.target.function_key, cfg.target.bar_id,
     //                项目定义的寄存器字节偏移, 4,
-    //                q.desc_iova[31:0], 0, ok, why);
-    // 随后继续写高地址、深度/模式，并用 q.global_qpair_id 选择表项。
+    //                cfg.desc_iova[31:0], 0, ok, why);
+    // 随后继续写高地址、深度/模式，每一步都检查 ok。
+    // cfg.target.bar_base 为管理窗口基址；helper 会执行 base + offset。
 endtask
 ```
 
-BAR/Mailbox/MSI-X 地址全部来自 setup。用户可显式传队列 owner 或 AF 作为访问
-目标，接口不偷偷把 VF 写重定向到 AF，也不把控制表地址当成 ring DMA 地址。
+BAR/Mailbox/MSI-X 地址全部来自 setup，并装入对应 cfg。`cfg.owner` 是队列所属
+Function，`cfg.target` 是本项配置实际访问的 Function/BAR，可以是 AF；两者由
+准备阶段明确绑定，接口不偷偷重定向，也不把控制表地址当成 ring DMA 地址。
+
+### 5.3 一个配置记录与环境统一遍历
+
+这里的“一个参数”指 task 的一个完整输入记录，不是把所有配置塞进一个命令行
+字符串。命令行仍用已有 dpu/vio/pcie_cfg 字段表达规格，环境解析并分配后产生
+具体记录。采用有明确类型的记录，便于用户在 task 中直接访问字段并由编译器
+检查拼写；不引入字符串字段查询或按 qid 手工拼接长参数列表。
+
+以 `vio_queue_setup_t cfg` 为例，单个输入至少提供以下内容；未适用字段有明确
+有效标志，例如 Packed 不提供私有 CQ，Custom 不提供 Packed event 区。
+
+| cfg 内容 | 用途 |
+| --- | --- |
+| `generation`、`owner`、`service_key` | 标识本代资源及真实 Host/PF/VF/BDF 归属 |
+| `target.function_key/bar_id/bar_base/bar_size` | 指定本 task 写 DUT 所走的 Host/RC 和管理 BAR 窗口 |
+| `virtio_pair_index`、`local_pair_id`、`local_virtqueue_id`、`global_qpair_id` | 分别提供本地和全局编号，硬件表索引取其实际定义的字段 |
+| `direction`、`queue_type`、`queue_size`、`usable_slots` | 控制单个队列的格式、深度和容量 |
+| `desc_iova`、对应 GPA/长度、event/CQ 地址与有效标志 | 配置真实 ring DMA 区域 |
+| 初始 index/wrap、RX buffer 大小及私有控制字段 | 配置该模式的数据面初态 |
+| `notify` 子记录 | owner BAR、最终 notify 地址/offset、宽度和数据编码 |
+| `completion_mode`、`msix` 子记录 | 轮询/MSI-X 选择、向量及关联消息地址/数据 |
+
+用户写 `user_configure_vtx_queue(cfg, ok, why)` 一次，环境对每条已准备 TX 传入
+各自 cfg；VRX、BDF、MSI-X、QSCH 等同样逐类复用各自的一份实现。用户方法只
+操作当前项；需要多个寄存器写入时可以在内部顺序执行，向外报告整项结果。
+
+环境从冻结视图查询真实记录集合，不重新按 `pairs` 拼 qid，也不假定全局编号
+连续。以下是环境负责的 VTX 阶段示意，仍属于拟实现接口：
+
+```systemverilog
+// 类内声明：这是环境的内部阶段，用户填写的是上面的单队列 hook。
+// 输入为本次冻结视图；任一条失败即停止，并保留错误队列身份。
+extern protected task configure_vtx_stage(
+    input vio_external_setup	setup,
+    output bit			ok,
+    output string		why
+);
+
+// 类外实现示意：只遍历已准备且启用的 TX，TX 关闭时此集合为空。
+// 本阶段成功不代表整机配置完成，后续仍需其他阶段、验证及最终提交。
+task project_env::configure_vtx_stage(
+    input vio_external_setup	setup,
+    output bit			ok,
+    output string		why
+);
+    vio_queue_setup_t	queue_cfgs[$];
+    bit			item_ok;
+    string		item_why;
+
+    ok  = 0;
+    why = "";
+
+    setup.list_tx_queues(queue_cfgs);
+
+    foreach (queue_cfgs[index]) begin
+        item_ok  = 0;
+        item_why = "";
+
+        user_configure_vtx_queue(queue_cfgs[index], item_ok, item_why);
+
+        if (!item_ok) begin
+            why = $sformatf(
+                "VTX item=%0d local_qid=%0d global_qpair=%0d: %s",
+                index,
+                queue_cfgs[index].local_virtqueue_id,
+                queue_cfgs[index].global_qpair_id,
+                item_why
+            );
+            return;
+        end
+    end
+
+    ok = 1;
+endtask
+```
+
+正式实现的诊断还应包含完整 Host/segment/Function/service key、准备代号和阶段。
+开启某 VF 的 32 对且 TX/RX 都启用时，VTX hook 调用 32 次、VRX hook 调用 32 次，
+各自收到不同的 local qid、global qpair 和真实 ring 地址。BDF/BAR 按 Function
+集合配置，MSI-X 按去重向量/表项集合配置，QSCH 按各表实际项配置；AF 额外资源
+仍单独处理。用户不因改变队列数量而修改 task 或遍历代码。
+
+环境为每次配置保存本代各阶段的成功结果；统一入口禁止同一代并发执行，不自动
+重试已发出的设备写。所有必需项成功且用户最终 verify hook 通过后，才标记
+本代可提交。中途失败立即返回，`commit_vio_configuration()` 不得将其置为 READY。
+在独立 sequence 中直接调用某个 hook 可用于调试，但不会绕过统一入口的完成检查。
 
 ## 6. 参数安排
 
@@ -514,7 +618,8 @@ qid/index/wrap，不从全局 qpair 编号重新推算。
 
 生命周期为“未准备→已准备→已导出待配置→已确认 READY→RUNNING”。
 提交确认必须校验视图来源、准备代号、全部目标 service、队列和 DMA 映射完整性。
-配置 task 的成功表示平台已配置并可接受 DMA；VIP 不自行读取寄存器证明这一点。
+还必须检查统一配置入口记录的本代完成结果。用户配置及最终 verify task 的成功
+表示平台报告已配置并可接受 DMA；VIP 不自行读取寄存器证明这一点。
 
 现有 `vio_start` 和 `vio_tx` 保留状态检查。通过受保护的外部确认入口完整设置
 有效队列数量、能力及运行策略，再进入 READY；不能只修改 `fsm.state`。
@@ -557,7 +662,7 @@ qid/index/wrap，不从全局 qpair 编号重新推算。
 | `virtio_net_vip/src/dpu_priv/dpu_priv_driver_config.sv` 及私有协议接入 | 复用参数解析、队列几何和控制字段，将外部数据协议与原 AF 寄存器配置路径分开 |
 | 拟新增 `virtio_net_vip/src/env/vio_external_setup.sv`，以及 `virtio_net_env.sv` | 冻结并查询实际配置，提供 service 级准备/确认/释放接口 |
 | `integration/project/project_env_cfg.sv` | 统一消费队列需求并生成 DPU 输入，参考模式选择 |
-| `integration/project/project_env.sv`、`project_base_test.sv` | 删除主动配置编排，新增数据导出、用户 task、PCIe 访问助手、准备/确认/释放流程 |
+| `integration/project/project_env.sv`、`project_base_test.sv` | 删除旧主动配置流程；提供统一遍历调度、单配置记录用户 task、PCIe 访问助手及准备/确认/释放流程 |
 | `integration/aip/virtio_aip_pkg.sv` | 沿用 target/pair 发包入口，项目仅注册业务命令，正确区分两种完成模式 |
 | 相关测试、`docs/aip_parameters.md`、项目 README/完整代码文档 | 验证参数、配置视图、数据路径并说明新的使用方式 |
 
@@ -603,10 +708,16 @@ DPU 已有 `get_service_owner/get_pcie_id/get_bar` 和
 16. MSI-X 消息地址不在旧硬编码 APIC 区、Message Data 低位不等于向量号仍按
     注册项正确路由；共享向量处理全部关联队列。跨 Host 相同地址/数据可隔离，
     同域有歧义的匹配项被拒绝，不匹配消息不唤醒错误 Function。
-17. MSI-X/PBA、ring DMA 和 BAR 地址各自独立，导出不访问设备；用户配置循环
+17. MSI-X/PBA、ring DMA 和 BAR 地址各自独立，导出不访问设备；环境统一配置循环
     不把 PBA 当成可写初始化表，也不触发隐含 MSI-X mask/read-modify-write。
 18. 使能后早到的中断不丢失；跨代资源不消费旧待处理状态。共享 Function 的布局
     和向量冲突明确失败；启用 self-mask 的测试由用户重新使能后收到下一次中断。
+19. 用户只提供一次各类单项 hook 实现，环境在一个 VF 32 对时分别调用 VTX/VRX
+    32 次；TX-only 不调用 VRX 配置。每次传入的 cfg 含完整身份/地址，非连续全局
+    qpair、多 Host 和共享表项均按真实记录遍历，不重复配置共享项。
+20. 注入中途 hook 失败时，后续使能/提交被阻止，报告完整目标身份并保留资源；
+    不自动重试已发写操作。单独调用一个 hook、旧代成功记录或并发配置均不能
+    绕过整代完成检查；修改输入记录副本不改变冻结状态和实际 ring 绑定。
 
 定向模型验证证明接入合同和 VIP 行为；用户实际 DUT 的寄存器语义、QSCH 和线侧
 收发仍由项目联合测试验证，不以结构或模型测试代替真实 DUT 的验收。
