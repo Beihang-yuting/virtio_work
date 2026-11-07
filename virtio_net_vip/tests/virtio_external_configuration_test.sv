@@ -181,6 +181,7 @@ class virtio_external_lifecycle_test extends uvm_test;
     bit	custom_mode;
     bit	msix_mode;
     bit	tx_only;
+    bit	two_services;
 
     // 只构造测试组件。
     extern function new(string name, uvm_component parent);
@@ -235,7 +236,13 @@ function void virtio_external_lifecycle_test::build_phase(uvm_phase phase);
     builder.select_af(pf);
     service_key = builder.allow_vio_service(vf);
     owners.push_back(vf.key);
-    void'(builder.add_fixed_vio_request(0, owners, 1));
+    if (two_services) begin
+        vf = builder.add_vf(0, 0, 1, 0);
+        builder.add_real_dut_bars(vf);
+        void'(builder.allow_vio_service(vf));
+        owners.push_back(vf.key);
+    end
+    void'(builder.add_fixed_vio_request(0, owners, two_services ? 2 : 1));
     device_cfg = builder.make_env_config();
     cfg = new("cfg");
     cfg.external_configuration = 1;
@@ -645,6 +652,208 @@ task virtio_external_direction_test::run_phase(uvm_phase phase);
     require_true(instance.driver_agent.monitor.protocol_vif.outstanding_submission_count == 0,
         "TX-only release clears protocol credit");
     `uvm_info("EXTERNAL_DIRECTION_PASS", "TX-only workers and QID16 upper byte lane passed", UVM_NONE)
+    phase.drop_objection(this);
+endtask
+
+
+// 双 service 的整代完整性边界；所有篡改均恢复后再释放，不能靠吞掉错误证明安全。
+class virtio_external_integrity_test extends virtio_external_lifecycle_test;
+    `uvm_component_utils(virtio_external_integrity_test)
+    virtio_function_instance	original[];
+    virtio_function_instance	replacement;
+    vio_external_setup	prepared;
+    vio_config_scope	all_scope;
+    vio_config_scope	second_scope;
+
+    // 构造测试，不创建额外 DMA owner。
+    extern function new(string name, uvm_component parent);
+
+    // 同一 Host 两个 VF，每个 service 分配一对队列。
+    extern virtual function void build_phase(uvm_phase phase);
+
+    // 一次篡改同时检查单 service/full scope 和 release 均拒绝，所有状态/资源保留。
+    extern function void reject_mutation(input string label);
+
+    // 使用已有公开 API 验证参与者、ring owner、映射完整性和成功恢复。
+    extern virtual task run_phase(uvm_phase phase);
+endclass
+
+function virtio_external_integrity_test::new(string name, uvm_component parent);
+    super.new(name, parent);
+endfunction
+
+function void virtio_external_integrity_test::build_phase(uvm_phase phase);
+    two_services = 1;
+    super.build_phase(phase);
+    // UVM component 必须在 build 阶段创建；替身仅用于身份负例，不启动驱动或分配 ring。
+    uvm_config_db#(uvm_active_passive_enum)::set(this, "replacement_identity.driver_agent", "is_active", UVM_PASSIVE);
+    replacement = new("replacement_identity", this);
+endfunction
+
+function void virtio_external_integrity_test::reject_mutation(input string label);
+    string	why;
+    int unsigned	unmaps_before;
+    fsm_state_e	states[$];
+    vf_state_e	function_states[$];
+    bit	confirmed[$];
+    int unsigned	queue_counts[$];
+
+    unmaps_before = env.iommu.total_unmaps;
+    foreach (original[f]) begin
+        queue_counts.push_back(original[f].vq_mgr.get_queue_count());
+        states.push_back(original[f].driver_agent.fsm.state);
+        function_states.push_back(original[f].state);
+        confirmed.push_back(env.external_service_confirmed(prepared, original[f].service_key));
+    end
+    require_true(!env.confirm_external_configuration(prepared, second_scope, 1, why),
+        {label, ": selected absent/mutated service must reject confirmation"});
+    require_true(!env.confirm_external_configuration(prepared, all_scope, 1, why),
+        {label, ": full scope must reject before any READY change"});
+    require_true(!env.release_external_resources(prepared, 1, why),
+        {label, ": release must reject before any reclamation"});
+    require_true(env.iommu.total_unmaps == unmaps_before, {label, ": no release side effects"});
+    foreach (original[f]) begin
+        require_true(original[f].vq_mgr.get_queue_count() == queue_counts[f] &&
+            original[f].driver_agent.ops.has_active_queues() &&
+            original[f].driver_agent.fsm.state == states[f] && original[f].state == function_states[f] &&
+            env.external_service_confirmed(prepared, original[f].service_key) == confirmed[f],
+            {label, ": every original participant and DMA ownership must remain intact"});
+    end
+endfunction
+
+task virtio_external_integrity_test::run_phase(uvm_phase phase);
+    vio_external_spy_bar	spy;
+    vio_external_queue_binding_t	bindings[$];
+    vio_external_queue_binding_t	binding;
+    dpu_vio_qpair_binding_t	pairs[$];
+    dpu_service_key_t	keys[$];
+    vio_queue_setup_t	record;
+    virtqueue_base	queue_handle;
+    virtio_atomic_ops	saved_ops;
+    virtio_resource_client	saved_client;
+    virtqueue_manager	saved_manager;
+    bit [63:0]	mapped;
+    bit	ok;
+    string	why;
+
+    phase.raise_objection(this);
+    original = env.function_instances;
+    require_true(original.size() == 2, "integrity fixture needs two services");
+    foreach (original[f]) begin
+        spy = new($sformatf("integrity_spy_%0d", f));
+        spy.configure_fabric_bar_pairs(original[f].bar_pairs);
+        original[f].transport.bar = spy;
+    end
+    require_true(env.bind_pcie(rc_seqr), "integrity Function binding");
+    wait (original[0].driver_agent.monitor.protocol_vif.rst_n === 1'b1);
+    foreach (original[f]) begin
+        device_env.get_resource_snapshot().list_vio_bindings_for_service(original[f].service_key, pairs);
+        require_true(pairs.size() == 1, "each service has one real qpair");
+        for (int unsigned q = 0; q < 2; q++) begin
+            binding.service_key = original[f].service_key;
+            binding.local_qid = q;
+            binding.notify_bar = 2;
+            binding.notify_offset = 64'h100;
+            binding.notify_encoding = VIO_NOTIFY_DPU32;
+            binding.local_vector = pairs[0].local_msix_vector_id;
+            binding.global_vector = pairs[0].global_msix_vector_id;
+            binding.msix_valid = 0;
+            binding.message_address = 0;
+            binding.message_data = 0;
+            binding.masked = 0;
+            bindings.push_back(binding);
+        end
+    end
+    env.prepare_external_configuration(bindings, prepared, ok, why);
+    require_true(ok, why);
+    all_scope = new("all", prepared, keys);
+    keys.push_back(original[1].service_key);
+    second_scope = new("second", prepared, keys);
+    require_true(prepared.get_queue(original[1].service_key, 1, record), "second service TX record");
+    queue_handle = original[1].vq_mgr.get_queue(1);
+    // RED 独立选项先锁定 release 缺陷，避免 I2 的首个 fatal 遮住 I1。
+    if ($test$plusargs("EXTERNAL_RELEASE_RED")) begin
+        queue_handle.desc_table_addr += 16;
+        require_true(!env.release_external_resources(prepared, 1, why),
+            "release mutated second ring must fail before first Function reclamation");
+        queue_handle.desc_table_addr = record.desc_gpa;
+    end
+    env.function_instances = new[1];
+    env.function_instances[0] = original[0];
+    reject_mutation("missing second participant");
+    env.function_instances = original;
+    env.function_instances[1] = original[0];
+    reject_mutation("duplicate participant");
+    env.function_instances = original;
+    replacement.service_key = original[1].service_key;
+    env.function_instances[1] = replacement;
+    reject_mutation("replacement participant with same service key");
+    env.function_instances = original;
+    original[1].service_key = original[0].service_key;
+    reject_mutation("wrong service owner");
+    original[1].service_key = record.service_key;
+    saved_ops = original[1].driver_agent.ops;
+    original[1].driver_agent.ops = original[0].driver_agent.ops;
+    reject_mutation("replacement ops");
+    original[1].driver_agent.ops = saved_ops;
+    saved_client = original[1].resource_client;
+    original[1].resource_client = original[0].resource_client;
+    reject_mutation("resource client bound to another service");
+    original[1].resource_client = saved_client;
+    saved_manager = original[1].vq_mgr;
+    original[1].vq_mgr = original[0].vq_mgr;
+    reject_mutation("replacement queue manager");
+    original[1].vq_mgr = saved_manager;
+    // 集合身份不依赖数组顺序；合法单 service 确认只能改变选中项。
+    env.function_instances[0] = original[1];
+    env.function_instances[1] = original[0];
+    require_true(env.confirm_external_configuration(prepared, second_scope, 1, why), why);
+    require_true(original[1].driver_agent.fsm.state == FSM_READY &&
+        original[0].driver_agent.fsm.state != FSM_READY, "selected scope commits only its service");
+    env.function_instances = original;
+    require_true(env.confirm_external_configuration(prepared, all_scope, 1, why), why);
+    queue_handle.desc_table_addr += 16;
+    reject_mutation("changed second ring address after confirmation");
+    queue_handle.desc_table_addr = record.desc_gpa;
+    void'(original[1].vq_mgr.create_queue(7, 16, VQ_PACKED));
+    reject_mutation("extra queue outside exported complete set");
+    original[1].vq_mgr.destroy_queue(7);
+    queue_handle.host_id++;
+    reject_mutation("changed queue Host owner");
+    queue_handle.host_id--;
+    original[1].transport.pcie_id.domain.host_id++;
+    reject_mutation("changed transport Host identity");
+    original[1].transport.pcie_id.domain.host_id--;
+    original[1].transport.bdf++;
+    reject_mutation("changed transport BDF");
+    original[1].transport.bdf--;
+    env.iommu.unmap_for_host(record.pcie_id.domain.host_id, original[1].bdf, record.region_iovas[0]);
+    reject_mutation("removed live mapping");
+    mapped = env.iommu.map_fixed_for_host(record.pcie_id.domain.host_id, original[1].bdf,
+        record.region_gpas[0] + 4096, record.region_bytes[0], DMA_BIDIRECTIONAL, record.region_iovas[0]);
+    require_true(mapped == record.region_iovas[0], "replacement mapping installed");
+    reject_mutation("replaced mapping GPA");
+    env.iommu.unmap_for_host(record.pcie_id.domain.host_id, original[1].bdf, record.region_iovas[0]);
+    mapped = env.iommu.map_fixed_for_host(record.pcie_id.domain.host_id, original[1].bdf,
+        record.region_gpas[0], record.region_bytes[0], DMA_TO_DEVICE, record.region_iovas[0]);
+    require_true(mapped == record.region_iovas[0], "changed mapping direction installed");
+    reject_mutation("changed mapping direction");
+    env.iommu.unmap_for_host(record.pcie_id.domain.host_id, original[1].bdf, record.region_iovas[0]);
+    mapped = env.iommu.map_fixed_for_host(record.pcie_id.domain.host_id, original[1].bdf,
+        record.region_gpas[0], record.region_bytes[0]/2, DMA_BIDIRECTIONAL, record.region_iovas[0]);
+    require_true(mapped == record.region_iovas[0], "changed mapping length installed");
+    reject_mutation("changed mapping length");
+    env.iommu.unmap_for_host(record.pcie_id.domain.host_id, original[1].bdf, record.region_iovas[0]);
+    mapped = env.iommu.map_fixed_for_host(record.pcie_id.domain.host_id, original[1].bdf,
+        record.region_gpas[0], record.region_bytes[0], DMA_BIDIRECTIONAL, record.region_iovas[0]);
+    require_true(mapped == record.region_iovas[0], "original mapping restored");
+    require_true(env.release_external_resources(prepared, 1, why), why);
+    foreach (original[f])
+        require_true(!original[f].driver_agent.ops.has_active_queues(), "restored complete generation released");
+    repeat (8) @(posedge original[0].driver_agent.monitor.protocol_vif.clk);
+    env.host_mem.leak_check();
+    env.iommu.leak_check();
+    `uvm_info("EXTERNAL_INTEGRITY_PASS", "two-service confirmation/release integrity and recovery passed", UVM_NONE)
     phase.drop_objection(this);
 endtask
 

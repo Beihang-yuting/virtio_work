@@ -59,6 +59,36 @@ class virtio_net_env extends uvm_env;
     local longint unsigned	external_generation;
     local bit	external_confirmed[string];
 
+    // 私有代次账本保存实际对象身份，不从可变公开数组重建所有权；队列引用与 setup 记录同序。
+    typedef struct {
+        virtio_function_instance	instance;
+        virtio_driver_agent	agent;
+        virtio_atomic_ops	ops;
+        virtio_auto_fsm	fsm;
+        virtqueue_manager	manager;
+        virtio_pci_transport	transport;
+        virtio_notification_manager	notifications;
+        virtio_config_backend	backend;
+        virtio_resource_client	client;
+        virtio_monitor	monitor;
+        dpu_resource_manager	resource_manager;
+        dpu_service_key_t	service_key;
+        dpu_pcie_function_id_t	pcie_id;
+    } external_participant_t;
+    local external_participant_t	external_participants[$];
+    local virtqueue_base	external_queue_refs[$];
+    local host_mem_manager	external_mem;
+    local virtio_iommu_model	external_iommu;
+
+    // 在本地分配前保存本代参与者；未交付失败也按该账本回滚，不依赖后来改写的公开集合。
+    extern local function void capture_external_participants();
+
+    // 确认与释放共用完整预检：先双向核对参与者，再校验选中 service 的全部 ring/DMA。
+    // scope=null 表示释放整代；输出私有账本索引，失败不改 READY、账本、queue 或映射。
+    extern local function bit validate_external_generation(input vio_external_setup setup,
+        input vio_config_scope scope, output int unsigned selected[$], output string why);
+
+
     // 平台在显式 prepare 时才提供 notify/MSI-X 最终绑定；不会在 connect 前抢读。
     extern task prepare_external_configuration(
         input vio_external_queue_binding_t bindings[$], output vio_external_setup setup,
@@ -1278,6 +1308,7 @@ task virtio_net_env::prepare_external_configuration(
     end
     external_generation++;
     external_session_key = new("external_session_key");
+    capture_external_participants();
     foreach (function_instances[f]) begin
         instance = function_instances[f];
         void'(cfg.resolve_final_service_requirement(instance.service_key, requirement, why));
@@ -1317,6 +1348,7 @@ task virtio_net_env::prepare_external_configuration(
                 return;
             end
             vq = instance.vq_mgr.get_queue(program_value.queue_id);
+            external_queue_refs.push_back(vq);
             records[r].desc_gpa = vq.desc_table_addr;
             records[r].driver_gpa = vq.driver_ring_addr;
             records[r].device_gpa = vq.device_ring_addr;
@@ -1335,110 +1367,242 @@ task virtio_net_env::prepare_external_configuration(
     ok = 1;
 endtask
 
-// 未交付失败只释放本环境/本代拥有的资源；导出后任何错误都不调用此路径。
+// 保存实际参与者及共享内存身份；只有尚未交付的新代准备可以重建私有账本。
+function void virtio_net_env::capture_external_participants();
+    external_participant_t	p;
+
+    external_participants.delete();
+    external_queue_refs.delete();
+    external_mem = host_mem;
+    external_iommu = iommu;
+    foreach (function_instances[f]) begin
+        p.instance = function_instances[f];
+        p.agent = p.instance.driver_agent;
+        p.ops = p.agent.ops;
+        p.fsm = p.agent.fsm;
+        p.manager = p.instance.vq_mgr;
+        p.transport = p.instance.transport;
+        p.notifications = p.transport.notify_mgr;
+        p.backend = p.ops.config_backend;
+        p.client = p.instance.resource_client;
+        p.monitor = p.agent.monitor;
+        p.resource_manager = p.instance.resource_manager;
+        p.service_key = p.instance.service_key;
+        p.pcie_id = p.instance.pcie_id;
+        external_participants.push_back(p);
+    end
+endfunction
+
+// 未交付失败只释放本环境/本代拥有的资源；不要求尚未生成的 setup 或完整 ring 集合。
 function void virtio_net_env::rollback_external_preparation();
     virtio_external_config_backend	backend;
     string	ignored;
 
     if (live_external_setup != null) return;
-    foreach (function_instances[f]) begin
-        if (function_instances[f].driver_agent.ops.release_external_session(external_session_key, external_generation, ignored)) begin
-            function_instances[f].transport.notify_mgr.clear_external_notifications();
-            if ($cast(backend, function_instances[f].driver_agent.ops.config_backend)) backend.clear_bindings();
+    foreach (external_participants[f]) begin
+        if (external_participants[f].ops.release_external_session(external_session_key, external_generation, ignored)) begin
+            external_participants[f].notifications.clear_external_notifications();
+            if ($cast(backend, external_participants[f].backend)) backend.clear_bindings();
         end
     end
+    external_participants.delete();
+    external_queue_refs.delete();
+    external_mem = null;
+    external_iommu = null;
+    external_session_key = null;
 endfunction
 
-// 所选 service 必须完整验证后才一起进入 READY；配置失败保留全部已导出资源。
-function bit virtio_net_env::confirm_external_configuration(
-    input vio_external_setup setup, input vio_config_scope scope,
-    input logic configured, output string why);
+// 私有参与者全集与公开集合一一对应；只有完成整项只读检查后，调用方才可提交状态变更。
+function bit virtio_net_env::validate_external_generation(input vio_external_setup setup,
+    input vio_config_scope scope, output int unsigned selected[$], output string why);
+    external_participant_t	p;
     vio_queue_setup_t	records[$];
+    bit	services[string];
+    int unsigned	identity_count;
     int unsigned	qids[$];
-    vio_service_requirement_t	requirement;
-    virtio_function_instance	instance;
+    bit [63:0]	gpas[$];
+    bit [63:0]	iovas[$];
+    int unsigned	sizes[$];
+    virtqueue_base	vq;
     iommu_mapping_t	mapping;
+    int unsigned	bytes;
+    string	service_name;
 
     why = "";
-    if (configured !== 1'b1 || setup == null || setup != live_external_setup ||
+    selected.delete();
+    if (setup == null || setup != live_external_setup ||
         !setup.belongs_to(this, device_snapshot, resource_snapshot, external_generation) ||
-        scope == null) begin
-        why = "external confirmation requires successful platform result and exact live setup/scope";
+        external_participants.size() == 0 || function_instances.size() != external_participants.size() ||
+        host_mem != external_mem || iommu != external_iommu) begin
+        why = "external generation origin, participant count or shared memory identity changed";
         return 0;
     end
-    if (!scope.validate(setup, why)) return 0;
+    if (scope != null && !scope.validate(setup, why)) return 0;
     setup.list_queues(records);
-    foreach (function_instances[f]) begin
-        instance = function_instances[f];
-        if (!scope.selects(instance.service_key)) continue;
+    if (records.size() != external_queue_refs.size()) begin
+        why = "external exported queue identity set changed";
+        return 0;
+    end
+    // 先核对全部拓扑，即使只确认第二个 service，也不能漏掉、重复或替换原参与者。
+    foreach (external_participants[f]) begin
+        p = external_participants[f];
+        service_name = dpu_service_key_name(p.service_key);
+        identity_count = 0;
+        foreach (function_instances[current])
+            if (function_instances[current] == p.instance) identity_count++;
+        if (identity_count != 1 || services.exists(service_name)) begin
+            why = "external participant missing, duplicated or replaced";
+            return 0;
+        end
+        services[service_name] = 1;
+        if (p.instance.driver_agent != p.agent || p.agent.ops != p.ops || p.agent.fsm != p.fsm ||
+            p.instance.vq_mgr != p.manager || p.ops.vq_mgr != p.manager ||
+            p.instance.transport != p.transport || p.ops.transport != p.transport ||
+            p.transport.notify_mgr != p.notifications || p.ops.config_backend != p.backend ||
+            p.instance.resource_client != p.client || p.agent.monitor != p.monitor ||
+            p.monitor.transport != p.transport || p.monitor.vq_mgr != p.manager ||
+            p.instance.resource_manager != p.resource_manager || p.fsm.ops != p.ops ||
+            p.instance.mem != external_mem || p.ops.mem != external_mem || p.manager.mem != external_mem ||
+            p.instance.iommu != external_iommu || p.ops.iommu != external_iommu || p.manager.iommu != external_iommu ||
+            !p.ops.uses_external_configuration() ||
+            dpu_service_key_name(p.instance.service_key) != service_name ||
+            !dpu_same_function_key(p.instance.function_key, p.service_key.function_key) ||
+            !p.instance.pcie_id_valid || !p.transport.pcie_id_valid ||
+            !dpu_same_domain_key(p.instance.pcie_id.domain, p.pcie_id.domain) ||
+            !dpu_same_domain_key(p.transport.pcie_id.domain, p.pcie_id.domain) ||
+            p.instance.pcie_id.bdf != p.pcie_id.bdf || p.transport.pcie_id.bdf != p.pcie_id.bdf ||
+            p.instance.bdf != p.pcie_id.bdf || p.transport.bdf != p.pcie_id.bdf ||
+            p.manager.host_id != p.pcie_id.domain.host_id || p.manager.bdf != p.pcie_id.bdf ||
+            !p.client.matches_service_binding(device_snapshot, resource_snapshot, p.service_key)) begin
+            why = "external participant object, service owner or Host/BDF binding changed";
+            return 0;
+        end
+        if (scope == null || scope.selects(p.service_key)) selected.push_back(f);
+    end
+    // 从不可变导出视图反向确认每个 service 均有私有参与者，防止只沿公开数组正向遍历漏项。
+    foreach (records[r]) begin
+        if (!services.exists(dpu_service_key_name(records[r].service_key))) begin
+            why = "exported service has no exact generation participant";
+            return 0;
+        end
+    end
+    if (selected.size() == 0) begin
+        why = "external scope has no generation participants";
+        return 0;
+    end
+    foreach (selected[s]) begin
+        p = external_participants[selected[s]];
         qids.delete();
-        if (!instance.driver_agent.fsm.external_workers_stopped() ||
-            instance.resource_client == null || !instance.resource_client.is_bound_to_service()) begin
-            why = "cannot confirm while workers run or resource ownership is missing";
+        if (!p.fsm.external_workers_stopped()) begin
+            why = "selected external workers must stop before confirmation or release";
             return 0;
         end
         foreach (records[r]) begin
-            if (dpu_service_key_name(records[r].service_key) != dpu_service_key_name(instance.service_key)) continue;
+            if (dpu_service_key_name(records[r].service_key) != dpu_service_key_name(p.service_key)) continue;
             qids.push_back(records[r].notification.local_qid);
-            foreach (records[r].region_iovas[i]) begin
-                if (!iommu.get_live_mapping_for_host(instance.pcie_id.domain.host_id, instance.bdf,
-                    records[r].region_iovas[i], mapping) || mapping.gpa != records[r].region_gpas[i] ||
-                    mapping.size != records[r].region_bytes[i] || mapping.dir != DMA_BIDIRECTIONAL) begin
-                    why = "external ring DMA mapping changed since export";
+            vq = p.manager.get_queue(records[r].notification.local_qid);
+            if (vq == null || vq != external_queue_refs[r] || vq.mem != external_mem || vq.iommu != external_iommu ||
+                vq.host_id != p.pcie_id.domain.host_id || vq.bdf != p.pcie_id.bdf ||
+                vq.queue_id != records[r].notification.local_qid || vq.queue_size != records[r].queue_size ||
+                vq.desc_table_addr != records[r].desc_gpa || vq.driver_ring_addr != records[r].driver_gpa ||
+                vq.device_ring_addr != records[r].device_gpa ||
+                !p.ops.get_local_ring_regions(vq.queue_id, gpas, sizes, iovas) ||
+                gpas.size() != records[r].region_gpas.size() || sizes.size() != records[r].region_bytes.size() ||
+                iovas.size() != records[r].region_iovas.size()) begin
+                why = "external queue object, owner, geometry or exported region set changed";
+                return 0;
+            end
+            bytes = 0;
+            foreach (iovas[i]) begin
+                if (gpas[i] != records[r].region_gpas[i] || sizes[i] != records[r].region_bytes[i] ||
+                    iovas[i] != records[r].region_iovas[i] ||
+                    !external_iommu.get_live_mapping_for_host(p.pcie_id.domain.host_id, p.pcie_id.bdf, iovas[i], mapping) ||
+                    mapping.host_id != p.pcie_id.domain.host_id || mapping.bdf != p.pcie_id.bdf ||
+                    mapping.iova != iovas[i] || mapping.gpa != gpas[i] || mapping.size != sizes[i] ||
+                    mapping.dir != DMA_BIDIRECTIONAL) begin
+                    why = "external ring live mapping differs from immutable export";
                     return 0;
                 end
+                bytes += sizes[i];
+            end
+            if (bytes != records[r].ring_bytes) begin
+                why = "external ring allocation length changed";
+                return 0;
             end
         end
-        if (!instance.driver_agent.ops.validate_external_session(external_session_key, external_generation, qids, why)) return 0;
-    end
-    foreach (function_instances[f]) begin
-        instance = function_instances[f];
-        if (!scope.selects(instance.service_key)) continue;
-        qids.delete();
-        foreach (records[r])
-            if (dpu_service_key_name(records[r].service_key) == dpu_service_key_name(instance.service_key))
-                qids.push_back(records[r].notification.local_qid);
-        void'(cfg.resolve_final_service_requirement(instance.service_key, requirement, why));
-        if (!instance.driver_agent.fsm.accept_external_configuration(external_session_key, external_generation,
-                qids, requirement.behavior, why)) return 0;
-        if (!instance.resource_client.mark_runtime_ready(why)) return 0;
-        foreach (qids[q]) instance.driver_agent.monitor.observe_queue_state(qids[q], 1, 1);
-        instance.state = VF_CONFIGURED;
-        external_confirmed[dpu_service_key_name(instance.service_key)] = 1;
+        if (qids.size() == 0 || p.manager.get_queue_count() != qids.size()) begin
+            why = "external participant complete queue set changed";
+            return 0;
+        end
+        if (!p.ops.validate_external_session(external_session_key, external_generation, qids, why)) return 0;
     end
     return 1;
 endfunction
 
-// 严格区分 VIP stop 和 DUT stop；未知 quiescence、旧视图或运行中 worker 不可释放。
+// 所选 service 必须先全部预检再一起进入 READY；使用私有参与者和导出的冻结行为提交。
+function bit virtio_net_env::confirm_external_configuration(
+    input vio_external_setup setup, input vio_config_scope scope,
+    input logic configured, output string why);
+    vio_queue_setup_t	records[$];
+    int unsigned	selected[$];
+    int unsigned	qids[$];
+    virtio_driver_config_t	behavior;
+    external_participant_t	p;
+
+    why = "";
+    if (configured !== 1'b1 || scope == null) begin
+        why = "external confirmation requires successful platform result and explicit scope";
+        return 0;
+    end
+    if (!validate_external_generation(setup, scope, selected, why)) return 0;
+    setup.list_queues(records);
+    foreach (selected[s]) begin
+        p = external_participants[selected[s]];
+        qids.delete();
+        foreach (records[r]) begin
+            if (dpu_service_key_name(records[r].service_key) != dpu_service_key_name(p.service_key)) continue;
+            qids.push_back(records[r].notification.local_qid);
+            behavior = records[r].requirement.behavior;
+        end
+        if (!p.fsm.accept_external_configuration(external_session_key, external_generation, qids, behavior, why)) return 0;
+        if (!p.client.mark_runtime_ready(why)) return 0;
+        foreach (qids[q]) p.monitor.observe_queue_state(qids[q], 1, 1);
+        p.instance.state = VF_CONFIGURED;
+        external_confirmed[dpu_service_key_name(p.service_key)] = 1;
+    end
+    return 1;
+endfunction
+
+// 释放整代先完整预检，随后在无时间推进的函数内提交回收；任一失败保留所有 Function。
 function bit virtio_net_env::release_external_resources(
     input vio_external_setup setup, input logic dut_quiesced, output string why);
     virtio_external_config_backend	backend;
+    external_participant_t	p;
+    int unsigned	selected[$];
 
     why = "";
-    if (dut_quiesced !== 1'b1 || setup == null || setup != live_external_setup ||
-        !setup.belongs_to(this, device_snapshot, resource_snapshot, external_generation)) begin
-        why = "release requires exact live setup and explicit DUT quiescence";
+    if (dut_quiesced !== 1'b1) begin
+        why = "release requires explicit DUT quiescence";
         return 0;
     end
-    foreach (function_instances[f]) begin
-        if (!function_instances[f].driver_agent.fsm.external_workers_stopped()) begin
-            why = "external workers must stop before releasing DMA";
-            return 0;
-        end
-    end
-    foreach (function_instances[f]) begin
-        if (!function_instances[f].driver_agent.ops.release_external_session(external_session_key, external_generation, why)) return 0;
-        function_instances[f].driver_agent.fsm.invalidate_external_configuration();
-        // 平台确认 quiescence 后，本代 monitor 信用也必须退休，不能污染下一代。
-        function_instances[f].driver_agent.monitor.reset_all_queue_state();
-        function_instances[f].resource_client.reset_runtime_state();
-        function_instances[f].state = VF_REINIT_REQUIRED;
-        function_instances[f].transport.notify_mgr.clear_external_notifications();
-        if ($cast(backend, function_instances[f].driver_agent.ops.config_backend)) backend.clear_bindings();
+    if (!validate_external_generation(setup, null, selected, why)) return 0;
+    foreach (selected[s]) begin
+        p = external_participants[selected[s]];
+        if (!p.ops.release_external_session(external_session_key, external_generation, why)) return 0;
+        p.fsm.invalidate_external_configuration();
+        p.monitor.reset_all_queue_state();
+        p.client.reset_runtime_state();
+        p.instance.state = VF_REINIT_REQUIRED;
+        p.notifications.clear_external_notifications();
+        if ($cast(backend, p.backend)) backend.clear_bindings();
     end
     live_external_setup = null;
     external_session_key = null;
     external_confirmed.delete();
+    external_participants.delete();
+    external_queue_refs.delete();
+    external_mem = null;
+    external_iommu = null;
     return 1;
 endfunction
 

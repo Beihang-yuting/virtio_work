@@ -146,6 +146,14 @@ class virtio_resource_client extends uvm_object;
         return service_binding_owned;
     endfunction
 
+    // 无副作用地核对完整绑定来源；用于外部代次预检，不能仅凭“已绑定”接受别的 service。
+    function bit matches_service_binding(input dpu_device_snapshot device_snapshot,
+        input dpu_resource_snapshot resource_snapshot, input dpu_service_key_t service_key);
+        return service_binding_owned && bound_device_snapshot == device_snapshot &&
+            bound_resource_snapshot == resource_snapshot &&
+            dpu_service_key_name(bound_service_key) == dpu_service_key_name(service_key);
+    endfunction
+
     // 返回已绑定的 qpair 映射条数（未绑定时为 0）。
     function int unsigned qpair_mapping_count();
         return qpair_mappings.size();
