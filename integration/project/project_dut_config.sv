@@ -234,10 +234,13 @@ typedef struct {
 } project_bar_mapping_cfg_t;
 
 // 平台控制项没有截图线格式，保留显式声明的 raw/mask；不同类别仍使用独立 hook。
+// consumers_complete 声明 catalog 的共享消费者完整（允许明确空集）；AF/SPWRR/TC_WEIGHT 必填。
+// MSI-X/RNET/RDMA 自动加入实际 owner service；非空额外消费者也必须声明完整并属于冻结拓扑。
 typedef struct {
 	project_table_context_t	ctx;
 	dpu_function_key_t	owner;
 	dpu_service_key_t	consumers[$];
+	bit	consumers_complete;
 	logic [127:0]	value;
 	logic [127:0]	writable_mask;
 } project_control_cfg_t;

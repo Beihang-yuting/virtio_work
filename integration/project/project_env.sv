@@ -4,6 +4,7 @@
 // 本层直接创建 DPU/PCIe/VIO；VIO 的 parent 指向 DPU，使 UVM 自动保证快照先发布。
 // 平台 pool 只借用并校验；本层不安装旧设备配置 executor/backend。
 // 公共路由在 connect 冻结，用户显式调用独立配置入口后确认 VIO。
+// 批次 hook/checked 写寿命阻止生命周期切换；控制依赖按冻结实际消费者保护和撤销。
 // 固定 Intel HARD_IP，在子组件 build 前取得或发布 cfg/VIF；EP 功能由真实 DUT 提供。
 class project_env extends uvm_env;
 	`uvm_component_utils(project_env)
@@ -67,6 +68,12 @@ class project_env extends uvm_env;
 		input logic [63:0] offset, input int unsigned length, input logic [127:0] mask,
 		input logic [127:0] expected, input int unsigned attempts, input time interval,
 		output bit ok, output string why);
+
+	// 零时生命周期入口不得越过正在运行的批次 hook 或独立 checked 写。
+	extern protected function bit configuration_idle(output string	why);
+	// 控制消费者来自冻结实际 service；平台共享范围必须显式完整声明。
+	extern protected function bit control_consumers(input project_control_cfg_t	item,
+		output dpu_service_key_t	consumers[$], output string	why);
 
 	// checked helper 是间接端口唯一锁持有层；整项预检后才允许首个 posted 写。
 	extern protected task checked_write(input project_config_record_t record,
@@ -1515,6 +1522,51 @@ function bit project_env::remember_record(input project_config_record_t record, 
 	return 1;
 endfunction
 
+// try_get/put 只探测批次寿命，不持锁进入 helper；调用者到完成均不让出仿真时间。
+// 批次等待锁时尚未接受记录，取得锁后重新预检；独立 helper 在首次等待前计数。
+function bit project_env::configuration_idle(output string	why);
+	if (checked_writes_active != 0) begin why = "configuration operation still active"; return 0; end
+	if (!configuration_lock.try_get()) begin why = "configuration operation still active"; return 0; end
+	configuration_lock.put();
+	return 1;
+endfunction
+
+// MSI-X/RNET/RDMA 的 Function 范围由实际 owner service 派生；AF/共享调度范围不能猜测。
+// 显式消费者逐一核对冻结拓扑并去重，后续读写/撤销共用这一份关系。
+function bit project_env::control_consumers(input project_control_cfg_t	item,
+	output dpu_service_key_t	consumers[$], output string	why);
+	project_function_record_t	functions[$];
+	bit	seen[string];
+	bit	owner_found;
+	consumers.delete();
+	dpu_setup.list_functions(functions);
+	if ((item.ctx.kind inside {PROJECT_AF, PROJECT_SPWRR, PROJECT_TC_WEIGHT} || item.consumers.size() != 0) &&
+		!item.consumers_complete) begin
+		why = "platform control requires complete explicit consumer scope"; return 0;
+	end
+	foreach (functions[f]) begin
+		if (!dpu_same_function_key(functions[f].key, item.owner)) continue;
+		owner_found = 1;
+		if (!(item.ctx.kind inside {PROJECT_MSIX_CONTROL, PROJECT_MSIX_FUNCTION, PROJECT_RNET, PROJECT_RDMA_NOTIFY})) continue;
+		foreach (functions[f].services[v]) begin
+			consumers.push_back(functions[f].services[v]);
+			seen[dpu_service_key_name(functions[f].services[v])] = 1;
+		end
+	end
+	if (!owner_found) begin why = "control owner absent from frozen topology"; return 0; end
+	foreach (item.consumers[c]) begin
+		bit	found;
+		string	name;
+		name = dpu_service_key_name(item.consumers[c]);
+		found = 0;
+		foreach (functions[f]) foreach (functions[f].services[v])
+			if (dpu_service_key_name(functions[f].services[v]) == name) found = 1;
+		if (!found) begin why = "control consumer absent from frozen topology"; return 0; end
+		if (!seen.exists(name)) begin consumers.push_back(item.consumers[c]); seen[name] = 1; end
+	end
+	return 1;
+endfunction
+
 // 在任何等待/TLP 前失效，失败或旧写返回均不能恢复较新写的结果。
 function void project_env::invalidate_write_result(input project_config_record_t record);
 	string key;
@@ -1974,6 +2026,7 @@ task project_env::dispatch_record(input project_config_record_t record, output b
 			item.ctx = record.ctx;
 			item.owner = record.owner;
 			item.consumers = record.consumers;
+			item.consumers_complete = 1;
 			item.value = record.entry;
 			item.writable_mask = platform_control_mask(record);
 			case (record.ctx.kind)
@@ -2102,7 +2155,7 @@ function bit project_env::public_records(input project_table_kind_e kind,
 			r.ctx = frozen_controls[i].ctx;
 			if (!make_context(kind, frozen_controls[i].owner, r.ctx.table_index, 0, r.ctx, why)) return 0;
 			r.owner = frozen_controls[i].owner;
-			r.consumers = frozen_controls[i].consumers;
+			if (!control_consumers(frozen_controls[i], r.consumers, why)) return 0;
 			r.entry = frozen_controls[i].value;
 			r.enable_mask = '0;
 			r.enable_value = '0;
@@ -2285,6 +2338,7 @@ function bit project_env::public_records(input project_table_kind_e kind,
 	return 1;
 endfunction
 
+// 活动配置期间拒绝 prepare；此任务及核心本地 ring 分配均不等待/TLP，准入到发布保持零时原子性。
 // 所有 Host 的绑定先解析，真实 ring 仅由核心 env 分配；准备失败保留已交付 Host 的视图。
 task project_env::prepare_vio_configuration(output project_vio_selection_t selection, output bit ok, output string why);
 	dpu_vio_qpair_binding_t	pairs[$];
@@ -2294,6 +2348,7 @@ task project_env::prepare_vio_configuration(output project_vio_selection_t selec
 	ok = 0;
 	selection.setups.delete();
 	selection.scopes.delete();
+	if (!configuration_idle(why)) return;
 	why = "public configuration must be published first";
 	if (dpu_setup == null) return;
 	foreach (vio_setups[h]) if (vio_setups[h] != null) begin why = "release existing VIO generation before reprepare"; return; end
@@ -2433,6 +2488,14 @@ function bit project_env::queue_records(input project_vio_selection_t selection,
 						(frozen_controls[c].value & ~frozen_controls[c].writable_mask) != 0) begin
 						why = "queue control contains unknown/reserved bits"; return 0;
 					end
+					if (!control_consumers(frozen_controls[c], r.consumers, why)) return 0;
+					if (kinds[k] == PROJECT_QUEUE_AUX) begin
+						bit	bound_consumer;
+						bound_consumer = 0;
+						foreach (r.consumers[v])
+							if (dpu_service_key_name(r.consumers[v]) == service) bound_consumer = 1;
+						if (!bound_consumer) r.consumers.push_back(queues[q].service_key);
+					end
 					r.has_queue = kinds[k] == PROJECT_QUEUE_AUX;
 					r.entry = frozen_controls[c].value;
 					r.enable_mask = 0;
@@ -2446,6 +2509,8 @@ function bit project_env::queue_records(input project_vio_selection_t selection,
 					why = {"required queue control missing: ", kinds[k].name()}; return 0;
 				end
 			end
+			r.consumers.delete();
+			r.consumers.push_back(queues[q].service_key);
 			r.has_queue = 1;
 			r.enable_mask = 128'h1 << 68;
 			r.enable_value = r.enable_mask;
@@ -2719,7 +2784,7 @@ function bit project_env::dependencies_ready(input project_config_record_t queue
 			bit	related;
 			if (records[name].ctx.kind != needed[k]) continue;
 			related = dpu_same_function_key(records[name].owner, queue.owner);
-			if (needed[k] inside {PROJECT_N2G, PROJECT_G2P, PROJECT_SPWRR, PROJECT_TC_WEIGHT}) begin
+			if (needed[k] inside {PROJECT_N2G, PROJECT_G2P, PROJECT_AF, PROJECT_MSIX_CONTROL, PROJECT_MSIX_FUNCTION, PROJECT_SPWRR, PROJECT_TC_WEIGHT}) begin
 				related = 0;
 				foreach (records[name].consumers[c])
 					if (dpu_service_key_name(records[name].consumers[c]) == dpu_service_key_name(queue.binding.service_key)) related = 1;
@@ -2897,12 +2962,12 @@ task project_env::verify_vio_configuration(input project_vio_selection_t selecti
 	configuration_lock.put();
 endtask
 
-// 所有 Host/队列依赖与 verify 先完整检查，再在不推进时间的函数内逐 Host 提交。
+// 活动 hook/helper 期间不能确认旧结果；所有 Host/队列依赖与 verify 先完整检查，再在不推进时间的函数内逐 Host 提交。
 function void project_env::commit_vio_configuration(input project_vio_selection_t selection, output bit ok, output string why);
 	project_config_record_t	batch[$];
 	project_table_kind_e	kinds[$] = '{PROJECT_VTX, PROJECT_VRX};
 	ok = 0;
-	if (checked_writes_active != 0) begin why = "checked table writes still in flight"; return; end
+	if (!configuration_idle(why)) return;
 	if (!queue_records(selection, kinds, batch, why)) return;
 	foreach (batch[i]) begin
 		string	key;
@@ -2919,11 +2984,12 @@ function void project_env::commit_vio_configuration(input project_vio_selection_
 	why = "";
 endfunction
 
-// 核心 release 为整 Host 代；拒绝局部 service scope，全部 Host 预检后才释放任何资源。
+// 活动 hook/helper 期间拒绝且不修改任何资源；核心 release 为整 Host 代；拒绝局部 service scope，全部 Host 预检后才释放任何资源。
 function void project_env::release_vio_resources(input project_vio_selection_t selection, input logic dut_quiesced, output bit ok, output string why);
 	vio_queue_setup_t	queues[$];
 	string	remove_keys[$];
 	ok = 0;
+	if (!configuration_idle(why)) return;
 	why = "release needs explicit platform quiescence";
 	if (dut_quiesced !== 1'b1 || !preflight_vio(selection, why)) return;
 	foreach (selection.setups[h]) begin

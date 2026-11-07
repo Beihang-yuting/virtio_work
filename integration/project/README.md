@@ -89,6 +89,20 @@ connect 路由安装。改变 topology 必须重建 env。VIO enabled/pairs/form
 更改，并在下一次 prepare 采样。任何 accepted typed 重写都会使旧配置/验证/使能
 结果失效，部分发送失败也不能保留旧 READY；必须重新使能、验证再确认。
 
+`platform_controls` 的 MSI-X control/function、RNET、RDMA notify 自动纳入冻结 owner 的
+实际 services。显式 `consumers` 是额外共享消费者，必须来自同一冻结拓扑；重复项会去重。
+非空额外列表必须设置 `consumers_complete=1`，声明平台已列全共享范围。
+AF、SPWRR、TC-weight 的硬件作用域不能推断，必须显式设置该标志并给出完整消费者列表；
+明确无消费者时可用空列表加该标志。它是 catalog 声明，不是运行时绕过检查的凭据。
+同一 canonical 消费者关系用于依赖就绪、confirmed/running 写保护与验证失败撤销；
+原始 owner 列表不能省略实际 VIO owner services。独立 Function 的控制仍可单独配置。
+
+配置/使能/验证批次（含等待中的平台 hook）或独立 checked 写未结束时，
+`prepare_vio_configuration()`、`commit_vio_configuration()` 和 `release_vio_resources()`
+返回失败且不修改资源。该准入按整个 project env 保守串行化生命周期边界；
+表项写仍保留原有同端口锁和逐记录 revision 检查。等待操作结束后重试，
+不要在 hook 内释放/reprepare 所操作的资源；原始 MMIO 的寿命由平台调用者负责。
+
 以下是**独立的平台布局示例**，所有基址、容量、端口、trigger/index 关系均是假定值，
 只能在平台寄存器规范明确相同时采用。`0x10000` 是图片 VTX 表内相对偏移，不能据此
 推断模块基址。表宽固定16B，VTX/VRX 必须间接访问；notify 仅单 bank。
@@ -129,6 +143,32 @@ endtask
 notify lookup base 与真正 doorbell 是不同输入。notify/MSI-X linear/RDMA notify
 按高 DWORD→低 DWORD写；VTX/VRX 按 data→control-clear→control-trigger 串行写。
 PBA/stat 没有初始化写；drop 清除使用独立显式 W1C mask API。
+
+## 合入已有 env 后如何发送 DUT 配置
+
+将当前 `project_env_cfg`/`project_env` 的字段、extern 声明和实现合入一个已有 cfg/env；
+同时保留 `project_dut_config.sv`、`project_vio_config.sv` 的类型/只读视图、
+`project_bar_registry.sv` 和 `project_pcie_rc_driver.sv`，按 `project_env_pkg.sv` 的依赖顺序编译。
+`cfg.load_params()` 只调用一次；随后填写真实平台数据和 VIF，再创建 env，不能在冻结后补布局。
+
+上面的 VTX hook 实际发送链为：`user_configure_vtx_queue(item)` → `write_vtx()` →
+`checked_write()` → `mmio()` → `pcie_tl_reg_seq` →
+`pcie_env.rc_agents[target.rc_slot].sequencer`。`mmio()` 从冻结 BAR 租约解析绝对地址并选择
+RC，填入 Memory Read/Write、长度、payload 和 skip-mask；既有 Intel 路由再按地址匹配
+Function sideband。平台 hook
+不需要另建 sequence 或手算 RC/BAR 地址。用户自写底层 sequence 必须保留同样的路由约束。
+
+```systemverilog
+// 平台自定义寄存器示例：地址和数据必须替换为真实规范；不是自动配置流程。
+logic [127:0]	readback;
+env.pcie_bar_write_by_name("h0.pf0.bar0", 'h40, 4, 128'h1234, 0, ok, why);
+if (!ok) `uvm_fatal("MMIO_WRITE", why)
+env.pcie_bar_read_by_name("h0.pf0.bar0", 'h40, 4, 0, readback, ok, why);
+if (!ok) `uvm_fatal("MMIO_READ", why)
+```
+
+原始 MMIO 只检查地址/路由/传输结果，不登记 typed 配置完成，也不替代 enable/verify/commit。
+平台不可用原始 MMIO 绕过已确认队列依赖的写保护；需要生命周期账本的表项使用 typed helper。
 
 ## BAR 目标与32对队列
 

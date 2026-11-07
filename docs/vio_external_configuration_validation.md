@@ -5,8 +5,10 @@
 因此这里不认证其模块基址、间接端口语义、PBA真实容量、QSCH调度或线侧收发。
 “模型未测的软件合同”也单独列出，不能用RTL边界代替。
 
-最终产品基线为 `2426d2e0e25c911806e10404917ffb3ccfbf1381`；Task4仅添加验证与文档。
-Task1/2/3已通过的未改源码证据复用，不为增加数量重复运行。全部仿真由指定5.6
+Task3历史产品基线为 `2426d2e0e25c911806e10404917ffb3ccfbf1381`，Task4随后添加验证与文档。
+全分支审查基线 `f8230f68c5b48efcdfe9d17603341b86af3730fb` 的I1/I2最终修复采用
+下文 `finalfix1` 冻结源码身份及六项聚焦证据；不把旧矩阵追记为新产品全量复测。
+Task1/2/3已通过的未改源码证据保留原身份复用。全部仿真由指定5.6
 验证代理在 `ubuntu@10.11.10.53`（`simv-ai`）通过 `bash -lic` 加载VCS/license执行，
 VCS版本 `W-2024.09-SP1_Full64`。本地未使用旧AIP checkout进行编译。
 
@@ -282,3 +284,72 @@ contract5的late-publication fixture失败于“late publication was already per
 静态门禁：`python3 scripts/render_project_code.py --check`、`git diff --check`，
 生产filelist/package无项目入口；新SystemVerilog使用extern、真实Tab和中文意图注释。
 未修改外部依赖或旧AIP checkout，不提交build产物，不推送。
+
+
+## 最终审查修复：finalfix1（I1/I2）
+
+I1修复让prepare/commit/release在配置、使能、验证批次hook或独立checked写仍活动时
+零副作用拒绝；不在helper内递归获取批次锁。I2以冻结实际owner service和经过校验、
+去重的显式shared消费者建立统一控制依赖；AF/SPWRR/TC-weight的平台作用域必须通过
+`consumers_complete`完整声明。实际硬件作用域仍由平台负责，不从PF/AF名称猜测。
+
+冻结manifest为 `finalfix1-controller-source.sha256`（151项），SHA-256：
+`0885d1e54f28220aac683d49194411c083d9070af8b6ecb9fc0c7b8333a3eb94`。
+控制端独立manifest、本地151/151、全新远端重新生成manifest逐字节比较及151/151
+`sha256sum -c`全部通过后才ACK编译；结束时控制端再次确认当前151源码未变。
+相对审查基线只有三个编译源码改变：
+
+| 文件 | finalfix1 SHA-256 |
+| --- | --- |
+| `integration/project/project_env.sv` | `9842b7931f46e6108b5a826c51b3d30cdb0aff7c6a4cfc86768ff62a633fcb58` |
+| `integration/project/project_dut_config.sv` | `c8284e2126faeefed848b39f156add0e043836405841ff5ada913441c8145f09` |
+| `integration/project/tests/project_external_contract_test.sv` | `1e52c74dbf87b38ca6e434567e113ca4074d7cd2fa1ea34e4b1d774481d13249` |
+
+远端候选根为
+`/home/ubuntu/ryan/vio_external_config_validation_20261107.DjqaPI/finalfix1_work`，
+`out=build/vio_external_config_validation/finalfix1/project`，日志为`$out/matrix/<row>.log`。
+编译使用本文前述两个project filelist、`project_env_tb`与同一VCS选项；compile/strict
+为0/0，compile log SHA `cfaa607ccfc75662115c1e3ebf2668a8f25648dda2e662f6a0a96a5e9c28707d`。
+逐行执行命令形式如下，`testname`和`plusargs`取表中值：
+
+```bash
+timeout 180s "$out/simv" -exitstatus "+UVM_TESTNAME=$testname" \
+  +UVM_VERBOSITY=UVM_LOW <plusargs> -l "$log"
+scripts/strict_log_check.sh sim "$log"
+```
+
+六项全部sim/strict=0/0、UVM W/E/F=0/0/0，每个指定marker恰好一次；所有PCIe
+scoreboard mismatch/unexpected/timed-out=0/0/0，两Host场景的两个scoreboard均通过。
+除rewrite外均为`project_external_contract_test`；rewrite为`project_external_integration_test`。
+
+| row | plusargs | 必需marker（均有`PROJECT_`前缀） | log SHA-256 |
+| --- | --- | --- | --- |
+| lifetime | `+PROJECT_SMALL +PROJECT_LIFETIME` | `OPERATION_LIFETIME_PASS`, `GENERATION_REUSE_PASS`, `EXTERNAL_CONTRACT_PASS` | `f417de468aef19178b6b4396f99199bda994fa705d0b958159a393ca9ae2f9e3` |
+| control_guard | `+PROJECT_SMALL +PROJECT_CONTROLS +PROJECT_CONTROL_GUARD +PROJECT_MSIX` | `CONTROL_CONSUMERS_PASS`, `CONTROLS_PASS`, `EXTERNAL_CONTRACT_PASS` | `0ab9202b1faabd739e5f3af4a94fef7eefebc70d5f85dbdaf0feb9f1df2353c9` |
+| control_scope_missing | `+PROJECT_SMALL +PROJECT_CONTROLS +PROJECT_POLICY_CASE=control_scope_missing` | `POLICY_REJECTION_PASS` | `ee1fd6db1c57c14451ed0da1c2a8957ce9254387e17e149d8db3132d20dda055` |
+| control_consumer_unknown | `+PROJECT_SMALL +PROJECT_CONTROLS +PROJECT_POLICY_CASE=control_consumer_unknown` | `POLICY_REJECTION_PASS` | `97c820bb702277953e72683ad2db35eba0c596b73bf12d31861d69f712ab8071` |
+| rewrite | `+PROJECT_SMALL +PROJECT_REWRITE` | `REWRITE_PASS`, `EXTERNAL_FLOW_PASS` | `a2184849cf3d97ea71dec32cf8dc871ef0e6692bcbc05c265203f30a46c48ff9` |
+| two_host_msix | `+PROJECT_TWO_HOSTS +PROJECT_SMALL +PROJECT_MSIX` | `GENERATION_REUSE_PASS`, `EXTERNAL_CONTRACT_PASS` | `fb61e4620e69a42f7cf8e9bd102d9b4f03e6bff1aa4ca230f526ed29340247f4` |
+
+lifetime覆盖间接独立写/使能的真实等待、configure/enable在helper前等待、verify返回前
+等待五个窗口。每次release/commit/prepare均以精确活动操作诊断拒绝，setup/ring和
+核心mapping完整性不变；恢复操作成功后正常release/reprepare，旧代typed写/使能/
+验证/提交仍拒绝且不发包。control_guard覆盖自动owner消费者、重复显式shared去重、
+confirmed/stopped及running两阶段typed/public写在hook/TLP前拒绝、独立PF正常使能，
+以及shared公共验证失败撤销VF确认而保留DMA、显式恢复成功。两个策略负例断言精确
+诊断、零hook、零requests/completions、保留资源和最后合法释放。
+
+完整证据位于 `build/vio_external_config_validation/remote_evidence/finalfix1/`：
+
+| 工件 | SHA-256 |
+| --- | --- |
+| `results.md` | `34bf7fe21a647565db741aca93cd44af0b4b8a9c13a90b868a3f01bc353bbdba` |
+| `SHA256SUMS`（50项全部复核通过） | `778292e6de319ad0a20aea8c79adde262bd5ea63fc6c4b5be2a5f6ee9769e081` |
+| `commands/run_primary_rows.sh` | `5a6895c2ee4b0a5c95a50e3cca6a6de6e2561701aacad5f817dcc5acf3101221` |
+| `commands/run_remaining_rows.sh` | `c771d128ce932a09e8ffc9671700143b2e8454e5323318fc378ccc04e23b190e` |
+| `build/vio_external_config_validation/finalfix1_validation_logs.tar.gz` | `00a089bab1be8b03ab3ff0339b983ac4ab3d0ca23ffce4eebfb5d888b4e342da` |
+
+I1/I2源于审查的具体源码交错分析；新catalog字段与旧fixture不兼容，没有声称精确旧基线
+RED仿真，也没有加入兼容shim。未改core/worker/legacy及Task1–4广域矩阵不重复运行，
+继续保留各自原冻结身份；本波只关闭两项最终审查缺口并覆盖相邻rewrite/两Host路径。
+证据仍是模型端点与Intel VIP路径的软件合同，不认证未提供用户RTL的物理寄存器语义。

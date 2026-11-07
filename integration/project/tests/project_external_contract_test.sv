@@ -14,6 +14,34 @@ package project_external_contract_test_pkg;
 	import project_external_integration_test_pkg::*;
 	`include "uvm_macros.svh"
 
+	// 在真实间接写的第二段入口暂停；继续后仍调用原 sequence，不伪造完成或丢弃请求。
+	class project_lifetime_pause_seq extends pcie_tl_reg_seq;
+		`uvm_object_utils(project_lifetime_pause_seq)
+		static int unsigned	pause_on_call;
+		static int unsigned	calls;
+		static uvm_event	entered = new("write_entered");
+		static uvm_event	resume_write = new("write_resume");
+		extern function new(string name = "project_lifetime_pause_seq");
+		extern virtual task body();
+	endclass
+
+	// 无暂停时与生产寄存器 sequence 相同。
+	function project_lifetime_pause_seq::new(string name = "project_lifetime_pause_seq");
+		super.new(name);
+	endfunction
+
+	// 第一个数据TLP已发送，第二段仍属于同一次已接受的 checked 写寿命。
+	task project_lifetime_pause_seq::body();
+		if (pause_on_call != 0) begin
+			calls++;
+			if (calls == pause_on_call) begin
+				entered.trigger();
+				resume_write.wait_trigger();
+			end
+		end
+		super.body();
+	endtask
+
 	// 单次UR注入的精确诊断窗口；其他severity/ID/状态照常报错，绝不全局降级。
 	class project_ur_expected_report extends uvm_report_catcher;
 		int unsigned	warnings;
@@ -42,6 +70,15 @@ package project_external_contract_test_pkg;
 	class project_contract_env extends project_external_model_env;
 		`uvm_component_utils(project_contract_env)
 		int unsigned	control_calls[project_table_kind_e];
+		int unsigned	pause_hook;
+		bit	fail_public_verify;
+		// 公共验证失败必须沿相同共享消费者关系撤销业务确认。
+		extern virtual task user_verify_dpu_configuration(input project_dpu_config_scope	scope, output bit	ok, output string	why);
+		uvm_event	hook_entered = new("hook_entered");
+		uvm_event	hook_resume = new("hook_resume");
+		// 配置和使能的 hook 在调用 checked helper 前等待，用于验证外层寿命。
+		extern virtual task user_configure_vtx_queue(input project_vtx_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task user_enable_queue(input project_queue_control_cfg_t	item, output bit	ok, output string	why);
 		// 创建只读观察层，沿用父类构建路径。
 		extern function new(string	name, uvm_component	parent);
 		// 可选RDMA与W1C都必须由平台显式调用，不随队列初始化自动运行。
@@ -78,6 +115,30 @@ package project_external_contract_test_pkg;
 	function project_contract_env::new(string	name, uvm_component	parent);
 		super.new(name, parent);
 	endfunction
+
+	// 仅测试显式失败结果；不修改验证/撤销生产路径。
+	task project_contract_env::user_verify_dpu_configuration(input project_dpu_config_scope	scope, output bit	ok, output string	why);
+		ok = !fail_public_verify;
+		why = ok ? "" : "injected shared control verification failure";
+	endtask
+
+	// 暂停发生于 helper 入口之前，批次 semaphore 必须覆盖该窗口。
+	task project_contract_env::user_configure_vtx_queue(input project_vtx_cfg_t	item, output bit	ok, output string	why);
+		if (pause_hook == 1) begin
+			hook_entered.trigger();
+			hook_resume.wait_trigger();
+		end
+		super.user_configure_vtx_queue(item, ok, why);
+	endtask
+
+	// 使能同样必须在平台 hook 等待期间保留原代资源。
+	task project_contract_env::user_enable_queue(input project_queue_control_cfg_t	item, output bit	ok, output string	why);
+		if (pause_hook == 2) begin
+			hook_entered.trigger();
+			hook_resume.wait_trigger();
+		end
+		super.user_enable_queue(item, ok, why);
+	endtask
 
 	// 可选RDMA条目使用同一冻结检查和高低DWORD写序。
 	task project_contract_env::user_configure_rdma_notify_entry(input project_rdma_notify_cfg_t	item, output bit	ok, output string	why);
@@ -176,6 +237,12 @@ package project_external_contract_test_pkg;
 		extern task check_public_controls(input project_dpu_config_scope	scope);
 		// 局部释放必须保留另一Host；全部释放后下一代才可复用预取RAM。
 		extern task check_release_generation();
+		// 覆盖独立写、enable、pre-helper hook 和 verify 的活动寿命。
+		extern task check_operation_lifetime();
+		// 暂停窗口内检查三种生命周期准入及 ring/IOMMU 资源不变。
+		extern task check_active_admission();
+		// confirmed/stopped 与 running 均保护 owner/shared 控制，独立 PF 仍可写。
+		extern task check_control_consumers(input project_dpu_config_scope	scope);
 		// BAR 读可注入 UR Completion；仍经 Intel APP 引脚发送。
 		extern task receive_contract(input int unsigned	host);
 		// 检查实际全部 Memory 请求的路由、长度、逐字节数据及 skip mask。
@@ -212,6 +279,9 @@ package project_external_contract_test_pkg;
 		bit	rdma_declared;
 		void'($value$plusargs("PROJECT_POLICY_CASE=%s", policy_case));
 		project_external_model_env::type_id::set_type_override(project_contract_env::get_type());
+		if ($test$plusargs("PROJECT_LIFETIME"))
+			pcie_tl_reg_seq::type_id::set_type_override(project_lifetime_pause_seq::get_type());
+		if ($test$plusargs("PROJECT_CONTROL_GUARD")) aip_cmdline_override::set_val("dpu.pfs_per_host", "2");
 		if ($test$plusargs("PROJECT_MIXED")) begin
 			aip_cmdline_override::set_val("vio.h0.pf0.vf1.i0.queue_type", "VQ_CUSTOM");
 			aip_cmdline_override::set_val("vio.h1.pf0.vf1.i0.queue_type", "VQ_CUSTOM");
@@ -312,6 +382,16 @@ package project_external_contract_test_pkg;
 		end
 
 		if ($test$plusargs("PROJECT_CONTROLS")) declare_controls();
+		if (policy_case inside {"control_scope_missing", "control_consumer_unknown"}) begin
+			foreach (cfg.platform_controls[c]) if (cfg.platform_controls[c].ctx.kind == PROJECT_AF) begin
+				if (policy_case == "control_scope_missing") cfg.platform_controls[c].consumers_complete = 0;
+				else begin
+					dpu_service_key_t	missing;
+					missing = '{function_key:cfg.platform_controls[c].owner, service_kind:DPU_SERVICE_VIO_NET, service_instance_id:99};
+					cfg.platform_controls[c].consumers.push_back(missing);
+				end
+			end
+		end
 
 		if (policy_case == "pba_overlap") begin
 			foreach (cfg.msix_policies[name]) if (cfg.function_policies[name].key.kind == DPU_FUNCTION_PF) begin
@@ -360,14 +440,26 @@ package project_external_contract_test_pkg;
 			cfg.function_policies[name].prefix = 32'h12340000+f;
 			cfg.msix_policies[name].table_only_enable = 0;
 			control.owner = key;
+			control.consumers_complete = 1;
 			control.ctx.table_index = cfg.function_policies[name].vport;
 			control.writable_mask = 32'hffff;
 			foreach (public_kinds[k]) begin
 				control.ctx.kind = public_kinds[k];
+				control.consumers.delete();
+				if ($test$plusargs("PROJECT_CONTROL_GUARD") && key.kind == DPU_FUNCTION_PF && key.pf_id == 0 && public_kinds[k] inside {PROJECT_MSIX_CONTROL, PROJECT_MSIX_FUNCTION}) begin
+					dpu_service_key_t	shared_service;
+					require_true(cfg.dpu_cfg.placement_cfg.vio_requests[0].fixed_devices.size() == 1, "shared control needs explicit service owner");
+					shared_service =
+						'{function_key:cfg.dpu_cfg.placement_cfg.vio_requests[0].fixed_devices[0], service_kind:DPU_SERVICE_VIO_NET,
+						service_instance_id:cfg.dpu_cfg.placement_cfg.vio_requests[0].service_instance_id};
+					control.consumers.push_back(shared_service);
+					control.consumers.push_back(shared_service); // canonical 输出必须去重。
+				end
 				control.value = public_kinds[k] == PROJECT_RNET ? (key.host_id << 1) | 1 : 32'h21+k;
 				cfg.platform_controls.push_back(control);
 			end
 			if (key.kind == DPU_FUNCTION_PF && key.pf_id == 0) begin
+				control.consumers.delete();
 				control.ctx.kind = PROJECT_AF;
 				control.value = 32'h15;
 				cfg.platform_controls.push_back(control);
@@ -383,6 +475,7 @@ package project_external_contract_test_pkg;
 			service = '{function_key:control.owner, service_kind:DPU_SERVICE_VIO_NET,
 				service_instance_id:cfg.dpu_cfg.placement_cfg.vio_requests[r].service_instance_id};
 			control.consumers.push_back(service);
+			control.consumers_complete = 1;
 			control.ctx.table_index = cfg.function_policies[dpu_function_key_name(control.owner)].vport;
 			control.writable_mask = 32'hff;
 			foreach (shared_kinds[k]) begin
@@ -433,11 +526,167 @@ package project_external_contract_test_pkg;
 			probe.control_calls[PROJECT_MSIX_CONTROL] == rows.size(), "MSI-X control traversal count");
 	endtask
 
+	// 三个零时入口均必须拒绝；核心完整性检查同时验证实际 ring 分配与 IOMMU 映射仍在。
+	task project_external_contract_test::check_active_admission();
+		project_vio_selection_t	attempted;
+		vio_queue_setup_t	before_rows[$];
+		vio_queue_setup_t	after_rows[$];
+		bit	ok;
+		string	why;
+		int unsigned	before_count;
+		#20ns;
+		before_count = requests[0].size();
+		selection.setups[0].list_queues(before_rows);
+		env.release_vio_resources(selection, 1, ok, why);
+		require_true(!ok && why == "configuration operation still active", "active operation allowed release");
+		env.commit_vio_configuration(selection, ok, why);
+		require_true(!ok && why == "configuration operation still active", "active operation allowed commit");
+		env.prepare_vio_configuration(attempted, ok, why);
+		require_true(!ok && why == "configuration operation still active" && attempted.setups.num() == 0, "active operation allowed prepare");
+		require_true(env.vio_setups[0] == selection.setups[0] &&
+			env.vio_envs[0].preflight_external_configuration(selection.setups[0], selection.scopes[0], why), "rejected lifecycle call changed setup/rings/mappings");
+		selection.setups[0].list_queues(after_rows);
+		require_true(before_rows.size() == after_rows.size(), "rejected lifecycle call changed queue count");
+		foreach (before_rows[q]) require_true(before_rows[q].desc_gpa == after_rows[q].desc_gpa &&
+			before_rows[q].desc_iova == after_rows[q].desc_iova && before_rows[q].driver_iova == after_rows[q].driver_iova &&
+			before_rows[q].device_iova == after_rows[q].device_iova, "rejected lifecycle call changed exported rings");
+		#20ns;
+		require_true(requests[0].size() == before_count, "paused operation/lifecycle rejection emitted a TLP");
+	endtask
+
+	// 每个窗口先进入真实等待再做拒绝断言，恢复后操作必须完成，后续正常 release/reprepare 由既有流程覆盖。
+	task project_external_contract_test::check_operation_lifetime();
+		project_vtx_cfg_t	tx;
+		bit	operation_ok;
+		string	operation_why;
+		tx = env.last_vtx;
+		for (int unsigned	window = 0; window < 5; window++) begin
+			project_lifetime_pause_seq::entered.reset();
+			probe.hook_entered.reset();
+			env.verify_entered.reset();
+			project_lifetime_pause_seq::calls = 0;
+			project_lifetime_pause_seq::pause_on_call = window < 2 ? 2 : 0;
+			probe.pause_hook = window == 2 ? 1 : (window == 3 ? 2 : 0);
+			env.hold_verify = window == 4;
+			fork
+				begin
+					case (window)
+						0: env.write_vtx(tx, operation_ok, operation_why);
+						1, 3: env.enable_vio_queues(selection, operation_ok, operation_why);
+						2: env.configure_vio_queues(selection, operation_ok, operation_why);
+						4: env.verify_vio_configuration(selection, operation_ok, operation_why);
+					endcase
+				end
+				begin
+					if (window < 2) project_lifetime_pause_seq::entered.wait_on();
+					else if (window < 4) probe.hook_entered.wait_on();
+					else env.verify_entered.wait_on();
+					check_active_admission();
+					project_lifetime_pause_seq::pause_on_call = 0;
+					probe.pause_hook = 0;
+					env.hold_verify = 0;
+					if (window < 2) project_lifetime_pause_seq::resume_write.trigger();
+					else if (window < 4) probe.hook_resume.trigger();
+					else env.verify_release.trigger();
+				end
+			join
+			require_true(operation_ok, operation_why);
+		end
+		`uvm_info("PROJECT_OPERATION_LIFETIME_PASS", "standalone write, indirect enable, pre-helper configure/enable and verification preserve active generation", UVM_LOW)
+	endtask
+
+	// 自动 owner、显式 shared、独立 PF 三种关系在 stopped/confirmed 与 running 两阶段逐一验证。
+	task project_external_contract_test::check_control_consumers(input project_dpu_config_scope	scope);
+		project_config_record_t	rows[$];
+		project_config_record_t	part[$];
+		project_control_cfg_t	item;
+		dpu_function_key_t	chosen[$];
+		int unsigned	bars[$];
+		project_dpu_config_scope	one;
+		project_function_record_t	functions[$];
+		int unsigned	queue_counts[$];
+		int unsigned	before_count;
+		int unsigned	before_hooks;
+		bit	ok;
+		bit	saw_owner;
+		bit	saw_shared;
+		string	why;
+		foreach (env.vio_envs[0].function_instances[f]) queue_counts.push_back(env.vio_envs[0].function_instances[f].vq_mgr.get_queue_count());
+		require_true(probe.inspect_public(PROJECT_MSIX_CONTROL, scope, rows, why), why);
+		require_true(probe.inspect_public(PROJECT_MSIX_FUNCTION, scope, part, why), why);
+		foreach (part[r]) rows.push_back(part[r]);
+		for (int unsigned	running = 0; running < 2; running++) begin
+			if (running) begin
+				foreach (env.vio_envs[0].function_instances[f]) env.vio_envs[0].function_instances[f].driver_agent.fsm.start_dataplane();
+				#30ns;
+			end
+			foreach (rows[r]) begin
+				if (rows[r].consumers.size() == 0) continue;
+				require_true(rows[r].consumers.size() == 1, "canonical control consumers missing/duplicated");
+				if (rows[r].owner.kind == DPU_FUNCTION_VF) saw_owner = 1;
+				else saw_shared = 1;
+				item.ctx = rows[r].ctx;
+				item.owner = rows[r].owner;
+				item.consumers = rows[r].consumers;
+				item.consumers_complete = 1;
+				item.value = rows[r].entry;
+				item.writable_mask = 32'hffff;
+				chosen.delete(); chosen.push_back(item.owner);
+				one = new("dependent_owner", env.dpu_setup, chosen, bars);
+				#20ns;
+				before_count = requests[0].size();
+				before_hooks = probe.control_calls[PROJECT_MSIX_FUNCTION];
+				env.write_control(item, ok, why); require_true(!ok, "confirmed consumer allowed typed control rewrite");
+				env.enable_msix(one, ok, why); require_true(!ok, "confirmed consumer allowed public control rewrite");
+				#20ns;
+				require_true(requests[0].size() == before_count && probe.control_calls[PROJECT_MSIX_FUNCTION] == before_hooks,
+					"rejected control rewrite reached hook/TLP");
+			end
+			env.dpu_setup.list_functions(functions);
+			chosen.delete();
+			foreach (functions[f]) if (functions[f].key.kind == DPU_FUNCTION_PF && functions[f].key.pf_id == 1) chosen.push_back(functions[f].key);
+			require_true(chosen.size() == 1, "independent PF missing");
+			one = new("independent_owner", env.dpu_setup, chosen, bars);
+			before_hooks = probe.control_calls[PROJECT_MSIX_FUNCTION];
+			env.enable_msix(one, ok, why); require_true(ok && probe.control_calls[PROJECT_MSIX_FUNCTION] == before_hooks+1, why);
+			foreach (env.vio_envs[0].function_instances[f]) begin
+				virtio_function_instance	instance;
+				instance = env.vio_envs[0].function_instances[f];
+				require_true(instance.vq_mgr.get_queue_count() == queue_counts[f] && instance.driver_agent.ops.external_queue_ready(1) &&
+					env.vio_envs[0].external_service_confirmed(selection.setups[0], instance.service_key), "control rejection revoked consumer readiness");
+				if (running) require_true(instance.driver_agent.fsm.state == FSM_RUNNING, "control rejection stopped consumer");
+			end
+		end
+		require_true(saw_owner && saw_shared, "owner/shared consumer coverage absent");
+		foreach (env.vio_envs[0].function_instances[f]) env.vio_envs[0].function_instances[f].driver_agent.fsm.stop_dataplane();
+		require_true(env.vio_envs[0].preflight_external_configuration(selection.setups[0], selection.scopes[0], why), "control guard changed rings/mappings");
+		// PF0 本身没有 VIO；失败仍须撤销其声明的 VF 消费者，保留所有 DMA。
+		chosen.delete();
+		foreach (functions[f]) if (functions[f].key.kind == DPU_FUNCTION_PF && functions[f].key.pf_id == 0) chosen.push_back(functions[f].key);
+		one = new("shared_revoke", env.dpu_setup, chosen, bars, '{PROJECT_MSIX_FUNCTION});
+		probe.fail_public_verify = 1;
+		env.verify_dpu_configuration(one, ok, why); require_true(!ok, "shared verification failure accepted");
+		probe.fail_public_verify = 0;
+		foreach (env.vio_envs[0].function_instances[f]) begin
+			virtio_function_instance	instance;
+			instance = env.vio_envs[0].function_instances[f];
+			require_true(!env.vio_envs[0].external_service_confirmed(selection.setups[0], instance.service_key) &&
+				instance.vq_mgr.get_queue_count() == queue_counts[f], "shared verification failure did not revoke readiness while retaining DMA");
+		end
+		env.verify_dpu_configuration(one, ok, why); require_true(ok, why);
+		env.enable_vio_queues(selection, ok, why); require_true(ok, why);
+		env.verify_vio_configuration(selection, ok, why); require_true(ok, why);
+		env.commit_vio_configuration(selection, ok, why); require_true(ok, why);
+		`uvm_info("PROJECT_CONTROL_CONSUMERS_PASS", "owner/shared confirmed and running guards reject pre-hook/TLP; independent PF remains writable", UVM_LOW)
+	endtask
+
 	// 一Host释放不改变另一Host的环/确认；旧代全部释放后允许明确的新预取分配。
 	task project_external_contract_test::check_release_generation();
 		project_vio_selection_t	released;
 		project_vio_selection_t	retained;
 		project_vio_selection_t	attempted;
+		project_vio_selection_t	old_selection;
+		project_vtx_cfg_t	stale_tx;
 		vio_queue_setup_t	before_rows[$];
 		vio_queue_setup_t	after_rows[$];
 		project_config_record_t	rows[$];
@@ -446,6 +695,8 @@ package project_external_contract_test_pkg;
 		int unsigned	before_count[int unsigned];
 		bit	ok;
 		string	why;
+		old_selection = selection;
+		stale_tx = env.last_vtx;
 		foreach (selection.setups[h]) begin
 			old_generation[h] = selection.setups[h].get_generation();
 			before_count[h] = requests[h].size();
@@ -483,6 +734,12 @@ package project_external_contract_test_pkg;
 		require_true(ok, why);
 		foreach (selection.setups[h])
 			require_true(selection.setups[h].get_generation() > old_generation[h], "reprepare reused old generation");
+		if ($test$plusargs("PROJECT_LIFETIME")) begin
+			env.write_vtx(stale_tx, ok, why); require_true(!ok, "old-generation typed write accepted after reprepare");
+			env.enable_vio_queues(old_selection, ok, why); require_true(!ok, "old-generation enable accepted after reprepare");
+			env.verify_vio_configuration(old_selection, ok, why); require_true(!ok, "old-generation verification accepted after reprepare");
+			env.commit_vio_configuration(old_selection, ok, why); require_true(!ok, "old-generation commit accepted after reprepare");
+		end
 		foreach (env.vio_envs[h]) foreach (env.vio_envs[h].function_instances[f]) begin
 			virtio_function_instance	instance;
 			instance = env.vio_envs[h].function_instances[f];
@@ -801,11 +1058,14 @@ package project_external_contract_test_pkg;
 		scope = new("policy", env.dpu_setup, keys, bars);
 		env.prepare_vio_configuration(selection, ok, why);
 		require_true(ok, why);
-		if (policy_case == "missing_hook") env.configure_tlp_prefix(scope, ok, why);
+		if (policy_case inside {"control_scope_missing", "control_consumer_unknown"}) env.configure_af(scope, ok, why);
+		else if (policy_case == "missing_hook") env.configure_tlp_prefix(scope, ok, why);
 		else if (policy_case == "pba_overlap") env.configure_msix(scope, ok, why);
 		else if (policy_case inside {"qsch_overflow", "qsch_conflict"}) env.configure_qsch(selection, ok, why);
 		else env.configure_vio_queues(selection, ok, why);
 		require_true(!ok && why != "", {"bad platform policy accepted: ", policy_case});
+		if (policy_case == "control_scope_missing") require_true(why == "platform control requires complete explicit consumer scope" && probe.control_calls[PROJECT_AF] == 0, "missing scope reached hook/wrong diagnostic");
+		if (policy_case == "control_consumer_unknown") require_true(why == "control consumer absent from frozen topology" && probe.control_calls[PROJECT_AF] == 0, "unknown consumer reached hook/wrong diagnostic");
 		#20ns;
 		foreach (apps[h]) begin
 			require_true(requests[h].size() == 0, "failed category emitted a partial TLP");
@@ -980,6 +1240,7 @@ package project_external_contract_test_pkg;
 			check_writes(rows, before_count);
 		end
 		check_concurrent_port();
+		if ($test$plusargs("PROJECT_LIFETIME")) check_operation_lifetime();
 		env.enable_vio_queues(selection, ok, why);
 		require_true(ok, why);
 		env.verify_vio_configuration(selection, ok, why);
@@ -998,6 +1259,7 @@ package project_external_contract_test_pkg;
 				"optional queue control traversal count");
 			`uvm_info("PROJECT_CONTROLS_PASS", "all declared public and queue control hooks emitted checked Memory writes", UVM_LOW)
 		end
+		if ($test$plusargs("PROJECT_CONTROL_GUARD")) check_control_consumers(public_scope);
 		check_release_generation();
 		foreach (env.vio_envs[h]) env.vio_envs[h].host_mem.leak_check();
 		`uvm_info("PROJECT_EXTERNAL_CONTRACT_PASS", $sformatf("checks=%0d mixed=%0d hosts=%0d", checks, $test$plusargs("PROJECT_MIXED"), host_count), UVM_LOW)
