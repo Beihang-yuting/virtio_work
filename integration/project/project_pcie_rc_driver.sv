@@ -24,7 +24,7 @@ class project_pcie_rc_driver extends pcie_tl_rc_driver;
         output string			why
     );
 
-    // 唯一发送前判定入口；成功只修改 cq_route，失败清空旧 route，保留 PCIe 身份和 Tag。
+    // 唯一发送前判定入口；先核对实际 Type/Fmt 与地址编码，再路由；失败清空旧 route，保留身份和 Tag。
     extern function bit	route_tlp(
         pcie_tl_tlp		tlp,
         output string	why
@@ -83,7 +83,7 @@ function bit	project_pcie_rc_driver::install_registry(
     return 1;
 endfunction
 
-// 唯一发送前判定入口；成功只修改 cq_route，失败清空旧 route，保留 PCIe 身份和 Tag。
+// 唯一发送前判定入口；先核对实际 Type/Fmt 与地址编码，再路由；失败清空旧 route，保留身份和 Tag。
 function bit	project_pcie_rc_driver::route_tlp(
     pcie_tl_tlp		tlp,
     output string	why
@@ -113,6 +113,21 @@ function bit	project_pcie_rc_driver::route_tlp(
                 why = "Memory TLP kind/type mismatch";
                 return 0;
             end
+            // kind 是对象语义，codec 却直接写 type_f/fmt；普通赋值不会执行随机约束，
+            // 必须在父类发送前核对，避免 Config 伪装或读写/锁定语义改变。
+            if (mem.type_f != (mem.kind == TLP_MEM_RD_LK ? TLP_TYPE_MEM_RD_LK : TLP_TYPE_MEM_RD) ||
+                (mem.kind == TLP_MEM_WR && !(mem.fmt inside {FMT_3DW_WITH_DATA, FMT_4DW_WITH_DATA})) ||
+                (mem.kind != TLP_MEM_WR && !(mem.fmt inside {FMT_3DW_NO_DATA, FMT_4DW_NO_DATA}))) begin
+                why = "Memory kind/Type/Fmt mismatch";
+                return 0;
+            end
+
+            // 3DW 编码只携带低 32 位；不能用完整高地址通过 BAR 检查后再在线上截断。
+            if ((mem.fmt inside {FMT_3DW_NO_DATA, FMT_3DW_WITH_DATA}) && mem.addr[63:32] != 0) begin
+                why = "3DW Memory cannot encode a nonzero upper address";
+                return 0;
+            end
+
             first_lane = -1;
             last_lane  = -1;
             // BE 可能稀疏：检查首末使能字节之间的整个跨度，不仅检查起始地址。
@@ -146,6 +161,13 @@ function bit	project_pcie_rc_driver::route_tlp(
         TLP_CPL, TLP_CPLD, TLP_CPL_LK, TLP_CPLD_LK: begin
             if (!$cast(cpl, tlp)) begin
                 why = "Completion TLP kind/type mismatch";
+                return 0;
+            end
+
+            // Completion 只有 3DW 形式；Type 的锁定位和 Fmt 的数据位须与 kind 同义。
+            if (cpl.type_f != ((cpl.kind inside {TLP_CPL_LK, TLP_CPLD_LK}) ? TLP_TYPE_CPL_LK : TLP_TYPE_CPL) ||
+                cpl.fmt != ((cpl.kind inside {TLP_CPLD, TLP_CPLD_LK}) ? FMT_3DW_WITH_DATA : FMT_3DW_NO_DATA)) begin
+                why = "Completion kind/Type/Fmt mismatch";
                 return 0;
             end
 

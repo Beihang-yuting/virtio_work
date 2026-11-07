@@ -39,6 +39,12 @@ package project_bar_registry_test_pkg;
             bit				add_empty_host = 0
         );
 
+        // 核对对象语义与线上报头一致；错误字段不得留下 route，高地址必须以 4DW 编码。
+        extern task	check_wire_contract(
+            project_bar_registry	registry,
+            intel_pcie_avst_codec	intel_codec
+        );
+
         // 覆盖名字/地址/引用/路由及非法发送，不依赖项目 env 自动配置。
         extern virtual task	run_phase(
             uvm_phase	phase
@@ -114,6 +120,12 @@ package project_bar_registry_test_pkg;
                     bar = '{DPU_BAR_MAILBOX, 4, bar.base + 'h1000, 64'h1000};
                     expect_true(snapshot.add_bar(key, bar, why), why);
 
+                    // 独立高地址 BAR 用于发现 codec 按 3DW 截断地址的问题。
+                    if (h == 1 && p == 1 && v == 1) begin
+                        bar = '{DPU_BAR_MSIX, 2, 64'h0000_0001_0001_0000, 64'h1000};
+                        expect_true(snapshot.add_bar(key, bar, why), why);
+                    end
+
                     if (h == 0 && p == 0 && v == 0) begin
                         expect_true(snapshot.set_expected_af(key, why), why);
                     end
@@ -132,6 +144,100 @@ package project_bar_registry_test_pkg;
         expect_true(snapshot.freeze(why), why);
         return snapshot;
     endfunction
+
+    // 核对对象语义与线上报头一致；错误字段不得留下 route，高地址必须以 4DW 编码。
+    task	project_bar_registry_test::check_wire_contract(
+        project_bar_registry	registry,
+        intel_pcie_avst_codec	intel_codec
+    );
+        pcie_tl_mem_tlp		mem;
+        pcie_tl_mem_tlp		decoded_mem;
+        pcie_tl_cpl_tlp		cpl;
+        pcie_tl_tlp			sent;
+        pcie_tl_tlp			decoded;
+        intel_pcie_packet	packet;
+        project_bar_target_t	high_target;
+        tlp_kind_e			memory_kinds[3];
+        tlp_kind_e			completion_kinds[4];
+        string				why;
+
+        memory_kinds = '{TLP_MEM_RD, TLP_MEM_RD_LK, TLP_MEM_WR};
+        completion_kinds = '{TLP_CPL, TLP_CPLD, TLP_CPL_LK, TLP_CPLD_LK};
+        mem = pcie_tl_mem_tlp::type_id::create("wire_contract_mem");
+        expect_true(registry.resolve_name("h1.pf1.vf0.bar4", high_target, why), why);
+        mem.addr = high_target.bar_lease.base;
+        mem.length = 1;
+        mem.first_be = 4'hf;
+        mem.last_be = 0;
+        mem.requester_id = 16'hf000;
+
+        foreach (memory_kinds[i]) begin
+            mem.kind = memory_kinds[i];
+            mem.type_f = mem.kind == TLP_MEM_RD_LK ? TLP_TYPE_MEM_RD_LK : TLP_TYPE_MEM_RD;
+            mem.fmt = mem.kind == TLP_MEM_WR ? FMT_3DW_WITH_DATA : FMT_3DW_NO_DATA;
+            expect_true(driver.route_tlp(mem, why), {"legal 3DW Memory: ", why});
+            mem.fmt = mem.kind == TLP_MEM_WR ? FMT_4DW_WITH_DATA : FMT_4DW_NO_DATA;
+            expect_true(driver.route_tlp(mem, why), {"legal 4DW Memory: ", why});
+            mem.fmt = mem.kind == TLP_MEM_WR ? FMT_4DW_NO_DATA : FMT_4DW_WITH_DATA;
+            expect_true(!driver.route_tlp(mem, why) && !mem.cq_route.valid, "Memory Fmt/data mismatch accepted");
+            mem.fmt = FMT_TLP_PREFIX;
+            expect_true(!driver.route_tlp(mem, why) && !mem.cq_route.valid, "Memory Prefix Fmt accepted");
+            mem.fmt = mem.kind == TLP_MEM_WR ? FMT_3DW_WITH_DATA : FMT_3DW_NO_DATA;
+            mem.type_f = TLP_TYPE_CFG_WR0;
+            expect_true(!driver.route_tlp(mem, why) && !mem.cq_route.valid, "Memory disguised Config Type accepted");
+            mem.type_f = TLP_TYPE_IO_RD;
+            expect_true(!driver.route_tlp(mem, why) && !mem.cq_route.valid, "Memory IO Type accepted");
+            mem.type_f = mem.kind == TLP_MEM_RD_LK ? TLP_TYPE_MEM_RD : TLP_TYPE_MEM_RD_LK;
+            expect_true(!driver.route_tlp(mem, why) && !mem.cq_route.valid, "Memory lock Type mismatch accepted");
+        end
+
+        cpl = pcie_tl_cpl_tlp::type_id::create("wire_contract_cpl");
+        cpl.requester_id = 16'h9011;
+
+        foreach (completion_kinds[i]) begin
+            cpl.kind = completion_kinds[i];
+            cpl.type_f = (cpl.kind inside {TLP_CPL_LK, TLP_CPLD_LK}) ? TLP_TYPE_CPL_LK : TLP_TYPE_CPL;
+            cpl.fmt = (cpl.kind inside {TLP_CPLD, TLP_CPLD_LK}) ? FMT_3DW_WITH_DATA : FMT_3DW_NO_DATA;
+            expect_true(driver.route_tlp(cpl, why), {"legal Completion: ", why});
+            cpl.fmt = (cpl.kind inside {TLP_CPLD, TLP_CPLD_LK}) ? FMT_4DW_WITH_DATA : FMT_4DW_NO_DATA;
+            expect_true(!driver.route_tlp(cpl, why) && !cpl.cq_route.valid, "4DW Completion accepted");
+            cpl.fmt = (cpl.kind inside {TLP_CPLD, TLP_CPLD_LK}) ? FMT_3DW_NO_DATA : FMT_3DW_WITH_DATA;
+            expect_true(!driver.route_tlp(cpl, why) && !cpl.cq_route.valid, "Completion data Fmt mismatch accepted");
+            cpl.fmt = (cpl.kind inside {TLP_CPLD, TLP_CPLD_LK}) ? FMT_3DW_WITH_DATA : FMT_3DW_NO_DATA;
+            cpl.type_f = TLP_TYPE_CFG_RD1;
+            expect_true(!driver.route_tlp(cpl, why) && !cpl.cq_route.valid, "Completion disguised Config Type accepted");
+            cpl.type_f = (cpl.kind inside {TLP_CPL_LK, TLP_CPLD_LK}) ? TLP_TYPE_CPL : TLP_TYPE_CPL_LK;
+            expect_true(!driver.route_tlp(cpl, why) && !cpl.cq_route.valid, "Completion lock Type mismatch accepted");
+        end
+
+        expect_true(registry.resolve_name("h1.pf1.vf0.bar2", high_target, why), why);
+        mem.addr = high_target.bar_lease.base;
+        mem.kind = TLP_MEM_WR;
+        mem.type_f = TLP_TYPE_MEM_WR;
+        mem.fmt = FMT_3DW_WITH_DATA;
+        mem.cq_route.valid = 1;
+        expect_true(!driver.route_tlp(mem, why) && !mem.cq_route.valid, "3DW high BAR address accepted");
+        mem.fmt = FMT_4DW_WITH_DATA;
+        mem.is_64bit = 1;
+        mem.payload = new[4];
+        driver.send_tlp(mem);
+        expect_true(adapter.tlm_tx_fifo.try_get(sent), "4DW high BAR send did not reach adapter");
+        packet = intel_codec.encode(sent);
+        expect_true(packet != null, "Intel codec rejected high BAR Memory");
+
+        if (packet != null) begin
+            expect_true(packet.bar == 2 && packet.pfnum == 6 && packet.vfactive && packet.vfnum == 101,
+                "high BAR Intel sideband wrong");
+            decoded = intel_codec.decode(packet);
+            expect_true($cast(decoded_mem, decoded), "codec did not decode high BAR Memory");
+
+            if (decoded_mem != null) begin
+                expect_true(decoded_mem.addr == high_target.bar_lease.base &&
+                    decoded_mem.fmt == FMT_4DW_WITH_DATA && decoded_mem.type_f == TLP_TYPE_MEM_WR,
+                    "4DW codec lost address or changed wire type");
+            end
+        end
+    endtask
 
     // 覆盖名字/地址/引用/路由及非法发送，不依赖项目 env 自动配置。
     task	project_bar_registry_test::run_phase(
@@ -274,8 +380,10 @@ package project_bar_registry_test_pkg;
         mem.last_be = 1;
         expect_true(!driver.route_tlp(mem, why), "driver accepted cross-window tail");
         mem.addr = 64'hfffffffffffffffc;
+        mem.fmt = FMT_4DW_WITH_DATA;
         expect_true(!driver.route_tlp(mem, why), "driver accepted 64-bit address overflow");
         mem.addr = target.bar_lease.base;
+        mem.fmt = FMT_3DW_WITH_DATA;
         mem.length = 1;
         mem.last_be = 0;
         mem.first_be = 0;
@@ -300,6 +408,8 @@ package project_bar_registry_test_pkg;
             expect_true(packet.pfnum == 6 && packet.vfactive && packet.vfnum == 101,
                 "Completion Intel sideband uses wrong identity");
         end
+        check_wire_contract(registry, intel_codec);
+
         cfg_tlp = pcie_tl_cfg_tlp::type_id::create("config");
         cfg_tlp.kind = TLP_CFG_RD0;
         expect_true(!driver.route_tlp(cfg_tlp, why), "Config TLP accepted");
@@ -307,6 +417,11 @@ package project_bar_registry_test_pkg;
 
         if (negative == "config") begin
             driver.send_tlp(cfg_tlp);
+        end
+
+        if (negative == "masked_config") begin
+            mem.type_f = TLP_TYPE_CFG_WR0;
+            driver.send_tlp(mem);
         end
 
         if (negative == "window") begin
