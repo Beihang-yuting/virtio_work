@@ -17,6 +17,8 @@
 最新平台约束：DUT 不包含真实 PCIe IP，通过 Intel HARD_IP 侧 BFM/bind 驱动
 应用接口。项目配置统一使用 Memory Read/Write；不发现 PCI capabilities，不写
 标准 PCI 配置空间 BAR/Command/MSI-X capability，也不等待相应配置 Completion。
+推荐目标输入改为 `pf0.bar0`、`pf0.vf3.bar0` 等逻辑路径；环境解析实际 BAR
+地址，并在分配冻结后打印完整映射。直接传物理 BAR base 只保留为显式调试入口。
 
 ## 1. 已确认的需求
 
@@ -662,6 +664,7 @@ DUT 中断表项修改遵循屏蔽后写地址/数据、再按目标 mask/enable
 
 | 接口 | 输入与底层实现 |
 | --- | --- |
+| `pcie_bar_read/write_by_name` | 逻辑目标路径、BAR 内字节 offset、长度/数据/字节 skip mask；解析到同一冻结目标后复用下行 helper |
 | `pcie_bar_read/write` | 目标 Function、BAR 编号、BAR 内字节 offset、4/8/12/16 字节长度、128 位数据和字节 skip mask；复用 `pcie_tl_reg_seq` |
 | `pcie_poll_bar` | 在上述 BAR read 上执行有限次数/时间的用户条件轮询；mask/value 明确区分于字节 skip mask |
 
@@ -722,7 +725,7 @@ BAR/Mailbox/MSI-X 地址全部来自 setup，并装入对应 cfg。`cfg.binding.
 队列所属 Function，`cfg.ctx.target` 是本项实际访问的 Function/BAR，可以是 AF；两者由
 准备阶段明确绑定，接口不偷偷重定向，也不把控制表地址当成 ring DMA 地址。
 
-#### 5.2.1 默认 PF0 与显式 BAR 地址
+#### 5.2.1 推荐逻辑目标路径，默认访问 PF0
 
 用户确认所有 DUT 表都通过 Memory Read/Write 配置；默认使用 PF0，也允许用户
 指定其他 PF/VF 的 BAR 地址空间。因此“默认 PF0”表示默认访问目标是已选择
@@ -730,15 +733,70 @@ Host 的 PF0 管理窗口，不表示 Memory 请求由 PF0 发出。真正 reque
 Host 的 RC；同 Host 的不同 PF/VF 仍复用一个 RC sequencer 和 bind wrapper。
 跨 Host 共用的管理 AF 窗口由平台显式指定其 Host，不能按条目 owner 猜访问路径。
 
-目标选择支持两种明确输入：
+用户不需要知道分配后的基址。常规配置采用以下严格路径语法，编号为非负十进制：
 
-1. Function key + BAR 编号：从 DPU 快照查询实际 base/size；未覆盖时选择平台
-   声明的 PF0 管理 BAR，不能把“管理 BAR”自动等同于 BAR0。
-2. 明确的 Host/segment + BAR base + 字节 offset：用冻结快照反查该窗口所属
-   Function/角色及实际 BAR 编号，再形成同样的目标记录。当前参考只支持
-   segment 0，其他 segment 必须有明确映射后才允许使用。
+```text
+[hH.]pfP[.vfV].barB
+```
 
-两种输入最终都归一化为相同的 `ctx.target`；同时提供身份与地址时必须一致，
+| 目标字符串 | 解析结果 |
+| --- | --- |
+| `pf0.bar0` | 当前明确访问 Host 的 PF0、BAR0 |
+| `pf1.bar2` | 当前明确访问 Host 的 PF1、BAR2 |
+| `pf0.vf3.bar0` | 当前明确访问 Host 的 PF0 下 VF3、BAR0 |
+| `h1.pf0.bar4` | Host1 的 PF0、BAR4 |
+| `h1.pf2.vf5.bar0` | Host1 的 PF2 下 VF5、BAR0 |
+
+省略 h 时，配置准备层使用该操作明确的访问 Host 上下文；单 Host 时可以使用
+唯一 Host。多 Host 且没有明确上下文时必须带 h，不能退回 Host0，也不能默认
+用队列 owner 的 Host 代替管理窗口的 Host。手工 `*_by_name` 调用在单 Host
+下允许短路径；多 Host 下要求完整 h 前缀。当前参考只支持 segment 0，遇到
+其他 segment 拒绝，不引入一个尚未实现的多 segment 字符串语法。
+
+VF 必须带父 PF，不接受有歧义的 `vf3.bar0`。解析要求完整匹配，未知字段、尾随
+字符、负值和整数溢出均报错。BAR 数字是实际 BAR 编号，不是 BAR 列表下标；
+当前 64 位配对 profile 使用 bar0/bar2/bar4，bar1/bar3/bar5 是对应高 DWORD，
+不能当作独立地址窗口，也不自动改写成前一个偶数 BAR。
+
+拟新增 `dpu.reg_target` 作为公共访问目标缺省值。当前参考 profile 的缺省为
+`pf0.bar0`，由平台明确声明这是管理窗口；不推广成所有平台都以 BAR0 管理。
+分别允许 `dpu.bar_map.reg_target`、`dpu.bdf.reg_target`、`dpu.msix.reg_target`、
+`dpu.qsch.reg_target`、`vio.vtx.reg_target`、`vio.vrx.reg_target`、
+`vio.notify_table.reg_target` 覆盖，未提供时继承公共值。notify_table 是配置
+映射表所走的管理窗口，不替代实际 doorbell 的 `vio.notify_bar`/逐队列绑定。
+这些字符串在原 `project_env_cfg.load_params()` 加载，在配置视图生成时解析并
+冻结为完整目标；运行期修改参数表不自动改写已有记录。
+准备阶段目标优先级为“记录显式目标 → 表类别目标 → 公共缺省目标”。手工调试
+明确传入逻辑路径或地址时采用该显式输入，不与未显式提供的 PF0 缺省值强行
+合并；只有调用方同时明确给出身份和地址时才要求两者相互吻合。
+
+项目内部把路径转为 `dpu_function_key_t` 和 BAR 编号，调用已有
+`snapshot.get_pcie_id()`、`snapshot.list_bars()` 并按 `even_bar_id` 查找租约。
+`get_bar()` 的第二参数是 BAR role，不能把数字 BAR ID 当作 role 传入。
+解析结果包含完整路径、Function key、Host/segment/BDF、BAR role/id/base/size
+和 RC slot，并检查平台的 Intel PF/VF 映射。每个用户 task 仍接收一个 cfg，
+其中 `cfg.ctx.target` 已包含上述值；正常批量配置不需要在每条 DWORD 写入时
+重新解析字符串，更不要求用户查询或复制 BAR 地址。
+
+手工调用形式示意，以下接口尚未实现；单 Host 情况下用户可直接指定短路径：
+
+```systemverilog
+// byte_offset 是该 BAR 内最终字节偏移；32 位数据先在调用前校验未知态和字段。
+// 解析、范围检查和发送错误都经 ok/why 返回；本调用不会触发其他表的配置。
+env.pcie_bar_write_by_name(
+    "pf0.bar0",
+    byte_offset,
+    4,
+    packed_data,
+    0,
+    ok,
+    why
+);
+```
+
+同时保留内部 Function key + BAR 编号入口，以及明确 Host/segment + BAR base
+的高级调试输入；后者反查冻结快照的窗口归属。各入口归一化为同一 `ctx.target`，
+绑定同一快照代号；同时提供身份与地址时必须一致，
 不静默让其中一个覆盖另一个。地址范围检查覆盖整个访问；BAR base 必须是真实
 窗口起点，不把 BAR 内的任意地址误当成新 base。多 Host 可有相同数值地址，
 必须先确定 Host/segment，再查归属。修改 BAR 的分配地址要在快照冻结前进行，
@@ -749,13 +807,43 @@ Host 的 RC；同 Host 的不同 PF/VF 仍复用一个 RC sequencer 和 bind wra
 | 操作 | 访问目标/Intel sideband | 表项内容描述的对象 |
 | --- | --- | --- |
 | 默认通过 PF0 管理 BAR 写 VF3 的 BDF 表 | PF0 与该管理 BAR | VF3 |
-| 显式传入 VF3 自己的 BAR base | VF3 与该 BAR | 由该寄存器/表项定义决定 |
+| 指定 `pf0.vf3.bar0`，或显式传入该 VF 的 BAR0 base | VF3 与其 BAR0 | 由该寄存器/表项定义决定 |
 | 通过 PF0 管理 BAR 写全局 VTX 表 | PF0 与该管理 BAR | 对应队列的真实 PF/VF owner |
 
 第二种情况下不能仍固定 PF0 sideband。用户只需要选目标窗口；公共访问层根据
 同一快照与平台编号映射生成 PF/VF/BAR 字段，不要求每个表的用户 task 重复计算。
 
-#### 5.2.2 实际发送入口与当前接入缺口
+#### 5.2.2 分配结果与目标解析的打印
+
+拟提供 `print_bar_map()`，自动输出由“本代 DPU 快照冻结且 Host→RC 映射完成”
+触发，并按快照代号去重。首代在当前项目 `end_of_elaboration_phase()` 已就绪
+时可调用同一打印检查入口；每次后续新快照/公共视图发布完成时也调用它，
+不能只依赖每次仿真执行一次的 EOE。较晚才就绪的首代同样由发布流程触发。
+不在 `env_cfg.load_params()` 或父 env 早期 build 中打印最终结果，因为此时
+子 DPU 的分配尚未完成。手工调用不受自动输出去重限制，输出当前代只读映射。
+
+由 `dpu.print_bar_map` 控制自动打印，缺省 1；在原 `project_env_cfg.load_params()`
+注册。打印只读快照，不访问 DUT，不创建新租约。按 Host、PF、PF/VF、VF ID、
+BAR 编号稳定排序，遍历实际 Function/BAR 列表，不根据最大能力生成虚假项。
+每条 64 位 BAR 租约只打印一次，不把高低 DWORD 打成两个窗口。
+
+每行包含完整目标路径、快照代号、Host/segment、BDF、global function ID、BAR
+角色/编号、64 位 base、size、末地址（含）、RC slot；Intel 映射已绑定时另列
+实际 PF/VF sideband 编号，未绑定则明确标注，不把逻辑 ID 假装成已确认硬件编号。
+配置目标解析后还打印类别到完整路径的关联，例如 VTX→h0.pf0.bar0，避免用户
+把正在配置的 queue owner 误认成寄存器访问窗口。详细每笔 MMIO 日志仅在调试
+级别打印，包含完整路径、BAR offset、绝对地址、宽度及结果。
+
+以下只示意日志格式，地址不代表当前实际仿真分配结果：
+
+```text
+[DPU_BAR_MAP] snapshot=1
+target=h0.pf0.bar0      seg=0 bdf=0000 gfid=0 role=DEVICE_MEMORY base=0000002080000000 size=0000000001000000 last=0000002080ffffff rc=0 intel_route=unbound
+target=h0.pf0.vf3.bar0  seg=0 bdf=0013 gfid=4 role=DEVICE_MEMORY base=0000002090000000 size=0000000001000000 last=0000002090ffffff rc=0 intel_route=unbound
+[DUT_REG_TARGET] vtx=h0.pf0.bar0 vrx=h0.pf0.bar0 bdf=h0.pf0.bar0
+```
+
+#### 5.2.3 实际发送入口与当前接入缺口
 
 已有 `pcie_work/pcie_tl_vip/src/seq/base/pcie_tl_reg_seq.sv` 能实际发送 Memory
 TLP。下面是用户 task 经公共 helper 解析并校验目标后的核心调用；`bar_lease`
@@ -949,6 +1037,8 @@ VIO 的 cfg 可以附带其依赖的只读 BDF/BAR 值，用于定位设备访�
 | --- | --- | --- |
 | `dpu.hosts`、`dpu.pfs_per_host`、`dpu.vfs_per_pf` | 已有项目参考入口 | 保持；资源身份由 DPU 解析 |
 | `dpu.hN.pfN[.vfN].barN.placement/base` | 已有 BAR request 入口 | 固定地址时在解析前设置，不在 VIO 重复注册 |
+| `dpu.reg_target` 及各表的 `*.reg_target` | 拟新增到原 project_env_cfg | 用 `pf0.bar0`/`pf0.vf3.bar0`/`h1.pf0.bar0` 选择访问窗口，环境解析实际地址 |
+| `dpu.print_bar_map` | 拟新增到原 project_env_cfg，缺省 1 | 快照和 Host→RC 绑定完成后，逐租约打印真实分配及完整逻辑路径 |
 | `vio.pairs` | 已有 | 表示队列对数，不是 RX+TX 的队列总数 |
 | `vio.enabled` | 拟新增 | 在冻结前选择全局/Host/精确 service 的业务启用状态 |
 | `vio.queue_type` | 已有 | 本次外部模式支持 `VQ_PACKED` 和 `VQ_CUSTOM`，选择完整匹配的数据协议 |
@@ -1152,6 +1242,13 @@ DPU 已有 `get_service_owner/get_pcie_id/get_bar` 和
     `rx_vfnum`，不能只检查 TLP 地址和 payload；全流程无 Configuration TLP。
     验证 base→RC→项目 driver 的 factory 解析及原 RC cast 均正确，未安装项目
     driver 时在配置阶段失败，不能仍用原 driver 却宣称 route 已补齐。
+33. 短/完整逻辑路径解析到与 DPU 快照一致的 Function/BAR；覆盖多个 PF 下同
+    编号 VF、非连续 Function ID、多 Host 同数值地址。未知 PF/VF/BAR、缺 Host
+    上下文、奇数高 BAR、尾随字符/溢出均在发 TLP 前拒绝；不回退默认窗口。
+34. 相同逻辑路径在不同种子或固定地址配置下自动跟随实际租约，不缓存旧快照
+    地址。各表目标覆盖只改变访问窗口，不修改条目 owner 或重分配 BDF/BAR。
+35. 日志逐项对照冻结快照，地址范围末尾为包含关系，64 位租约不重复打印；
+    自动输出每代一次，配置类别→访问路径可追踪，打印本身无任何 DUT 事务。
 
 定向模型验证证明接入合同和 VIP 行为；用户实际 DUT 的寄存器语义、QSCH 和线侧
 收发仍由项目联合测试验证，不以结构或模型测试代替真实 DUT 的验收。
