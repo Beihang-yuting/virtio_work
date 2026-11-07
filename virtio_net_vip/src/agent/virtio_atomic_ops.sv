@@ -186,6 +186,23 @@ class virtio_atomic_ops extends uvm_object;
         return 1;
     endfunction
 
+	// 只认证会话凭证，允许几何已损坏的所有者安全关闭业务门禁。
+	function bit owns_external_session(input uvm_object owner, input longint unsigned generation);
+		return owner != null && owner == external_owner && generation == external_generation;
+	endfunction
+
+	// 仅撤销业务凭证；失败配置保留所有 ring、映射和 pending DMA。
+	function bit revoke_external_session(input uvm_object owner,
+		input longint unsigned generation, output string why);
+		why = "";
+		if (!owns_external_session(owner, generation)) begin
+			why = "external revoke origin/generation mismatch";
+			return 0;
+		end
+		external_active = 0;
+		return 1;
+	endfunction
+
     // 环境已确认 workers 停止和 DUT quiesced 后回收；未交付失败也使用同一资源出口。
     function bit release_external_session(input uvm_object owner,
         input longint unsigned generation, output string why);

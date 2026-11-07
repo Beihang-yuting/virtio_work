@@ -180,10 +180,9 @@ package project_env_test_pkg;
             active_functions = 0;
             expect_true(env.shared_pool == injected_pool, "project replaced platform pool");
             expect_true(cfg.dpu_cfg.host_mem_pool_ref == injected_pool, "DPU has a different pool");
-            expect_true(env.reg_backend.device_snapshot == env.dpu_env.get_snapshot(),
-                "executor backend did not receive authoritative snapshot during DPU build");
-            expect_true(env.reg_backend.virtual_sequencer == env.pcie_env.v_seqr,
-                "register backend has wrong virtual sequencer");
+            expect_true(cfg.dpu_cfg.executor == null, "project installed a legacy executor");
+            expect_true(env.dpu_setup.belongs_to(env.dpu_env.get_snapshot(), env.bar_registry),
+                "public setup differs from authoritative snapshot");
             expect_true(env.dpu_env.get_state() == DPU_DEVICE_RESOLVED,
                 "assembly unexpectedly executed device configuration");
             expect_true(env.dpu_env.get_type_name() == "dpu_device_env" && env.dpu_env.get_parent() == env,
@@ -249,8 +248,6 @@ package project_env_test_pkg;
                         expect_true(adapter.cfg == published_cfg, "env replaced wrapper-owned cfg");
                     end
                 end
-                expect_true(env.reg_backend.root_by_domain[longint'(h) << 32] == slot,
-                    "register plan selects a different RC slot than VIO");
                 expect_true(vio.iommu == injected_iommu[h], "VIO replaced injected IOMMU");
                 expect_true(vio.iommu.translate_for_host(h, 16'hfffe, cfg.vio_cfg_by_host[h].iova_base,
                     64, DMA_TO_DEVICE, gpa, fault), "preexisting IOMMU mapping lost");

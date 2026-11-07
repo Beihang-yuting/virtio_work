@@ -10,7 +10,7 @@
 // 生命周期覆盖一次 Function 驱动会话。
 //
 // 并发与复位约束：
-//   1. 后台任务只使用命名 fork，便于按代次辨认和收敛；
+//   1. 每次等待使用独立子进程，只清理本次等待分支，不取消其他队列或 Function；
 //   2. 所有 worker 每次等待后检查 epoch，旧代 worker 不得访问重建后的队列；
 //   3. stop_dataplane 等待全部 worker 明确退出，调用方随后才可拆队或复位 DMA；
 //   4. 运行期 MQ 先完整停止旧代 worker，成功变更后才按新队列集合启动下一代；
@@ -205,6 +205,20 @@ class virtio_auto_fsm extends uvm_report_object;
     );
         return migration.migration_snapshot_checksum(snap);
     endfunction
+
+    // 隔离子进程后清理本次等待，避免具名 disable 取消其他队列/Function 的等待。
+    protected task wait_event_or_stop(input uvm_event wake_event, input int unsigned interval);
+        fork
+            begin
+                fork
+                    wake_event.wait_trigger();
+                    #(interval * 1ns);
+                    @stop_event;
+                join_any
+                disable fork;
+            end
+        join
+    endtask
 
     // A worker belongs to precisely one start_dataplane() generation.  The
     // epoch check prevents a worker that missed a transient event from doing
@@ -560,7 +574,7 @@ class virtio_auto_fsm extends uvm_report_object;
     // wait_packets -- Wait for packets to arrive on receive queues
     //
     // Uses mixed event + polling approach (no bare #delay).
-    // Loop until count >= expected or timeout, using named fork blocks.
+    // Loop until count >= expected or timeout, using isolated wait blocks.
     // ------------------------------------------------------------------------
     virtual task wait_packets(
         int unsigned expected_count,
@@ -600,19 +614,8 @@ class virtio_auto_fsm extends uvm_report_object;
                 return;
             end
 
-            // Wait for used ring event or poll interval (named fork)
-            fork : pkt_wait_blk
-                begin : pkt_wait_evt_arm
-                    used_ring_updated_event.wait_trigger();
-                end
-                begin : pkt_wait_timeout_arm
-                    #(interval * 1ns);
-                end
-                begin : pkt_wait_stop_arm
-                    @stop_event;
-                end
-            join_any
-            disable pkt_wait_blk;
+            // Wait for used ring event or poll interval (isolated wait)
+            wait_event_or_stop(used_ring_updated_event, interval);
 
             if (!dataplane_running)
                 return;
@@ -1219,7 +1222,7 @@ class virtio_auto_fsm extends uvm_report_object;
     //
     // ALL background tasks must:
     //   - Loop with dataplane_worker_may_run(worker_epoch)
-    //   - Use named fork blocks for internal waits
+    //   - 每次等待独立清理子进程，保留 worker 代次检查及 stop 退出应答
     //   - Check the run epoch after every wait and shared operation
     //   - Exit gracefully on stop_event
     // ========================================================================
@@ -1245,19 +1248,8 @@ class virtio_auto_fsm extends uvm_report_object;
         while (dataplane_worker_may_run(worker_epoch)) begin
             virtqueue_base vq;
 
-            // Wait for event or poll interval (named fork)
-            fork : rx_refill_wait_blk
-                begin : rx_refill_evt_arm
-                    used_ring_updated_event.wait_trigger();
-                end
-                begin : rx_refill_timeout_arm
-                    #(interval * 1ns);
-                end
-                begin : rx_refill_stop_arm
-                    @stop_event;
-                end
-            join_any
-            disable rx_refill_wait_blk;
+            // Wait for event or poll interval (isolated wait)
+            wait_event_or_stop(used_ring_updated_event, interval);
 
             if (!dataplane_worker_may_run(worker_epoch)) return;
 
@@ -1296,19 +1288,8 @@ class virtio_auto_fsm extends uvm_report_object;
         while (dataplane_worker_may_run(worker_epoch)) begin
             uvm_object completed[$];
 
-            // Wait for event or poll interval (named fork)
-            fork : tx_complete_wait_blk
-                begin : tx_complete_evt_arm
-                    used_ring_updated_event.wait_trigger();
-                end
-                begin : tx_complete_timeout_arm
-                    #(interval * 1ns);
-                end
-                begin : tx_complete_stop_arm
-                    @stop_event;
-                end
-            join_any
-            disable tx_complete_wait_blk;
+            // Wait for event or poll interval (isolated wait)
+            wait_event_or_stop(used_ring_updated_event, interval);
 
             if (!dataplane_worker_may_run(worker_epoch)) return;
 
@@ -1334,19 +1315,8 @@ class virtio_auto_fsm extends uvm_report_object;
         `uvm_info("AUTO_FSM", "interrupt_handler_loop: started", UVM_HIGH)
 
         while (dataplane_worker_may_run(worker_epoch)) begin
-            // Wait for interrupt event or poll interval (named fork)
-            fork : irq_handler_wait_blk
-                begin : irq_handler_evt_arm
-                    interrupt_event.wait_trigger();
-                end
-                begin : irq_handler_timeout_arm
-                    #(interval * 1ns);
-                end
-                begin : irq_handler_stop_arm
-                    @stop_event;
-                end
-            join_any
-            disable irq_handler_wait_blk;
+            // Wait for interrupt event or poll interval (isolated wait)
+            wait_event_or_stop(interrupt_event, interval);
 
             if (!dataplane_worker_may_run(worker_epoch)) return;
 
@@ -1382,22 +1352,26 @@ class virtio_auto_fsm extends uvm_report_object;
         while (dataplane_worker_may_run(worker_epoch)) begin
             pkt_count_window = 0;
 
-            // Count packet completions over one measurement window (named fork)
-            fork : adaptive_irq_wait_blk
-                begin : adaptive_irq_evt_arm
-                    while (dataplane_worker_may_run(worker_epoch)) begin
-                        packet_completed_event.wait_trigger();
-                        pkt_count_window++;
-                    end
+            // Count packet completions over one measurement window (isolated wait)
+            fork
+                begin
+                    fork
+                        begin : adaptive_irq_evt_arm
+                            while (dataplane_worker_may_run(worker_epoch)) begin
+                                packet_completed_event.wait_trigger();
+                                pkt_count_window++;
+                            end
+                        end
+                        begin : adaptive_irq_timeout_arm
+                            #(interval * 1ns);
+                        end
+                        begin : adaptive_irq_stop_arm
+                            @stop_event;
+                        end
+                    join_any
+                    disable fork;
                 end
-                begin : adaptive_irq_timeout_arm
-                    #(interval * 1ns);
-                end
-                begin : adaptive_irq_stop_arm
-                    @stop_event;
-                end
-            join_any
-            disable adaptive_irq_wait_blk;
+            join
 
             if (!dataplane_worker_may_run(worker_epoch)) return;
 
@@ -1448,19 +1422,8 @@ class virtio_auto_fsm extends uvm_report_object;
         `uvm_info("AUTO_FSM", "config_change_handler: started", UVM_HIGH)
 
         while (dataplane_worker_may_run(worker_epoch)) begin
-            // Wait for config change event or poll interval (named fork)
-            fork : cfg_change_wait_blk
-                begin : cfg_change_evt_arm
-                    config_change_event.wait_trigger();
-                end
-                begin : cfg_change_timeout_arm
-                    #(interval * 1ns);
-                end
-                begin : cfg_change_stop_arm
-                    @stop_event;
-                end
-            join_any
-            disable cfg_change_wait_blk;
+            // Wait for config change event or poll interval (isolated wait)
+            wait_event_or_stop(config_change_event, interval);
 
             if (!dataplane_worker_may_run(worker_epoch)) return;
 

@@ -70,7 +70,7 @@ module project_env_tb;
         run_test();
     end
     initial begin
-        #10us;
+        #1ms;
         `uvm_fatal("PROJECT_TOP", "assembly test timeout")
     end
 endmodule

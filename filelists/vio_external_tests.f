@@ -5,4 +5,6 @@ virtio_net_vip/tests/virtio_test_device_builder.sv
 virtio_net_vip/tests/virtio_shared_mem_fixture.sv
 virtio_net_vip/tests/virtio_vq_test_kit.sv
 virtio_net_vip/tests/virtio_external_configuration_test.sv
+virtio_net_vip/tests/virtio_mock_transport.sv
+virtio_net_vip/tests/virtio_worker_wait_test.sv
 virtio_net_vip/tests/virtio_tb_top.sv

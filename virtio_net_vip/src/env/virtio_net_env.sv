@@ -89,6 +89,20 @@ class virtio_net_env extends uvm_env;
         input vio_config_scope scope, output int unsigned selected[$], output string why);
 
 
+    // 项目跨 Host 操作的薄只读预检；不泄露私有参与者下标，也不改变 READY/DMA。
+    extern function bit preflight_external_configuration(input vio_external_setup setup,
+        input vio_config_scope scope, output string why);
+
+    // 撤销仅认证已签发视图和私有参与者，不以损坏 ring 阻止关闭业务门禁。
+    extern function bit preflight_external_revocation(input vio_external_setup setup,
+        input vio_config_scope scope, output string why);
+    extern function bit revoke_external_configuration(input vio_external_setup setup,
+        input vio_config_scope scope, output string why);
+
+    // 取消恢复使用单调代号；confirmed_only 要求完整当前 service 确认，释放不回退代号。
+    extern function longint unsigned external_service_generation(input dpu_service_key_t key,
+        input bit confirmed_only = 0);
+
     // 平台在显式 prepare 时才提供 notify/MSI-X 最终绑定；不会在 connect 前抢读。
     extern task prepare_external_configuration(
         input vio_external_queue_binding_t bindings[$], output vio_external_setup setup,
@@ -1607,11 +1621,71 @@ function bit virtio_net_env::release_external_resources(
 endfunction
 
 // 确认账本只承认当前环境交付的视图；释放后旧代查询立即为假。
+// 复用唯一完整性 validator，使跨 Host 调用方在任何提交前完成全部 Host 预检。
+function bit virtio_net_env::preflight_external_configuration(input vio_external_setup setup,
+	input vio_config_scope scope, output string why);
+	int unsigned	selected[$];
+	return validate_external_generation(setup, scope, selected, why);
+endfunction
+
+// 只读恢复凭证：同一代重复确认不能解除取消，只有已确认的新准备代可重新开放业务。
+function longint unsigned virtio_net_env::external_service_generation(input dpu_service_key_t key,
+	input bit confirmed_only);
+	if (confirmed_only && !external_service_confirmed(live_external_setup, key)) return 0;
+	return external_generation;
+endfunction
+
 function bit virtio_net_env::external_service_confirmed(
-    input vio_external_setup setup, input dpu_service_key_t key);
-    return setup != null && setup == live_external_setup &&
-        external_confirmed.exists(dpu_service_key_name(key)) &&
-        external_confirmed[dpu_service_key_name(key)];
+	input vio_external_setup setup, input dpu_service_key_t key);
+	return setup != null && setup == live_external_setup &&
+		external_confirmed.exists(dpu_service_key_name(key)) &&
+		external_confirmed[dpu_service_key_name(key)];
+endfunction
+
+// 失败撤销不能依赖完整几何校验；使用不可变视图和保存的私有参与者。
+function bit virtio_net_env::preflight_external_revocation(input vio_external_setup setup,
+	input vio_config_scope scope, output string why);
+	int unsigned selected;
+	why = "external revoke origin/generation/scope mismatch";
+	if (setup == null || setup != live_external_setup || scope == null) return 0;
+	if (!setup.belongs_to(this, device_snapshot, resource_snapshot, external_generation)) return 0;
+	if (!scope.validate(setup, why)) return 0;
+	selected = 0;
+	foreach (external_participants[f]) begin
+		if (!scope.selects(external_participants[f].service_key)) continue;
+		selected++;
+		if (external_participants[f].ops == null || external_participants[f].fsm == null) begin
+			why = "external revoke saved participant is null"; return 0;
+		end
+		if (!external_participants[f].ops.owns_external_session(external_session_key, external_generation)) begin
+			why = "external revoke saved participant credential mismatch";
+			return 0;
+		end
+		if (!external_participants[f].fsm.external_workers_stopped()) begin
+			why = "external revocation requires selected workers stopped";
+			return 0;
+		end
+	end
+	if (selected == 0) begin why = "external revoke has no owned participants"; return 0; end
+	why = "";
+	return 1;
+endfunction
+
+// 只关闭软件就绪，不改变设备、queue state、通知、映射或 DMA 分配。
+function bit virtio_net_env::revoke_external_configuration(input vio_external_setup setup,
+	input vio_config_scope scope, output string why);
+	external_participant_t p;
+	if (!preflight_external_revocation(setup, scope, why)) return 0;
+	foreach (external_participants[f]) begin
+		p = external_participants[f];
+		if (!scope.selects(p.service_key)) continue;
+		if (!p.ops.revoke_external_session(external_session_key, external_generation, why)) return 0;
+		p.fsm.invalidate_external_configuration();
+		p.client.reset_runtime_state();
+		p.instance.state = VF_REINIT_REQUIRED;
+		external_confirmed.delete(dpu_service_key_name(p.service_key));
+	end
+	return 1;
 endfunction
 
 `endif // VIRTIO_NET_ENV_SV

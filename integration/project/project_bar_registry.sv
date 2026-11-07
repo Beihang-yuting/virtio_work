@@ -33,6 +33,11 @@ class project_bar_registry extends uvm_object;
     protected project_bar_target_t				m_targets[$];
     protected static bit						m_auto_printed[string];
 
+    // 根据 wire requester 查冻结 Function/BDF；用于接收 DMA，不按数组位置推测。
+    extern function bit resolve_requester(input int unsigned host_id,
+        input bit [15:0] requester_id, output dpu_function_key_t key,
+        output dpu_pcie_function_id_t pcie_id, output string why);
+
     // 创建空对象；调用 initialize 前任何查询/绑定都失败。
     extern function	new(
         string	name = "project_bar_registry"
@@ -725,4 +730,20 @@ function bit	project_bar_registry::print_bar_map(
         m_auto_printed[identity] = 1;
     end
     return 1;
+endfunction
+
+// 只读遍历平台 requester 映射；只有冻结 registry 可用于接收，未知身份明确拒绝。
+function bit project_bar_registry::resolve_requester(input int unsigned host_id,
+    input bit [15:0] requester_id, output dpu_function_key_t key,
+    output dpu_pcie_function_id_t pcie_id, output string why);
+    why = "unknown DMA requester in frozen Host registry";
+    if (!m_frozen) return 0;
+    foreach (m_routes[name]) begin
+        if (m_routes[name].function_key.host_id == host_id &&
+            m_routes[name].requester_id == requester_id) begin
+            key = m_routes[name].function_key;
+            return m_snapshot.get_pcie_id(key, pcie_id, why);
+        end
+    end
+    return 0;
 endfunction

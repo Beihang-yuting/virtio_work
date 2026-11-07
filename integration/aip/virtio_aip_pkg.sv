@@ -22,6 +22,9 @@ package virtio_aip_pkg;
 	// 同一 env 重复绑定幂等；不同 env 的同名 service 冲突会在提交之前拒绝。
 	class virtio_aip_registry;
 		static virtio_function_instance	targets[string];
+		static virtio_net_env	target_envs[string];
+		static longint unsigned	cancelled_generation[string];
+		static longint unsigned	owner_generation[string];
 		static bit			needs_init[string];
 		static bit			needs_reset[string];
 		static process			owners[string];
@@ -40,10 +43,11 @@ package virtio_aip_pkg;
 				if (owners[name].status() == process::KILLED) stale.push_back(name);
 			end
 			foreach (stale[i]) begin
-				needs_reset[owner_targets[stale[i]]] = 1;
+				mark_cancelled(owner_targets[stale[i]], owner_generation[stale[i]]);
 				owners.delete(stale[i]);
 				owner_targets.delete(stale[i]);
 				owner_is_tx.delete(stale[i]);
+				owner_generation.delete(stale[i]);
 			end
 			foreach (owners[name]) begin
 				if (owner_targets[name] == target && !(is_tx && owner_is_tx[name])) begin
@@ -54,6 +58,8 @@ package virtio_aip_pkg;
 			owners[command] = process::self();
 			owner_targets[command] = target;
 			owner_is_tx[command] = is_tx;
+			owner_generation[command] = target_envs.exists(target) ?
+				target_envs[target].external_service_generation(targets[target].service_key) : 0;
 			why = "";
 			return 1;
 		endfunction
@@ -63,6 +69,7 @@ package virtio_aip_pkg;
 			owners.delete(command);
 			owner_targets.delete(command);
 			owner_is_tx.delete(command);
+			owner_generation.delete(command);
 		endfunction
 
 		// 将 service key 转为用户路径；VIO service kind 在本包固定，PF 不显示 vf。
@@ -102,8 +109,11 @@ package virtio_aip_pkg;
 					return 0;
 				end
 			end
-			foreach (env.function_instances[i])
-				targets[target_name(env.function_instances[i].service_key)] = env.function_instances[i];
+			foreach (env.function_instances[i]) begin
+				name = target_name(env.function_instances[i].service_key);
+				targets[name] = env.function_instances[i];
+				target_envs[name] = env;
+			end
 			return 1;
 		endfunction
 
@@ -120,6 +130,15 @@ package virtio_aip_pkg;
 			target = targets[name];
 			return 1;
 		endfunction
+
+		// 取消不回收 DMA；记录取消时的准备代号，stop 和同代确认均不能清除。
+		extern static function void mark_cancelled(input string name, input longint unsigned generation);
+
+		// 外部模式只在确认的新一代才放行业务；传统模式仍走原 reset/init 门禁。
+		extern static function bit external_reuse_ready(input string name);
+
+		// 项目只公开业务命令；保留 legacy register_commands 给独立用户。
+		extern static function bit register_business_commands(output string why);
 
 		// 注册定义在 command 类之后；只实例化对象，不在 function 内展开 class 宏。
 		extern static function bit	register_commands(output string	why);
@@ -282,11 +301,13 @@ package virtio_aip_pkg;
 		endtask
 
 		// kill只撤销sequence线程；driver接受的事务仍可继续，因此下一命令必须先
-		// 经过reset恢复。reset事务在同一sequencer排队，等在途driver返回后才执行。
+		// 传统模式经过reset恢复；外部模式只允许stop，再由平台quiesce/reprepare/verify恢复。
 		virtual function void do_kill();
 			ok = 0;
 			result_text = "sequence cancelled; accepted driver work is not rolled back";
-			virtio_aip_registry::needs_reset[target_path] = 1;
+			virtio_aip_registry::mark_cancelled(target_path,
+				virtio_aip_registry::target_envs.exists(target_path) ?
+				virtio_aip_registry::target_envs[target_path].external_service_generation(virtio_aip_registry::targets[target_path].service_key) : 0);
 			super.do_kill();
 		endfunction
 
@@ -320,7 +341,14 @@ package virtio_aip_pkg;
 			if (get_sequencer() != target.driver_agent.sequencer) begin
 				result_text = "sequence started on a sequencer belonging to another target"; return;
 			end
-			if (virtio_aip_registry::needs_reset.exists(target_path) &&
+			if (target.driver_agent.ops.uses_external_configuration()) begin
+				if (!(operation inside {VIO_TXN_START_DP, VIO_TXN_SEND_PKTS, VIO_TXN_WAIT_PKTS, VIO_TXN_STOP_DP})) begin
+					result_text = "external mode accepts business/stop only; platform owns device configuration"; return;
+				end
+				if (!virtio_aip_registry::external_reuse_ready(target_path) && operation != VIO_TXN_STOP_DP) begin
+					result_text = "external cancellation requires stop, platform quiescence, release, new prepare and verified confirmation"; return;
+				end
+			end else if (virtio_aip_registry::needs_reset.exists(target_path) &&
 				virtio_aip_registry::needs_reset[target_path] && operation != VIO_TXN_RESET) begin
 				result_text = "target cancelled/failed reset; run vio_reset before reuse"; return;
 			end
@@ -330,6 +358,13 @@ package virtio_aip_pkg;
 				result_text = "target was reset; run vio_init before reuse"; return;
 			end
 			fsm = target.driver_agent.driver.fsm;
+			// 外部取消后允许幂等受控 stop；不清取消标志，更不推断硬件已停 DMA。
+			if (target.driver_agent.ops.uses_external_configuration() && operation == VIO_TXN_STOP_DP &&
+				fsm.state == FSM_READY && fsm.external_workers_stopped()) begin
+				ok = 1;
+				result_text = "VIP already stopped; platform quiescence and a new verified generation still required after cancellation";
+				return;
+			end
 			state_before = fsm.state;
 			reports = uvm_report_server::get_server();
 			errors_before = reports.get_severity_count(UVM_ERROR) + reports.get_severity_count(UVM_FATAL);
@@ -359,7 +394,9 @@ package virtio_aip_pkg;
 						result_text = "TX pair out of active range or dataplane stopped"; return;
 					end
 					if (virtio_aip_registry::needs_reset.exists(target_path) && virtio_aip_registry::needs_reset[target_path]) begin
-						result_text = "another TX stream was cancelled; target requires reset"; return;
+						result_text = target.driver_agent.ops.uses_external_configuration() ?
+						"external TX cancelled; stop and reprepare after platform quiescence" :
+						"another TX stream was cancelled; target requires reset"; return;
 					end
 					packet_handle = packet_item::type_id::create($sformatf("packet_%0d", i));
 					packet_handle.pkt = new();
@@ -549,6 +586,40 @@ package virtio_aip_pkg;
 		virtio_txn_type_e	ops[$] = '{VIO_TXN_INIT, VIO_TXN_START_DP, VIO_TXN_SEND_PKTS, VIO_TXN_WAIT_PKTS, VIO_TXN_SET_MQ, VIO_TXN_SET_RSS, VIO_TXN_STOP_DP, VIO_TXN_RESET};
 		virtio_aip_command	command;
 
+		why = "";
+		foreach (names[i]) begin
+			if (aip_cmd::get_handle(names[i]) != null) begin
+				why = {"command already registered: ", names[i]}; return 0;
+			end
+		end
+		foreach (names[i]) command = new(names[i], ops[i], paths[i]);
+		return 1;
+	endfunction
+
+	// 记录外部取消代号；不更改核心 READY，也不把停止等同于设备停止 DMA。
+	function void virtio_aip_registry::mark_cancelled(input string name, input longint unsigned generation);
+		needs_reset[name] = 1;
+		if (!cancelled_generation.exists(name) || generation > cancelled_generation[name])
+			cancelled_generation[name] = generation;
+	endfunction
+
+	// 核心确认凭证与单调准备代号联合判断，旧代重复确认永远不能解除取消。
+	function bit virtio_aip_registry::external_reuse_ready(input string name);
+		longint unsigned	generation;
+		if (!needs_reset.exists(name) || !needs_reset[name]) return 1;
+		if (!target_envs.exists(name) || !targets.exists(name) || !cancelled_generation.exists(name)) return 0;
+		generation = target_envs[name].external_service_generation(targets[name].service_key, 1);
+		if (generation <= cancelled_generation[name]) return 0;
+		needs_reset[name] = 0;
+		return 1;
+	endfunction
+
+	// 名称整组预检，外部项目不重新注册已移除的设备 reset/init/MQ/RSS 链。
+	function bit virtio_aip_registry::register_business_commands(output string why);
+		string	names[$] = '{"vio_start", "vio_tx", "vio_wait_rx", "vio_stop"};
+		string	paths[$] = '{"vio", "vio.tx", "vio.rx", "vio"};
+		virtio_txn_type_e	ops[$] = '{VIO_TXN_START_DP, VIO_TXN_SEND_PKTS, VIO_TXN_WAIT_PKTS, VIO_TXN_STOP_DP};
+		virtio_aip_command	command;
 		why = "";
 		foreach (names[i]) begin
 			if (aip_cmd::get_handle(names[i]) != null) begin
