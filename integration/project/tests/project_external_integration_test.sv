@@ -15,26 +15,26 @@ package project_external_integration_test_pkg;
 	`include "uvm_macros.svh"
 
 	// 仅回归注入一次发送失败；其余访问调用真实 PCIe sequence。
-	class project_rewrite_fault_seq extends pcie_tl_reg_seq;
-		`uvm_object_utils(project_rewrite_fault_seq)
+	class project_config_fault_seq extends pcie_tl_reg_seq;
+		`uvm_object_utils(project_config_fault_seq)
 		static int unsigned	fail_on_call;
 		static int unsigned	calls;
-		extern function new(string name = "project_rewrite_fault_seq");
+		extern function new(string name = "project_config_fault_seq");
 		extern virtual task body();
 	endclass
 
 	// 构造发送失败观察器，不改变正常寄存器访问参数。
-	function project_rewrite_fault_seq::new(string name = "project_rewrite_fault_seq");
+	function project_config_fault_seq::new(string name = "project_config_fault_seq");
 		super.new(name);
 	endfunction
 
 	// 在指定分段拒绝发送，保留之前真正发出的间接数据端口写。
-	task project_rewrite_fault_seq::body();
+	task project_config_fault_seq::body();
 		if (fail_on_call != 0) begin
 			calls++;
 			if (calls == fail_on_call) begin
 				status = PCIE_RW_ERR;
-				error_msg = "injected indirect control send failure";
+				error_msg = "injected indirect DWORD send failure";
 				return;
 			end
 		end
@@ -64,24 +64,26 @@ package project_external_integration_test_pkg;
 		return THROW;
 	endfunction
 
-	// 用户仅实现每类别单项访问；外围循环、校验和锁完全使用 project_env 产品方法。
-	class project_external_model_env extends project_env;
-		`uvm_component_utils(project_external_model_env)
+	// 用户仅实现每类别单项访问；外围循环和写序使用 project_dut_config_seq，配置数据来自 cfg。
+	class project_external_model_seq extends project_dut_config_seq;
+		`uvm_object_utils(project_external_model_seq)
 		int unsigned	vtx_calls;
 		int unsigned	vrx_calls;
 		int unsigned	notify_calls;
 		int unsigned	bar_calls;
 		int unsigned	fail_vtx_call;
 		bit	fail_verify;
-		bit	hold_verify;
-		uvm_event	verify_entered = new("verify_entered");
-		uvm_event	verify_release = new("verify_release");
+		int unsigned	fail_dword;
+		string	fail_direction = "vtx";
+		bit	fault_armed;
+		// 故障仅在选定队列的实际 PCIe 发送段注入，整条配置 seq 必须停止。
+		extern function void arm_send_failure(input string	direction);
 		int unsigned	pfvf_calls;
 		project_pfvf_cfg_t	pfvf_items[string];
 		project_vtx_cfg_t	last_vtx;
 		project_vrx_cfg_t	last_vrx;
 		// 构造模型 hook 容器，不修改生产 build/connect。
-		extern function new(string name, uvm_component parent);
+		extern function new(string	name = "project_external_model_seq");
 		// BAR 编码没有图片规格，测试只核对真实租约组后作为模型平台报告成功。
 		extern virtual task user_configure_bar_mapping_entry(input project_bar_mapping_cfg_t item, output bit ok, output string why);
 		// 显式平台模型 verify，实际 RTL 应覆写为读回/状态检查。
@@ -115,94 +117,103 @@ package project_external_integration_test_pkg;
 	endclass
 
 	// UVM 构造，所有硬件访问都在 run 阶段用户入口进行。
-	function project_external_model_env::new(string name, uvm_component parent); super.new(name,parent); endfunction
+	function project_external_model_seq::new(string	name = "project_external_model_seq");
+		super.new(name);
+	endfunction
+	// 在首次指定方向 hook 前设置 PCIe fault；其余类别仍走正常真实发送。
+	function void project_external_model_seq::arm_send_failure(input string	direction);
+		if (fail_dword == 0 || fault_armed || direction != fail_direction) return;
+
+		fault_armed = 1;
+		project_config_fault_seq::calls = 0;
+		project_config_fault_seq::fail_on_call = fail_dword;
+	endfunction
+
 	// 没有猜测 BAR payload，模型仅确认完整声明组收到真实租约。
-	task project_external_model_env::user_configure_bar_mapping_entry(input project_bar_mapping_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_bar_mapping_entry(input project_bar_mapping_cfg_t item, output bit ok, output string why);
 		bar_calls++;
 		ok = item.members.size() != 0;
 		why = ok ? "" : "empty BAR group";
 	endtask
 	// 模型平台明确报告所选公共配置完成；产品仍检查上下文和依赖。
-	task project_external_model_env::user_verify_dpu_configuration(input project_dpu_config_scope scope, output bit ok, output string why);
+	task project_external_model_seq::user_verify_dpu_configuration(input project_dpu_config_scope scope, output bit ok, output string why);
 		ok = 1; why = "";
 	endtask
 	// 模型平台明确报告队列配置完成；后续核心 preflight 不能被此成功绕过。
-	task project_external_model_env::user_verify_vio_configuration(input project_vio_selection_t selection, output bit ok, output string why);
-		if (hold_verify) begin
-			verify_entered.trigger();
-			verify_release.wait_trigger();
-		end
+	task project_external_model_seq::user_verify_vio_configuration(input project_vio_selection_t selection, output bit ok, output string why);
 		ok = !fail_verify; why = ok ? "" : "injected platform verification failure";
 	endtask
 	// 使能使用唯一 checked 路径，只允许 enable 位变化。
-	task project_external_model_env::user_enable_queue(input project_queue_control_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_enable_queue(input project_queue_control_cfg_t item, output bit ok, output string why);
 		write_enabled_queue(item, ok, why);
 	endtask
 
 	// 单项 bdf 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_bdf_entry(input project_bdf_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_bdf_entry(input project_bdf_cfg_t item, output bit ok, output string why);
 		write_bdf(item, ok, why);
 	endtask
 
 	// 单项 pfvf 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_pf_vf_entry(input project_pfvf_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_pf_vf_entry(input project_pfvf_cfg_t item, output bit ok, output string why);
 		pfvf_calls++;
 		pfvf_items[dpu_function_key_name(item.owner)] = item;
 		write_pfvf(item, ok, why);
 	endtask
 
 	// 单项 msix_linear 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_msix_linear_entry(input project_msix_linear_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_msix_linear_entry(input project_msix_linear_cfg_t item, output bit ok, output string why);
 		write_msix_linear(item, ok, why);
 	endtask
 
 	// 单项 msix_info 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_msix_info_entry(input project_msix_info_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_msix_info_entry(input project_msix_info_cfg_t item, output bit ok, output string why);
 		write_msix_info(item, ok, why);
 	endtask
 
 	// 单项 msix_interval 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_msix_interval_entry(input project_msix_interval_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_msix_interval_entry(input project_msix_interval_cfg_t item, output bit ok, output string why);
 		write_msix_interval(item, ok, why);
 	endtask
 
 	// 单项 msix_table 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_msix_table_entry(input project_msix_table_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_msix_table_entry(input project_msix_table_cfg_t item, output bit ok, output string why);
 		write_msix_table(item, ok, why);
 	endtask
 
 	// 单项 qsch_q2tc 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_qsch_q2tc(input project_qsch_q2tc_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_qsch_q2tc(input project_qsch_q2tc_cfg_t item, output bit ok, output string why);
 		write_qsch_q2tc(item, ok, why);
 	endtask
 
 	// 单项 qsch_n2g 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_qsch_n2g(input project_qsch_n2g_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_qsch_n2g(input project_qsch_n2g_cfg_t item, output bit ok, output string why);
 		write_qsch_n2g(item, ok, why);
 	endtask
 
 	// 单项 qsch_g2p 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_qsch_g2p(input project_qsch_g2p_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_qsch_g2p(input project_qsch_g2p_cfg_t item, output bit ok, output string why);
 		write_qsch_g2p(item, ok, why);
 	endtask
 
 	// 单项 vtx 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_vtx_queue(input project_vtx_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_vtx_queue(input project_vtx_cfg_t item, output bit ok, output string why);
 		vtx_calls++;
 		last_vtx = item;
 		if (fail_vtx_call != 0 && vtx_calls == fail_vtx_call) begin ok = 0; why = "injected midway VTX hook failure"; return; end
+		arm_send_failure("vtx");
 		write_vtx(item, ok, why);
 	endtask
 
 	// 单项 vrx 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_vrx_queue(input project_vrx_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_vrx_queue(input project_vrx_cfg_t item, output bit ok, output string why);
 		vrx_calls++;
 		last_vrx = item;
+		arm_send_failure("vrx");
 		write_vrx(item, ok, why);
 	endtask
 
 	// 单项 vio_notify 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_env::user_configure_vio_notify_entry(input project_vio_notify_cfg_t item, output bit ok, output string why);
+	task project_external_model_seq::user_configure_vio_notify_entry(input project_vio_notify_cfg_t item, output bit ok, output string why);
 		notify_calls++;
 		write_vio_notify(item, ok, why);
 	endtask
@@ -253,7 +264,8 @@ package project_external_integration_test_pkg;
 	class project_external_integration_test extends uvm_test;
 		`uvm_component_utils(project_external_integration_test)
 		project_env_cfg	cfg;
-		project_external_model_env	env;
+		project_env					env;
+		project_external_model_seq	config_seq;
 		intel_pcie_if_adapter	apps[int unsigned];
 		pcie_tl_cpl_tlp	completions[int unsigned][$];
 		byte	mmio_bytes[int unsigned][bit [63:0]];
@@ -284,13 +296,8 @@ package project_external_integration_test_pkg;
 			input bit [63:0] address, input bit [31:0] data, input bit [9:0] tag = 10'h155);
 		// 非 identity 双向 DMA、权限/未知 requester、真实 MSI-X sink 与 Completion sideband。
 		extern task check_receive_path();
-		// 实际取消在发包间隔中的 AIP sequence；stop 不清取消，只有新代确认后才能复用。
-		extern task check_cancel_recovery();
-		extern task check_revoke();
-		// 原 typed 条目回写、分段失败和 verify 交错必须使旧结果失效。
-		extern task check_rewrite_guard();
-		// 整族 PFVF 依赖保护实际稀疏 VF，同时允许无关 PF 配置。
-		extern task check_pfvf_guard();
+
+
 		// typed hook 中途失败、确认/释放全 Host 预检与 AIP 取消后重准备。
 		extern virtual task run_phase(uvm_phase phase);
 	endclass
@@ -336,8 +343,8 @@ package project_external_integration_test_pkg;
 		string	why;
 		project_external_model_cfg	model_cfg;
 		super.build_phase(phase);
-		if ($test$plusargs("PROJECT_REWRITE"))
-			pcie_tl_reg_seq::type_id::set_type_override(project_rewrite_fault_seq::get_type());
+		if ($test$plusargs("PROJECT_FAIL_DWORD"))
+			pcie_tl_reg_seq::type_id::set_type_override(project_config_fault_seq::get_type());
 
 		no_vio = $test$plusargs("PROJECT_NO_VIO");
 		tx_only = $test$plusargs("PROJECT_TX_ONLY");
@@ -465,6 +472,24 @@ package project_external_integration_test_pkg;
 		add_layout(PROJECT_Q2TC,4,1024,'h600000,'h10000);
 		add_layout(PROJECT_N2G,4,2048,'h600000,'h12000);
 		add_layout(PROJECT_G2P,4,1024,'h600000,'h14000);
+
+		// 仅显式参考场景采用上传驱动地址；模型不证明真实 RTL 的地址/位域兼容。
+		// 生产 cfg 不隐含此选择，队列 data/control 的写序仍采用用户要求的高位先写。
+		if ($test$plusargs("PROJECT_DRIVER_PORTS")) begin
+			cfg.table_layouts[PROJECT_VTX].module_offset = 'h880000;
+			cfg.table_layouts[PROJECT_VTX].data_port     = 'h134;
+			cfg.table_layouts[PROJECT_VTX].control_port  = 'h130;
+			cfg.table_layouts[PROJECT_VTX].index_mask    = 'h7ff;
+			cfg.table_layouts[PROJECT_VTX].trigger_mask  = 'h2000;
+			cfg.table_layouts[PROJECT_VTX].index_policy  = PROJECT_INDEX_GLOBAL_QPAIR;
+
+			cfg.table_layouts[PROJECT_VRX].module_offset = 'h900000;
+			cfg.table_layouts[PROJECT_VRX].index_policy  = PROJECT_INDEX_GLOBAL_QPAIR;
+			cfg.table_layouts[PROJECT_Q2TC].module_offset = 'hb00000;
+			cfg.table_layouts[PROJECT_N2G].module_offset  = 'hb00000;
+			cfg.table_layouts[PROJECT_G2P].module_offset  = 'hb00000;
+		end
+
 		for (int unsigned h = 0; h < host_count; h++) begin
 			intel_pcie_vif_t	vif;
 			intel_pcie_adapter_config	app_cfg;
@@ -481,7 +506,9 @@ package project_external_integration_test_pkg;
 			apps[h] = intel_pcie_if_adapter::type_id::create(path,this);
 		end
 		uvm_config_db#(project_env_cfg)::set(this,"env","cfg",cfg);
-		env = project_external_model_env::type_id::create("env",this);
+		env = project_env::type_id::create("env", this);
+		config_seq = project_external_model_seq::type_id::create("config_seq");
+		config_seq.cfg = cfg;
 	endfunction
 
 	// 实际 Intel RX 返回 sideband 与 payload；模型只管理设备 BAR 存储，不响应 Host DMA。
@@ -544,7 +571,7 @@ package project_external_integration_test_pkg;
 		project_dma_expected_error	catcher;
 		string	why;
 		catcher = new();
-		env.dpu_setup.list_functions(functions);
+		cfg.dpu_setup.list_functions(functions);
 		foreach (functions[f]) begin
 			bit [63:0]	gpa;
 			bit [63:0]	iova;
@@ -644,395 +671,63 @@ package project_external_integration_test_pkg;
 		#100ns;
 	endtask
 
-	// 完整模型流程：独立类别、失败保留、跨 Host 原子预检、旧代拒绝及真正 Intel 收发。
-	task project_external_integration_test::run_phase(uvm_phase phase);
-		project_dpu_config_scope	public_scope;
-		dpu_function_key_t	keys[$];
-		int unsigned	bars[$];
-		bit	ok;
-		string	why;
-		int unsigned	posted_before;
-		project_vtx_cfg_t	changed;
-		logic [127:0]	readback;
+	// 正常使用方式：只启动一个配置 seq，自动 get 同一 cfg，成功后进入 READY。
+	// 故障行每次仿真只注入一个 DWORD，检查整个 body 停止且不进入发包状态。
+	task project_external_integration_test::run_phase(uvm_phase	phase);
+		bit				ok;
+		string			why;
+		int unsigned	host;
+
 		phase.raise_objection(this);
 		foreach (apps[h]) begin
-			automatic int unsigned	host = h;
-			fork app_receive(host); join_none
+			automatic int unsigned	access_host = h;
+
+			fork app_receive(access_host); join_none
 		end
 		#100ns;
-		begin
-			project_function_record_t functions[$];
-			project_dpu_config_scope probe;
-			project_dpu_setup foreign;
-			dpu_function_key_t chosen[$];
-			env.dpu_setup.list_functions(functions);
-			chosen.push_back(functions[0].key);
-			chosen[0].host_id = 32'hffff;
-			probe = new("unknown_public", env.dpu_setup, chosen, bars);
-			env.configure_bdf_table(probe, ok, why);
-			require_true(!ok, "unknown Function scope accepted");
-			chosen.delete();
-			foreign = new("foreign_public", env.dpu_env.get_snapshot(), env.bar_registry, env.dpu_setup.get_generation());
-			probe = new("foreign_scope", foreign, chosen, bars);
-			require_true(!probe.validate(env.dpu_setup, why), "foreign public setup accepted");
-			if (functions.size() > 2) begin
-				chosen.push_back(functions[0].key);
-				chosen.push_back(functions[functions.size()-1].key);
-				probe = new("noncontiguous_public", env.dpu_setup, chosen, bars);
-				require_true(probe.validate(env.dpu_setup, why) && !probe.selects(functions[1].key), "noncontiguous public selection expanded");
-				env.configure_bdf_table(probe, ok, why);
-				require_true(ok, why);
+		void'($value$plusargs("PROJECT_FAIL_DWORD=%d", config_seq.fail_dword));
+		void'($value$plusargs("PROJECT_FAIL_DIRECTION=%s", config_seq.fail_direction));
+		require_true(config_seq.fail_dword <= 6, "failure point must be within six queue writes");
+		require_true(cfg.tl_slot_by_host.first(host), "Host mapping missing");
+
+		config_seq.cfg = null;
+		config_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[host]]);
+		selection = config_seq.selection;
+		require_true(config_seq.cfg == cfg, "sequence did not retrieve the shared env_cfg");
+		#100ns;
+
+		if (config_seq.fail_dword != 0) begin
+			require_true(!config_seq.success && config_seq.error_msg != "", "send failure was not propagated");
+			require_true(config_seq.fault_armed && project_config_fault_seq::calls == config_seq.fail_dword,
+				"configuration continued sending after failed DWORD");
+			foreach (cfg.vio_envs[h]) foreach (cfg.vio_envs[h].function_instances[f]) begin
+				require_true(cfg.vio_envs[h].function_instances[f].driver_agent.fsm.state != FSM_READY,
+					"failed configuration entered packet-ready state");
 			end
-		end
-		public_scope = new("all_public",env.dpu_setup,keys,bars);
-		env.configure_bar_table(public_scope,ok,why); require_true(ok,why);
-		env.configure_bdf_table(public_scope,ok,why); require_true(ok,why);
-		env.configure_pf_vf_map(public_scope,ok,why); require_true(ok,why);
-		env.configure_msix(public_scope,ok,why); require_true(ok,why);
-		env.verify_dpu_configuration(public_scope,ok,why); require_true(ok,why);
-		env.pcie_bar_write_by_name("h0.pf0.bar0",'h40,16,128'hffeeddccbbaa99887766554433221100,32'h0a0a,ok,why);
-		require_true(ok,why);
-		env.pcie_bar_read_by_name("h0.pf0.bar0",'h40,16,32'h0a0a,readback,ok,why);
-		require_true(ok && readback==128'hffeeddcc00aa00887766554400220000,"MMIO little endian sparse skip/read path");
-		env.prepare_vio_configuration(selection,ok,why); require_true(ok,why);
-		if (!no_vio) begin
-			require_true(selection.setups.num()==host_count,"missing prepared Host");
-			env.configure_vio_notify(selection,ok,why); require_true(ok,why);
-			env.configure_qsch(selection,ok,why); require_true(ok,why);
-			env.fail_vtx_call = (pairs*vf_count*host_count > 1) ? 2 : 1;
-			env.configure_vio_queues(selection,ok,why); require_true(!ok,"midway hook failure not propagated");
-			env.enable_vio_queues(selection,ok,why); require_true(!ok,"enable allowed after partial hook failure");
-			env.commit_vio_configuration(selection,ok,why); require_true(!ok,"commit allowed after partial hook failure");
-			env.fail_vtx_call = 0;
-			env.vtx_calls = 0;
-			env.vrx_calls = 0;
-			env.configure_vio_queues(selection,ok,why); require_true(ok,why);
-			require_true(env.vtx_calls==pairs*vf_count*host_count,"VTX hook count differs from actual queue count");
-			require_true(env.vrx_calls==(tx_only?0:pairs*vf_count*host_count),"VRX hook direction/count");
-			require_true(env.notify_calls==pairs*vf_count*host_count,"notify pair dedup count");
-			changed = env.last_vtx;
-			changed.entry.desc_addr ^= 64'h1000;
-			posted_before = posted[0].size();
-			env.write_vtx(changed,ok,why); require_true(!ok,"checked VTX accepted mutated ring IOVA");
-			for (int mutation = 0; mutation < 7; mutation++) begin
-				changed = env.last_vtx;
-				case (mutation)
-					0: changed.binding.qpair.global_qpair_id++;
-					1: changed.entry.dma_msix++;
-					2: changed.entry.q_depth++;
-					3: changed.entry.virtio_mode ^= 1;
-					4: changed.ctx.byte_offset += 4;
-					5: changed.ctx.layout.module_offset = 'x;
-					6: changed.entry.desc_addr = 'x;
-				endcase
-				env.write_vtx(changed, ok, why);
-				require_true(!ok, "typed queue mutation accepted");
-			end
-			#20ns;
-			require_true(posted[0].size()==posted_before,"invalid typed entry emitted TLP");
-			env.enable_vio_queues(selection,ok,why); require_true(ok,why);
-			env.verify_vio_configuration(selection,ok,why); require_true(ok,why);
-			if ($test$plusargs("PROJECT_REWRITE")) check_rewrite_guard();
-			if (host_count==2) begin
-				virtqueue_base	queue;
-				bit [63:0]	saved;
-				fsm_state_e	state;
-				vio_queue_setup_t	rows[$];
-				selection.setups[1].list_queues(rows);
-				queue = env.vio_envs[1].function_instances[0].vq_mgr.get_queue(rows[0].notification.local_qid);
-				saved = queue.desc_table_addr;
-				state = env.vio_envs[0].function_instances[0].driver_agent.fsm.state;
-				queue.desc_table_addr += 16;
-				env.commit_vio_configuration(selection,ok,why);
-				require_true(!ok && env.vio_envs[0].function_instances[0].driver_agent.fsm.state==state,"later Host mismatch partially confirmed earlier Host");
-				queue.desc_table_addr = saved;
-			end
-			env.commit_vio_configuration(selection,ok,why); require_true(ok,why);
-		end else require_true(selection.setups.num()==0,"no-VIO scenario prepared rings");
-		check_receive_path();
-		if ($test$plusargs("PROJECT_PFVF_GUARD")) check_pfvf_guard();
-		if ($test$plusargs("PROJECT_CANCEL")) begin
-			fork : bounded_cancel_fixture
-				check_cancel_recovery();
-				begin
-					#20us;
-					`uvm_fatal("PROJECT_CANCEL_TIMEOUT", {"cancel fixture stalled at ", cancel_stage})
+			`uvm_info("PROJECT_CONFIG_FAILURE_PASS", $sformatf("direction=%s failure=%0d stopped whole configuration sequence",
+				config_seq.fail_direction, config_seq.fail_dword), UVM_LOW)
+		end else begin
+			require_true(config_seq.success, config_seq.error_msg);
+			if (!no_vio) begin
+				require_true(selection.setups.num() == host_count, "missing prepared Host");
+				require_true(config_seq.vtx_calls == pairs*vf_count*host_count, "VTX hook count differs from actual queues");
+				require_true(config_seq.vrx_calls == (tx_only ? 0 : pairs*vf_count*host_count), "VRX hook count differs from actual queues");
+				foreach (cfg.vio_envs[h]) foreach (cfg.vio_envs[h].function_instances[f]) begin
+					require_true(cfg.vio_envs[h].function_instances[f].driver_agent.fsm.state == FSM_READY,
+						"successful configuration did not enable packet admission");
 				end
-			join_any
-			disable bounded_cancel_fixture;
-		end
-		if ($test$plusargs("PROJECT_REVOKE")) check_revoke();
-		if (!no_vio) begin
-			if (host_count==2) begin
-				virtqueue_base	queue;
-				bit [63:0]	saved;
-				vio_queue_setup_t	rows[$];
-				selection.setups[1].list_queues(rows);
-				queue = env.vio_envs[1].function_instances[0].vq_mgr.get_queue(rows[0].notification.local_qid);
-				saved = queue.desc_table_addr;
-				queue.desc_table_addr += 16;
-				env.release_vio_resources(selection,1,ok,why);
-				require_true(!ok && env.vio_envs[0].function_instances[0].driver_agent.fsm.state==FSM_READY &&
-					env.vio_envs[0].function_instances[0].vq_mgr.get_queue_count()!=0,"later Host mismatch partially released earlier Host");
-				queue.desc_table_addr = saved;
 			end
-			env.release_vio_resources(selection,0,ok,why); require_true(!ok,"release accepted no platform quiescence");
-			env.release_vio_resources(selection,1,ok,why); require_true(ok,why);
-			env.commit_vio_configuration(selection,ok,why); require_true(!ok,"stale generation recommitted");
+			check_receive_path();
+			`uvm_info("PROJECT_CONFIG_SEQ_PASS", $sformatf("one sequence retrieved cfg, configured and verified %0d Hosts", host_count), UVM_LOW)
 		end
-		foreach (env.vio_envs[h]) env.vio_envs[h].host_mem.leak_check();
-		`uvm_info("PROJECT_EXTERNAL_FLOW",$sformatf("PROJECT_EXTERNAL_FLOW_PASS checks=%0d hosts=%0d vfs=%0d pairs=%0d",checks,host_count,vf_count,pairs),UVM_LOW)
+
+		// APP fixture 此时没有在途 DMA；真实 DUT 项目应由平台确认停机后再释放。
+		if (selection.setups.num() != 0) begin
+			cfg.release_vio_resources(selection, 1, ok, why);
+			require_true(ok, why);
+		end
+		foreach (cfg.vio_envs[h]) cfg.vio_envs[h].host_mem.leak_check();
+		`uvm_info("PROJECT_EXTERNAL_FLOW_PASS", $sformatf("checks=%0d", checks), UVM_LOW)
 		phase.drop_objection(this);
 	endtask
-	// 同一禁用条目仍合法，但每次写之后必须重新使能并验证。
-	task project_external_integration_test::check_rewrite_guard();
-		project_vtx_cfg_t tx;
-		project_vrx_cfg_t rx;
-		bit ok;
-		bit verify_ok;
-		string why;
-		string verify_why;
-		int unsigned before_posted;
-		tx = env.last_vtx;
-		rx = env.last_vrx;
-		require_true(tx.entry.queue_en == 0, "original VTX must be disabled");
-		for (int direction = 0; direction < (tx_only ? 1 : 2); direction++) begin
-			if (direction == 0) env.write_vtx(tx, ok, why);
-			else env.write_vrx(rx, ok, why);
-			require_true(ok, why);
-			env.commit_vio_configuration(selection, ok, why); require_true(!ok, "typed disabled rewrite retained old readiness");
-			env.enable_vio_queues(selection, ok, why); require_true(ok, why);
-			env.commit_vio_configuration(selection, ok, why); require_true(!ok, "enable restored stale verification");
-			env.verify_vio_configuration(selection, ok, why); require_true(ok, why);
-		end
-		#20ns;
-		before_posted = posted[tx.ctx.target.function_key.host_id].size();
-		project_rewrite_fault_seq::calls = 0;
-		project_rewrite_fault_seq::fail_on_call = 2;
-		env.write_vtx(tx, ok, why);
-		project_rewrite_fault_seq::fail_on_call = 0;
-		require_true(!ok, "partial indirect write did not fail");
-		#20ns;
-		require_true(posted[tx.ctx.target.function_key.host_id].size() == before_posted + 1, "partial write did not emit exactly its data TLP");
-		env.commit_vio_configuration(selection, ok, why); require_true(!ok, "partial write retained commit readiness");
-		env.enable_vio_queues(selection, ok, why); require_true(!ok, "partial write retained configured result");
-		env.write_vtx(tx, ok, why); require_true(ok, why);
-		env.enable_vio_queues(selection, ok, why); require_true(ok, why);
-		env.verify_vio_configuration(selection, ok, why); require_true(ok, why);
-
-		// 验证先进入真实等待；typed 写在 hook 返回前完成，旧观察不能覆盖写入失效。
-		env.verify_entered.reset();
-		env.hold_verify = 1;
-		fork
-			env.verify_vio_configuration(selection, verify_ok, verify_why);
-			begin
-				env.verify_entered.wait_on();
-				#1ns;
-				env.write_vtx(tx, ok, why); require_true(ok, why);
-				env.hold_verify = 0;
-				env.verify_release.trigger();
-			end
-		join
-		require_true(!verify_ok, "overlapping verification accepted stale observation");
-		env.commit_vio_configuration(selection, ok, why); require_true(!ok, "overlapping verify restored commit readiness");
-		env.enable_vio_queues(selection, ok, why); require_true(ok, why);
-		env.verify_vio_configuration(selection, ok, why); require_true(ok, why);
-		`uvm_info("PROJECT_REWRITE_PASS", "typed VTX/VRX rewrite, partial send failure and overlapping verify rejected stale results", UVM_LOW)
-	endtask
-
-	// PF0 无 VIO，实际 VF0/VF3 已确认并运行；PF1 保持独立。
-	task project_external_integration_test::check_pfvf_guard();
-		project_function_record_t functions[$];
-		project_dpu_config_scope scope;
-		dpu_function_key_t chosen[$];
-		int unsigned bars[$];
-		project_pfvf_cfg_t item;
-		int unsigned before_hooks;
-		int unsigned before_posted;
-		int unsigned queues_before[$];
-		bit saw_vf0;
-		bit saw_vf3;
-		bit ok;
-		string why;
-		env.dpu_setup.list_functions(functions);
-		foreach (functions[f]) begin
-			if (functions[f].key.kind == DPU_FUNCTION_VF) begin
-				require_true(functions[f].key.pf_id == 0 && functions[f].key.vf_id inside {0,3}, "fixture sparse VF membership");
-				if (functions[f].key.vf_id == 0) saw_vf0 = 1;
-				if (functions[f].key.vf_id == 3) saw_vf3 = 1;
-			end
-			if (functions[f].key.kind == DPU_FUNCTION_PF && functions[f].key.pf_id == 0) chosen.push_back(functions[f].key);
-		end
-		require_true(saw_vf0 && (saw_vf3 || $test$plusargs("PROJECT_PFVF_SINGLE")) && chosen.size() == 1, "sparse PF family missing");
-		item = env.pfvf_items[dpu_function_key_name(chosen[0])];
-		saw_vf0 = 0; saw_vf3 = 0;
-		foreach (item.consumers[c]) begin
-			require_true(item.consumers[c].function_key.pf_id == 0, "PFVF acquired unrelated family consumer");
-			if (item.consumers[c].function_key.kind != DPU_FUNCTION_VF) continue;
-			if (item.consumers[c].function_key.vf_id == 0) saw_vf0 = 1;
-			if (item.consumers[c].function_key.vf_id == 3) saw_vf3 = 1;
-		end
-		require_true(saw_vf0 && (saw_vf3 || $test$plusargs("PROJECT_PFVF_SINGLE")), "PFVF omitted actual sparse VF services");
-		foreach (env.vio_envs[0].function_instances[f]) begin
-			queues_before.push_back(env.vio_envs[0].function_instances[f].vq_mgr.get_queue_count());
-			env.vio_envs[0].function_instances[f].driver_agent.fsm.start_dataplane();
-		end
-		#30ns;
-		before_hooks = env.pfvf_calls;
-		before_posted = posted[0].size();
-		scope = new("pf0_only", env.dpu_setup, chosen, bars);
-		env.configure_pf_vf_map(scope, ok, why); require_true(!ok, "running VF allowed parent PFVF batch write");
-		env.write_pfvf(item, ok, why); require_true(!ok, "running VF allowed captured PFVF write");
-		#20ns;
-		require_true(env.pfvf_calls == before_hooks && posted[0].size() == before_posted, "rejected PFVF rewrite reached hook/TLP");
-		chosen.delete();
-		foreach (functions[f])
-			if (functions[f].key.kind == DPU_FUNCTION_PF && functions[f].key.pf_id == 1) chosen.push_back(functions[f].key);
-		scope = new("pf1_only", env.dpu_setup, chosen, bars);
-		env.configure_pf_vf_map(scope, ok, why); require_true(ok, why);
-		require_true(env.pfvf_calls == before_hooks + 1, "unrelated PF family configuration blocked");
-		foreach (env.vio_envs[0].function_instances[f]) begin
-			virtio_function_instance instance;
-			instance = env.vio_envs[0].function_instances[f];
-			require_true(instance.driver_agent.fsm.state == FSM_RUNNING && instance.driver_agent.ops.external_queue_ready(1) &&
-				instance.vq_mgr.get_queue_count() == queues_before[f], "PFVF rewrite changed VF readiness/DMA ownership");
-			instance.driver_agent.fsm.stop_dataplane();
-		end
-		`uvm_info("PROJECT_PFVF_GUARD_PASS", "sparse VF family protects parent PFVF and leaves unrelated PF writable", UVM_LOW)
-	endtask
-
-	// 已确认停止状态和损坏几何均能撤销；外来 scope 不能影响有效资源。
-	task project_external_integration_test::check_revoke();
-		project_vio_selection_t subset;
-		vio_queue_setup_t rows[$];
-		dpu_service_key_t keys[$];
-		virtio_function_instance instance;
-		virtqueue_base queue;
-		bit [63:0] saved;
-		string why;
-		bit ok;
-		require_true(!no_vio, "revoke fixture requires VIO");
-		selection.setups[0].list_queues(rows);
-		keys.push_back(rows[0].service_key);
-		subset.setups[0] = selection.setups[0];
-		subset.scopes[0] = new("revoke_subset", subset.setups[0], keys);
-		instance = env.vio_envs[0].function_instances[0];
-		queue = instance.vq_mgr.get_queue(rows[0].notification.local_qid);
-		ok = env.vio_envs[0].revoke_external_configuration(null, subset.scopes[0], why);
-		require_true(!ok && instance.driver_agent.ops.external_queue_ready(queue.queue_id), "foreign revoke mutated READY");
-		for (int invalid_case = 0; invalid_case < 3; invalid_case++) begin
-			project_vio_selection_t invalid_selection;
-			invalid_selection = subset;
-			case (invalid_case)
-				0: begin invalid_selection.scopes.delete(0); invalid_selection.scopes[99] = subset.scopes[0]; end
-				1: invalid_selection.scopes[0] = null;
-				2: begin
-					invalid_selection.setups.delete(0); invalid_selection.scopes.delete(0);
-					invalid_selection.setups[99] = subset.setups[0]; invalid_selection.scopes[99] = subset.scopes[0];
-				end
-			endcase
-			env.verify_vio_configuration(invalid_selection, ok, why);
-			require_true(!ok && instance.driver_agent.ops.external_queue_ready(queue.queue_id) &&
-				env.vio_envs.num() == host_count, "invalid Host/scope changed live state or map");
-		end
-		env.fail_verify = 1;
-		env.verify_vio_configuration(subset, ok, why);
-		require_true(!ok && !instance.driver_agent.ops.external_queue_ready(queue.queue_id) &&
-			instance.driver_agent.fsm.state == FSM_REINIT_REQUIRED && instance.vq_mgr.get_queue_count() != 0,
-			"failed verify did not close business gate while retaining rings");
-		if (host_count > 1) require_true(env.vio_envs[1].function_instances[0].driver_agent.fsm.state == FSM_READY,
-			"scoped revoke invalidated another Host");
-		env.fail_verify = 0;
-		env.verify_vio_configuration(selection, ok, why); require_true(ok, why);
-		env.commit_vio_configuration(selection, ok, why); require_true(ok, why);
-		saved = queue.desc_table_addr;
-		queue.desc_table_addr += 16;
-		env.verify_vio_configuration(subset, ok, why);
-		require_true(!ok && !instance.driver_agent.ops.external_queue_ready(queue.queue_id) &&
-			instance.vq_mgr.get_queue_count() != 0, "corrupt geometry prevented safe revoke");
-		queue.desc_table_addr = saved;
-		env.verify_vio_configuration(selection, ok, why); require_true(ok, why);
-		env.commit_vio_configuration(selection, ok, why); require_true(ok, why);
-		`uvm_info("PROJECT_EXTERNAL_FLOW", "PROJECT_REVOKE_PASS", UVM_LOW)
-	endtask
-
-	// 使用真正 AIP sequence kill 路径，driver 已接受的第一个 TX 留待平台 quiescence 后释放。
-	task project_external_integration_test::check_cancel_recovery();
-		virtio_function_instance	instance;
-		virtio_aip_sequence	start_seq;
-		virtio_aip_sequence	tx_seq;
-		virtio_aip_sequence	stop_seq;
-		project_vio_selection_t	old_selection;
-		string	name;
-		string	why;
-		bit	ok;
-		require_true(!no_vio && host_count==1 && tx_only,"cancel fixture requires single Host TX-only");
-		instance = env.vio_envs[0].function_instances[0];
-		env.register_aip_commands();
-		require_true(aip_cmd::get_handle("vio_init")==null && aip_cmd::get_handle("vio_reset")==null &&
-			aip_cmd::get_handle("vio_start")!=null,"project registered removed legacy commands");
-		name = virtio_aip_registry::target_name(instance.service_key);
-		start_seq = new("start_before_cancel");
-		start_seq.target = instance;
-		start_seq.target_path = name;
-		start_seq.operation = VIO_TXN_START_DP;
-		require_true(instance.driver_agent.ops.wait_pol.default_poll_interval_ns != 0, "cancel fixture has zero worker poll interval");
-		`uvm_info("PROJECT_CANCEL", $sformatf("effective worker poll_ns=%0d", instance.driver_agent.ops.wait_pol.default_poll_interval_ns), UVM_LOW)
-		cancel_stage = "start dataplane";
-		start_seq.start(instance.driver_agent.sequencer);
-		require_true(start_seq.ok,start_seq.result_text);
-		tx_seq = new("cancel_stream");
-		tx_seq.target = instance;
-		tx_seq.target_path = name;
-		tx_seq.operation = VIO_TXN_SEND_PKTS;
-		tx_seq.count = 2;
-		tx_seq.pair = 0;
-		tx_seq.len_min = 512;
-		tx_seq.len_max = 512;
-		tx_seq.gap_ns = 5000;
-		cancel_stage = "kill TX sequence";
-		fork
-			tx_seq.start(instance.driver_agent.sequencer);
-			begin
-				#500ns;
-				`uvm_info("PROJECT_CANCEL", "issuing sequence kill", UVM_LOW)
-				tx_seq.kill();
-				`uvm_info("PROJECT_CANCEL", "sequence kill returned", UVM_LOW)
-			end
-		join
-		require_true(virtio_aip_registry::needs_reset[name],"AIP kill did not retain cancellation gate");
-		stop_seq = new("stop_after_cancel");
-		stop_seq.target = instance;
-		stop_seq.target_path = name;
-		stop_seq.operation = VIO_TXN_STOP_DP;
-		cancel_stage = "stop dataplane";
-		stop_seq.start(instance.driver_agent.sequencer);
-		require_true(stop_seq.ok,stop_seq.result_text);
-		require_true(!virtio_aip_registry::external_reuse_ready(name),"mere stop cleared cancellation");
-		env.commit_vio_configuration(selection,ok,why); require_true(ok,why);
-		require_true(!virtio_aip_registry::external_reuse_ready(name),"same generation confirmation cleared cancellation");
-		old_selection = selection;
-		cancel_stage = "release old generation";
-		env.release_vio_resources(selection,1,ok,why); require_true(ok,why);
-		cancel_stage = "prepare new generation";
-		env.prepare_vio_configuration(selection,ok,why); require_true(ok,why);
-		require_true(selection.setups[0].get_generation()>old_selection.setups[0].get_generation(),"new preparation did not advance generation");
-		cancel_stage = "configure new generation";
-		env.configure_vio_notify(selection,ok,why); require_true(ok,why);
-		env.configure_qsch(selection,ok,why); require_true(ok,why);
-		env.configure_vio_queues(selection,ok,why); require_true(ok,why);
-		env.enable_vio_queues(selection,ok,why); require_true(ok,why);
-		env.verify_vio_configuration(selection,ok,why); require_true(ok,why);
-		require_true(!virtio_aip_registry::external_reuse_ready(name),"unconfirmed new generation cleared cancellation");
-		env.commit_vio_configuration(selection,ok,why); require_true(ok,why);
-		require_true(virtio_aip_registry::external_reuse_ready(name),"verified new generation did not clear cancellation");
-		cancel_stage = "start dataplane";
-		start_seq.start(instance.driver_agent.sequencer);
-		require_true(start_seq.ok,start_seq.result_text);
-		cancel_stage = "stop dataplane";
-		stop_seq.start(instance.driver_agent.sequencer);
-		require_true(stop_seq.ok,stop_seq.result_text);
-		`uvm_info("PROJECT_EXTERNAL_FLOW","PROJECT_AIP_CANCEL_RECOVERY_PASS",UVM_LOW)
-	endtask
-
 endpackage

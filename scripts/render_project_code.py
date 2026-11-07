@@ -18,6 +18,7 @@ SOURCES = (
     "integration/project/project_vio_config.sv",
     "integration/project/project_pcie_rc_driver.sv",
     "integration/project/project_env_cfg.sv",
+    "integration/project/project_dut_config_seq.sv",
     "integration/project/project_env.sv",
     "integration/project/project_base_test.sv",
 )
@@ -43,7 +44,8 @@ DPU、net_packet、host_mem、PCIe TL、VIO、AIP glue、Intel interface/adapter
 生产 VIO filelist 不包含本目录；模型测试需另外添加 `filelists/project_tests.f`。
 
 public table hooks 默认失败；没有配置平台输入的示例不是可直接运行的真实 DUT test。
-项目执行外部 prepare→typed配置→enable→verify→commit 生命周期，无自动 executor/init/reset。
+base_test 显式启动一个配置 seq，共用 env_cfg 中的资源完成写表、使能、验证和确认。
+ring 在写队列表前准备；不自动执行 Virtio capability 发现、协商或复位。
 
 """]
     for relative in SOURCES:
@@ -67,7 +69,7 @@ def main():
         if not OUTPUT.exists() or OUTPUT.read_text(encoding="utf-8") != content:
             print("project_env_full_code.md is stale; run scripts/render_project_code.py", file=sys.stderr)
             return 1
-        print("project source export matches all 9 source files")
+        print(f"project source export matches all {len(SOURCES)} source files")
         return 0
     OUTPUT.write_text(content, encoding="utf-8")
     print(f"generated {OUTPUT.relative_to(ROOT)}")

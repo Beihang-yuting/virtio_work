@@ -1,5 +1,7 @@
 # VIO 项目参考集成简化：一个 env、一个 env_cfg、原生 PCIe TL
 
+历史设计：配置 task 的归属与运行期组织已由 [单 seq 方案](2026-11-07-project-dut-config-sequence-design.md) 更新。当前集成代码以 integration/project 为准。
+
 日期：2026-11-06
 
 状态：已按用户补充的“不要继承 dpu_device_env，直接创建”更新结构并实现参考代码。

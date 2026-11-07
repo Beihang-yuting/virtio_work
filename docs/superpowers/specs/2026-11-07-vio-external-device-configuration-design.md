@@ -1,5 +1,7 @@
 # VIO 外部设备配置接入：Packed 与自定义队列共享分配、配置和运行流程
 
+历史设计：配置 task 的归属与运行期组织已由 [单 seq 方案](2026-11-07-project-dut-config-sequence-design.md) 更新。当前集成代码以 integration/project 为准。
+
 日期：2026-11-07
 
 状态：用户已批准，正在实现。各接口是否完成以源码和验证记录为准。

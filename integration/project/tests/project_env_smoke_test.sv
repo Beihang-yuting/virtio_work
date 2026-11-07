@@ -181,7 +181,7 @@ package project_env_test_pkg;
             expect_true(env.shared_pool == injected_pool, "project replaced platform pool");
             expect_true(cfg.dpu_cfg.host_mem_pool_ref == injected_pool, "DPU has a different pool");
             expect_true(cfg.dpu_cfg.executor == null, "project installed a legacy executor");
-            expect_true(env.dpu_setup.belongs_to(env.dpu_env.get_snapshot(), env.bar_registry),
+            expect_true(cfg.dpu_setup.belongs_to(env.dpu_env.get_snapshot(), cfg.bar_registry),
                 "public setup differs from authoritative snapshot");
             expect_true(env.dpu_env.get_state() == DPU_DEVICE_RESOLVED,
                 "assembly unexpectedly executed device configuration");

@@ -1,5 +1,9 @@
 # VIO 外部配置验证记录
 
+当前项目已改为单个配置 seq，配置数据直接取同一 env_cfg。旧 env 配置接口、并发锁、
+重写/撤销等条目仅描述下文对应版本的历史证据，不能作为当前接口说明。
+当前用法见 [集成说明](../integration/project/README.md)，本轮结果见文末单 seq 验证。
+
 证据分三层：核心/registry组件合同、真实 Intel VIP adapter→monitor→bridge→项目RC的
 模型报文路径、用户实际RTL。前两层使用明确声明的模型平台；没有提供用户RTL，
 因此这里不认证其模块基址、间接端口语义、PBA真实容量、QSCH调度或线侧收发。
@@ -375,3 +379,96 @@ Important问题由同一修复提交处理；随后独立审查仅复核
 同目录`final-review.md`。临时工作目录只在归档核对成功后清理。
 
 保留本地分支 `review/virtio-sdd-optimized`，本轮没有合并或推送；本地build证据未加入Git。
+
+## 2026-11-07：逐 DWORD 写表与上传驱动地址参考
+
+以 `8290bb9` 为代码基线，本次修改仅涉及项目参考 env 的表项发送、两个项目测试
+和参考文档。所有 checked 表项每次发送4B，按高 DWORD→低 DWORD；VTX/VRX
+保持同端口锁，完整四笔数据后才发送 clear/trigger。原始 `pcie_bar_write*` 的
+宽度/byte-mask 合同不变，新增 `pcie_table_write_by_name()` 供用户自定义表复用。
+
+仿真主机为 `ubuntu@10.11.10.53`，VCS `W-2024.09-SP1 Full64`。
+独立工作目录：`/home/ubuntu/ryan/table_write_vcs_20261107.vH77Xj`。
+完整编译/运行/strict/源码身份/依赖身份记录保存在本地
+`build/vio_external_config_validation/remote_evidence/table_write_vcs/`。
+
+| 验证 | 结果 |
+| --- | --- |
+| 项目编译、strict compile | `0 / 0` |
+| `project_external_contract_test +PROJECT_SMALL +PROJECT_DRIVER_PORTS` | 仿真/strict `0 / 0`，2583项检查；MMIO/TABLE_DWORD/INDIRECT_SERIAL/EXTERNAL_CONTRACT marker 各1次 |
+| `project_external_integration_test +PROJECT_SMALL +PROJECT_DRIVER_PORTS +PROJECT_REWRITE` | 仿真/strict `0 / 0`，834项检查；INDIRECT_FAILURE/REWRITE/EXTERNAL_FLOW marker 各1次 |
+| 文档提取 `driver_reference_sample_tb` | 编译/strict `0 / 0`，运行0，ADDRESS_PASS 1次；检查18种地址/宽度，编译19个 typed hook 和 BAR helper |
+
+两条项目仿真的 PCIe scoreboard mismatched/unexpected/timed-out 均为 `0/0/0`。
+合同覆盖 raw MMIO、4/8/12/16B 高到低写、非法整项零发送、PF/VF 路由、typed 表项
+写序和并发12笔完整组。VTX/VRX 分别注入第1至6笔失败，检查立即停止及旧就绪状态撤销。
+首轮发现测试固定使用旧 QSCH 模型地址，改为显式选择驱动参考地址后同场景通过；
+该失败日志保留在证据中。33项证据文件校验和全部通过。
+
+驱动真实 VTX/VRX 写序是低到高，当前项目按用户要求采用高到低；地址参考与此差异
+已在 [逐表写入示例](../integration/project/driver_address_example.md) 明确区分。
+验证使用模型端点和 Intel VIP，不证明用户 RTL 的地址、BAR limit 或 VF size-code 语义。
+本节证据不包含后续 env→sequence 拆分；拆分后的验证见下一节。
+
+## 2026-11-07：单个配置 sequence 与共享 env_cfg
+
+在 `0f1fee8` 基线后的工作区中，将 DUT 写表和平台 hook 移到
+`project_dut_config_seq`，参数、资源视图和 typed 表项保存在同一个 `project_env_cfg`。
+env 负责组件组装和句柄发布，base_test 等待平台就绪后启动一个配置 seq。
+本轮按用户的单 seq 使用方式删除项目层并发锁、写版本、重写撤销及相应测试，
+保留正常配置顺序、参数/路由检查和发送失败立即停止的行为。
+
+仿真在 `ubuntu@10.11.10.53` 的独立目录
+`/home/ubuntu/ryan/project_config_seq_vcs_20261107.Y1zthi` 执行，
+使用 VCS `W-2024.09-SP1 Full64`。项目重新编译与 strict compile 均返回0。
+以下16条项目仿真全部 sim/strict=`0/0`，UVM W/E/F=`0/0/0`，
+每个 PCIe scoreboard 的 mismatched/unexpected/timed-out 均为 `0/0/0`。
+
+| 测试 | plusargs | 验证结果 |
+| --- | --- | --- |
+| `project_external_integration_test` | `+PROJECT_SMALL +PROJECT_DRIVER_PORTS` | 正常 start，从 PCIe sequencer 取得同一 cfg；写表后进入 READY；CONFIG_SEQ/FLOW marker各1次 |
+| `project_external_contract_test` | `+PROJECT_SMALL +PROJECT_DRIVER_PORTS` | MMIO、PF/VF 路由、高到低 DWORD 写序、typed 表项和实际 Intel RX；MMIO_CONTRACT/TABLE_DWORD/EXTERNAL_CONTRACT marker各1次 |
+| `project_external_integration_test` | `+PROJECT_SMALL +PROJECT_DRIVER_PORTS +PROJECT_TWO_HOSTS +PROJECT_CUSTOM +PROJECT_MSIX` | 单个 seq 顺序配置两 Host；Custom 512B TX、used DMA 和真实 MSI-X 消息；两个 scoreboard 均通过 |
+| `project_external_integration_test` | `+PROJECT_SMALL +PROJECT_DRIVER_PORTS +PROJECT_NO_VIO` | 只配置公共资源，无 VIO ring；CONFIG_SEQ/FLOW marker各1次 |
+| `project_external_integration_test`，12条独立仿真 | `+PROJECT_SMALL +PROJECT_DRIVER_PORTS +PROJECT_FAIL_DIRECTION=vtx\|vrx +PROJECT_FAIL_DWORD=1..6` | 两方向各六笔发送失败点；CONFIG_FAILURE/FLOW marker各1次，CONFIG_SEQ marker为0；方向与失败序号逐行核对 |
+
+表中的 marker 均带 `PROJECT_` 前缀和 `_PASS` 后缀，只计实际 `UVM_INFO` 消息，
+不重复计算 UVM summary 中的 ID 统计。失败注入要求在第 N 笔立即停止，
+不能继续发送、确认资源或进入发包状态；不测试其他 seq 重写或自动恢复。
+
+驱动地址文档同步为派生配置 seq 写法，提取后的 `driver_reference_sample_tb`
+独立编译/strict compile=`0/0`、运行返回0，`DRIVER_REFERENCE_ADDRESS_PASS` 恰好一次。
+该 top 为纯 module，没有 UVM summary；运行日志按 strict 警告/错误扫描检查，
+返回0，另行核对 VCS/UVM warning 和 error/fatal 均为0。
+样例编译19个 typed hook 和 BAR helper，按独立数字期望检查18种地址/宽度。
+驱动的低到高写序与项目按用户要求采用的高到低写序仍在示例中明确区分。
+
+编译修正过程保留两次 fixture 错误：迁移时漏掉三个 extern 构造声明，以及
+`private_cfg` 被替换为 `private_this`；修复后重新编译当前源码并运行全部项目。
+首条正常行曾因 wrapper 同时计入 UVM summary 而误报 marker 两次，
+按实际 `UVM_INFO` 行重新核对后通过，没有为计数错误修改产品逻辑。
+
+完整证据位于 `build/vio_external_config_validation/remote_evidence/project_config_seq_vcs/`。
+`results.tsv` 的19项包括两个编译、16条项目仿真及一个文档样例，全部通过。
+本地复核 `SHA256SUMS` 的115/115项一致；`provenance/source_manifest.sha256`
+覆盖参考 package/全部参考 SV、项目测试及 testbench、三个 filelist 和抽取样例，
+与仿真完成时的工作区19/19项逐字节一致。依赖继续使用本文前述隔离快照，入口 SHA 记录于
+`provenance/dependency_provenance.txt`。本轮未修改生产源码或依赖。
+
+提交前的暂存区检查发现新文件 `project_dut_config_seq.sv` 末尾多一个空行，
+仅删除最后一个换行字节并重新生成完整源码文档；其余18项编译输入与清单完全一致。
+删除前源码保存在 `build/dut_config_seq_migration/project_dut_config_seq.validated.sv`，
+逐字节验证最终源码加一个换行即等于该仿真版本，未因这项格式修正重复仿真。
+最终 seq SHA-256 为 `385d71ba64055ff68be6c19ffef77c2e5dbe25bb907fbb23ab3322c61cb21178`。
+
+| 证据文件 | SHA-256 |
+| --- | --- |
+| `provenance/source_manifest.sha256` | `442803ce482c4d661661d2dc55a4b7e2e506fded8d20b8a4d472496e5882fc05` |
+| `results.tsv` | `70f4c14fc406ca0838ea7c9583623858006e9d69c4b655a69733f4297a7f3fae` |
+| `SHA256SUMS` | `3c2e1b0a921d3ade8322a561c3b7c8b323df383f26f307b50fd05ad7e74eced4` |
+
+`python3 scripts/render_project_code.py --check` 与 `git diff --check` 均通过。
+
+当前证据仍是模型端点与实际 Intel VIP 路径的软件验证。真实 RTL 的寄存器偏移、
+BAR 编码和平台 verify hook 由集成项目提供。生产 filelist/package 未加入 integration，
+`dpu_common`、`pcie_work` 无需本轮修改。
