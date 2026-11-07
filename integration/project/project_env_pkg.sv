@@ -16,6 +16,8 @@ package project_env_pkg;
     import intel_pcie_adapter_pkg::*;
     `include "uvm_macros.svh"
 
+    `include "project_bar_registry.sv"
+    `include "project_pcie_rc_driver.sv"
     `include "project_env_cfg.sv"
     `include "project_env.sv"
     `include "project_base_test.sv"
