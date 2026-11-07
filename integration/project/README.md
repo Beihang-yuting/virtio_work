@@ -249,7 +249,12 @@ bridge，不会创建 SVT、global_cfg、topology adapter 或链路训练。
 ### 已经使用 Intel bind wrapper
 
 沿用 `pcie_intel/bind/intel_pcie_bind_wrapper.sv` 的
-`intel_pcie_bind_wrapper_inout`。当前一个 Host 时只绑定一个物理端口，例如：
+`intel_pcie_bind_wrapper_inout`。在 `filelists/project_integration.f` 之外，
+还需将 `$INTEL_PCIE_ROOT/bind/intel_pcie_bind_wrapper.sv` 和项目自己的 bind 文件
+按此顺序加入编译，并放在 Intel 接口与 adapter package 之后；这些依赖已由
+`project_integration.f` 提供，不要重复编译 package。该参考 filelist 不包含
+wrapper 或项目绑定。
+当前一个 Host 时只绑定一个物理端口，例如：
 
 ```systemverilog
 // 放在项目自己的 bind 文件中；路径替换成实际 DUT 实例。
