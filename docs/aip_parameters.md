@@ -4,6 +4,9 @@
 `load_params()` 执行读取和赋值；它不是 Tcl 参数到 SV 字段的持续绑定。
 构造函数、复制和普通 `get` 不会重新读取全局参数。
 
+本页同时保留普通标准驱动和项目外部配置入口。普通入口可执行 init/reset/MQ/RSS；
+[项目外部配置](#项目外部配置参数)只注册 start/tx/wait_rx/stop，设备配置由 typed hook 承担。
+
 ## 编译与文件定位
 
 可选完整编译入口为 `filelists/aip_integration.f`，顺序是 AIP、DPU、
@@ -112,7 +115,8 @@ host_cfg.enable_service_params("vio");
 
 这里由调用顺序实现全局 → Host → service。AIP 本身没有自动的路径继承。
 PF service 路径为 `vio.h0.pf0.i0`，VF 路径多一个 `.vfN`。
-service 只允许覆盖 pairs、queue_size、queue_type、features、napi_budget、rx_refill。
+普通 service 行为覆盖 pairs、queue_size、queue_type、features、napi_budget、rx_refill；
+external service 另外在 placement 前冻结 enabled、方向、completion 与 notify 合同，见下节。
 
 ### PCIe TL 策略
 
@@ -161,7 +165,7 @@ PCIe env 前加载 `pcie_cfg`。该 fixture 另外要求 `ep_auto_response` 与�
 `cfg`，不创建 global/topology 对象。该参考的大 cfg 统一加载参数并保护重复调用，
 默认规模是 1 Host / 1 PF / 0 VF；下方 DPU 表中的 2/1/2 是参数回归示例的默认规模。
 
-Intel 项目使用独立的 `filelists/project_intel_integration.f`，在同一 env/cfg 中
+Intel 项目使用独立的 `filelists/project_integration.f`，在同一 env/cfg 中
 启用 RC-only、HARD_IP 和外部引脚 bridge。`pcie_cfg.infinite_credit` 必须保持 1；
 实际 AVST credit 由 `intel_pcie_adapter_config` 控制。Intel cfg 原类尚未提供
 `load_params()`，所以当前 `pcie_cfg.*` 不包含 Intel 私有字段。端口字段的设置和
@@ -199,9 +203,9 @@ pcie_cfg.load_params("pcie_cfg"); // 此后再创建消费它的 PCIe env
 | `dpu.candidate_kind/device_policy/ordering/placement_seed` | 选择 PF/VF、固定/自动放置、排序和候选 shuffle seed |
 | `dpu.host_ids/vf_ids/parent_pfs/functions/fixed_devices` | 候选过滤/固定设备集合，按完整 Function 身份声明 |
 | `dpu.lan_msix` | 每 Function LAN 向量数，0 表示按分配到的 qpair 数量 |
-| `dpu.notify.bank/auto_bank/type/offset/verify/retries/interval_ns/full_bank` | register-plan policy；`retries` 表示包含首次操作的总尝试次数 |
-| `dpu.msix.rate/packets/self_mask/emit_interval` | MSI-X 寄存器计划策略 |
-| `dpu.qsch.mode/max_groups/max_ports/max_tc/shared_group/include_af` | QSCH generator 约束，需显式调用 generator.load_params 后再生成拓扑 |
+| `dpu.notify.bank/auto_bank/type/offset/verify/retries/interval_ns/full_bank` | **legacy register-plan** policy；`retries` 表示包含首次操作的总尝试次数 |
+| `dpu.msix.rate/packets/self_mask/emit_interval` | **legacy register-plan** 策略；project 使用下节 interval 字段，self_mask 为同名显式项目输入 |
+| `dpu.qsch.mode/max_groups/max_ports/max_tc/shared_group/include_af` | **legacy** QSCH generator 约束，需显式调用 generator.load_params 后再生成拓扑 |
 | `dpu.caps.*` | DUT 能力边界；不能把声明上限当成实际已创建数量 |
 
 Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来的 GPA/MMIO
@@ -220,11 +224,92 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 
 支持 `queue_size`（2..4096 的 2 的幂）、`rx_buf_size`（64..16383）、
 `local_qid_base`（偶数、范围受最终队列数约束）、`notify_bar/notify_offset`、
-`dport_info/dport_id/dport_type/cpu_tx_cos/rss_lag/l3_cs/l4_cs/fwd`。
+`dport_info/dport_id/dport_type/cpu_tx_cos/rss_lag/l3_cs/l4_cs/i_l3_cs/i_l4_cs/fwd`。
+四个 checksum 字段分别保留，均只接受 0/1；`i_l3_cs/i_l4_cs` 由
+`dpu_priv_queue_config::load_params` 注册，不能用原 `l3_cs/l4_cs` 替代。
 已有单队列覆盖对象使用 `vio.private.qN.*`，并可指定该队列 `local_qid`。
-不会通过这些参数自动创建覆盖对象，最终还须调用 `validate(pairs, why)`。
+普通 legacy 调用不会通过这些参数自动创建覆盖对象，最终还须调用
+`validate(pairs, why)`。项目 external Custom 在首次解析最终 service 需求时，
+若未注入私有配置则创建它：先按全局 → Host → service 合并 `.private.*` 默认值，
+再为实际 `2*pairs` 个队列创建独立副本，按同样顺序合并 `.private.qN.*`。
+例如 `vio.h0.pf0.vf1.i0.private.q0.i_l3_cs=1` 只覆盖该 service 的队列0。
+已有显式私有配置仍由调用方加载。`notify_bar_present/notify_offset_present`
+是读取对应参数时设置的 SV 标志，不是另行注册的参数键。
 
-## 在现有 base_test 注册命令
+## 项目外部配置参数
+
+入口是 `project_env_cfg::load_params()`；它调用原配置类并在生成 topology/placement
+前解析最终 service 需求，重复调用不再加载。默认1 Host/1 PF/0 VF、REAL_DUT、
+`external_configuration=1`；默认 AF PF0 的额外资源仍占每 Function 容量。
+`dpu.hosts/pfs_per_host/vfs_per_pf/mem_mode/mem_granule/reg_target/print_bar_map`
+在 `integration/project/project_env_cfg.sv` 注册；DPU/PCIe/核心 VIO 原字段仍在各自拥有类注册。
+
+| 参数 | 拥有类 / 确切行为 |
+| --- | --- |
+| `dpu.reg_target` | `project_env_cfg`；默认 `pf0.bar0`，只是访问窗口，不改变条目 owner |
+| `dpu.print_bar_map` | `project_env_cfg`；默认1，发布后逐代打印真实 BAR，不发 TLP |
+| `dpu.<category>.reg_target` | `project_env_cfg::load_platform_params`；覆盖该类别访问窗口，类别见下表 |
+| `dpu.bar_map.reg_target` / `dpu.msix.reg_target` / `dpu.qsch.reg_target` | 同类；BAR/MSI-X/QSCH 家族默认，详细类别覆盖家族 |
+| `vio.vtx.reg_target` / `vio.vrx.reg_target` / `vio.notify_table.reg_target` | 同类；分别最后覆盖 `dpu.vtx/vrx/vio_notify.reg_target` |
+| `vio.enabled` / `tx_enable` / `rx_enable` | `virtio_net_env_config::load_external_requirement`；0/1，默认均1；禁用服务不删除公共 Function，启用服务至少开一个方向 |
+| `vio.pairs/queue_size/queue_type` | 核心同类；先求最终需求再 placement，不静默减小。项目使用 `VQ_PACKED` 或 `VQ_CUSTOM`；实际深度同时受VIP和图片约束 |
+| `vio.features` | 核心同类；external Packed 默认 VERSION_1 与 RING_PACKED，二者必需；另只允许 NOTIFICATION_DATA、IN_ORDER、RING_EVENT_IDX、ACCESS_PLATFORM。Custom 强制0，显式非零拒绝，不执行设备协商 |
+| `vio.completion_mode` | 核心同类；`VIRTIO_COMPLETION_POLLING` 或 `VIRTIO_COMPLETION_MSIX`，MSI-X 无轮询兜底 |
+| `vio.notify_bar/notify_base/notify_stride/notify_encoding` | 核心同类；真实 doorbell 的偶数 BAR、BAR内offset/队列步长/`VIO_NOTIFY_QID16`、`VIO_NOTIFY_DATA32`、`VIO_NOTIFY_DPU32`。提供 notify_base 标记布局有效，不能拿 notify lookup 表偏移替代 |
+
+核心 external 合同使用 `vio → vio.hH → vio.hH.pfP[.vfV].iI` 优先级；只采样一次，
+以后 Tcl `set_param` 不会改变 placement/已准备 ring。`external_configuration`、
+`notify_layout_valid` 是 SV 字段，没有同名注册参数；project 构造器设置前者，
+提供 notify_base 或显式 SV 字段设置后者。
+
+详细类别名（均在 `dpu.` 下，后接 `.reg_target`）：
+`bar`、`af`、`pfvf`、`bdf`、`completion_bdf`、`tlp_prefix`、`msix_linear`、
+`msix_info`、`msix_interval`、`msix_control`、`msix_table`、`msix_function`、
+`vio_notify`、`qsch_q2tc`、`qsch_n2g`、`qsch_g2p`、`qsch_spwrr`、
+`qsch_tc_weight`、`vtx`、`vrx`、`queue_aux`、`rdma_notify`、`qsch_rnet`。
+未提供的表布局仍失败，reg_target 不能代替布局声明。完整 `hH.pfP[.vfV].barB`
+自带访问 Host；多 Host 短路径必须由 typed layout 指定访问 Host 或明确采用 owner Host。
+
+公共 MSI-X 参数由 `project_env_cfg::load_platform_params` 拥有，不依赖 VIO service。
+路径依次为 `dpu.msix → dpu.hH.msix → dpu.hH.pfP[.vfV].msix`，后者覆盖前者：
+
+| 相对该路径的字段 | 含义与校验 |
+| --- | --- |
+| `table_bar/table_offset/table_size` | 显式 table 偶数 BAR/offset/entry数；提供 offset 才标记存在，16B对齐，1..1024项 |
+| `pba_bar/pba_offset/pba_words` | PBA 独立布局，显式64位word容量，8B对齐；不从 vector 数猜容量，不做初始化写 |
+| `msg_addr_base/msg_addr_stride` | 64位 Message Address 模板，溢出拒绝，无APIC区域限制 |
+| `msg_data_base/msg_data_stride` | 32位完整 Message Data 模板；不要求低位等于vector |
+| `interval_rate/interval_packets` | 各16位，必须明确声明；对应图片 MSI-X interval 两字段 |
+| `self_mask` | 0/1，必须显式声明；实际RTL的再次使能由平台完成 |
+| `table_only_enable` | 0/1，显式声明是否仅靠table mask使能；否则提供 Function control catalog/hook |
+| `vN.msg_addr/vN.msg_data/vN.masked` | 按local vector N逐项覆盖模板；data32位，masked为0/1 |
+
+项目队列表策略也在 `project_env_cfg::load_platform_params` 注册。
+除 QSCH 额外先读 `dpu.qsch.*` 外，优先级是
+`vio → vio.hH → vio.hH.pfP[.vfV].i0`。下表字段相对上述 VIO 路径：
+
+| 字段 | 语义 |
+| --- | --- |
+| `vtx.dma_info` | 4位显式平台策略 |
+| `vtx.tail_buf_id_dis/redraw_en/high_speed_mode/seg_en/interl_seg_en` | 各0/1，硬件/深度约束另行检查 |
+| `vrx.dsc_pre_max_num/dsc_pre_read_threshold/dsc_dma_num/dsc_mode/payload_dsc_len/head_dsc_len` | 图片位宽分别3/2/2/2/3/2；目前非零dsc_mode/payload/head split 不支持并拒绝 |
+| `qsch.net_base/net_stride/group_id/cos/eth_ports/ets/distinguish_business/ets_priority` | 生成实际Q2TC/N2G/G2P；net/group10位、cos3位、ETH加Host须容纳4位、ETS priority3位；不等同legacy generator参数 |
+| `fpga` | 0/1，限制global qpair/VRX RAM高位容量 |
+| `prefetch_ram/prefetch_start/prefetch_slots` | RAM名字表示真实共享域，起点/容量单位是descriptor槽；同名RAM跨Host也检查重叠 |
+| `notify_net_pair5` | 0/1，明确采用单bank net pair5编码 |
+| `notify_table_bar/notify_table_offset` | notify lookup base的owner BAR/offset；提供offset才标记存在，与核心doorbell不同 |
+
+以上整数在窄字段赋值前检查越界。模块基址、间接端口、PBA容量、队列mode选择、
+Function编码关系、BAR原子组和控制catalog没有猜测默认；以typed cfg填写。
+`dpu.notify.bank/auto_bank/full_bank`、legacy `dpu.msix.rate/packets/emit_interval`
+与 legacy QSCH generator 不是项目执行策略；项目 notify 只支持单bank逐项写。
+
+项目运行时只调用 `env.register_aip_commands()`，内部使用
+`virtio_aip_registry::register_business_commands()`；公共无VIO用途跳过注册。
+不能在同一个项目流程另行调用下节 `register_commands()` 打开旧init/reset/MQ/RSS。
+项目启动/停止并不自动配置硬件，必须先完成 typed 配置/使能/验证/确认。
+
+## 普通标准驱动：在现有 base_test 注册命令
 
 各 Host env 已创建并且真实 PCIe/driver 绑定完成后、进入 bridge 之前调用：
 
@@ -242,7 +327,7 @@ endfunction
 
 run_phase 持有 objection，完成注册后调用 `aip_tcl_bridge::run_loop()`；
 Tcl `end_test` 使其返回，再释放 objection。参考 `virtio_aip_driver_test.sv`。
-默认命令是 `vio_init/vio_start/vio_tx/vio_wait_rx/vio_set_mq/vio_set_rss/vio_stop/vio_reset`。
+普通 legacy 注册的默认命令是 `vio_init/vio_start/vio_tx/vio_wait_rx/vio_set_mq/vio_set_rss/vio_stop/vio_reset`。
 
 | 运行参数 | 语义 |
 | --- | --- |
@@ -281,7 +366,8 @@ end_test
 
 独立发包流可调用 `register_tx_command("vio_tx0", "vio.tx0", why)` 注册别名。
 同名命令由 AIP 检查 BUSY；同一 service 上允许 TX/TX 逐事务仲裁，控制/RX 命令
-与其它命令互斥。取消后目标需要 reset，driver 已接收事务不会自动回滚。
+与其它命令互斥。普通 legacy 注册取消后目标需要 reset，driver 已接收事务不会自动回滚。
+project external 注册不开放 reset；必须停机/quiesce/release，再准备、验证和确认新代。
 命令采用保守错误判定：期间出现 UVM_ERROR/FATAL 即失败，并发其它流的错误也可能
 使本次失败。严格退出应接入平台自己的 `aip_end_checker`，再使用
 `end_test wait_done=1 timeout=2ms strict=1`。
