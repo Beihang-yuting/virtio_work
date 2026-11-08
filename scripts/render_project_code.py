@@ -18,6 +18,7 @@ SOURCES = (
     "integration/project/project_vio_config.sv",
     "integration/project/project_pcie_rc_driver.sv",
     "integration/project/project_env_cfg.sv",
+    "integration/project/project_pcie_reg_seq.sv",
     "integration/project/project_dut_config_seq.sv",
     "integration/project/project_single_queue_config_seq.sv",
     "integration/project/project_env.sv",
@@ -58,6 +59,8 @@ ring 在写队列表前准备；不自动执行 Virtio capability 发现、协�
 单队列联调可改用 project_single_queue_config_seq：在独立 seq 内固定 BDF/Notify/QSCH/VTX
 布局和策略，实际 BAR/ring 继续由 env 分配；原 project_dut_config_seq 行为不变。
 Host0/PF0/no-VF、一对 Packed256/Polling/TX-only 和 DPU32 Notify 必须在 env 构建前选定。
+独立寄存器访问可用 project_pcie_reg_seq 注册 aip_cmd_reg：addr 为 Host0/PF0 BAR0 偏移，
+cfg 来自显式句柄或启动 sequencer 的 env_cfg；实际 BAR 基址和 RC 由环境解析。
 
 """]
     for relative in SOURCES:

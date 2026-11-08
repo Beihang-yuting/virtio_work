@@ -665,3 +665,33 @@ UVM W/E/F及PCIe SCB mismatch/unexpected/timeout均为0。
 新seq验证源码SHA-256为 `0839c6ac1ecb1e0bf88fed249c6aba18594ae69d0b41bcacbb580826e63d9862`。
 最终技术审查、源码导出一致性及 `git diff --check` 通过；构建证据不加入Git。
 以上证明模型端点与实际Intel VIP路径的配置和首次Notify，不宣称真实RTL已消费报文或完成业务。
+
+## 2026-11-08：PF0 BAR0 相对地址 reg_acc
+
+新增参考 `project_pcie_reg_seq`，继承原生寄存器命令字段，接收显式cfg或从RC sequencer
+取得env_cfg。`addr`保持BAR0内偏移，经真实registry检查后向对应RC发送绝对地址请求；
+不启动配置seq、不分配ring，错误通过四参数 `aip_cmd_reg` 的 `seq.error_msg` 返回。
+本轮未修改原env/env_cfg/DUT配置seq、`pcie_work`或生产filelist/package。
+
+在 `ubuntu@10.11.10.53` 使用AIP依赖 `aip_core_set_param_expr` 的 `660d6dd` 版本，
+仅运行SV命令派发与真实Tcl/UCLI两个定向场景。最终编译、两例仿真及严格日志检查均返回0。
+
+| `project_pcie_reg_test` 入口 | 实际Memory请求 | 检查结果 |
+| --- | --- | --- |
+| SV `aip_cmd::exec_result` | 24，12写/12读 | 106项断言通过，覆盖命名/位置参数和错误回传 |
+| `+AIP_TCL` / `project_pcie_reg.tcl` | 24，12写/12读 | Tcl9项检查和SV收尾97项断言通过 |
+
+两例均覆盖显式cfg注入、同一对象重复start不累加BAR基址、issued_tlps清理、越界后恢复读回，
+以及自动获取cfg的 `reg_acc`：偏移0x1010写/读0x5555aaaa、128bit读写、0x5555稀疏mask，
+完整范围越界返回非零状态和准确错误且不新增请求。实际Intel端检查环境分配的BAR基址加
+指定偏移与最终字节内容。UVM W/E/F均为0；PCIe SCB req=24、cpl=12、matched=12，
+mismatch/unexpected/timeout均为0。
+
+首次Tcl启动在0fs因依赖模块加载需要 `AIP_CORE`、而runner仅设置 `AIP_CORE_ROOT` 失败；
+测试脚本已在source前将两者指向同一仓库，随后真实UCLI通过，SV源码无需改动或重编。
+证据位于 `build/vio_external_config_validation/remote_evidence/project_pcie_reg_seq_vcs_final/`，
+包含编译日志、`sv_exec`、`tcl_ucli`、首次失败 `tcl_ucli_env_missing` 及冻结源码。
+产品seq SHA-256为 `a5d581d27cccf9771ea82046d2498998f0e42e3b0ae3132fa86fabbaaf92cf15`，
+最终Tcl脚本SHA-256为 `d2c39531321ed7f82805529ded996a560d08f1c06e2cfa9b6fe1be8e9ba2e637`。
+最终技术审查、完整源码导出一致性和 `git diff --check` 通过；验证对象为Intel模型端点，
+不代表真实RTL寄存器副作用已验证，构建证据不加入Git。

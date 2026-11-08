@@ -310,6 +310,50 @@ if (!ok) return;
 `pcie_bar_write*` 保留整宽及 byte skip-mask 语义。`dpu.verify_readback=1` 时默认验证执行实际读回；
 覆写验证 hook 时按真实寄存器语义检查。posted 发送完成只表示请求已发出。
 
+## Tcl reg_acc 使用 PF0 BAR0 偏移
+
+[project_pcie_reg_seq](project_pcie_reg_seq.sv) 继承 `pcie_tl_reg_seq`，沿用 `is_write/addr/len/mask/wdata/rdata`
+接口；这里 `addr` 是 **Host0/PF0 BAR0 内偏移**。实际地址由环境已分配的 BAR0.base 加偏移得到，
+随后使用对应 Host 的原生 PCIe RC 发 Memory 请求，不启动 DUT 配置 seq。
+
+把已有 `reg_acc` 注册中的类型换成新类，并使用第四参数返回错误。以下沿用工程已有的真实 RC 句柄：
+
+```systemverilog
+`aip_cmd_reg(reg_acc, project_pcie_reg_seq, virtual_sqr::pcie_rc_sqr, seq.error_msg)
+```
+
+环境已经向 PCIe sequencer 发布 `env_cfg`，因此 Tcl 只需传偏移和值：
+
+```tcl
+reg_acc write 0x1010 4 0x5555aaaa
+reg_acc read 0x1010
+reg_acc op=write addr=0x3000 len=16 data=0x112233445566778899aabbccddeeff00
+reg_acc op=read addr=0x3000 len=16
+```
+
+其中 `0x1010` 写对应 `h0.pf0.bar0.base+0x1010`；日志 `PROJECT_REG_ACC` 会打印实际
+`base + offset = address`。`0x3000` 仅展示宽访问格式，使用时替换为 DUT 实际寄存器偏移。
+`len` 支持4/8/12/16字节，默认4；`mask` 默认0，bit i为1表示跳过第i字节，稀疏mask沿用原生拆分逻辑。
+范围或读写失败通过 `status/error_msg` 返回，第四参数使 Tcl 的 `aip_check_status` 非零。
+posted写成功表示发送完成；是否读回由用户后续命令决定。
+
+也可在 SV 中显式传入已有 cfg；不赋值时自动从启动 sequencer 的 `env_cfg` 获取：
+
+```systemverilog
+project_pcie_reg_seq	access;
+
+access = project_pcie_reg_seq::type_id::create("access");
+access.cfg      = cfg;
+access.is_write = 1;
+access.addr     = 'h1010;
+access.len      = 4;
+access.wdata    = 'h5555aaaa;
+access.start(cfg.rc_sequencers[cfg.tl_slot_by_host[0]]);
+```
+
+`access.addr` 执行后仍是偏移，重复启动同一对象不会再次累加 BAR 基址；`issued_tlps` 保存本次实际请求。
+新文件在参考 `project_env_pkg.sv` 中位于 `project_env_cfg.sv` 后，复制到自己的 package 时保持该顺序。
+
 ## BAR 目标与32对队列
 
 默认访问目标 `pf0.bar0` 指管理窗口；配置 VF3 的 VTX 表项仍以 PF0 sideband 发出。
