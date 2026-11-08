@@ -1,6 +1,6 @@
 // integration/project/tests：真实 Intel 引脚/monitor/bridge 的项目合同模型回归。
 // 应用侧 adapter 仅模拟 DUT 的 BAR MMIO、VTX/VRX 间接表和主动 DMA；Host 仍由项目 RC 唯一响应。
-// 裸 seq 回归不覆写生产 hook，以真实 Memory Completion 验证默认配置、读回失败及缺布局拒绝。
+// 裸 seq 回归不覆写生产 hook，核对 AF 首笔写和发送失败停止，再验证配置、读回及缺布局拒绝。
 // 测试拥有 app adapter 和期望值；不向 observer 直接注入，不声称覆盖真实 RTL。
 package project_external_integration_test_pkg;
 	import uvm_pkg::*;
@@ -29,13 +29,13 @@ package project_external_integration_test_pkg;
 		super.new(name);
 	endfunction
 
-	// 在指定分段拒绝发送，保留之前真正发出的间接数据端口写。
+	// 在指定调用拒绝发送，支持 AF 首笔或间接 DWORD 故障；之前真实发送的写仍保留。
 	task project_config_fault_seq::body();
 		if (fail_on_call != 0) begin
 			calls++;
 			if (calls == fail_on_call) begin
 				status = PCIE_RW_ERR;
-				error_msg = "injected indirect DWORD send failure";
+				error_msg = "injected configuration DWORD send failure";
 				return;
 			end
 		end
@@ -890,6 +890,7 @@ package project_external_integration_test_pkg;
 		bit			corrupt_readback;
 		bit			missing_layout;
 		bit			missing_message;
+		bit			fail_af_write;
 		bit			corrupt_bdf;
 		bit			corrupted;
 		bit			business_notify_enabled;
@@ -940,7 +941,14 @@ package project_external_integration_test_pkg;
 		missing_message = $test$plusargs("PROJECT_BARE_MSIX_MISSING_MESSAGE");
 		msix_mode = $test$plusargs("PROJECT_BARE_MSIX") || missing_message;
 		missing_layout = $test$plusargs("PROJECT_BARE_MISSING_LAYOUT");
-		require_true(int'(corrupt_readback)+int'(missing_layout)+int'(missing_message) <= 1, "select one bare failure per run");
+		fail_af_write = $test$plusargs("PROJECT_BARE_AF_WRITE_FAIL");
+		require_true(int'(corrupt_readback)+int'(missing_layout)+int'(missing_message)+int'(fail_af_write) <= 1,
+			"select one bare failure per run");
+		if (fail_af_write) begin
+			pcie_tl_reg_seq::type_id::set_type_override(project_config_fault_seq::get_type());
+			project_config_fault_seq::calls = 0;
+			project_config_fault_seq::fail_on_call = 1;
+		end
 		// 故障必须经可选的真实读回路径观察；普通正例保留产品默认零读请求。
 		if (corrupt_readback) aip_cmdline_override::set_val("dpu.verify_readback", "1");
 
@@ -1055,8 +1063,18 @@ package project_external_integration_test_pkg;
 		for (int unsigned i = 0; i < 4; i++)
 			mmio_bytes[0][management.bar_lease.base+offset+i] = request.payload[i];
 
-		// 仅允许必要 BDF 和按场景选择的 MSI-X；BAR/PFVF/其他公共表不得被总开关带入。
-		require_true(offset == 'h108000 ||
+		// AF 声明必须是第一笔完整 DWORD；真实地址由管理 BAR 租约加固定偏移得到。
+		if (write_offsets.size() == 1 || offset == 'h1010) begin
+			require_true(write_offsets.size() == 1 && offset == 'h1010 && value == 32'h5555_aaaa,
+				"AF declaration must be the first and only 0x1010 write with data 0x5555aaaa");
+			require_true(pcie_tl_mem_wire_addr(request) == management.bar_lease.base + 64'h1010,
+				"AF declaration did not use allocated PF0 BAR0");
+			require_true(!cfg.configure_public && read_requests == 0,
+				"AF declaration depends on public tables or followed an unexpected read");
+		end
+
+		// 仅允许 AF、必要 BDF 和所选 MSI-X；BAR/PFVF/其他公共表不得被总开关带入。
+		require_true(offset == 'h1010 || offset == 'h108000 ||
 			(msix_mode && ((offset >= 'hc0000 && offset < 'hc4000) ||
 				(offset >= 'h120000 && offset < 'h124000) ||
 				(offset >= 'h140000 && offset < 'h141000) ||
@@ -1104,6 +1122,10 @@ package project_external_integration_test_pkg;
 			if (t == null) continue;
 			require_true($cast(m, t), "bare configuration issued non-Memory request");
 			offset = pcie_tl_mem_wire_addr(m) - management.bar_lease.base;
+			if (offset == 'h1010) begin
+				require_true(host == 0 && m.kind == TLP_MEM_WR,
+					"AF declaration must use Host0 RC Memory Write without readback");
+			end
 			// DUT 未用 Notify 行由复位提供无效值；配置过程只可访问实际 pair，读写共用此边界检查。
 			if (offset >= 'ha0000 && offset < 'ha2000) begin
 				require_true(offset + pcie_tl_mem_dw_count(m)*4 <= 'ha0000 + 64'(pairs)*16,
@@ -1155,12 +1177,12 @@ package project_external_integration_test_pkg;
 		end
 	endtask
 
-	// 以冻结的唯一表项计算发送笔数：Notify 仅实际 pair、QSCH mode、普通 DWORD 表，
+	// 以冻结的唯一表项计算发送笔数：AF 一笔、Notify 实际 pair、QSCH mode、普通 DWORD 表，
 	// VTX/VRX 各有初始化和使能两组六笔写。按接收完成数等待，不用任意固定延迟假设。
 	task project_bare_config_test::await_configuration_writes();
 		int unsigned	expected_writes;
 
-		expected_writes = pairs*4 + (msix_mode ? 2048*2 : 0) + (cfg.qsch_configure_controls ? 1 : 0);
+		expected_writes = 1 + pairs*4 + (msix_mode ? 2048*2 : 0) + (cfg.qsch_configure_controls ? 1 : 0);
 		foreach (cfg.records[name]) begin
 			case (cfg.records[name].ctx.kind)
 				PROJECT_NOTIFY, PROJECT_MSIX_LINEAR: ;
@@ -1187,6 +1209,9 @@ package project_external_integration_test_pkg;
 		bit [127:0]	expected;
 		bit [127:0]	actual;
 
+		require_true(write_offsets.size() != 0 && write_offsets[0] == 'h1010 &&
+			write_values[0] == 32'h5555_aaaa && table_value('h1010, 4) == 128'h5555_aaaa,
+			"default configuration did not declare AF before table writes");
 		require_true(indirect_transactions[0] == pairs*2, "VTX needs initial write and enabled rewrite per pair");
 		require_true(indirect_transactions[1] == (tx_only ? 0 : pairs*2), "VRX enabled rewrite count");
 		if (cfg.verify_readback)
@@ -1406,26 +1431,29 @@ package project_external_integration_test_pkg;
 		fork app_receive(0); join_none
 		#100ns;
 		catcher = new();
-		catcher.expected_stage = missing_message ? "select_msix_scope" :
+		catcher.expected_stage = fail_af_write ? "declare_af" : missing_message ? "select_msix_scope" :
 			(corrupt_bdf ? "verify_function_configuration" :
 			(corrupt_readback ? "verify_vio_configuration" : "prepare_vio_configuration"));
-		if (corrupt_readback || missing_layout || missing_message) uvm_report_cb::add(null, catcher);
+		if (corrupt_readback || missing_layout || missing_message || fail_af_write) uvm_report_cb::add(null, catcher);
 		started = $time;
 		bare_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[0]]);
-		if (corrupt_readback || missing_layout || missing_message) uvm_report_cb::delete(null, catcher);
+		if (corrupt_readback || missing_layout || missing_message || fail_af_write) uvm_report_cb::delete(null, catcher);
 		selection = bare_seq.selection;
 		require_true(bare_seq.cfg == cfg, "bare sequence did not retrieve the same env_cfg");
 
-		if (corrupt_readback || missing_layout || missing_message) begin
+		if (corrupt_readback || missing_layout || missing_message || fail_af_write) begin
 			require_true(catcher.count == 1 && !bare_seq.success && bare_seq.error_msg != "",
 				"configuration failure did not report exactly one fatal");
-			if (corrupt_readback) begin
+			if (fail_af_write) begin
+				require_true(project_config_fault_seq::calls == 1 && write_offsets.size() == 0 && read_requests == 0,
+					"AF send failure did not stop all following Memory requests");
+			end else if (corrupt_readback) begin
 				require_true(corrupted && read_requests > 0 && $time > started, "negative readback never reached Intel completion");
 			end else if (missing_message) begin
 				require_true(write_offsets.size() == 0, "missing MSI-X message allowed configuration writes");
 			end else begin
-				// BDF 可先完成，但缺 Notify 布局不得下发任何队列/通知/调度配置。
-				foreach (write_offsets[i]) require_true(write_offsets[i] == 'h108000,
+				// AF/BDF 可先完成，但缺 Notify 布局不得下发任何队列/通知/调度配置。
+				foreach (write_offsets[i]) require_true(write_offsets[i] inside {'h1010, 'h108000},
 					"missing Notify layout allowed dependent configuration writes");
 			end
 			foreach (cfg.vio_envs[h]) foreach (cfg.vio_envs[h].function_instances[f]) begin

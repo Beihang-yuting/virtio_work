@@ -2,7 +2,7 @@
 // 依赖 cfg 中的真实 BAR/队列视图与 PCIe RC sequencer；不创建第二套 context 或 env。
 // task/hook 属于本 sequence，cfg 保存参数、资源与表项数据；ring/BAR 不归 seq 所有。
 // 所有硬件访问复用 pcie_tl_reg_seq，经实际目标 RC、Intel bind 发往 DUT。
-// 默认 body 配置 BDF、VIO/QSCH，MSI-X 按实际完成模式选择；其余公共表独立可选。
+// 默认 body 先声明 Host0/PF0 为 AF，再配置 BDF、VIO/QSCH；MSI-X 按完成模式选择。
 // 已知表按图片字段和 cfg 地址真实写入；读回可选，失败报告 fatal 并保留 DMA 资源。
 // Notify 仅访问实际队列对的有效项；首次配置前 DUT 已按 05.png 复位为无效项：
 // type=3，lookup key/global_qid 全1，reserved=0。未用槽位保持该复位值，不由 seq 写入或读回。
@@ -22,8 +22,14 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 	// start 时取得配置句柄；派生 body 自动获得 cfg，不需要调用 env 的配置 task。
 	extern virtual task pre_start();
 
-	// 平台先等待复位就绪；基础 BDF/所选 MSI-X 先写，VIO 在写入、所选验证和 commit 后成功。
+	// 平台先等待复位就绪；AF 声明先于写表，VIO 在写入、所选验证和 commit 后成功。
 	extern virtual task body();
+
+	// 固定向 Host0/PF0 BAR0+0x1010 写一个声明 DWORD；失败停止，不读回、不遍历 Host。
+	extern virtual task declare_af(
+		output bit	ok,
+		output string	why
+	);
 
 	// start 返回前报告失败，AIP 直接注册本类时也不会把提前 return 显示为配置成功。
 	extern virtual task post_start();
@@ -710,7 +716,7 @@ task project_dut_config_seq::pre_start();
 	end
 endtask
 
-// 默认执行基础 BDF、按完成模式选择的 MSI-X 和 VIO 配置；其余公共硬件表独立可选。
+// 默认先声明 Host0/PF0 为 AF，再执行 BDF、所选 MSI-X 和 VIO；其余公共表独立可选。
 // 同一 seq 串行完成配置；verify_readback=1 时读回符合预期才开放业务，首次失败保留现场。
 task project_dut_config_seq::body();
 	project_dpu_config_scope	public_scope;
@@ -725,6 +731,9 @@ task project_dut_config_seq::body();
 	if (cfg.configure_bdf) bdf_scope = public_scope;
 	ok = cfg.select_msix_scope(msix_scope, error_msg);
 	if (!completed_step("select_msix_scope", ok)) return;
+
+	declare_af(ok, error_msg);
+	if (!completed_step("declare_af", ok)) return;
 
 	if (cfg.configure_public) begin
 		configure_bar_table(public_scope, ok, error_msg);
@@ -805,6 +814,16 @@ task project_dut_config_seq::body();
 	success   = 1;
 	error_msg = "";
 	`uvm_info("PROJECT_CONFIG_SEQ", $sformatf("DUT configuration completed (readback=%0b)", cfg.verify_readback), UVM_LOW)
+endtask
+
+
+// 用真实租约解析 BAR 基址和 Host0 RC；固定 32bit 写，不受公共表开关或读回开关影响。
+// 复用 pcie_tl_reg_seq 的 Memory Write 路径；posted 成功只表示发送完成，不证明 DUT 已生效。
+task project_dut_config_seq::declare_af(
+	output bit	ok,
+	output string	why
+);
+	pcie_bar_write_by_name("h0.pf0.bar0", 64'h1010, 4, 128'h5555_aaaa, 32'h0, ok, why);
 endtask
 
 

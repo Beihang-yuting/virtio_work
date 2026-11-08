@@ -25,6 +25,7 @@ VTX/VRX 的 ring 地址 = prepare 导出的 item.entry.desc_addr / dsc_addr
 
 | 表或端口 | BAR 内地址 | 每项字节 | 索引来源 / 说明 |
 | --- | --- | ---: | --- |
+| AF 声明 | Host0 PF0 BAR0 `0x1010` | 4 | 默认 seq 首笔写 `32'h5555_aaaa`，不读回；独立于可选 `PROJECT_AF` 表 |
 | PFVF map | `0x088000 + i*4` | 4 | 驱动 `host*16+pf`；本例 Host0 |
 | BDF map | `0x108000 + i*4` | 4 | Function 对应的全局表索引 |
 | Completion BDF | `0x098000 + i*4` | 4 | 驱动用 srcid；当前由 `completion_index` 显式声明 |
@@ -69,7 +70,16 @@ base/limit 表每项8B，size-code 每项4B。归档中找到了这些寄存器�
 `+dpu.driver_layouts=0`。修改现有地址只需在 env 构建前修改 `cfg.table_layouts`，
 无需复制这些方法或手填 BAR 物理地址。
 
-当前默认 BDF 已独立下发，MSI-X 按完成模式选择。以下其余公共地址仅在需要时添加；可在已有 cfg 中增加
+当前默认先发送 AF 声明，再独立下发 BDF，MSI-X 按完成模式选择。AF 仅包含 magic 写，
+不执行驱动后续读回/Host-ID 握手，也不受 `dpu.configure_public` 或 `dpu.driver_layouts` 控制。
+基类已在 `declare_af()` 中调用以下 helper；只展示写法，使用默认 body 时不要再调用一遍：
+
+```systemverilog
+// 配置 seq 内复用真实 BAR 租约和 Host0 RC；ok/why 接收发送结果，失败由调用方立即停止。
+pcie_bar_write_by_name("h0.pf0.bar0", 64'h1010, 4, 128'h5555_aaaa, 32'h0, ok, why);
+```
+
+以下其余公共地址仅在需要时添加；可在已有 cfg 中增加
 这个可选方法；它复用源码已有 `set_driver_layout()`，仍需提供真实身份、BAR 分组及公共验证。
 这里 capacity 是参考上限，最终按 DUT 规格调整。
 
@@ -476,13 +486,9 @@ cfg.platform_controls.push_back(control);
 ```
 
 下面是用户主动控制的独立 Memory Write 示例。每次调用后均检查 `ok/why`，
-不要把 AF 初始化、运行期 rearm 或队列 reset 混入普通表项循环。
+不要把运行期 rearm 或队列 reset 混入普通表项循环。AF 声明已由默认 seq 执行，写法见前文。
 
 ```systemverilog
-// AF 声明：驱动先写 magic，再读回确认；只有平台需要此握手时才调用。
-pcie_bar_write_by_name("h0.pf0.bar0", 'h1010, 4, 128'h5555_aaaa, 0, ok, why);
-if (!ok) `uvm_fatal("AF_DECLARE", why)
-
 // QSCH 模式：默认 seq 已写入，读回由开关选择；下面仅展示平台独立控制时的写入。
 pcie_bar_write_by_name("h0.pf0.bar0", 'hb001c0, 4, 128'h0, 0, ok, why);
 if (!ok) `uvm_fatal("QSCH_MODE", why)

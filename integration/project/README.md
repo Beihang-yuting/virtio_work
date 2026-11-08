@@ -10,7 +10,7 @@ MSI-X 和 BAR 窗口的可替换偏移。BAR 物理地址由环境分配、解�
 
 每 Host 一个 segment 0、一个 RC 与 Intel `HARD_IP` wrapper；同 Host 的 PF/VF 共用端口。
 DPU 快照拥有 BDF/BAR/队列资源身份，VIO 拥有 ring/DMA，平台拥有 RTL 配置与停机判断。
-项目配置只发 Memory Read/Write，不发现 capability、不协商、不自动 reset/init。
+项目配置只发 Memory Read/Write，不发现 capability、不协商、不自动执行 Virtio reset/init。
 准备和软件确认不访问 DUT。Packed 使用标准 12B `virtio_net_hdr`，512B 报文另计；
 Custom 使用私有 descriptor/CQ，512B 报文不带 Virtio header。
 
@@ -27,10 +27,13 @@ Custom 使用私有 descriptor/CQ，512B 报文不带 Virtio header。
    发布到 `pcie_env.*`。config_db 传递句柄，seq 能看到 connect 后生成的资源。
    合入你自己的 cfg 类型时，同步替换 seq 与 `config_db` 中的类型名，get/set 使用同一类型。
 4. 平台等待 DUT 复位释放、Intel 接口可用后，启动一个配置 seq。
-   默认 body 执行 BDF→按完成模式配置 MSI-X→准备 ring→排序并初始化单 bank Notify→QSCH→VTX/VRX→使能→确认。
+   默认 body 执行 AF 声明→BDF→按完成模式配置 MSI-X→准备 ring→排序并初始化单 bank Notify→QSCH→VTX/VRX→使能→确认。
+   AF 声明固定经 Host0 RC 向环境分配的 `h0.pf0.bar0.base + 0x1010` 写 `32'h5555_aaaa`，
+   使用 `pcie_tl_reg_seq` 发送一个 4B Memory Write；发送失败立即停止，不读回、不遍历 Host。
    `dpu.verify_readback=1` 才增加配置读回；默认0，不发送配置 Memory Read。
    `dpu.configure_public=1` 才额外执行 BAR/PFVF/Completion BDF/Prefix 等配置；默认关闭。
-   BDF 默认独立开启，MSI-X 中断模式不依赖这个公共开关。
+   AF 声明、默认开启的 BDF 和 MSI-X 中断模式均不依赖这个公共开关。
+   `declare_af()` 与可选的 `PROJECT_AF` 表 hook 独立；此处仅发送声明值，不执行驱动后续读回/Host-ID 握手。
    任何一步失败在 sequence 的 `post_start()` 报告 fatal，直接通过 AIP 启动也不会静默 done。
 5. 配置成功后 `env.register_aip_commands()`，进入 `aip_tcl_bridge::run_loop()`。
    业务结束后平台停止 DUT DMA，再用 `cfg.release_vio_resources()` 释放 ring。
@@ -92,7 +95,7 @@ seq 自动从启动用的 PCIe sequencer 取得 `env_cfg`，无需另外传 cont
 ## 当前一对 VTX 的可执行配置
 
 启动参数在 `cfg.load_params()` 时读取；Host/PF/队列/布局参数应在仿真启动前提供。
-默认配置 BDF 和 VIO/QSCH，其他公共表不下发；采用驱动参考地址、QSCH VNET 模式，
+默认先声明 Host0/PF0 为 AF，再配置 BDF 和 VIO/QSCH，其他公共表不下发；采用驱动参考地址、QSCH VNET 模式，
 SP/WRR=`0xff`、TC weight=`0x11111111`。
 单 Host PF0/no-VF 的软件接口约定为 `intel_pf=0, intel_vf=-1, requester=0, vport=0`。
 若 DUT 的 Intel sideband/Requester 约定不同，使用 `dpu.h0.pf0.requester/intel_pf/intel_vf/vport` 覆盖。

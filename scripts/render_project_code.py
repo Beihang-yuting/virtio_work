@@ -44,6 +44,9 @@ DPU、net_packet、host_mem、PCIe TL、VIO、AIP glue、Intel interface/adapter
 生产 VIO filelist 不包含本目录；模型测试需另外添加 `filelists/project_tests.f`。
 
 默认采用驱动参考 BDF/MSI-X/VIO/QSCH 布局，配置 seq 已实现这些表的写入和可选真实读回。
+第一笔配置写为 AF 声明：经 Host0 RC 向已分配的 h0.pf0.bar0.base+0x1010 写32'h5555_aaaa。
+declare_af() 复用 pcie_tl_reg_seq，仅发送一个4B Memory Write，失败立即停止；不读回，
+不受 configure_public 控制，与 PROJECT_AF 表独立，也不执行驱动后续读回/Host-ID 握手。
 BDF默认开启，MSI-X按实际完成模式选择；其余公共表默认关闭。
 默认 dpu.verify_readback=0；设为1时增加配置读回。
 Notify 仅写/读实际队列对的有效项；首次配置前 DUT 须按05.png复位未用项
