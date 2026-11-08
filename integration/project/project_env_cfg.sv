@@ -3,15 +3,29 @@
 // 类内集中声明配置成员和 extern 方法；全部实现在本文件类外展开，无额外编译入口。
 // cfg 拥有输入配置与资源视图，借用 env 发布的组件、快照、pool、IOMMU 与 VIF。
 // 同一 cfg 通过 config_db 交给配置 seq；纯校验/资源生命周期在此，硬件访问在 seq。
+// BDF 独立默认开启，MSI-X 按完成模式选择；其余公共表由 configure_public 显式开启。
 // load_params 只生成输入，不解析快照、不创建组件、不访问 DUT；每个对象只加载一次。
 // 每 Host 一个 segment 0 和一组 TL 接口；PF/VF 共用接口，不配置 SVT 或链路训练。
 // 固定使用真实 EP 应用 DUT 的 Intel HARD_IP 接口；每 Host 仅创建一个 RC。
 class project_env_cfg extends uvm_object;
 	`uvm_object_utils(project_env_cfg)
 
-	// 平台布局/身份唯一输入；缺失项仅在对应类别导出/执行时失败，绝不补造硬件地址。
+	// 默认采用驱动 VIO/QSCH/BDF/MSI-X 布局与无 IP 的 PF0 软件路由；显式平台声明优先。
+	// BDF 默认下发，MSI-X 按完成模式选择；其余公共表开关不影响 BAR/队列软件资源。
 	string				reg_target = "pf0.bar0";
 	bit				print_bar_map = 1;
+	bit				configure_public = 0;
+	bit				configure_bdf = 1;
+	bit				driver_layouts = 1;
+	// 日常用例默认只写；调试时开启配置读回，失败则不确认资源。
+	bit				verify_readback = 0;
+
+	// QSCH 模式寄存器采用驱动偏移；SP/WRR 与 TC 权重按实际 net_id 生成。
+	bit				qsch_configure_controls = 1;
+	int unsigned			qsch_mode = 0;
+	logic [63:0]			qsch_mode_offset = 'hb001c0;
+	logic [31:0]			qsch_spwrr = 'hff;
+	logic [31:0]			qsch_tc_weight = 'h11111111;
 	project_table_layout_t		table_layouts[project_table_kind_e];
 	project_function_policy_t	function_policies[string];
 	project_vio_policy_t		vio_policies[string];
@@ -26,6 +40,37 @@ class project_env_cfg extends uvm_object;
 
 	// 参数只在 load_params 一次采样；消息模板无需 VIO service，公共向量在发布时关联。
 	extern protected function void load_platform_params();
+	// 只补未声明布局；调用者可用 provided 布局覆盖，或关闭 driver_layouts 全部自行提供。
+	extern function void use_driver_reference_layouts();
+	extern protected function void set_driver_layout(
+		input project_table_kind_e	kind,
+		input logic [63:0]		module_offset,
+		input logic [63:0]		table_offset,
+		input int unsigned		entry_bytes,
+		input int unsigned		capacity,
+		input project_index_policy_e	index_policy
+	);
+
+	// 软件路由只在默认 PF0/no-VF 场景补齐；其余 Function 的 requester 必须显式提供。
+	extern protected function void load_function_routes();
+
+	// 每代准备时从实际资源生成缺省调度项；显式 catalog 优先，不累积上代生成项。
+	extern protected function bit materialize_qsch_controls(
+		output string	why
+	);
+
+	// 从最终完成模式选择中断 Function；无中断时返回 null，缺消息或 mask 置位则失败。
+	extern function bit select_msix_scope(
+		output project_dpu_config_scope	scope,
+		output string			why
+	);
+
+	// 完整冻结消息生成稳定查找行号，独立 scope 只筛选；不依赖 ring 分配。
+	extern protected function bit materialize_msix_linear_records(
+		output string	why,
+		input project_dpu_config_scope	scope = null
+	);
+
 	// 公共向量来自资源快照，AF 额外资源也能在没有任何 VIO service 时产生消息项。
 	extern function bit materialize_messages(
 		input dpu_resource_snapshot	resources,
@@ -39,7 +84,7 @@ class project_env_cfg extends uvm_object;
 		output string			why
 	);
 
-	// 图片未提供完整 PFVF 公式；平台一次实现纯关系校验，默认缺规则只阻止依赖类别。
+	// PF0/no-VF 参考关系可直接校验；其他 PF/VF 家族须由平台提供真实编码规则。
 	extern virtual function bit validate_pfvf_relationship(
 		input project_pfvf_relationship_t	family,
 		output string				why
@@ -116,6 +161,11 @@ class project_env_cfg extends uvm_object;
 	vio_external_setup	vio_setups[int unsigned];
 	project_msix_message_t	frozen_messages[$];
 	project_config_record_t	records[string];
+	// 全部已准备服务的单 bank Notify 排序目录；scope 只筛选，不能重新编号。
+	project_config_record_t	notify_records[$];
+	// MSI-X 线性查找表按 Host/PFVF/local vector 排序，global vector 只保存到内容。
+	project_config_record_t	msix_linear_records[$];
+	protected bit		msix_directory_ready;
 
 
 	project_table_layout_t		frozen_layouts[project_table_kind_e];
@@ -134,13 +184,18 @@ class project_env_cfg extends uvm_object;
 		output string			why
 	);
 
+	// 全部 Host 准备完成后按驱动查找键排序，发布稳定行号；失败不发布半份目录。
+	extern protected function bit materialize_notify_records(
+		output string	why
+	);
+
 	// 所选全部 Host 共用核心只读 validator；所有检查结束前绝不确认/释放第一个 Host。
 	extern function bit preflight_vio(
 		input project_vio_selection_t	selection,
 		output string			why
 	);
 
-	// 在配置 sequence 的写表、使能、平台验证全部成功后确认资源，随后允许业务发包。
+	// 在配置 sequence 的写表、使能及所选验证成功后确认资源，随后允许业务发包。
 	extern function void commit_vio_configuration(
 		input project_vio_selection_t	selection,
 		output bit			ok,
@@ -653,6 +708,10 @@ function void	project_env_cfg::load_params();
 	end
 
 	load_platform_params();
+	load_function_routes();
+	if (driver_layouts) begin
+		use_driver_reference_layouts();
+	end
 	params_loaded = 1;
 endfunction
 
@@ -695,7 +754,42 @@ function void project_env_cfg::load_platform_params();
 	string	labels[$] = '{"bar","af","pfvf","bdf","completion_bdf","tlp_prefix","msix_linear","msix_info",
 		"msix_interval","msix_control","msix_table","msix_function","vio_notify","qsch_q2tc","qsch_n2g","qsch_g2p",
 		"qsch_spwrr","qsch_tc_weight","vtx","vrx","queue_aux","rdma_notify","qsch_rnet"};
+	// 无 IP 参考模式：仅使用消息表使能，默认不节流、不自屏蔽；真实消息地址/数据仍必须提供。
+	foreach (dpu_cfg.device_cfg.functions[f]) begin
+		name = dpu_function_key_name(dpu_cfg.device_cfg.functions[f].key);
+		if (!msix_policies.exists(name)) begin
+			msix_policies[name] = '{table_only_enable:1, interval_present:1, self_mask_present:1, default:0};
+		end
+	end
 `ifdef AIP_CMDLINE_SV
+	`aip_int("dpu", bit, configure_public, this.configure_public)
+	`aip_int("dpu", bit, configure_bdf, this.configure_bdf)
+	`aip_int("dpu", bit, driver_layouts, this.driver_layouts)
+	`aip_int("dpu", bit, verify_readback, this.verify_readback)
+	begin
+		longint unsigned	mode;
+		longint unsigned	mode_offset;
+		longint unsigned	spwrr;
+		longint unsigned	tc_weight;
+		bit			configure_controls;
+
+		`DPU_AIP_UINT("dpu.qsch", longint unsigned, mode, qsch_mode)
+		`DPU_AIP_UINT("dpu.qsch", longint unsigned, mode_offset, qsch_mode_offset)
+		`DPU_AIP_UINT("dpu.qsch", longint unsigned, spwrr, qsch_spwrr)
+		`DPU_AIP_UINT("dpu.qsch", longint unsigned, tc_weight, qsch_tc_weight)
+		`aip_int("dpu.qsch", bit, configure_controls, qsch_configure_controls)
+
+		if (mode > 1 || spwrr > 'hff || tc_weight > 32'hffffffff || mode_offset[1:0] != 0) begin
+			`uvm_fatal("PROJECT_CFG", "QSCH mode/weight width or mode register alignment is invalid")
+		end
+
+		qsch_mode               = mode;
+		qsch_mode_offset        = mode_offset;
+		qsch_spwrr              = spwrr;
+		qsch_tc_weight          = tc_weight;
+		qsch_configure_controls = configure_controls;
+	end
+
 	foreach (kinds[k]) begin
 		paths.delete();
 		case (kinds[k])
@@ -964,6 +1058,238 @@ function void project_env_cfg::load_platform_params();
 `endif
 endfunction
 
+// 采用驱动中已经核对的模块/表偏移；只补缺项，保留用户提供的完整布局和目标覆盖。
+// 空目标由 frozen_reg_target 解析；短名字通常按 owner Host 访问，Notify/MSI-X 线性表由 Host0 管理。
+function void project_env_cfg::set_driver_layout(
+	input project_table_kind_e	kind,
+	input logic [63:0]		module_offset,
+	input logic [63:0]		table_offset,
+	input int unsigned		entry_bytes,
+	input int unsigned		capacity,
+	input project_index_policy_e	index_policy
+);
+	string	target;
+	string	access_target;
+
+	if (table_layouts.exists(kind) && table_layouts[kind].provided) return;
+	target = table_layouts.exists(kind) ? table_layouts[kind].reg_target : "";
+	access_target = target == "" ? reg_target : target;
+	table_layouts[kind] = '{
+		provided:1, reg_target:target, access_uses_owner_host:(access_target.substr(0, 0) != "h"),
+		module_offset:module_offset, table_offset:table_offset,
+		entry_bytes:entry_bytes, capacity:capacity,
+		index_policy:index_policy, required:!(kind inside {PROJECT_SPWRR, PROJECT_TC_WEIGHT}), default:0
+	};
+
+	// 多 Host 共用全局查找表；短目标默认走 Host0，显式 hH 目标保持平台选择。
+	if (kind inside {PROJECT_NOTIFY, PROJECT_MSIX_LINEAR} && access_target.substr(0, 0) != "h") begin
+		table_layouts[kind].access_host_provided   = 1;
+		table_layouts[kind].access_host            = 0;
+		table_layouts[kind].access_uses_owner_host = 0;
+	end
+endfunction
+
+
+// 安装 VIO/QSCH、BDF 与 MSI-X 的驱动参考布局；BAR/PFVF 等其他公共表仍由平台声明。
+// VTX/VRX 使用四次 DWORD 数据写和控制触发端口，不把间接表当作线性 MMIO。
+function void project_env_cfg::use_driver_reference_layouts();
+	set_driver_layout(PROJECT_BDF, 'h100000, 'h08000, 4, 128, PROJECT_INDEX_EXPLICIT);
+	set_driver_layout(PROJECT_MSIX_LINEAR, 'h080000, 'h40000, 8, 2048, PROJECT_INDEX_EXPLICIT);
+	set_driver_layout(PROJECT_MSIX_INFO, 'h100000, 'h50000, 4, 1024, PROJECT_INDEX_GLOBAL_VECTOR);
+	set_driver_layout(PROJECT_MSIX_INTERVAL, 'h100000, 'h40000, 4, 1024, PROJECT_INDEX_GLOBAL_VECTOR);
+	set_driver_layout(PROJECT_MSIX_TABLE, 'h100000, 'h20000, 16, 1024, PROJECT_INDEX_GLOBAL_VECTOR);
+	set_driver_layout(PROJECT_NOTIFY, 'h080000, 'h20000, 16, 512, PROJECT_INDEX_EXPLICIT);
+	set_driver_layout(PROJECT_Q2TC, 'hb00000, 'h10000, 4, 2048, PROJECT_INDEX_GLOBAL_QPAIR);
+	set_driver_layout(PROJECT_N2G, 'hb00000, 'h12000, 4, 1024, PROJECT_INDEX_EXPLICIT);
+	set_driver_layout(PROJECT_G2P, 'hb00000, 'h14000, 4, 1024, PROJECT_INDEX_EXPLICIT);
+	set_driver_layout(PROJECT_SPWRR, 'hb00000, 'h16000, 4, 1024, PROJECT_INDEX_EXPLICIT);
+	set_driver_layout(PROJECT_TC_WEIGHT, 'hb00000, 'h18000, 4, 1024, PROJECT_INDEX_EXPLICIT);
+
+	if (!table_layouts.exists(PROJECT_VTX) || !table_layouts[PROJECT_VTX].provided) begin
+		set_driver_layout(PROJECT_VTX, 'h880000, 'h10000, 16, 2048, PROJECT_INDEX_GLOBAL_QPAIR);
+		table_layouts[PROJECT_VTX].indirect     = 1;
+		table_layouts[PROJECT_VTX].data_port    = 'h134;
+		table_layouts[PROJECT_VTX].control_port = 'h130;
+		table_layouts[PROJECT_VTX].index_mask   = 'h7ff;
+		table_layouts[PROJECT_VTX].trigger_mask = 'h2000;
+	end
+
+	if (!table_layouts.exists(PROJECT_VRX) || !table_layouts[PROJECT_VRX].provided) begin
+		set_driver_layout(PROJECT_VRX, 'h900000, 'h10000, 16, 2048, PROJECT_INDEX_GLOBAL_QPAIR);
+		table_layouts[PROJECT_VRX].indirect     = 1;
+		table_layouts[PROJECT_VRX].data_port    = 'h204;
+		table_layouts[PROJECT_VRX].control_port = 'h200;
+		table_layouts[PROJECT_VRX].index_mask   = 'hffff;
+		table_layouts[PROJECT_VRX].trigger_mask = 'h10000;
+	end
+
+endfunction
+
+
+// 无 PCIe IP 的参考接线约定为各 Host PF0 / VF=-1 / wire requester=0 / vport=0。
+// 这是 Intel sideband/DMA 软件路由，绝不表示已向 DUT 写 BDF/PFVF 表。
+// 显式 policy 优先作为缺省值；CLI 可覆盖字段，其余 PF/VF 不猜 requester/Intel 身份。
+function void project_env_cfg::load_function_routes();
+	foreach (dpu_cfg.device_cfg.functions[f]) begin
+		dpu_function_key_t		owner;
+		project_function_policy_t	policy;
+		string				name;
+		string				path;
+		bit				provided;
+		bit [3:0]			fields_present;
+
+		owner    = dpu_cfg.device_cfg.functions[f].key;
+		name     = dpu_function_key_name(owner);
+		provided = function_policies.exists(name);
+		if (provided) begin
+			policy = function_policies[name];
+		end
+		else begin
+			policy = '{key:owner, mode:PROJECT_HOST_EP, intel_vf:-1, default:0};
+			provided = owner.kind == DPU_FUNCTION_PF && owner.pf_id == 0 && vfs_per_pf == 0;
+		end
+
+		if (!function_policies.exists(name)) policy.bdf_index = policy.vport;
+		fields_present = provided ? 4'hf : 0;
+		path = $sformatf("dpu.h%0d.pf%0d", owner.host_id, owner.pf_id);
+		if (owner.kind == DPU_FUNCTION_VF) path = {path, $sformatf(".vf%0d", owner.vf_id)};
+`ifdef AIP_CMDLINE_SV
+		begin
+			string	fields[$] = '{"requester", "intel_pf", "intel_vf", "vport"};
+
+			foreach (fields[i]) begin
+				string		raw;
+				longint signed	value;
+
+				raw = aip_cmdline#(longint signed)::get_cmdline_string(fields[i], path);
+				if (raw == "") continue;
+				aip_cmdline#(longint signed)::get_single_value(fields[i], path, 0, value);
+				if ((i == 0 && (value < 0 || value > 65535)) ||
+					(i == 1 && (value < 0 || value > 7)) ||
+					(i == 2 && ((owner.kind == DPU_FUNCTION_PF && value != -1) ||
+						(owner.kind == DPU_FUNCTION_VF && (value < 0 || value > 2047)))) ||
+					(i == 3 && (value < 0 || value > 1023))) begin
+					`uvm_fatal("PROJECT_CFG", {path, ".", fields[i], " is outside the Intel/VIO field range"})
+				end
+
+				case (i)
+					0: policy.requester = value;
+					1: policy.intel_pf  = value;
+					2: policy.intel_vf  = value;
+					3: policy.vport     = value;
+				endcase
+				fields_present[i] = 1;
+			end
+		end
+		begin
+			string		raw;
+			longint unsigned	value;
+
+			if (!function_policies.exists(name)) policy.bdf_index = policy.vport;
+			raw = aip_cmdline#(longint unsigned)::get_cmdline_string("bdf_index", path);
+			if (raw != "") begin
+				if (aip_str::str_find(raw, "-") >= 0) `uvm_fatal("PROJECT_CFG", "bdf_index must be unsigned")
+				aip_cmdline#(longint unsigned)::get_single_value("bdf_index", path, policy.bdf_index, value);
+				if (value >= 128) `uvm_fatal("PROJECT_CFG", "bdf_index exceeds 128-row requester table")
+				policy.bdf_index = value;
+			end
+		end
+`endif
+		if (fields_present != 0 && fields_present != 4'hf) begin
+			`uvm_fatal("PROJECT_CFG", {path, " requires requester, intel_pf, intel_vf and vport together"})
+		end
+		if (fields_present == 4'hf) function_policies[name] = policy;
+	end
+endfunction
+
+
+// 以实际 qpair/net_id 和最终管理 BAR 为键合并默认调度项，覆盖所有实际消费者。
+// 每代从用户 catalog 重建 frozen_controls；同一地址的显式项优先，不改变其值或声明范围。
+// 非 ETS/ETS 必须与全局模式一致；范围/布局失败在任何 VIO MMIO 写入前返回原因。
+function bit project_env_cfg::materialize_qsch_controls(
+	output string	why
+);
+	dpu_vio_qpair_binding_t	pairs[$];
+	project_table_kind_e	kinds[$] = '{PROJECT_SPWRR, PROJECT_TC_WEIGHT};
+	bit			automatic_item[int];
+
+	frozen_controls = platform_controls;
+	why = "";
+	if (!qsch_configure_controls) return 1;
+	if (qsch_mode > 1 || $isunknown({qsch_mode_offset, qsch_spwrr, qsch_tc_weight}) ||
+		qsch_mode_offset[1:0] != 0 || qsch_spwrr > 'hff) begin
+		why = "QSCH mode/weight width or mode register alignment is invalid";
+		return 0;
+	end
+
+	resource_snapshot.list_vio_bindings(pairs);
+	foreach (pairs[p]) begin
+		project_vio_policy_t		policy;
+		vio_service_requirement_t	requirement;
+		logic [63:0]			net_id;
+		string				name;
+
+		name = dpu_service_key_name(pairs[p].service_key);
+		if (!frozen_policies.exists(name)) begin
+			why = {"queue platform policy missing: ", name};
+			return 0;
+		end
+		policy = frozen_policies[name];
+		if (!vio_cfg_by_host[pairs[p].service_key.function_key.host_id].resolve_final_service_requirement(
+			pairs[p].service_key, requirement, why)) return 0;
+		if (!requirement.tx_enable) continue;
+		if (policy.ets != qsch_mode) begin
+			why = {"QSCH mode disagrees with service ets: ", name};
+			return 0;
+		end
+		net_id = 64'(policy.net_base) + 64'(pairs[p].virtio_pair_index) * policy.net_stride;
+		if (net_id >= 1024) begin
+			why = {"QSCH net_id exceeds 10 bits: ", name};
+			return 0;
+		end
+
+		foreach (kinds[k]) begin
+			project_control_cfg_t	item;
+			int			match;
+
+			item.owner = pairs[p].service_key.function_key;
+			if (!make_context(kinds[k], item.owner, int'(net_id), 0, item.ctx, why)) return 0;
+			match = -1;
+			foreach (frozen_controls[c]) begin
+				project_table_context_t	ctx;
+
+				if (frozen_controls[c].ctx.kind != kinds[k]) continue;
+				if (!make_context(kinds[k], frozen_controls[c].owner,
+					frozen_controls[c].ctx.table_index, 0, ctx, why)) return 0;
+				if (ctx.record_key == item.ctx.record_key) begin
+					match = c;
+					break;
+				end
+			end
+
+			if (match == -1) begin
+				item.consumers = '{pairs[p].service_key};
+				item.consumers_complete = 1;
+				item.value = kinds[k] == PROJECT_SPWRR ? 128'(qsch_spwrr) : 128'(qsch_tc_weight);
+				item.writable_mask = kinds[k] == PROJECT_SPWRR ? 128'hff : 128'hffffffff;
+				automatic_item[frozen_controls.size()] = 1;
+				frozen_controls.push_back(item);
+			end
+			else if (automatic_item.exists(match)) begin
+				bit	found;
+
+				found = 0;
+				foreach (frozen_controls[match].consumers[c]) begin
+					if (dpu_service_key_name(frozen_controls[match].consumers[c]) == name) found = 1;
+				end
+				if (!found) frozen_controls[match].consumers.push_back(pairs[p].service_key);
+			end
+		end
+	end
+	return 1;
+endfunction
+
+
 // 公共向量来自资源快照，AF 额外资源也能在没有任何 VIO service 时产生消息项。
 function bit project_env_cfg::materialize_messages(
 	input dpu_resource_snapshot	resources,
@@ -982,6 +1308,166 @@ function bit project_env_cfg::materialize_messages(
 	why = "";
 	return 1;
 endfunction
+
+// 以最终 service 完成模式选择 Function；轮询且未要求公共配置时保持空范围，不误选全部。
+// MSI-X pair 必须有对应未屏蔽消息；公共模式另保留显式消息的 AF/其他 Function。
+// 在 env connect 发布资源后、任何 DUT 写入前调用；缺 Host cfg/快照时明确返回依赖错误。
+function bit project_env_cfg::select_msix_scope(
+	output project_dpu_config_scope	scope,
+	output string			why
+);
+	dpu_vio_qpair_binding_t	pairs[$];
+	dpu_function_key_t	keys[$];
+	int unsigned		bars[$];
+	bit			seen[string];
+
+	scope = null;
+	why = "MSI-X selection requires published DPU resources";
+	if (resource_snapshot == null || dpu_setup == null) return 0;
+	resource_snapshot.list_vio_bindings(pairs);
+	foreach (pairs[p]) begin
+		vio_service_requirement_t	requirement;
+		bit				found;
+		string				name;
+
+		if (!vio_cfg_by_host.exists(pairs[p].service_key.function_key.host_id)) begin
+			why = "MSI-X selection requires the published Host VIO config";
+			return 0;
+		end
+		if (vio_cfg_by_host[pairs[p].service_key.function_key.host_id] == null) begin
+			why = "MSI-X selection Host VIO config is null";
+			return 0;
+		end
+		if (!vio_cfg_by_host[pairs[p].service_key.function_key.host_id].resolve_final_service_requirement(
+			pairs[p].service_key, requirement, why)) return 0;
+		if (!requirement.enabled || requirement.completion_mode != VIRTIO_COMPLETION_MSIX) continue;
+		found = 0;
+		foreach (frozen_messages[m]) begin
+			if (!dpu_same_function_key(frozen_messages[m].owner, pairs[p].service_key.function_key) ||
+				frozen_messages[m].local_vector != pairs[p].local_msix_vector_id) continue;
+			if (frozen_messages[m].global_vector != pairs[p].global_msix_vector_id ||
+				frozen_messages[m].masked !== 1'b0 ||
+				$isunknown({frozen_messages[m].address, frozen_messages[m].data})) begin
+				why = "MSI-X queue message is masked, unknown or disagrees with allocated vector";
+				return 0;
+			end
+			found = 1;
+		end
+		if (!found) begin
+			why = {"MSI-X completion requires explicit message address/data: ", dpu_service_key_name(pairs[p].service_key)};
+			return 0;
+		end
+		name = dpu_function_key_name(pairs[p].service_key.function_key);
+		if (!seen.exists(name)) begin
+			seen[name] = 1;
+			keys.push_back(pairs[p].service_key.function_key);
+		end
+	end
+	if (configure_public) begin
+		foreach (frozen_messages[m]) begin
+			string	name;
+
+			name = dpu_function_key_name(frozen_messages[m].owner);
+			if (!seen.exists(name)) begin
+				seen[name] = 1;
+				keys.push_back(frozen_messages[m].owner);
+			end
+		end
+	end
+	msix_linear_records.delete();
+	msix_directory_ready = 1;
+	why = "";
+	if (keys.size() == 0) return 1;
+	scope = new("msix_scope", dpu_setup, keys, bars);
+	if (!scope.validate(dpu_setup, why)) return 0;
+	return materialize_msix_linear_records(why, scope);
+endfunction
+
+
+// 驱动按 Host/PFVF 排 Function、按 local vector 排组内项；global vector 仅作为查找结果。
+// 默认独立 API 首次消费完整冻结消息；默认 body 显式选择完成模式范围后生成紧凑目录。
+// 所有行必须落到同一管理 bank，失败不发布半份目录，也不按局部 public scope 重新编号。
+function bit project_env_cfg::materialize_msix_linear_records(
+	output string	why,
+	input project_dpu_config_scope	scope
+);
+	project_config_record_t	pending[$];
+	project_function_record_t	functions[$];
+	string			owner_by_key[int unsigned];
+	bit			checked_family[string];
+
+	msix_directory_ready = 0;
+	msix_linear_records.delete();
+	why = "";
+	dpu_setup.list_functions(functions);
+	foreach (frozen_messages[m]) begin
+		project_function_policy_t	policy;
+		project_msix_linear_entry_t	entry;
+		project_config_record_t		record;
+		string				name;
+		int unsigned			lookup_key;
+
+		if (scope != null && !scope.selects(frozen_messages[m].owner)) continue;
+		name = dpu_function_key_name(frozen_messages[m].owner);
+		if (!frozen_functions.exists(name)) begin
+			why = {"MSI-X Function routing policy missing: ", name};
+			return 0;
+		end
+		policy = frozen_functions[name];
+		if (!checked_family.exists(name)) begin
+			if (!validate_pfvf_family(policy.key, why)) return 0;
+			checked_family[name] = 1;
+		end
+		if (policy.key.host_id >= 8 || policy.pfvf >= 1024 ||
+			frozen_messages[m].local_vector >= 512 || frozen_messages[m].global_vector >= 8192) begin
+			why = "MSI-X linear field exceeds screenshot encoding";
+			return 0;
+		end
+		lookup_key = (policy.key.host_id << 19) | (policy.pfvf << 9) | frozen_messages[m].local_vector;
+		if (owner_by_key.exists(lookup_key)) begin
+			why = "duplicate MSI-X Host/PFVF/local-vector lookup key";
+			return 0;
+		end
+		owner_by_key[lookup_key] = name;
+		entry                 = '0;
+		entry.global_msix_idx = frozen_messages[m].global_vector;
+		entry.host_id         = policy.key.host_id;
+		entry.pfvf_id         = policy.pfvf;
+		entry.local_msix_idx  = frozen_messages[m].local_vector;
+		record.owner          = frozen_messages[m].owner;
+		record.has_queue      = 0;
+		record.entry          = 128'(entry);
+		record.enable_mask    = 0;
+		record.enable_value   = 0;
+		record.consumers.delete();
+		record.dependencies.delete();
+		foreach (functions[f]) begin
+			if (dpu_same_function_key(functions[f].key, record.owner)) record.consumers = functions[f].services;
+		end
+		pending.push_back(record);
+	end
+	pending.sort() with (item.entry[21:0]);
+	if (pending.size() > 2048) begin
+		why = "MSI-X linear single-bank image exceeds 2048 rows";
+		return 0;
+	end
+	foreach (pending[i]) begin
+		if (!make_context(PROJECT_MSIX_LINEAR, pending[i].owner, i, 0, pending[i].ctx, why)) return 0;
+		if (i != 0 && (
+			pending[i].ctx.target.canonical_name != pending[0].ctx.target.canonical_name ||
+			pending[i].ctx.layout.module_offset != pending[0].ctx.layout.module_offset ||
+			pending[i].ctx.layout.table_offset != pending[0].ctx.layout.table_offset ||
+			pending[i].ctx.layout.capacity != pending[0].ctx.layout.capacity
+		)) begin
+			why = "MSI-X linear directory requires one management window; set dpu.msix_linear.reg_target";
+			return 0;
+		end
+	end
+	msix_linear_records = pending;
+	msix_directory_ready = 1;
+	return 1;
+endfunction
+
 
 // 同一共享向量只登记一次；显式消息优先但必须与冻结向量身份一致。
 function bit project_env_cfg::add_message(
@@ -1007,12 +1493,19 @@ function bit project_env_cfg::add_message(
 	return 1;
 endfunction
 
-// 平台关系不猜测；未提供规则时 PFVF/MSI-X linear 明确失败，但 BAR/BDF 可独立运行。
+// 仅 PF0/no-VF 且 Intel/PFVF 均为参考编码时通过；其余家族保留平台真实关系校验。
 function bit project_env_cfg::validate_pfvf_relationship(
 	input project_pfvf_relationship_t	family,
 	output string				why
 );
-	why = "platform PFVF relationship validator is not implemented";
+	if (family.functions.size() == 1 && family.policies.size() == 1 &&
+		family.functions[0].key.kind == DPU_FUNCTION_PF && family.functions[0].key.pf_id == 0 &&
+		family.policies[0].intel_pf == 0 && family.policies[0].intel_vf == -1 &&
+		family.policies[0].pfvf == 0) begin
+		why = "";
+		return 1;
+	end
+	why = "platform PFVF relationship validator is required beyond the PF0/no-VF reference";
 	return 0;
 endfunction
 
@@ -1262,6 +1755,13 @@ function bit project_env_cfg::public_records(
 	if (scope == null) return 0;
 	if (!scope.validate(dpu_setup, why)) return 0;
 	dpu_setup.list_functions(functions);
+	if (kind == PROJECT_MSIX_LINEAR) begin
+		if (!msix_directory_ready && !materialize_msix_linear_records(why)) return 0;
+		foreach (msix_linear_records[i]) begin
+			if (scope.selects(msix_linear_records[i].owner)) selected.push_back(msix_linear_records[i]);
+		end
+		return 1;
+	end
 	if (kind == PROJECT_BAR) begin
 		if (frozen_bar_groups.size() == 0) begin why = "BAR mapping atomic groups must be explicitly declared"; return 0; end
 		foreach (frozen_bar_groups[g]) begin
@@ -1376,7 +1876,7 @@ function bit project_env_cfg::public_records(
 		name = dpu_function_key_name(functions[f].key);
 		if (!frozen_functions.exists(name)) begin why = {"platform Function mapping missing: ", name}; return 0; end
 		p = frozen_functions[name];
-		if ((kind == PROJECT_PFVF || kind == PROJECT_MSIX_LINEAR) && !validate_pfvf_family(p.key, why)) return 0;
+		if (kind == PROJECT_PFVF && !validate_pfvf_family(p.key, why)) return 0;
 		r.owner = functions[f].key;
 		r.consumers = functions[f].services;
 		r.has_queue = 0;
@@ -1384,7 +1884,7 @@ function bit project_env_cfg::public_records(
 		r.enable_mask = '0;
 		r.enable_value = '0;
 		r.dependencies.delete();
-		if (kind inside {PROJECT_MSIX_LINEAR, PROJECT_MSIX_INFO, PROJECT_MSIX_INTERVAL, PROJECT_MSIX_TABLE}) begin
+		if (kind inside {PROJECT_MSIX_INFO, PROJECT_MSIX_INTERVAL, PROJECT_MSIX_TABLE}) begin
 			foreach (frozen_messages[m]) begin
 				project_msix_message_t	message;
 				message = frozen_messages[m];
@@ -1398,21 +1898,11 @@ function bit project_env_cfg::public_records(
 				end
 				index = frozen_layouts[kind].index_policy == PROJECT_INDEX_GLOBAL_VECTOR ? message.global_vector : message.local_vector;
 				end
-				if ((kind == PROJECT_MSIX_LINEAR && (index >= 2048 || p.pfvf >= 1024 || p.key.host_id >= 8)) ||
-					(kind != PROJECT_MSIX_LINEAR && index >= 1024) ||
+				if (index >= 1024 ||
 					(kind == PROJECT_MSIX_INFO && p.vport >= 128)) begin
 					why = "MSI-X mapping exceeds screenshot capacity/reserved fields"; return 0;
 				end
 				case (kind)
-					PROJECT_MSIX_LINEAR: begin
-						project_msix_linear_entry_t	e;
-						e = '0;
-						e.global_msix_idx = message.global_vector;
-						e.host_id = p.key.host_id;
-						e.pfvf_id = p.pfvf;
-						e.local_msix_idx = message.local_vector;
-						r.entry = 128'(e);
-					end
 					PROJECT_MSIX_INFO: begin
 						project_msix_info_entry_t	e;
 						e = '0;
@@ -1529,8 +2019,10 @@ task project_env_cfg::prepare_vio_configuration(
 	why = "public configuration must be published first";
 	if (dpu_setup == null) return;
 	foreach (vio_setups[h]) if (vio_setups[h] != null) begin why = "release existing VIO generation before reprepare"; return; end
+	notify_records.delete();
 	// 全部旧 ring 代释放后才冻结显式平台表策略；核心 service enabled/pairs/geometry/format 仍用 placement 前缓存合同。
 	frozen_policies = this.vio_policies;
+	if (!materialize_qsch_controls(why)) return;
 	resource_snapshot.list_vio_bindings(pairs);
 	foreach (pairs[p]) begin
 		int unsigned	h;
@@ -1596,9 +2088,119 @@ task project_env_cfg::prepare_vio_configuration(
 		selection.setups[h] = setup;
 		selection.scopes[h] = scope;
 	end
+	if (!materialize_notify_records(why)) begin
+		ok = 0;
+		return;
+	end
 	ok = 1;
 	why = "";
 endtask
+
+
+// 驱动先按 Host/BAR 查找基址排序 Function，再在组内按 pair 编号排列；硬件行号是排序位置。
+// 从完整已准备目录生成一次，RX/TX 共用 pair 项；global_qid 只写入 payload，不作为表行号。
+// 同 Host 同基址属于不同 service 时存在查找歧义，拒绝发布；失败保持目录为空。
+function bit project_env_cfg::materialize_notify_records(
+	output string	why
+);
+	project_config_record_t	pending[$];
+	vio_queue_setup_t	queues[$];
+	string			service_by_base[bit [63:0]];
+	int			pair_rows[string];
+
+	notify_records.delete();
+	why = "";
+	foreach (vio_setups[h]) begin
+		if (vio_setups[h] == null) continue;
+		vio_setups[h].list_queues(queues);
+		foreach (queues[q]) begin
+			project_vio_policy_t		policy;
+			project_vio_notify_entry_t	entry;
+			project_bar_target_t		target;
+			project_config_record_t		record;
+			bit [63:0]			base;
+			bit [63:0]			lookup_key;
+			string				service;
+			string				pair_name;
+
+			service = dpu_service_key_name(queues[q].service_key);
+			if (!frozen_policies.exists(service)) begin
+				why = {"queue platform policy missing: ", service};
+				return 0;
+			end
+			policy = frozen_policies[service];
+			if (!policy.notify_table_base_provided || $isunknown(policy.notify_table_offset) ||
+				!bar_registry.resolve_function(queues[q].service_key.function_key,
+					policy.notify_table_bar, target, why) ||
+				!bar_registry.check_range(target, policy.notify_table_offset, 128, base, why)) begin
+				why = "notify table lookup base requires explicit owner BAR/offset";
+				return 0;
+			end
+			if (!policy.notify_net_pair5 || queues[q].qpair.virtio_pair_index >= 32 ||
+				queues[q].qpair.rx_local_virtqueue_id >= 64 || queues[q].qpair.tx_local_virtqueue_id >= 64 ||
+				queues[q].qpair.global_qpair_id >= 2048 || h >= 8 ||
+				base[63:61] != 0 || base[6:0] != 0) begin
+				why = "notify single-bank pair5/base/index cannot represent binding";
+				return 0;
+			end
+
+			lookup_key = (64'(h) << 61) | base;
+			if (service_by_base.exists(lookup_key) && service_by_base[lookup_key] != service) begin
+				why = "different VIO services share the same Notify Host/BAR lookup base";
+				return 0;
+			end
+			service_by_base[lookup_key] = service;
+			entry                    = '0;
+			entry.global_qid         = queues[q].qpair.global_qpair_id;
+			entry.host_id            = h;
+			entry.base_addr_60_7     = base[60:7];
+			entry.local_qid_encoding = (queues[q].qpair.virtio_pair_index << 1) | 1;
+			pair_name = $sformatf("%s.pair%0d", service, queues[q].qpair.virtio_pair_index);
+			if (pair_rows.exists(pair_name)) begin
+				if (pending[pair_rows[pair_name]].entry != 128'(entry)) begin
+					why = "RX/TX of one qpair disagree on the Notify mapping";
+					return 0;
+				end
+				continue;
+			end
+
+			record.owner        = queues[q].service_key.function_key;
+			record.consumers    = '{queues[q].service_key};
+			record.has_queue    = 1;
+			record.binding      = queues[q];
+			record.entry        = entry;
+			record.enable_mask  = 0;
+			record.enable_value = 0;
+			record.dependencies.delete();
+			pair_rows[pair_name] = pending.size();
+			pending.push_back(record);
+		end
+	end
+
+	// 低 64 位恰好为 {host_id, base_addr_60_7, local_qid_encoding}，不含 global_qid。
+	pending.sort() with (item.entry[63:0]);
+	if (pending.size() > 512) begin
+		why = "Notify single-bank image exceeds 512 rows";
+		return 0;
+	end
+	foreach (pending[i]) begin
+		if (!make_context(PROJECT_NOTIFY, pending[i].owner, i,
+			vio_setups[pending[i].owner.host_id].get_generation(), pending[i].ctx, why)) return 0;
+
+		// 全局行号必须落到同一 bank；按 owner 分散窗口会留下未初始化的中间行。
+		if (i != 0 && (
+			pending[i].ctx.target.canonical_name != pending[0].ctx.target.canonical_name ||
+			pending[i].ctx.layout.module_offset != pending[0].ctx.layout.module_offset ||
+			pending[i].ctx.layout.table_offset != pending[0].ctx.layout.table_offset ||
+			pending[i].ctx.layout.capacity != pending[0].ctx.layout.capacity
+		)) begin
+			why = "Notify single-bank directory requires one management window; set vio.notify_table.reg_target to a complete hH.pfP.barB target";
+			return 0;
+		end
+	end
+	notify_records = pending;
+	return 1;
+endfunction
 
 
 // 所选全部 Host 共用核心只读 validator；所有检查结束前绝不确认/释放第一个 Host。
@@ -1638,6 +2240,21 @@ function bit project_env_cfg::queue_records(
 	string				service;
 	selected.delete();
 	if (!preflight_vio(selection, why)) return 0;
+	if (kind_selected(PROJECT_NOTIFY, kinds)) begin
+		foreach (notify_records[i]) begin
+			int unsigned	host_id;
+
+			host_id = notify_records[i].owner.host_id;
+			if (selection.scopes.exists(host_id) &&
+				selection.scopes[host_id].selects(notify_records[i].binding.service_key)) begin
+				selected.push_back(notify_records[i]);
+			end
+		end
+		if (kinds.size() == 1) begin
+			why = "";
+			return 1;
+		end
+	end
 	foreach (selection.setups[h]) begin
 		selection.setups[h].list_queues(queues);
 		foreach (queues[q]) begin
@@ -1666,8 +2283,15 @@ function bit project_env_cfg::queue_records(
 				if (!(kinds[k] inside {PROJECT_SPWRR, PROJECT_TC_WEIGHT, PROJECT_QUEUE_AUX})) continue;
 				found = 0;
 				foreach (frozen_controls[c]) begin
-					if (frozen_controls[c].ctx.kind != kinds[k] ||
-						!dpu_same_function_key(frozen_controls[c].owner, r.owner)) continue;
+					bit	selected_consumer;
+
+					if (frozen_controls[c].ctx.kind != kinds[k]) continue;
+					selected_consumer = dpu_same_function_key(frozen_controls[c].owner,
+						queues[q].service_key.function_key);
+					foreach (frozen_controls[c].consumers[v]) begin
+						if (dpu_service_key_name(frozen_controls[c].consumers[v]) == service) selected_consumer = 1;
+					end
+					if (!selected_consumer) continue;
 					if (kinds[k] == PROJECT_QUEUE_AUX && frozen_controls[c].ctx.table_index != queues[q].qpair.global_qpair_id) continue;
 					if ($isunknown({frozen_controls[c].value, frozen_controls[c].writable_mask}) ||
 						(frozen_controls[c].value & ~frozen_controls[c].writable_mask) != 0) begin
@@ -1681,6 +2305,7 @@ function bit project_env_cfg::queue_records(
 							if (dpu_service_key_name(r.consumers[v]) == service) bound_consumer = 1;
 						if (!bound_consumer) r.consumers.push_back(queues[q].service_key);
 					end
+					r.owner = frozen_controls[c].owner;
 					r.has_queue = kinds[k] == PROJECT_QUEUE_AUX;
 					r.entry = frozen_controls[c].value;
 					r.enable_mask = 0;
@@ -1694,6 +2319,7 @@ function bit project_env_cfg::queue_records(
 					why = {"required queue control missing: ", kinds[k].name()}; return 0;
 				end
 			end
+			r.owner = queues[q].service_key.function_key;
 			r.consumers.delete();
 			r.consumers.push_back(queues[q].service_key);
 			r.has_queue = 1;
@@ -1760,31 +2386,6 @@ function bit project_env_cfg::queue_records(
 			// 非 ring 表不携带 ring enable 位，独立批次与合并 verify 必须生成相同记录。
 			r.enable_mask = 0;
 			r.enable_value = 0;
-			// Notify 是每 pair 一个单 bank 项；实际 doorbell qid 仍留在 binding，不能混作 pair 编码。
-			if (kind_selected(PROJECT_NOTIFY, kinds)) begin
-				project_vio_notify_entry_t	e;
-				bit [63:0]			base;
-				project_bar_target_t		notify_target;
-				if (!policy.notify_table_base_provided || $isunknown(policy.notify_table_offset) ||
-					!bar_registry.resolve_function(r.owner, policy.notify_table_bar, notify_target, why) ||
-					!bar_registry.check_range(notify_target, policy.notify_table_offset, 128, base, why)) begin
-					why = "notify table lookup base requires explicit owner BAR/offset"; return 0;
-				end
-				if (!policy.notify_net_pair5 || queues[q].qpair.virtio_pair_index >= 32 ||
-					queues[q].qpair.rx_local_virtqueue_id >= 64 || queues[q].qpair.tx_local_virtqueue_id >= 64 ||
-					queues[q].qpair.global_qpair_id >= 512 || base[63:61] != 0 ||
-					base[6:0] != 0) begin why = "notify single-bank pair5/base/index cannot represent binding"; return 0; end
-				e = '0;
-				e.global_qid = queues[q].qpair.global_qpair_id;
-				e.host_id = h;
-				e.base_addr_60_7 = base[60:7];
-				e.local_qid_encoding = (queues[q].qpair.virtio_pair_index << 1) | 1;
-				r.entry = e;
-				r.enable_mask = 0;
-				r.enable_value = 0;
-				if (!make_context(PROJECT_NOTIFY, r.owner, queues[q].qpair.global_qpair_id, selection.setups[h].get_generation(), r.ctx, why)) return 0;
-				selected.push_back(r);
-			end
 			if (kind_selected(PROJECT_Q2TC, kinds) || kind_selected(PROJECT_N2G, kinds) || kind_selected(PROJECT_G2P, kinds)) begin
 			// Q2TC/N2G/G2P 编号由显式策略生成；net/group 十位先检查再赋值。
 			if (64'(policy.net_base) + 64'(queues[q].qpair.virtio_pair_index)*policy.net_stride >= 1024 ||
@@ -1840,7 +2441,8 @@ function bit project_env_cfg::kind_selected(
 endfunction
 
 
-// 在配置 sequence 的写表、使能、平台验证全部成功后确认资源，随后允许业务发包。
+// 在配置 sequence 的写表、使能及所选验证成功后确认资源，随后允许业务发包。
+// 关闭读回时以平台认可的写入流程作为确认依据，不代表已读取 DUT 验证硬件状态。
 // 核心仍校验导出的 ring 与实际队列一致；此处不维护跨 sequence 的状态账本。
 function void project_env_cfg::commit_vio_configuration(
 	input project_vio_selection_t	selection,
@@ -1878,6 +2480,10 @@ function void project_env_cfg::release_vio_resources(
 	foreach (selection.setups[h]) begin
 		if (!vio_envs[h].release_external_resources(selection.setups[h], dut_quiesced, why)) return;
 		vio_setups.delete(h);
+	end
+	// 只移除已释放 Host 的 Notify 项，存活 Host 保持硬件行号；下一代全量 prepare 再排序。
+	for (int i = notify_records.size() - 1; i >= 0; i--) begin
+		if (selection.setups.exists(notify_records[i].owner.host_id)) notify_records.delete(i);
 	end
 	foreach (records[name]) begin
 		if (records[name].ctx.kind inside {PROJECT_N2G, PROJECT_G2P, PROJECT_SPWRR, PROJECT_TC_WEIGHT}) begin

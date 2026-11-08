@@ -2,7 +2,8 @@
 // 依赖 cfg 中的真实 BAR/队列视图与 PCIe RC sequencer；不创建第二套 context 或 env。
 // task/hook 属于本 sequence，cfg 保存参数、资源与表项数据；ring/BAR 不归 seq 所有。
 // 所有硬件访问复用 pcie_tl_reg_seq，经实际目标 RC、Intel bind 发往 DUT。
-// 默认 body 配置公共表和 VIO 后验证/提交；未知平台 hook 明确失败并保留 DMA 资源。
+// 默认 body 配置 BDF、VIO/QSCH，MSI-X 按实际完成模式选择；其余公共表独立可选。
+// 已知表按图片字段和 cfg 地址真实写入；读回可选，失败报告 fatal 并保留 DMA 资源。
 class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 	`uvm_object_utils(project_dut_config_seq)
 
@@ -19,8 +20,17 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 	// start 时取得配置句柄；派生 body 自动获得 cfg，不需要调用 env 的配置 task。
 	extern virtual task pre_start();
 
-	// 默认完整配置流程；平台先等待复位就绪，成功只在最终验证/commit 后发布。
+	// 平台先等待复位就绪；基础 BDF/所选 MSI-X 先写，VIO 在写入、所选验证和 commit 后成功。
 	extern virtual task body();
+
+	// start 返回前报告失败，AIP 直接注册本类时也不会把提前 return 显示为配置成功。
+	extern virtual task post_start();
+
+	// 给当前失败添加阶段名；所有调用均在首次失败停止，不继续使能或释放资源。
+	extern protected function bit completed_step(
+		input string	step,
+		input bit	ok
+	);
 
 
 	// MMIO helper 校验四态输入和完整范围，posted success 仅表示发送完成。
@@ -240,8 +250,30 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
+	// 完整初始化时将剩余单 bank 行设为驱动的最大 key 无效项，verify 时读回同一范围。
+	// 只由默认 body/验证调用；局部 configure_vio_notify 不搬移其他服务的表项。
+	extern protected task process_notify_tail(
+		input bit	verify,
+		output bit	ok,
+		output string	why
+	);
+
+	// MSI-X linear 同样按查找键排列；完整流程填充单 bank 无效尾部，独立表入口不隐含初始化。
+	extern protected task process_msix_tail(
+		input bit	verify,
+		output bit	ok,
+		output string	why
+	);
+
 	// 独立 configure_qsch 入口；不隐含调用其他类别。
 	extern task configure_qsch(
+		input project_vio_selection_t	selection,
+		output bit			ok,
+		output string			why
+	);
+
+	// 每个实际管理 BAR 写一次 QSCH 模式，按开关读回；不改变调度表的 owner 或索引。
+	extern task configure_qsch_mode(
 		input project_vio_selection_t	selection,
 		output bit			ok,
 		output string			why
@@ -268,6 +300,15 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
+	// 读回本轮基础 BDF 和所选 MSI-X 数据表；不要求平台实现其他公共表验证。
+	// 默认 body 仅在 verify_readback=1 时调用；显式调用本方法始终执行真实读取。
+	extern virtual task verify_function_configuration(
+		input project_dpu_config_scope	bdf_scope,
+		input project_dpu_config_scope	msix_scope,
+		output bit			ok,
+		output string			why
+	);
+
 	// 队列配置写完后执行平台验证；成功后默认 body 才调用 cfg.commit_vio_configuration。
 	extern task verify_vio_configuration(
 		input project_vio_selection_t	selection,
@@ -275,7 +316,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 bdf，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_bdf；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_bdf_entry(
 		input project_bdf_cfg_t	item,
 		output bit		ok,
@@ -289,7 +330,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string		why
 	);
 
-	// 单项用户实现 completion_bdf，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_completion_bdf；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_completion_bdf_entry(
 		input project_completion_bdf_cfg_t	item,
 		output bit				ok,
@@ -303,7 +344,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string				why
 	);
 
-	// 单项用户实现 pfvf，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_pfvf；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_pf_vf_entry(
 		input project_pfvf_cfg_t	item,
 		output bit			ok,
@@ -317,7 +358,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 tlp_prefix，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_tlp_prefix；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_tlp_prefix_entry(
 		input project_tlp_prefix_cfg_t	item,
 		output bit			ok,
@@ -331,7 +372,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 msix_linear，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_msix_linear；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_msix_linear_entry(
 		input project_msix_linear_cfg_t	item,
 		output bit			ok,
@@ -345,7 +386,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 msix_info，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_msix_info；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_msix_info_entry(
 		input project_msix_info_cfg_t	item,
 		output bit			ok,
@@ -359,7 +400,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 msix_interval，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_msix_interval；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_msix_interval_entry(
 		input project_msix_interval_cfg_t	item,
 		output bit				ok,
@@ -373,7 +414,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string				why
 	);
 
-	// 单项用户实现 msix_table，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_msix_table；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_msix_table_entry(
 		input project_msix_table_cfg_t	item,
 		output bit			ok,
@@ -387,7 +428,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 qsch_q2tc，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_qsch_q2tc；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_qsch_q2tc(
 		input project_qsch_q2tc_cfg_t	item,
 		output bit			ok,
@@ -401,7 +442,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 qsch_n2g，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_qsch_n2g；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_qsch_n2g(
 		input project_qsch_n2g_cfg_t	item,
 		output bit			ok,
@@ -415,7 +456,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 qsch_g2p，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_qsch_g2p；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_qsch_g2p(
 		input project_qsch_g2p_cfg_t	item,
 		output bit			ok,
@@ -429,7 +470,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 rdma_notify，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_rdma_notify；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_rdma_notify_entry(
 		input project_rdma_notify_cfg_t	item,
 		output bit			ok,
@@ -443,7 +484,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 qsch_rnet，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_qsch_rnet；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_qsch_rnet_entry(
 		input project_qsch_rnet_cfg_t	item,
 		output bit			ok,
@@ -457,7 +498,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 单项用户实现 vtx，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_vtx；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_vtx_queue(
 		input project_vtx_cfg_t	item,
 		output bit		ok,
@@ -471,7 +512,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string		why
 	);
 
-	// 单项用户实现 vrx，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_vrx；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_vrx_queue(
 		input project_vrx_cfg_t	item,
 		output bit		ok,
@@ -485,7 +526,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string		why
 	);
 
-	// 单项用户实现 vio_notify，缺失实现明确失败；推荐调用 checked typed helper。
+	// 本类默认调用 write_vio_notify；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_vio_notify_entry(
 		input project_vio_notify_cfg_t	item,
 		output bit			ok,
@@ -527,28 +568,28 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 平台专有控制由用户实现，未知地址/语义不能默认成功。
+	// 本类默认调用 write_control；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_qsch_spwrr(
 		input project_control_cfg_t	item,
 		output bit			ok,
 		output string			why
 	);
 
-	// 平台专有控制由用户实现，未知地址/语义不能默认成功。
+	// 本类默认调用 write_control；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_qsch_tc_weight(
 		input project_control_cfg_t	item,
 		output bit			ok,
 		output string			why
 	);
 
-	// 平台专有控制由用户实现，未知地址/语义不能默认成功。
+	// 本类默认调用 write_queue_aux；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_configure_queue_aux(
 		input project_queue_control_cfg_t	item,
 		output bit				ok,
 		output string				why
 	);
 
-	// 平台专有控制由用户实现，未知地址/语义不能默认成功。
+	// 本类默认调用 write_enabled_queue；覆写此 hook 可适配平台访问时序。
 	extern virtual task user_enable_queue(
 		input project_queue_control_cfg_t	item,
 		output bit				ok,
@@ -583,7 +624,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 用户显式验证平台行为；默认失败，不以 posted send 代替设备确认。
+	// 默认真实读回 Notify/QSCH/队列表并比较；项目可覆写自清零或只写寄存器的验证。
 	extern virtual task user_verify_vio_configuration(
 		input project_vio_selection_t	selection,
 		output bit			ok,
@@ -675,55 +716,130 @@ task project_dut_config_seq::pre_start();
 	end
 endtask
 
-// 用户 task 只处理单项；类别循环、真实路由和状态均复用现有 checked 路径。
-// 第一个失败立即返回，保留现场；不自动 reset、回收 ring 或继续发包。
+// 默认执行基础 BDF、按完成模式选择的 MSI-X 和 VIO 配置；其余公共硬件表独立可选。
+// 同一 seq 串行完成配置；verify_readback=1 时读回符合预期才开放业务，首次失败保留现场。
 task project_dut_config_seq::body();
 	project_dpu_config_scope	public_scope;
-	dpu_function_key_t		functions[$];
-	int unsigned			bars[$];
-	bit				ok;
+	project_dpu_config_scope	bdf_scope;
+	project_dpu_config_scope	msix_scope;
+	dpu_function_key_t	functions[$];
+	int unsigned		bars[$];
+	bit			ok;
 
+	`uvm_info("PROJECT_CONFIG_SEQ", $sformatf("begin DUT configuration (readback=%0b)", cfg.verify_readback), UVM_LOW)
 	public_scope = new("public_scope", cfg.dpu_setup, functions, bars);
-	configure_bar_table(public_scope, ok, error_msg);
-	if (!ok) return;
-	if (cfg.frozen_layouts.exists(PROJECT_AF)) begin
-		configure_af(public_scope, ok, error_msg);
-		if (!ok) return;
+	if (cfg.configure_bdf) bdf_scope = public_scope;
+	ok = cfg.select_msix_scope(msix_scope, error_msg);
+	if (!completed_step("select_msix_scope", ok)) return;
+
+	if (cfg.configure_public) begin
+		configure_bar_table(public_scope, ok, error_msg);
+		if (!completed_step("configure_bar_table", ok)) return;
+
+		if (cfg.frozen_layouts.exists(PROJECT_AF)) begin
+			configure_af(public_scope, ok, error_msg);
+			if (!completed_step("configure_af", ok)) return;
+		end
+
+		configure_pf_vf_map(public_scope, ok, error_msg);
+		if (!completed_step("configure_pf_vf_map", ok)) return;
+
+		configure_completion_bdf_table(public_scope, ok, error_msg);
+		if (!completed_step("configure_completion_bdf_table", ok)) return;
+
+		configure_tlp_prefix(public_scope, ok, error_msg);
+		if (!completed_step("configure_tlp_prefix", ok)) return;
 	end
-	configure_pf_vf_map(public_scope, ok, error_msg);
-	if (!ok) return;
-	configure_bdf_table(public_scope, ok, error_msg);
-	if (!ok) return;
-	configure_completion_bdf_table(public_scope, ok, error_msg);
-	if (!ok) return;
-	configure_tlp_prefix(public_scope, ok, error_msg);
-	if (!ok) return;
-	configure_msix(public_scope, ok, error_msg);
-	if (!ok) return;
-	verify_dpu_configuration(public_scope, ok, error_msg);
-	if (!ok) return;
+
+	if (bdf_scope != null) begin
+		configure_bdf_table(bdf_scope, ok, error_msg);
+		if (!completed_step("configure_bdf_table", ok)) return;
+	end
+
+	// 消息映射与中断控制先于队列使能；无公共消息需求的 polling 不产生 MSI-X 配置写。
+	if (msix_scope != null) begin
+		configure_msix(msix_scope, ok, error_msg);
+		if (!completed_step("configure_msix", ok)) return;
+
+		process_msix_tail(0, ok, error_msg);
+		if (!completed_step("initialize_msix_tail", ok)) return;
+
+		enable_msix(msix_scope, ok, error_msg);
+		if (!completed_step("enable_msix", ok)) return;
+	end
+
+	if (cfg.verify_readback) begin
+		verify_function_configuration(bdf_scope, msix_scope, ok, error_msg);
+		if (!completed_step("verify_function_configuration", ok)) return;
+
+		if (msix_scope != null) begin
+			process_msix_tail(1, ok, error_msg);
+			if (!completed_step("verify_msix_tail", ok)) return;
+		end
+
+		if (cfg.configure_public) begin
+			verify_dpu_configuration(public_scope, ok, error_msg);
+			if (!completed_step("verify_dpu_configuration", ok)) return;
+		end
+	end
 
 	cfg.prepare_vio_configuration(selection, ok, error_msg);
-	if (!ok) return;
+	if (!completed_step("prepare_vio_configuration", ok)) return;
+
 	if (selection.setups.num() != 0) begin
 		configure_vio_notify(selection, ok, error_msg);
-		if (!ok) return;
+		if (!completed_step("configure_vio_notify", ok)) return;
+
+		process_notify_tail(0, ok, error_msg);
+		if (!completed_step("initialize_notify_tail", ok)) return;
+
 		configure_qsch(selection, ok, error_msg);
-		if (!ok) return;
+		if (!completed_step("configure_qsch", ok)) return;
+
 		configure_vio_queues(selection, ok, error_msg);
-		if (!ok) return;
+		if (!completed_step("configure_vio_queues", ok)) return;
+
 		enable_vio_queues(selection, ok, error_msg);
-		if (!ok) return;
-		enable_msix(public_scope, ok, error_msg);
-		if (!ok) return;
-		verify_vio_configuration(selection, ok, error_msg);
-		if (!ok) return;
+		if (!completed_step("enable_vio_queues", ok)) return;
+
+		if (cfg.verify_readback) begin
+			verify_vio_configuration(selection, ok, error_msg);
+			if (!completed_step("verify_vio_configuration", ok)) return;
+
+			process_notify_tail(1, ok, error_msg);
+			if (!completed_step("verify_notify_tail", ok)) return;
+		end
+
 		cfg.commit_vio_configuration(selection, ok, error_msg);
-		if (!ok) return;
+		if (!completed_step("commit_vio_configuration", ok)) return;
 	end
-	success = 1;
+
+	success   = 1;
 	error_msg = "";
+	`uvm_info("PROJECT_CONFIG_SEQ", $sformatf("DUT configuration completed (readback=%0b)", cfg.verify_readback), UVM_LOW)
 endtask
+
+
+// 失败在 start 返回前显式报告；AIP 无需理解自定义 success 字段也能看见错误。
+task project_dut_config_seq::post_start();
+	if (!success) begin
+		`uvm_fatal("PROJECT_CONFIG_SEQ", error_msg == "" ? "DUT configuration failed" : error_msg)
+	end
+endtask
+
+
+// 给首个错误加执行阶段，保留底层地址/字段/Completion 原因以便定位。
+function bit project_dut_config_seq::completed_step(
+	input string	step,
+	input bit	ok
+);
+	if (!ok) begin
+		error_msg = {step, ": ", error_msg};
+	end
+
+	return ok;
+endfunction
+
 
 // 只调用本类别的完整预检与执行，不串联其他配置入口。
 task project_dut_config_seq::configure_bar_table(
@@ -847,6 +963,119 @@ task project_dut_config_seq::configure_vio_notify(
 endtask
 
 
+// 驱动以最大 Host/地址 key 和 type=RSV 填充空行，保持整张有序查找表的尾部无效。
+// 这里仅访问图片定义的单 bank；不发送 bank-select/ready，也不按 global_qid 留空洞。
+// 全量默认流程在业务开始前调用，局部类别入口仍保留已发布行号。
+task project_dut_config_seq::process_notify_tail(
+	input bit	verify,
+	output bit	ok,
+	output string	why
+);
+	project_vio_notify_entry_t	invalid_entry;
+	project_table_context_t		ctx;
+	bit				seen[string];
+	logic [127:0]			readback;
+	bit [63:0]			offset;
+	bit [63:0]			address;
+
+	ok  = 0;
+	why = "Notify directory is empty";
+	if (cfg.notify_records.size() == 0) return;
+
+	invalid_entry                    = '0;
+	invalid_entry.notify_type        = '1;
+	invalid_entry.global_qid         = '1;
+	invalid_entry.host_id            = '1;
+	invalid_entry.base_addr_60_7      = '1;
+	invalid_entry.local_qid_encoding = '1;
+
+	foreach (cfg.notify_records[n]) begin
+		ctx = cfg.notify_records[n].ctx;
+		if (seen.exists(ctx.target.canonical_name)) continue;
+		seen[ctx.target.canonical_name] = 1;
+
+		if (ctx.layout.capacity > 512 || cfg.notify_records.size() > ctx.layout.capacity) begin
+			why = "Notify directory exceeds the single-bank layout";
+			return;
+		end
+
+		offset = ctx.layout.module_offset + ctx.layout.table_offset;
+		if (!cfg.bar_registry.check_range(ctx.target, offset,
+			64'(ctx.layout.capacity) * 16, address, why)) return;
+
+		for (int unsigned row = cfg.notify_records.size(); row < ctx.layout.capacity; row++) begin
+			offset = ctx.layout.module_offset + ctx.layout.table_offset + 64'(row) * 16;
+
+			if (verify) begin
+				mmio(ctx.target, 0, offset, 16, 0, 0, readback, ok, why);
+				if (!ok) return;
+
+				if (readback !== invalid_entry) begin
+					ok  = 0;
+					why = $sformatf("Notify invalid-row readback mismatch row=%0d offset=0x%016h", row, offset);
+					return;
+				end
+			end else begin
+				write_table_dwords(ctx.target, offset, 16, invalid_entry, ok, why);
+				if (!ok) return;
+			end
+		end
+	end
+
+	ok  = 1;
+	why = "";
+endtask
+
+
+// 驱动的 MSI-X linear 无效行将全部非 reserved 字段置1，使空行排在查找目录尾部。
+// 完整配置只使用一张统一管理窗口的单 bank；不自动切换 bank 或写 ready 寄存器。
+task project_dut_config_seq::process_msix_tail(
+	input bit	verify,
+	output bit	ok,
+	output string	why
+);
+	project_msix_linear_entry_t	invalid_entry;
+	project_table_context_t		ctx;
+	logic [127:0]			readback;
+	bit [63:0]			offset;
+	bit [63:0]			address;
+
+	ok  = 0;
+	why = "MSI-X linear directory is empty";
+	if (cfg.msix_linear_records.size() == 0) return;
+
+	ctx = cfg.msix_linear_records[0].ctx;
+	if (ctx.layout.capacity > 2048 || cfg.msix_linear_records.size() > ctx.layout.capacity) begin
+		why = "MSI-X linear directory exceeds the single-bank layout";
+		return;
+	end
+	invalid_entry                = '1;
+	invalid_entry.reserved_63_35 = '0;
+	offset = ctx.layout.module_offset + ctx.layout.table_offset;
+	if (!cfg.bar_registry.check_range(ctx.target, offset,
+		64'(ctx.layout.capacity) * 8, address, why)) return;
+
+	for (int unsigned row = cfg.msix_linear_records.size(); row < ctx.layout.capacity; row++) begin
+		offset = ctx.layout.module_offset + ctx.layout.table_offset + 64'(row) * 8;
+		if (verify) begin
+			mmio(ctx.target, 0, offset, 8, 0, 0, readback, ok, why);
+			if (!ok) return;
+			if (readback !== 128'(invalid_entry)) begin
+				ok  = 0;
+				why = $sformatf("MSI-X invalid-row readback mismatch row=%0d offset=0x%016h", row, offset);
+				return;
+			end
+		end else begin
+			write_table_dwords(ctx.target, offset, 8, 128'(invalid_entry), ok, why);
+			if (!ok) return;
+		end
+	end
+
+	ok  = 1;
+	why = "";
+endtask
+
+
 // 本批次共享项按真实表地址去重，调用前完成全部 scope 预检。
 task project_dut_config_seq::configure_qsch(
 	input project_vio_selection_t	selection,
@@ -854,7 +1083,54 @@ task project_dut_config_seq::configure_qsch(
 	output string			why
 );
 	project_table_kind_e	kinds[$] = '{PROJECT_Q2TC, PROJECT_N2G, PROJECT_G2P, PROJECT_SPWRR, PROJECT_TC_WEIGHT};
+
+	if (cfg.qsch_configure_controls) begin
+		configure_qsch_mode(selection, ok, why);
+		if (!ok) return;
+	end
+
 	configure_queues(kinds, selection, ok, why);
+endtask
+
+
+// 从实际 Q2TC 目标解析管理 BAR；同一窗口仅写一次模式，所有值均由 cfg 参数提供。
+// mode 的 VNET/ETS 关系已在 cfg 准备控制项时校验；可选读回失败不会继续使能队列。
+task project_dut_config_seq::configure_qsch_mode(
+	input project_vio_selection_t	selection,
+	output bit			ok,
+	output string			why
+);
+	project_table_kind_e	kinds[$] = '{PROJECT_Q2TC};
+	project_config_record_t	batch[$];
+	bit			seen[string];
+	logic [127:0]		readback;
+
+	ok = 0;
+	if (!cfg.queue_records(selection, kinds, batch, why)) return;
+
+	foreach (batch[i]) begin
+		if (seen.exists(batch[i].ctx.target.canonical_name)) continue;
+		seen[batch[i].ctx.target.canonical_name] = 1;
+
+		mmio(batch[i].ctx.target, 1, cfg.qsch_mode_offset,
+			4, 128'(cfg.qsch_mode), 0, readback, ok, why);
+		if (!ok) return;
+		if (!cfg.verify_readback) continue;
+
+		mmio(batch[i].ctx.target, 0, cfg.qsch_mode_offset,
+			4, 0, 0, readback, ok, why);
+		if (!ok) return;
+
+		if (readback[31:0] !== 32'(cfg.qsch_mode)) begin
+			ok  = 0;
+			why = $sformatf("QSCH mode readback mismatch offset=0x%016h expected=%08h actual=%08h",
+				cfg.qsch_mode_offset, cfg.qsch_mode, readback[31:0]);
+			return;
+		end
+	end
+
+	ok  = 1;
+	why = "";
 endtask
 
 
@@ -869,179 +1145,163 @@ task project_dut_config_seq::configure_vio_queues(
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_bdf 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_bdf_entry(
 	input project_bdf_cfg_t	item,
 	output bit		ok,
 	output string		why
 );
-	ok = 0;
-	why = "required user_configure_bdf_entry is not implemented";
+	write_bdf(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_completion_bdf 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_completion_bdf_entry(
 	input project_completion_bdf_cfg_t	item,
 	output bit				ok,
 	output string				why
 );
-	ok = 0;
-	why = "required user_configure_completion_bdf_entry is not implemented";
+	write_completion_bdf(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_pfvf 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_pf_vf_entry(
 	input project_pfvf_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_pf_vf_entry is not implemented";
+	write_pfvf(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_tlp_prefix 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_tlp_prefix_entry(
 	input project_tlp_prefix_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_tlp_prefix_entry is not implemented";
+	write_tlp_prefix(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_msix_linear 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_msix_linear_entry(
 	input project_msix_linear_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_msix_linear_entry is not implemented";
+	write_msix_linear(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_msix_info 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_msix_info_entry(
 	input project_msix_info_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_msix_info_entry is not implemented";
+	write_msix_info(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_msix_interval 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_msix_interval_entry(
 	input project_msix_interval_cfg_t	item,
 	output bit				ok,
 	output string				why
 );
-	ok = 0;
-	why = "required user_configure_msix_interval_entry is not implemented";
+	write_msix_interval(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_msix_table 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_msix_table_entry(
 	input project_msix_table_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_msix_table_entry is not implemented";
+	write_msix_table(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_qsch_q2tc 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_qsch_q2tc(
 	input project_qsch_q2tc_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_qsch_q2tc is not implemented";
+	write_qsch_q2tc(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_qsch_n2g 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_qsch_n2g(
 	input project_qsch_n2g_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_qsch_n2g is not implemented";
+	write_qsch_n2g(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_qsch_g2p 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_qsch_g2p(
 	input project_qsch_g2p_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_qsch_g2p is not implemented";
+	write_qsch_g2p(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_rdma_notify 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_rdma_notify_entry(
 	input project_rdma_notify_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_rdma_notify_entry is not implemented";
+	write_rdma_notify(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_qsch_rnet 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_qsch_rnet_entry(
 	input project_qsch_rnet_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_qsch_rnet_entry is not implemented";
+	write_qsch_rnet(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_vtx 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_vtx_queue(
 	input project_vtx_cfg_t	item,
 	output bit		ok,
 	output string		why
 );
-	ok = 0;
-	why = "required user_configure_vtx_queue is not implemented";
+	write_vtx(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_vrx 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_vrx_queue(
 	input project_vrx_cfg_t	item,
 	output bit		ok,
 	output string		why
 );
-	ok = 0;
-	why = "required user_configure_vrx_queue is not implemented";
+	write_vrx(item, ok, why);
 endtask
 
 
-// 用户必须覆写本单项 hook；base 返回失败，不能把未实现配置记成成功。
+// 默认以 write_vio_notify 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_vio_notify_entry(
 	input project_vio_notify_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_vio_notify_entry is not implemented";
+	write_vio_notify(item, ok, why);
 endtask
 
 
@@ -1089,47 +1349,43 @@ task project_dut_config_seq::user_configure_msix_function(
 endtask
 
 
-// 平台控制语义未定义；用户实现后才能报告成功，不自动调用旧 reset/init。
+// 默认以 write_control 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_qsch_spwrr(
 	input project_control_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_qsch_spwrr is not implemented";
+	write_control(item, ok, why);
 endtask
 
 
-// 平台控制语义未定义；用户实现后才能报告成功，不自动调用旧 reset/init。
+// 默认以 write_control 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_qsch_tc_weight(
 	input project_control_cfg_t	item,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_configure_qsch_tc_weight is not implemented";
+	write_control(item, ok, why);
 endtask
 
 
-// 平台控制语义未定义；用户实现后才能报告成功，不自动调用旧 reset/init。
+// 默认以 write_queue_aux 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_configure_queue_aux(
 	input project_queue_control_cfg_t	item,
 	output bit				ok,
 	output string				why
 );
-	ok = 0;
-	why = "required user_configure_queue_aux is not implemented";
+	write_queue_aux(item, ok, why);
 endtask
 
 
-// 平台控制语义未定义；用户实现后才能报告成功，不自动调用旧 reset/init。
+// 默认以 write_enabled_queue 发送本项；平台可覆写写法，失败原样交给配置流程。
 task project_dut_config_seq::user_enable_queue(
 	input project_queue_control_cfg_t	item,
 	output bit				ok,
 	output string				why
 );
-	ok = 0;
-	why = "required user_enable_queue is not implemented";
+	write_enabled_queue(item, ok, why);
 endtask
 
 
@@ -1177,16 +1433,54 @@ task project_dut_config_seq::user_verify_dpu_configuration(
 endtask
 
 
-// 用户显式验证平台行为；默认失败，不以 posted send 代替设备确认。
+// 读回实际配置表，而非共享 data staging 端口；使能后的队列表按 enable 位更新期望值。
+// 当前初始化尚未发 Notify，ring 不应运行；自清零/只写的项目寄存器可覆写此验证方法。
+// 读失败或任一有效位不符都阻止 commit，不把 posted 发送成功视为设备已应用。
 task project_dut_config_seq::user_verify_vio_configuration(
 	input project_vio_selection_t	selection,
 	output bit			ok,
 	output string			why
 );
-	ok = 0;
-	why = "required user_verify_vio_configuration is not implemented";
-endtask
+	project_table_kind_e	kinds[$] = '{
+		PROJECT_NOTIFY, PROJECT_Q2TC, PROJECT_N2G, PROJECT_G2P,
+		PROJECT_SPWRR, PROJECT_TC_WEIGHT, PROJECT_VTX, PROJECT_VRX, PROJECT_QUEUE_AUX
+	};
+	project_config_record_t	batch[$];
+	bit			seen[string];
+	logic [127:0]		readback;
+	logic [127:0]		expected;
+	logic [127:0]		mask;
 
+	ok = 0;
+	if (!cfg.queue_records(selection, kinds, batch, why)) return;
+
+	foreach (batch[i]) begin
+		if (seen.exists(batch[i].ctx.record_key)) continue;
+		seen[batch[i].ctx.record_key] = 1;
+
+		expected = (batch[i].entry & ~batch[i].enable_mask) | batch[i].enable_value;
+		mask     = '1;
+		mask     = mask >> (128 - batch[i].ctx.layout.entry_bytes * 8);
+
+		if (batch[i].ctx.kind inside {PROJECT_SPWRR, PROJECT_TC_WEIGHT, PROJECT_QUEUE_AUX}) begin
+			mask = cfg.platform_control_mask(batch[i]);
+		end
+
+		mmio(batch[i].ctx.target, 0, batch[i].ctx.byte_offset,
+			batch[i].ctx.layout.entry_bytes, 0, 0, readback, ok, why);
+		if (!ok) return;
+
+		if ((readback & mask) !== (expected & mask)) begin
+			ok  = 0;
+			why = $sformatf("readback mismatch %s BAR offset=0x%016h expected=%032h actual=%032h mask=%032h",
+				batch[i].ctx.record_key, batch[i].ctx.byte_offset, expected, readback, mask);
+			return;
+		end
+	end
+
+	ok  = 1;
+	why = "";
+endtask
 
 // 全部四态检查在两态 registry/sequence 转换前执行，保留小端 byte lane 和 skip-mask 语义。
 task project_dut_config_seq::mmio(
@@ -2078,6 +2372,47 @@ task project_dut_config_seq::verify_dpu_configuration(
 	if (!scope.validate(cfg.dpu_setup, why)) return;
 
 	user_verify_dpu_configuration(scope, ok, why);
+endtask
+
+
+// BDF 与 MSI-X 已从其他公共配置独立；可选读回只覆盖本次真正选中的数据表。
+// 空 scope 表示该类别未执行，不能构造空 Function 列表来意外验证全部 Function。
+// 每条记录按实际 BAR 和宽度读取；任一不符立即返回，不使能后续 VIO 队列。
+task project_dut_config_seq::verify_function_configuration(
+	input project_dpu_config_scope	bdf_scope,
+	input project_dpu_config_scope	msix_scope,
+	output bit			ok,
+	output string			why
+);
+	project_table_kind_e	kinds[$] = '{PROJECT_BDF, PROJECT_MSIX_LINEAR,
+		PROJECT_MSIX_INFO, PROJECT_MSIX_INTERVAL, PROJECT_MSIX_TABLE};
+	project_config_record_t	batch[$];
+	project_dpu_config_scope	scope;
+	bit			seen[string];
+	logic [127:0]		readback;
+
+	ok = 0;
+	foreach (kinds[k]) begin
+		scope = kinds[k] == PROJECT_BDF ? bdf_scope : msix_scope;
+		if (scope == null) continue;
+		if (!cfg.public_records(kinds[k], scope, batch, why)) return;
+		foreach (batch[i]) begin
+			if (seen.exists(batch[i].ctx.record_key)) continue;
+			seen[batch[i].ctx.record_key] = 1;
+			mmio(batch[i].ctx.target, 0, batch[i].ctx.byte_offset,
+				batch[i].ctx.layout.entry_bytes, 0, 0, readback, ok, why);
+			if (!ok) return;
+			if (readback !== batch[i].entry) begin
+				ok  = 0;
+				why = $sformatf("readback mismatch %s BAR offset=0x%016h expected=%032h actual=%032h",
+					batch[i].ctx.record_key, batch[i].ctx.byte_offset, batch[i].entry, readback);
+				return;
+			end
+		end
+	end
+
+	ok  = 1;
+	why = "";
 endtask
 
 

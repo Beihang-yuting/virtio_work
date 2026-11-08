@@ -43,8 +43,11 @@ DPU、net_packet、host_mem、PCIe TL、VIO、AIP glue、Intel interface/adapter
 依赖版本与 package SHA-256 见 [验证记录](vio_external_configuration_validation.md)。
 生产 VIO filelist 不包含本目录；模型测试需另外添加 `filelists/project_tests.f`。
 
-public table hooks 默认失败；没有配置平台输入的示例不是可直接运行的真实 DUT test。
-base_test 显式启动一个配置 seq，共用 env_cfg 中的资源完成写表、使能、验证和确认。
+默认采用驱动参考 BDF/MSI-X/VIO/QSCH 布局，配置 seq 已实现这些表的写入和可选真实读回。
+BDF默认开启，MSI-X按实际完成模式选择；其余公共表默认关闭。
+默认 dpu.verify_readback=0；设为1时增加配置读回。
+BAR 编码、公共验证及实际复位/接口绑定仍由平台负责。
+base_test 显式启动一个配置 seq，共用 env_cfg 中的资源完成写表、使能、所选验证和确认。
 ring 在写队列表前准备；不自动执行 Virtio capability 发现、协商或复位。
 
 """]

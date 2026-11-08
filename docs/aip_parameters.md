@@ -184,7 +184,7 @@ pcie_cfg.load_params("pcie_cfg"); // 此后再创建消费它的 PCIe env
 +pcie_cfg.read_completion_boundary=RCB_128
 ```
 
-桥进入运行阶段后执行 `set_param pcie_cfg.* ...` 只修改 AIP 参数表，不会重新加载
+桥进入运行阶段后执行 `set_param path=pcie_cfg.<字段> value=<值>` 只修改 AIP 参数表，不会重新加载
 已构建的配置，也不会自动重配 manager、driver 或硬件。构建参数应通过启动 plusargs
 或平台在 build 前的参数设置提供。
 
@@ -248,6 +248,15 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 | --- | --- |
 | `dpu.reg_target` | `project_env_cfg`；默认 `pf0.bar0`，只是访问窗口，不改变条目 owner |
 | `dpu.print_bar_map` | `project_env_cfg`；默认1，发布后逐代打印真实 BAR，不发 TLP |
+| `dpu.configure_public` | 默认0；1才额外执行 BAR/PFVF/Completion BDF/Prefix 等公共配置，保留显式非VIO消息；不控制软件BAR分配或VIO所需BDF/MSI-X |
+| `dpu.configure_bdf` | 默认1；独立配置BDF请求身份表，地址为管理BAR+0x108000+bdf_index*4；0用于平台已配置的场景 |
+| `dpu.driver_layouts` | 默认1；补齐 BDF/MSI-X/Notify/QSCH/VTX/VRX 驱动参考地址，已提供布局优先；0时自行声明 |
+| `dpu.verify_readback` | 默认0；配置 seq 只写、不读回。1时验证BDF、所选MSI-X、QSCH模式、Notify/QSCH/队列表及两张查找表尾部，以及已选择的其他公共配置 |
+| `dpu.hH.pfP[.vfV].requester/intel_pf/intel_vf/vport` | 软件路由；每 Host 的 PF0/no-VF 默认0/0/-1/0，其余Function显式提供四项或完整 policy；不下发硬件表 |
+| `dpu.hH.pfP[.vfV].bdf_index` | BDF表硬件索引0..127；新生成policy默认取vport，已有显式policy保持其索引；配置seq使用同一身份写表 |
+| `dpu.qsch.configure_controls` | 默认1；配置模式并自动生成缺少的SP/WRR和TC weight项，显式catalog优先 |
+| `dpu.qsch.mode/mode_offset` | 默认0/0xb001c0；mode为0=VNET、1=ETS，须与service的ets一致；offset为管理BAR内字节偏移 |
+| `dpu.qsch.spwrr/tc_weight` | 默认0xff/0x11111111；分别8位SP/WRR选择、32位TC权重，每个实际net_id生成一项 |
 | `dpu.<category>.reg_target` | `project_env_cfg::load_platform_params`；覆盖该类别访问窗口，类别见下表 |
 | `dpu.bar_map.reg_target` / `dpu.msix.reg_target` / `dpu.qsch.reg_target` | 同类；BAR/MSI-X/QSCH 家族默认，详细类别覆盖家族 |
 | `vio.vtx.reg_target` / `vio.vrx.reg_target` / `vio.notify_table.reg_target` | 同类；分别最后覆盖 `dpu.vtx/vrx/vio_notify.reg_target` |
@@ -267,7 +276,7 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 `msix_info`、`msix_interval`、`msix_control`、`msix_table`、`msix_function`、
 `vio_notify`、`qsch_q2tc`、`qsch_n2g`、`qsch_g2p`、`qsch_spwrr`、
 `qsch_tc_weight`、`vtx`、`vrx`、`queue_aux`、`rdma_notify`、`qsch_rnet`。
-未提供的表布局仍失败，reg_target 不能代替布局声明。完整 `hH.pfP[.vfV].barB`
+默认驱动布局覆盖 VIO/QSCH；其他未提供的表布局在使用时仍失败，reg_target 只选访问窗口。完整 `hH.pfP[.vfV].barB`
 自带访问 Host；多 Host 短路径必须由 typed layout 指定访问 Host 或明确采用 owner Host。
 
 公共 MSI-X 参数由 `project_env_cfg::load_platform_params` 拥有，不依赖 VIO service。
@@ -279,9 +288,9 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 | `pba_bar/pba_offset/pba_words` | PBA 独立布局，显式64位word容量，8B对齐；不从 vector 数猜容量，不做初始化写 |
 | `msg_addr_base/msg_addr_stride` | 64位 Message Address 模板，溢出拒绝，无APIC区域限制 |
 | `msg_data_base/msg_data_stride` | 32位完整 Message Data 模板；不要求低位等于vector |
-| `interval_rate/interval_packets` | 各16位，必须明确声明；对应图片 MSI-X interval 两字段 |
-| `self_mask` | 0/1，必须显式声明；实际RTL的再次使能由平台完成 |
-| `table_only_enable` | 0/1，显式声明是否仅靠table mask使能；否则提供 Function control catalog/hook |
+| `interval_rate/interval_packets` | 各16位，参考默认均0；对应图片 MSI-X interval 两字段 |
+| `self_mask` | 参考默认0；设为1时实际RTL的再次使能由平台完成 |
+| `table_only_enable` | 参考默认1，仅靠table mask使能；设为0时提供 Function control catalog/hook |
 | `vN.msg_addr/vN.msg_data/vN.masked` | 按local vector N逐项覆盖模板；data32位，masked为0/1 |
 
 项目队列表策略也在 `project_env_cfg::load_platform_params` 注册。
@@ -299,15 +308,18 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 | `notify_net_pair5` | 0/1，明确采用单bank net pair5编码 |
 | `notify_table_bar/notify_table_offset` | notify lookup base的owner BAR/offset；提供offset才标记存在，与核心doorbell不同 |
 
-以上整数在窄字段赋值前检查越界。模块基址、间接端口、PBA容量、队列mode选择、
-Function编码关系、BAR原子组和控制catalog没有猜测默认；以typed cfg填写。
+以上整数在窄字段赋值前检查越界。VIO/QSCH 模块与间接端口由驱动参考布局提供，
+可在env构建前修改typed cfg；公共PBA/Function表编码/BAR组仍按平台明确声明。
+Notify 按 `{host_id, BAR匹配基址, pair编号}` 排序后分配物理行，global_qid保持实际资源编号。
+默认seq初始化512行单bank及无效尾部；`dpu.verify_readback=1` 时通过真实Memory Read验证。
+Notify目录使用统一管理BAR；参考布局短目标默认Host0，可用`vio.notify_table.reg_target`改为完整目标。
 `dpu.notify.bank/auto_bank/full_bank`、legacy `dpu.msix.rate/packets/emit_interval`
 与 legacy QSCH generator 不是项目执行策略；项目 notify 只支持单bank逐项写。
 
 项目运行时只调用 `env.register_aip_commands()`，内部使用
 `virtio_aip_registry::register_business_commands()`；公共无VIO用途跳过注册。
 不能在同一个项目流程另行调用下节 `register_commands()` 打开旧init/reset/MQ/RSS。
-项目启动/停止并不自动配置硬件，必须先完成 typed 配置/使能/验证/确认。
+项目启动/停止并不自动配置硬件，必须先完成 typed 配置/使能/所选验证/确认。
 
 ## 普通标准驱动：在现有 base_test 注册命令
 
@@ -342,17 +354,20 @@ Tcl `end_test` 使其返回，再释放 objection。参考 `virtio_aip_driver_te
 | `vio.mq.target/pairs` | 动态 MQ 命令，必须服从当前已分配资源上限 |
 | `vio.rss.target/hash_types/hash_key_size/hash_key[i]/table_size/indirection_table[i]` | RSS 控制输入；设备须已协商对应功能 |
 
+单条设置使用 `set_param path=<参数路径> value=<值>`；直接写
+`set_param <参数路径> <值>` 会因缺少命名字段 `path` 而报错。
+
 ```tcl
-set_param vio.target h0.pf0.i0
-set_param vio.tx.kind ETH_IPV4_UDP
-set_param vio.tx.len 128
-set_param vio.tx.hdr.eth.dst_mac 0x001122334455
+set_param path=vio.target value=h0.pf0.i0
+set_param path=vio.tx.kind value=ETH_IPV4_UDP
+set_param path=vio.tx.len value=128
+set_param path=vio.tx.hdr.eth.dst_mac value=0x001122334455
 vio_init
 vio_start
 vio_tx count=100
 # 下一次调用使用新参数；已运行的构建配置不会因此改变。
-set_param vio.tx.kind ETH_IPV4_TCP
-set_param vio.tx.len 512
+set_param path=vio.tx.kind value=ETH_IPV4_TCP
+set_param path=vio.tx.len value=512
 vio_tx count=20
 vio_stop
 vio_reset

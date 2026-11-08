@@ -35,7 +35,7 @@ virtual class project_base_test extends uvm_test;
 		input string	why
 	);
 
-	// 唯一运行顺序：平台就绪→独立表配置/验证→VIO 确认→业务命令→Tcl→业务收尾。
+	// 唯一运行顺序：平台就绪→独立表配置/可选读回→VIO 确认→业务命令→Tcl→业务收尾。
 	// 运行期 Tcl 只能改变下一条命令采样的参数，不能改写已冻结拓扑。
 	extern virtual task run_phase(
 		uvm_phase	phase
@@ -73,7 +73,7 @@ function void project_base_test::require_success(
 endfunction
 
 // 平台就绪后启动一个配置 sequence；失败不进入业务，成功才注册发包命令。
-// 用户通过 factory override 替换 project_dut_config_seq 的单项硬件 hook。
+// 参考 VIO/QSCH 布局可直接使用基类；平台特殊访问才需 factory override 单项 hook。
 task project_base_test::run_phase(
 	uvm_phase	phase
 );

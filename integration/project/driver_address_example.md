@@ -29,8 +29,8 @@ VTX/VRX 的 ring 地址 = prepare 导出的 item.entry.desc_addr / dsc_addr
 | BDF map | `0x108000 + i*4` | 4 | Function 对应的全局表索引 |
 | Completion BDF | `0x098000 + i*4` | 4 | 驱动用 srcid；当前由 `completion_index` 显式声明 |
 | TLP prefix | `0x118000 + i*8` | 8 | `prefix_index`；不从 BDF 或 qid 猜测 |
-| VIO notify lookup | `0x0a0000 + i*16` | 16 | 当前单 bank；不是业务 doorbell 地址 |
-| MSI-X linear | `0x0c0000 + i*8` | 8 | 当前显式单 bank 布局；不写驱动 bank-select/ready |
+| VIO notify lookup | `0x0a0000 + i*16` | 16 | 当前单 bank；i 是按 Host/BAR/pair 排序后的行号，global_qid 存在表项中 |
+| MSI-X linear | `0x0c0000 + i*8` | 8 | 单 bank；i为Host/PFVF/local-vector排序行号，global-vector存在表项中 |
 | MSI-X message table | `0x120000 + i*16` | 16 | 管理窗口全局 vector；与 Function 本地 BAR4 窗口区分 |
 | MSI-X interval | `0x140000 + i*4` | 4 | 全局 vector |
 | MSI-X info | `0x150000 + i*4` | 4 | 全局 vector |
@@ -64,98 +64,44 @@ base/limit 表每项8B，size-code 每项4B。归档中找到了这些寄存器�
 
 ## cfg：集中填写偏移
 
-将两个方法合入已有 cfg；类名按你的项目替换。先调用 `load_params()`，再调用
-`use_driver_reference_layouts()`，最后创建 env。这里的 capacity 是参考配置上限，
-不是从 C 结构宽度推导出的硬件容量；最终按 DUT 规格调整，越界仍由环境拒绝。
+`project_env_cfg::load_params()` 默认调用已有 `use_driver_reference_layouts()`，
+补齐 BDF/MSI-X/Notify/QSCH/VTX/VRX 地址。显式 `provided` 布局优先，关闭默认地址可设置
+`+dpu.driver_layouts=0`。修改现有地址只需在 env 构建前修改 `cfg.table_layouts`，
+无需复制这些方法或手填 BAR 物理地址。
+
+当前默认 BDF 已独立下发，MSI-X 按完成模式选择。以下其余公共地址仅在需要时添加；可在已有 cfg 中增加
+这个可选方法；它复用源码已有 `set_driver_layout()`，仍需提供真实身份、BAR 分组及公共验证。
+这里 capacity 是参考上限，最终按 DUT 规格调整。
 
 <!-- cfg-declarations -->
 ```systemverilog
-// 放入 cfg 类内；不访问 DUT，不分配或重写 BAR。
-extern function void set_driver_layout(
-	input project_table_kind_e	kind,
-	input logic [63:0]			module_offset,
-	input logic [63:0]			table_offset,
-	input int unsigned			entry_bytes,
-	input int unsigned			capacity,
-	input project_index_policy_e	index_policy
-);
-
-// 显式选择本驱动的地址参考；不在 new/load_params 中自动调用。
-extern function void use_driver_reference_layouts();
+// 仅公共表模式需要；在 load_params 后、env 创建前由平台显式调用。
+extern function void use_public_driver_reference_layouts();
 ```
 
 <!-- cfg-implementations -->
 ```systemverilog
-// 保存完整布局声明；真实访问地址由 cfg 的冻结 BAR registry 在运行时解析。
-function void project_env_cfg::set_driver_layout(
-	input project_table_kind_e	kind,
-	input logic [63:0]			module_offset,
-	input logic [63:0]			table_offset,
-	input int unsigned			entry_bytes,
-	input int unsigned			capacity,
-	input project_index_policy_e	index_policy
-);
-	table_layouts[kind] = '{
-		provided:1, reg_target:"h0.pf0.bar0",
-		module_offset:module_offset, table_offset:table_offset,
-		entry_bytes:entry_bytes, capacity:capacity,
-		index_policy:index_policy, required:1,
-		default:0
-	};
-endfunction
-
-// 地址仅来自上传驱动；保留图片字段与单 bank 方案。
-// Function 身份、PFVF 关系、消息地址、预取 RAM 和服务策略仍使用你已有的配置。
-function void project_env_cfg::use_driver_reference_layouts();
+// 补充公共硬件表地址；不下发配置，不设置 BAR 分组或猜测 PFVF 身份编码。
+function void project_env_cfg::use_public_driver_reference_layouts();
 	set_driver_layout(PROJECT_PFVF, 'h080000, 'h08000, 4, 4, PROJECT_INDEX_EXPLICIT);
-	set_driver_layout(PROJECT_BDF, 'h100000, 'h08000, 4, 128, PROJECT_INDEX_GLOBAL_FUNCTION);
 	set_driver_layout(PROJECT_COMPLETION_BDF, 'h080000, 'h18000, 4, 4096, PROJECT_INDEX_EXPLICIT);
 	set_driver_layout(PROJECT_PREFIX, 'h100000, 'h18000, 8, 256, PROJECT_INDEX_EXPLICIT);
-
-	set_driver_layout(PROJECT_NOTIFY, 'h080000, 'h20000, 16, 512, PROJECT_INDEX_GLOBAL_QPAIR);
-	set_driver_layout(PROJECT_MSIX_LINEAR, 'h080000, 'h40000, 8, 2048, PROJECT_INDEX_GLOBAL_VECTOR);
-	set_driver_layout(PROJECT_MSIX_TABLE, 'h100000, 'h20000, 16, 1024, PROJECT_INDEX_GLOBAL_VECTOR);
-	set_driver_layout(PROJECT_MSIX_INTERVAL, 'h100000, 'h40000, 4, 1024, PROJECT_INDEX_GLOBAL_VECTOR);
-	set_driver_layout(PROJECT_MSIX_INFO, 'h100000, 'h50000, 4, 1024, PROJECT_INDEX_GLOBAL_VECTOR);
-
-	set_driver_layout(PROJECT_Q2TC, 'hb00000, 'h10000, 4, 2048, PROJECT_INDEX_GLOBAL_QPAIR);
-	set_driver_layout(PROJECT_N2G, 'hb00000, 'h12000, 4, 1024, PROJECT_INDEX_EXPLICIT);
-	set_driver_layout(PROJECT_G2P, 'hb00000, 'h14000, 4, 1024, PROJECT_INDEX_EXPLICIT);
-	set_driver_layout(PROJECT_SPWRR, 'hb00000, 'h16000, 4, 1024, PROJECT_INDEX_EXPLICIT);
-	set_driver_layout(PROJECT_TC_WEIGHT, 'hb00000, 'h18000, 4, 1024, PROJECT_INDEX_EXPLICIT);
-
-	set_driver_layout(PROJECT_VTX, 'h880000, 'h10000, 16, 2048, PROJECT_INDEX_GLOBAL_QPAIR);
-	table_layouts[PROJECT_VTX].indirect     = 1;
-	table_layouts[PROJECT_VTX].data_port    = 'h134;
-	table_layouts[PROJECT_VTX].control_port = 'h130;
-	table_layouts[PROJECT_VTX].index_mask   = 'h0000_07ff;
-	table_layouts[PROJECT_VTX].trigger_mask = 'h0000_2000;
-
-	set_driver_layout(PROJECT_VRX, 'h900000, 'h10000, 16, 2048, PROJECT_INDEX_GLOBAL_QPAIR);
-	table_layouts[PROJECT_VRX].indirect     = 1;
-	table_layouts[PROJECT_VRX].data_port    = 'h204;
-	table_layouts[PROJECT_VRX].control_port = 'h200;
-	table_layouts[PROJECT_VRX].index_mask   = 'h0000_ffff;
-	table_layouts[PROJECT_VRX].trigger_mask = 'h0001_0000;
-
-	// 只登记可选类别的地址；没有相应 catalog 时不要求写入。
 	set_driver_layout(PROJECT_RDMA_NOTIFY, 'h080000, 'h0c000, 8, 256, PROJECT_INDEX_EXPLICIT);
 	set_driver_layout(PROJECT_RNET, 'hb00000, 'h15000, 4, 256, PROJECT_INDEX_EXPLICIT);
 	table_layouts[PROJECT_RDMA_NOTIFY].required = 0;
 	table_layouts[PROJECT_RNET].required        = 0;
-	table_layouts[PROJECT_SPWRR].required       = 0;
-	table_layouts[PROJECT_TC_WEIGHT].required   = 0;
 endfunction
 ```
 
-若使用上面的管理窗口全局 MSI-X message table，应将相应 `msix_policies[name].table_present`
+若使用默认管理窗口全局 MSI-X message table，应将相应 `msix_policies[name].table_present`
 设为0，让环境使用 `table_layouts[PROJECT_MSIX_TABLE]`。`table_present=1` 会优先选择
 Function 自己的 BAR/本地 vector 布局。Host MSI-X 消息目的地址来自 message policy，
 它是 Host 地址，与这里的 DUT BAR 地址不同。
 
 ## 配置 seq：各类别使用同一份 cfg 生成的 item
 
-在 `my_dut_config_seq extends project_dut_config_seq` 中覆写所需 hook，类内保持对应 `extern virtual task` 声明，类外实现如下。只改地址时修改 cfg 布局即可。
+下列 typed 写法已由 `project_dut_config_seq` 基类实现；沿用这些写法时直接启动基类即可。
+若平台需要覆写单项时序，在 `my_dut_config_seq extends project_dut_config_seq` 中使用相应 `extern virtual task` 声明和以下实现。只改地址时修改 cfg 布局即可。
 `item.entry` 包含冻结的 Function/ring/vector 关联，字段策略应在 prepare 前填写。
 
 <!-- seq-typed-implementations -->
@@ -275,8 +221,26 @@ task my_dut_config_seq::user_enable_queue(
 endtask
 ```
 
-上述 posted 写成功仅表示发送完成。`user_verify_*` 仍需接入平台读回/状态检查，
-不能改成空成功。VTX/VRX 可通过 `item.ctx.byte_offset` 读回参数表，而不是读取 data staging 端口。
+上述 posted 写成功仅表示发送完成。`dpu.verify_readback=1` 时，`user_verify_vio_configuration()`
+读回 Notify、QSCH、VTX/VRX 参数表，body 另读回单 bank 无效尾部；默认0时跳过这些配置读回。
+公共 `user_verify_dpu_configuration()` 仍由平台实现，在同时开启公共配置与读回时调用。
+独立 BDF/MSI-X 的内建读回由 `verify_function_configuration()` 完成，不依赖公共验证 hook；
+MSI-X linear 无效尾部也只在开启读回时检查。
+VTX/VRX 读回位置为 `item.ctx.byte_offset`，与 data staging 端口分别处理。
+
+## Notify 表项排序
+
+驱动 `af_mng.c:1632–1640` 取表项低64位并清除低7位作为 Function 查找 key；
+`:1676–1685` 按 `host_id` 和 Notify 基址的组合升序插入，`:1717–1734` 在组内按 pair 编号填入。
+`global_qid` 只作为查找结果写入表项，不能用它直接计算 Notify 表行号。
+当前 cfg 按同一规则生成 `notify_records`，排序后行号为 `0..N-1`，RX/TX 共用一行。
+默认 seq 将其余行填为驱动无效项：type=3，Host/base/local/global qid域全1，reserved=0。
+图片版本保持512行单 bank，不执行驱动的双 bank 切换或 ready 寄存器写入。
+
+MSI-X linear 同样按查找键排列：驱动 `af_mng.c:1068–1191` 使用
+`(host_id<<19)|(pfvf_id<<9)` 确定 Function 顺序，再按 local vector 递增。
+`cfg.msix_linear_records` 保存完整排序目录；global vector仅保留为映射结果。
+参考流程在选择 MSI-X 时初始化2048行单 bank，空行有效字段全1、reserved=0。
 
 ## VTX/VRX 的六次写入
 
@@ -480,8 +444,10 @@ VF 组调用同一 task，传入对应 family 硬件行号和已确认的 size-c
 
 ## QSCH 可选项和其他显式控制
 
-SP/WRR、TC weight 在 `cfg.platform_controls` 中登记 value/mask 和完整消费者，
-再由 `configure_qsch()` 调用前面的 hook。下面展示 cfg 中已有 service 的一项登记；
+SP/WRR、TC weight 默认按实际 net_id 自动生成，值由 `dpu.qsch.spwrr/tc_weight` 指定；
+QSCH 模式由 `dpu.qsch.mode/mode_offset` 控制，默认 0/0xb001c0。
+需要逐项覆盖时，在 `cfg.platform_controls` 中登记 value/mask 和完整消费者，显式项优先。
+下面展示 cfg 中已有 service 的一项登记；
 共享同一 net_id 时应合并其全部 service 到 `consumers`，不能只写其中一个消费者。
 
 ```systemverilog
@@ -516,7 +482,7 @@ cfg.platform_controls.push_back(control);
 pcie_bar_write_by_name("h0.pf0.bar0", 'h1010, 4, 128'h5555_aaaa, 0, ok, why);
 if (!ok) `uvm_fatal("AF_DECLARE", why)
 
-// QSCH 模式：驱动 0=VNET、1=ETS；这里选择 VNET。
+// QSCH 模式：默认 seq 已写入，读回由开关选择；下面仅展示平台独立控制时的写入。
 pcie_bar_write_by_name("h0.pf0.bar0", 'hb001c0, 4, 128'h0, 0, ok, why);
 if (!ok) `uvm_fatal("QSCH_MODE", why)
 

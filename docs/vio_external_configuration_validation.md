@@ -472,3 +472,130 @@ env 负责组件组装和句柄发布，base_test 等待平台就绪后启动一
 当前证据仍是模型端点与实际 Intel VIP 路径的软件验证。真实 RTL 的寄存器偏移、
 BAR 编码和平台 verify hook 由集成项目提供。生产 filelist/package 未加入 integration，
 `dpu_common`、`pcie_work` 无需本轮修改。
+
+## 2026-11-08：PF0 直接配置、Notify 排序与可选读回
+
+本轮基于 `6de73f9`，补齐参考 `project_env_cfg` 与 `project_dut_config_seq`，
+使无 PCIe IP 的 Host0/PF0、标准 Packed、轮询、一对只启 VTX 场景可以直接启动配置基类。
+`dpu.configure_public=0` 默认跳过公共硬件表，软件 BAR 分配、Intel 路由和队列资源仍保留。
+`dpu.driver_layouts=1` 提供上传驱动的 VIO/QSCH 地址；显式平台布局优先。
+默认 seq 写入 Notify、QSCH 模式与映射/权重、VTX/VRX 参数及使能位，然后确认资源。
+任一步失败以带阶段名的 `PROJECT_CONFIG_SEQ` fatal 结束，不再静默返回成功。
+
+按用户最终要求，`dpu.verify_readback=0` 为默认值：内建配置流程不发送 Memory Read。
+设为1恢复 QSCH 模式、VIO/QSCH 表和 Notify 无效尾部的读回，以及已选公共配置的验证。
+独立显式 verify API 仍执行验证。关闭读回时，READY 表示配置写入流程完成，
+不表示已读取 DUT 确认寄存器值；参数检查、发送结果检查和失败停止仍然有效。
+
+Notify 排序直接核对上传驱动 `af_mng.c:1632–1734`：
+
+```text
+Function key = (host_id << 61) | (notify_addr & 0x1fffffffffffff80)
+先按 Function key 升序，再按 Function 内本地 pair 编号升序
+Notify 行号 = 排序后的位置；global_qid = 资源分配的映射结果
+```
+
+驱动包 `prj1_v2_dpu_kernel_eth_driver.tar.gz` 的 SHA-256 为
+`97d8422424354c53c8ca7155a1b769e35b120c1d7a77d2be0faed642eb407ac7`。
+当前仍采用图片的512行单 bank：RX/TX 共用一行，空行填最大 key、type=3、reserved=0；
+全部 Host 共用一个管理窗口，不操作双 bank 切换或 ready 寄存器。
+独立排序 fixture 故意让 PF1 BAR 低于 PF0、pair 输入倒序且重复 RX/TX，
+断言排序后的 global qid 为 `2,3,0,1`，验证行号与 global qid 相互独立。
+
+仿真主机 `ubuntu@10.11.10.53`，VCS `W-2024.09-SP1_Full64`。
+远端隔离根为 `/home/ubuntu/ryan/project_config_notify_vcs_20261108.B07JHL`，
+构建输出为 `build/vio_external_config_validation/config_notify_vcs/final`。
+使用 `filelists/project_integration.f`、`filelists/project_tests.f` 和 `project_env_tb`；
+编译及 strict compile 均为0。最终15条仿真全部 sim/strict=`0/0`，
+UVM W/E/F=`0/0/0`，所有 PCIe scoreboard 的 mismatch/unexpected/timeout=`0/0/0`。
+
+| 场景 | 测试 / 附加参数 | 结果 |
+| --- | --- | --- |
+| 默认只写 | `project_bare_config_test` | 2066次配置写，0次读，READY 与512B TX Notify通过 |
+| 开启读回 | 同上，`+dpu.verify_readback=1` | 相同2066次写，519次真实读，READY 与TX Notify通过 |
+| 两对 VTX | 同上，`+PROJECT_BARE_PAIRS=2` | 2082次写、0次读；排序、队列表与TX Notify通过 |
+| Packed TX+RX | 同上，`+PROJECT_BARE_RX` | 2078次写、0次读；两方向配置与使能通过 |
+| Custom VTX | 同上，`+PROJECT_CUSTOM` | 2066次写、0次读；私有模式位与TX Notify通过 |
+| Custom TX+RX | 同上，`+PROJECT_CUSTOM +PROJECT_BARE_RX` | 2078次写、0次读；配置与TX Notify通过 |
+| 错误读回 | 同上，`+PROJECT_BARE_CORRUPT` | fixture开启读回；精确捕获验证失败，不进入READY |
+| 缺少布局 | 同上，`+PROJECT_BARE_MISSING_LAYOUT` | prepare失败，零配置写，不进入READY |
+| 原集成流程 | `project_external_integration_test +PROJECT_SMALL +PROJECT_DRIVER_PORTS` | CONFIG_SEQ / EXTERNAL_FLOW marker各1次 |
+| 两Host | 同上，`+PROJECT_TWO_HOSTS +PROJECT_SMALL +PROJECT_TX_ONLY` | 两Host与统一Notify窗口通过，两个SCB均无错误 |
+| 原接口合同 | `project_external_contract_test +PROJECT_SMALL +PROJECT_DRIVER_PORTS` | EXTERNAL_CONTRACT / TABLE_DWORD / INTEL_RX marker各1次 |
+| VTX/VRX发送故障，4条 | 集成测试，`+PROJECT_SMALL +PROJECT_DRIVER_PORTS +PROJECT_FAIL_DIRECTION=vtx\|vrx +PROJECT_FAIL_DWORD=3\|6` | 各失败点停止，CONFIG_FAILURE / EXTERNAL_FLOW各1次，无CONFIG_SEQ成功marker |
+
+表中缩写 marker 均有 `PROJECT_` 前缀与 `_PASS` 后缀，仅统计实际报告、不重复计入summary。
+所有 bare 正例同时出现 `PROJECT_BARE_CONFIG_PASS` 和 `PROJECT_BARE_TX_NOTIFY_PASS`，
+负例只有预期 `PROJECT_BARE_FAILURE_PASS`，禁止两个正例 marker。
+默认只写与开启读回的仿真时间分别为8.354μs、12.506μs；统计区间从 seq 启动前到
+首次512B TX Notify观测完成，包含模型检查，**不是单独的配置延迟**。
+
+错误读回 fixture 最初只改变 Completion 字节，导致 PCIe SCB 同时记录数据不一致。
+修正为模拟设备存储错误：同步设备模型和 SCB 的单字节数据基准，保留 cfg 期望值；
+实际 Completion 仍触发配置 seq 的比较失败，SCB 的传输检查保持开启。
+原失败证据保存在 `config_notify_vcs_readback_on_baseline/`，未修改产品逻辑来屏蔽错误。
+
+最终证据位于 `build/vio_external_config_validation/remote_evidence/config_notify_vcs_final/`。
+`source_manifest.sha256` 的21项与最终本地源码逐字节一致；`SHA256SUMS` 的88项复核通过。
+`accepted_results.tsv` 保存15行返回码、strict、marker、UVM与SCB结果；
+`simulation_log_manifest.sha256` 保存15个仿真日志哈希，依赖身份见 `dependency_provenance.txt`。
+
+| 证据文件 | SHA-256 |
+| --- | --- |
+| `source_manifest.sha256` | `a5eaa064c7d3dab7533eb60dc63d7cde1c40cc16e08246b6ce0e37ea47d376b3` |
+| `accepted_results.tsv` | `e985bedc99f0068121d879e6571e74b61f404e794283bfb5423cf0057fcd2f0b` |
+| `SHA256SUMS` | `395f8c6dae9f9b9d0119ef2874c574264d021d18bd5a9b276595a3f428b82cc8` |
+
+`python3 scripts/render_project_code.py --check` 与 `git diff --check` 通过。
+参考 env 接线、生产 filelist/package、核心 VIO、`dpu_common` 和 `pcie_work` 本轮均未修改。
+验证使用真实 Intel VIP 请求与模型端点，512B测试观察首次业务Notify；
+未模拟真实 DUT 的报文消费或完成，不把上述结果当作完整RTL收发通过。
+
+## 2026-11-08：独立 BDF 与按完成模式配置 MSI-X
+
+按用户要求，本增量只验证新增配置，没有重新运行上一节15项回归。
+`dpu.configure_bdf=1` 默认在队列配置前写 BDF 表；`configure_public=0` 不再跳过它。
+MSI-X 按最终完成模式选择 Function，先配置映射、消息和控制，再使能队列；
+普通轮询不写 MSI-X，其他 BAR/PFVF/Completion BDF/Prefix 配置仍由公共开关选择。
+默认消息表使能、interval=0、self_mask=0；消息地址和data必须显式提供。
+
+MSI-X linear 按上传驱动的 Host/PFVF/local-vector 查找顺序分配行号，global vector
+仅保存为映射结果。中断场景初始化2048行单 bank，空行有效字段全1、reserved=0；
+不操作双 bank 切换或 ready。BDF/MSI-X 的读回沿用 `dpu.verify_readback=0` 默认关闭。
+
+VCS 仍在 `ubuntu@10.11.10.53` 执行，版本 `W-2024.09-SP1_Full64`，远端隔离根为
+`/home/ubuntu/ryan/project_config_notify_vcs_20261108.B07JHL`，本轮输出目录为
+`build/vio_external_config_validation/public_split_vcs/final`。
+增量编译、strict compile和以下5项 sim/strict 全部返回0。
+每项 UVM W/E/F=`0/0/0`，所有 PCIe scoreboard 的 mismatch/unexpected/timeout=`0/0/0`。
+
+| 测试：`project_bare_config_test` | 配置写／读 | 检查结果 |
+| --- | --- | --- |
+| 默认参数 | 2067／0 | BDF `0x108000=0x00010000` 恰好写一次且先于队列；未写MSI-X；首次512B TX Notify通过 |
+| `+PROJECT_BARE_MSIX` | 6235／0 | 四类MSI-X表、Host消息地址/data、实际向量关联、完整单bank与尾项通过 |
+| `+PROJECT_BARE_MSIX +dpu.verify_readback=1` | 6235／2604 | BDF、MSI-X及原VIO表实际Memory读回通过 |
+| `+PROJECT_BARE_MSIX_MISSING_MESSAGE` | 零PCIe请求 | 在 `select_msix_scope` 精确失败，不进入READY |
+| `+PROJECT_BARE_CORRUPT_BDF` | 1／1 | 实际读回 `0x00010001` 与期望 `0x00010000` 不符，在 `verify_function_configuration` 失败，不进入READY |
+
+正例的 `PROJECT_BARE_CONFIG_PASS`、`PROJECT_BARE_TX_NOTIFY_PASS` 各1次；负例只有
+`PROJECT_BARE_FAILURE_PASS`，两个成功marker均为0。BDF故障注入同步设备模型和SCB的
+单字节存储基准，保留cfg期望，实际Completion触发比较失败；没有关闭传输检查。
+
+MSI-X场景比轮询多4168笔写：2048行linear表的4096个DWORD，加12个实际消息向量各
+6个DWORD（info 1、interval 1、message 4）。这些向量来自本次实际VIO/AF资源快照；
+table-only策略没有额外Function控制写。三条正例从seq启动到首次Notify观测分别为
+8.358μs、25.030μs、45.862μs，不作为纯配置延迟。
+
+证据保存在 `build/vio_external_config_validation/remote_evidence/public_split_vcs_final/`，
+包括5条日志、返回码、strict/marker结果、依赖身份和源文件清单。
+21项冻结源码与当前本地源码一致，42项证据SHA核对通过。
+
+| 证据文件 | SHA-256 |
+| --- | --- |
+| `source_manifest.sha256` | `9a798da83af47255a11529b8e9b2ba20e0c570b023b8d5948ecb73f017306bfd` |
+| `accepted_results.tsv` | `3221a4d96f15ea30362f8e3dae724b330ab89e0ce5bad9a9ce3446cbfaec4191` |
+| `SHA256SUMS` | `3d083fbf83cf6100e887a25458600bedf82fd2bd19599d564abe13e609a07655` |
+
+本轮仍是模型端点与实际Intel VIP路径的配置验证，不宣称真实DUT报文处理或中断业务完成。
+生产filelist/package、参考env接线、核心VIO、`dpu_common`和`pcie_work`均未修改。
+源码导出一致性与 `git diff --check` 通过；本地构建证据不加入Git。
