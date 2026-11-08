@@ -1486,4 +1486,63 @@ package project_external_integration_test_pkg;
 		phase.drop_objection(this);
 	endtask
 
+	// 独立固定入口回归：env 发布前删掉全部布局，证明新 seq 不依赖已生成的参考表。
+	// 继续复用真实 Intel 模型、24 笔配置检查和 512B TX Notify，不覆写产品配置 hook。
+	class project_single_queue_config_test extends project_bare_config_test;
+		`uvm_component_utils(project_single_queue_config_test)
+		// 构造测试组件；不改变父类 Intel 模型的资源所有权。
+		extern function new(string name, uvm_component parent);
+		// 只替换启动的 seq 并删除布局；软件队列合同沿用 Packed256/Polling/TX-only。
+		extern virtual function void build_phase(uvm_phase phase);
+		// 正例与发送失败复用父类断言；旧 seq 缺 BDF 仍应准确失败，不能被新入口影响。
+		extern virtual task run_phase(uvm_phase phase);
+	endclass
+
+	// 初始化父类测试名。
+	function project_single_queue_config_test::new(string name, uvm_component parent);
+		super.new(name, parent);
+	endfunction
+
+	// 构建后删除的是输入布局；真正 frozen 副本仍由产品 env 正常发布，测试不手动回填。
+	function void project_single_queue_config_test::build_phase(uvm_phase phase);
+		super.build_phase(phase);
+		cfg.table_layouts.delete();
+		if (!$test$plusargs("PROJECT_FIXED_ORIGINAL"))
+			bare_seq = project_single_queue_config_seq::type_id::create("fixed_seq");
+	endfunction
+
+	// 旧入口负例只允许 AF 写，精确 BDF fatal 后不生成 ring；其余场景沿用完整正常/故障验证。
+	task project_single_queue_config_test::run_phase(uvm_phase phase);
+		project_bare_expected_failure	catcher;
+		string				why;
+
+		require_true(cfg.table_layouts.num() == 0 && cfg.frozen_layouts.num() == 0,
+			"fixed sequence fixture must begin with no input or frozen layouts");
+		if (!$test$plusargs("PROJECT_FIXED_ORIGINAL")) begin
+			super.run_phase(phase);
+			return;
+		end
+
+		phase.raise_objection(this);
+		require_true(cfg.bar_registry.resolve_name("h0.pf0.bar0", management, why), why);
+		fork app_receive(0); join_none
+		#100ns;
+		catcher = new();
+		catcher.expected_stage = "configure_bdf_table";
+		uvm_report_cb::add(null, catcher);
+		bare_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[0]]);
+		uvm_report_cb::delete(null, catcher);
+		require_true(catcher.count == 1 && !bare_seq.success &&
+			bare_seq.error_msg == "configure_bdf_table: missing platform layout: PROJECT_BDF",
+			"original sequence no longer reports its missing BDF layout");
+		for (int unsigned attempt = 0; attempt < 1000 && write_offsets.size() < 1; attempt++) #10ns;
+		#100ns;
+		require_true(write_offsets.size() == 1 && write_offsets[0] == 'h1010 && read_requests == 0,
+			"original sequence sent configuration after the missing BDF failure");
+		require_true(bare_seq.selection.setups.num() == 0, "original failure allocated VIO rings");
+		foreach (cfg.vio_envs[h]) cfg.vio_envs[h].host_mem.leak_check();
+		`uvm_info("PROJECT_FIXED_ORIGINAL_FAILURE_PASS", catcher.message, UVM_LOW)
+		phase.drop_objection(this);
+	endtask
+
 endpackage

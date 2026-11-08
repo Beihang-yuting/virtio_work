@@ -22,6 +22,7 @@ package project_env_pkg;
 	`include "project_pcie_rc_driver.sv"
 	`include "project_env_cfg.sv"
 	`include "project_dut_config_seq.sv"
+	`include "project_single_queue_config_seq.sv"
 	`include "project_env.sv"
 	`include "project_base_test.sv"
 endpackage

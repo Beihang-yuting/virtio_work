@@ -638,3 +638,30 @@ UVM W/E/F及PCIe SCB mismatch/unexpected/timeout均为0。
 最终源码技术复审、源码导出一致性及 `git diff --check` 通过。本轮验证使用模型端点和
 实际Intel VIP路径，确认配置请求及首次业务Notify；未验证真实RTL的复位值、查找行为、
 报文消费或完成。生产filelist/package、cfg、env、核心VIO、`dpu_common`和`pcie_work`均未修改。
+
+## 2026-11-08：独立单队列固定配置 seq
+
+新增参考入口 `project_single_queue_config_seq`，固定 BDF/Notify/QSCH/VTX 地址和策略，
+通过原配置 seq 的 PCIe Memory 路径执行。原 `project_dut_config_seq`、env、env_cfg 和
+生产 filelist/package 保持不变；新类只加入参考 project package 与完整源码导出。
+
+本轮只在 `ubuntu@10.11.10.53` 运行三项聚焦验证。编译、三项仿真及各自严格日志检查
+均返回0，UVM WARNING/ERROR/FATAL均为0；预期负例仅精确捕获对应配置阶段的 fatal。
+测试在 env 发布前删除全部表布局，并确认执行前输入与冻结布局均为空。
+
+| `project_single_queue_config_test` 场景 | 配置写／读 | 结果 |
+| --- | --- | --- |
+| 独立固定 seq；`dpu.bdf_first=16` | 24／0 | Packed256、Polling、TX-only、一对队列到 READY；另产生一次512B TX业务Notify |
+| `+PROJECT_FIXED_ORIGINAL` | 1／0 | 原seq只发送AF，准确报缺少PROJECT_BDF布局，不分配VIO ring |
+| `+PROJECT_BARE_AF_WRITE_FAIL` | 0／0 | 新seq首笔AF发送故障准确停在declare_af，不进入READY |
+
+正例使用真实分配的 PCI BDF `0x0010`、独立的 EP requester编码0，以及 PF0 BAR0基址
+`0x000000201e000000`。AF写地址为该基址加 `0x1010`，BDF写地址为基址加 `0x108000`；
+其余地址、VTX ring IOVA、Notify的local/global qid关联均由实际Intel请求和表内容检查。
+24笔配置写包括AF1、BDF1、Notify4、QSCH6、VTX初始化及使能12；后续业务Notify另计。
+
+本地证据位于 `build/vio_external_config_validation/remote_evidence/single_queue_seq_vcs_final/`，
+包含 `accepted_results.txt`、编译/运行日志、严格检查结果、依赖身份、冻结源码与SHA校验。
+新seq验证源码SHA-256为 `0839c6ac1ecb1e0bf88fed249c6aba18594ae69d0b41bcacbb580826e63d9862`。
+最终技术审查、源码导出一致性及 `git diff --check` 通过；构建证据不加入Git。
+以上证明模型端点与实际Intel VIP路径的配置和首次Notify，不宣称真实RTL已消费报文或完成业务。

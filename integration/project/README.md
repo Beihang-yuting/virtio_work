@@ -94,6 +94,56 @@ seq 自动从启动用的 PCIe sequencer 取得 `env_cfg`，无需另外传 cont
 
 ## 当前一对 VTX 的可执行配置
 
+如果先用写死的单队列基线调通真实 DUT，启动独立的
+[project_single_queue_config_seq](project_single_queue_config_seq.sv)。它在 seq 内固定
+BDF、Notify、QSCH、VTX 的驱动地址与策略，不要求 `table_layouts/frozen_layouts` 已提供；
+`dpu.driver_layouts=0` 也可使用。原 `project_dut_config_seq` 保持原来的平台布局要求。
+
+这一入口固定只配置 Host0/PF0、一对队列中的 VTX：Packed、深度256、Polling，
+不启用 VRX、不写 MSI-X/BAR/PFVF 公共表、不做配置读回。
+顺序为 AF→BDF→Notify→QSCH→VTX初始化→VTX使能，共24笔32bit Memory Write。
+表地址和策略覆盖 cfg 中的相应输入/冻结值；BAR基址、global qid、ring IOVA仍取环境实际分配值。
+后续改硬件地址或固定字段，直接修改新 seq 的 `prepare_fixed_configuration()`。
+
+Host/PF/队列模式已在 env 构建时形成合同，seq 不在运行期重建它们。仿真启动前提供：
+
+```text
++dpu.hosts=1 +dpu.pfs_per_host=1 +dpu.vfs_per_pf=0
++vio.enabled=1 +vio.pairs=1 +vio.tx_enable=1 +vio.rx_enable=0
++vio.queue_type=VQ_PACKED +vio.queue_size=256 +vio.features=0x0000000500000000
++vio.completion_mode=VIRTIO_COMPLETION_POLLING
++vio.notify_bar=0 +vio.notify_base=0 +vio.notify_stride=0 +vio.notify_encoding=VIO_NOTIFY_DPU32
+```
+
+PF0 EP 路由沿用环境默认 `requester=0/intel_pf=0/no-VF/vport=0`；新 seq 校验真实资源后才写寄存器。
+EP requester 编码独立于环境分配的 PCI BDF，`dpu.bdf_first=16` 等起点无需改成0。
+Notify查找表使用PF0的实际BAR0，`net_id/group_id/cos=0`、VNET、SP=`0xff`、TC weight=`0x11111111`
+均由新 seq 固定，无需再提供 Notify table 或 QSCH 参数。接口 bind、等待复位仍由平台完成。
+
+```systemverilog
+// 放在 test 的 run_phase 中：平台复位就绪后，启动独立固定配置入口。
+project_single_queue_config_seq	config_seq;
+
+config_seq = project_single_queue_config_seq::type_id::create("config_seq");
+config_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[0]]);
+```
+
+已有 AIP 命令可只替换注册的 sequence 类型，沿用原来绑定的 RC sequencer 表达式。
+例如原工程已有 `virtual_sqr::pcie_rc_sqr` 指向真实 RC 时：
+
+```systemverilog
+`aip_cmd_user_seq(dut_config_fixed, project_single_queue_config_seq, virtual_sqr::pcie_rc_sqr)
+```
+
+```tcl
+dut_config_fixed
+```
+
+自建 package 时在 `project_dut_config_seq.sv` 后 include 新 `.sv`；参考 `project_env_pkg.sv`
+已包含它。配置成功后再启动发包；实际发送失败继续报告 fatal，不会把错误当作配置成功。
+
+以下为原通用 `project_dut_config_seq` 的参数化用法：
+
 启动参数在 `cfg.load_params()` 时读取；Host/PF/队列/布局参数应在仿真启动前提供。
 默认先声明 Host0/PF0 为 AF，再配置 BDF 和 VIO/QSCH，其他公共表不下发；采用驱动参考地址、QSCH VNET 模式，
 SP/WRR=`0xff`、TC weight=`0x11111111`。

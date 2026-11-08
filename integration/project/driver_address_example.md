@@ -7,6 +7,11 @@
 
 **你只需调整寄存器偏移，不需要填写 PF/VF 的 BAR 物理地址。**
 
+单 Host/PF0、一对 Packed VTX 的固定联调入口见
+[project_single_queue_config_seq.sv](project_single_queue_config_seq.sv)。该 seq 自带 BDF/Notify/QSCH/VTX
+地址和策略，覆盖对应的输入/冻结布局；实际 BAR/ring 地址仍从环境获取。
+原 `project_dut_config_seq` 继续使用下文的平台布局机制。
+
 ```text
 访问 DUT 的地址 = registry 查询到的 h0.pf0.bar0.base + 寄存器偏移
 BAR 映射表的内容 = item.members 中环境已分配的 base / size / limit

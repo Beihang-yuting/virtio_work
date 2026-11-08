@@ -19,6 +19,7 @@ SOURCES = (
     "integration/project/project_pcie_rc_driver.sv",
     "integration/project/project_env_cfg.sv",
     "integration/project/project_dut_config_seq.sv",
+    "integration/project/project_single_queue_config_seq.sv",
     "integration/project/project_env.sv",
     "integration/project/project_base_test.sv",
 )
@@ -54,6 +55,9 @@ Notify 仅写/读实际队列对的有效项；首次配置前 DUT 须按05.png�
 BAR 编码、公共验证及实际复位/接口绑定仍由平台负责。
 base_test 显式启动一个配置 seq，共用 env_cfg 中的资源完成写表、使能、所选验证和确认。
 ring 在写队列表前准备；不自动执行 Virtio capability 发现、协商或复位。
+单队列联调可改用 project_single_queue_config_seq：在独立 seq 内固定 BDF/Notify/QSCH/VTX
+布局和策略，实际 BAR/ring 继续由 env 分配；原 project_dut_config_seq 行为不变。
+Host0/PF0/no-VF、一对 Packed256/Polling/TX-only 和 DPU32 Notify 必须在 env 构建前选定。
 
 """]
     for relative in SOURCES:
