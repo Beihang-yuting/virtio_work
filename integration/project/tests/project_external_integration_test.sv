@@ -1103,6 +1103,12 @@ package project_external_integration_test_pkg;
 			apps[host].receive(t);
 			if (t == null) continue;
 			require_true($cast(m, t), "bare configuration issued non-Memory request");
+			offset = pcie_tl_mem_wire_addr(m) - management.bar_lease.base;
+			// DUT 未用 Notify 行由复位提供无效值；配置过程只可访问实际 pair，读写共用此边界检查。
+			if (offset >= 'ha0000 && offset < 'ha2000) begin
+				require_true(offset + pcie_tl_mem_dw_count(m)*4 <= 'ha0000 + 64'(pairs)*16,
+					"configuration accessed an unused Notify row");
+			end
 			if (m.kind == TLP_MEM_WR) begin
 				posted[host].push_back(m);
 				capture_write(m);
@@ -1149,12 +1155,12 @@ package project_external_integration_test_pkg;
 		end
 	endtask
 
-	// 以冻结的唯一表项计算发送笔数：Notify 全 bank、QSCH mode、普通 DWORD 表，
+	// 以冻结的唯一表项计算发送笔数：Notify 仅实际 pair、QSCH mode、普通 DWORD 表，
 	// VTX/VRX 各有初始化和使能两组六笔写。按接收完成数等待，不用任意固定延迟假设。
 	task project_bare_config_test::await_configuration_writes();
 		int unsigned	expected_writes;
 
-		expected_writes = 512*4 + (msix_mode ? 2048*2 : 0) + (cfg.qsch_configure_controls ? 1 : 0);
+		expected_writes = pairs*4 + (msix_mode ? 2048*2 : 0) + (cfg.qsch_configure_controls ? 1 : 0);
 		foreach (cfg.records[name]) begin
 			case (cfg.records[name].ctx.kind)
 				PROJECT_NOTIFY, PROJECT_MSIX_LINEAR: ;
@@ -1252,18 +1258,15 @@ package project_external_integration_test_pkg;
 		notify_writes = 0;
 		foreach (write_offsets[i]) begin
 			if (write_offsets[i] < 'ha0000 || write_offsets[i] >= 'ha2000) continue;
-			require_true(write_offsets[i][3:0] == (3-(notify_writes%4))*4,
-				"Notify write order is not high DWORD to low DWORD");
+			require_true(write_offsets[i] == 'ha0000 + 64'(notify_writes/4)*16 + (3-(notify_writes%4))*4,
+				"Notify rows are not sequential or DWORD writes are not high to low");
 			notify_writes++;
 		end
-		require_true(notify_writes == 512*4, "Notify single bank must contain 512 complete rows");
-		for (int unsigned row = pairs; row < 512; row++) begin
-			project_vio_notify_entry_t	entry;
-
-			entry = project_vio_notify_entry_t'(table_value('ha0000+row*16, 16));
-			require_true(entry.notify_type == 3 && entry.global_qid == '1 && entry.host_id == '1 &&
-				entry.base_addr_60_7 == '1 && entry.local_qid_encoding == '1 && entry.reserved_127_77 == 0,
-				"Notify unused row was not invalid sentinel");
+		require_true(notify_writes == pairs*4, "Notify must contain exactly one written row per queue pair");
+		if (cfg.verify_readback && !msix_mode) begin
+			// 每个唯一表项读一次，加 QSCH mode 一次；不存在未用 Notify 行的额外读回。
+			require_true(read_requests == cfg.records.num() + (cfg.qsch_configure_controls ? 1 : 0),
+				"configuration read count includes missing/extra table reads");
 		end
 	endfunction
 

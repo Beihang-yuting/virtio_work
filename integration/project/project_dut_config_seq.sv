@@ -4,6 +4,8 @@
 // 所有硬件访问复用 pcie_tl_reg_seq，经实际目标 RC、Intel bind 发往 DUT。
 // 默认 body 配置 BDF、VIO/QSCH，MSI-X 按实际完成模式选择；其余公共表独立可选。
 // 已知表按图片字段和 cfg 地址真实写入；读回可选，失败报告 fatal 并保留 DMA 资源。
+// Notify 仅访问实际队列对的有效项；首次配置前 DUT 已按 05.png 复位为无效项：
+// type=3，lookup key/global_qid 全1，reserved=0。未用槽位保持该复位值，不由 seq 写入或读回。
 class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 	`uvm_object_utils(project_dut_config_seq)
 
@@ -248,14 +250,6 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		input project_vio_selection_t	selection,
 		output bit			ok,
 		output string			why
-	);
-
-	// 完整初始化时将剩余单 bank 行设为驱动的最大 key 无效项，verify 时读回同一范围。
-	// 只由默认 body/验证调用；局部 configure_vio_notify 不搬移其他服务的表项。
-	extern protected task process_notify_tail(
-		input bit	verify,
-		output bit	ok,
-		output string	why
 	);
 
 	// MSI-X linear 同样按查找键排列；完整流程填充单 bank 无效尾部，独立表入口不隐含初始化。
@@ -790,9 +784,6 @@ task project_dut_config_seq::body();
 		configure_vio_notify(selection, ok, error_msg);
 		if (!completed_step("configure_vio_notify", ok)) return;
 
-		process_notify_tail(0, ok, error_msg);
-		if (!completed_step("initialize_notify_tail", ok)) return;
-
 		configure_qsch(selection, ok, error_msg);
 		if (!completed_step("configure_qsch", ok)) return;
 
@@ -805,9 +796,6 @@ task project_dut_config_seq::body();
 		if (cfg.verify_readback) begin
 			verify_vio_configuration(selection, ok, error_msg);
 			if (!completed_step("verify_vio_configuration", ok)) return;
-
-			process_notify_tail(1, ok, error_msg);
-			if (!completed_step("verify_notify_tail", ok)) return;
 		end
 
 		cfg.commit_vio_configuration(selection, ok, error_msg);
@@ -952,7 +940,8 @@ task project_dut_config_seq::configure_qsch_rnet(
 endtask
 
 
-// 本批次共享项按真实表地址去重，调用前完成全部 scope 预检。
+// 每对队列只写一条排序后的有效 Notify 项；同 pair 的 TX/RX 已由 cfg 去重。
+// 首次配置前未用槽位须为图片复位无效值，本入口不初始化或读回未用槽位。
 task project_dut_config_seq::configure_vio_notify(
 	input project_vio_selection_t	selection,
 	output bit			ok,
@@ -960,70 +949,6 @@ task project_dut_config_seq::configure_vio_notify(
 );
 	project_table_kind_e	kinds[$] = '{PROJECT_NOTIFY};
 	configure_queues(kinds, selection, ok, why);
-endtask
-
-
-// 驱动以最大 Host/地址 key 和 type=RSV 填充空行，保持整张有序查找表的尾部无效。
-// 这里仅访问图片定义的单 bank；不发送 bank-select/ready，也不按 global_qid 留空洞。
-// 全量默认流程在业务开始前调用，局部类别入口仍保留已发布行号。
-task project_dut_config_seq::process_notify_tail(
-	input bit	verify,
-	output bit	ok,
-	output string	why
-);
-	project_vio_notify_entry_t	invalid_entry;
-	project_table_context_t		ctx;
-	bit				seen[string];
-	logic [127:0]			readback;
-	bit [63:0]			offset;
-	bit [63:0]			address;
-
-	ok  = 0;
-	why = "Notify directory is empty";
-	if (cfg.notify_records.size() == 0) return;
-
-	invalid_entry                    = '0;
-	invalid_entry.notify_type        = '1;
-	invalid_entry.global_qid         = '1;
-	invalid_entry.host_id            = '1;
-	invalid_entry.base_addr_60_7      = '1;
-	invalid_entry.local_qid_encoding = '1;
-
-	foreach (cfg.notify_records[n]) begin
-		ctx = cfg.notify_records[n].ctx;
-		if (seen.exists(ctx.target.canonical_name)) continue;
-		seen[ctx.target.canonical_name] = 1;
-
-		if (ctx.layout.capacity > 512 || cfg.notify_records.size() > ctx.layout.capacity) begin
-			why = "Notify directory exceeds the single-bank layout";
-			return;
-		end
-
-		offset = ctx.layout.module_offset + ctx.layout.table_offset;
-		if (!cfg.bar_registry.check_range(ctx.target, offset,
-			64'(ctx.layout.capacity) * 16, address, why)) return;
-
-		for (int unsigned row = cfg.notify_records.size(); row < ctx.layout.capacity; row++) begin
-			offset = ctx.layout.module_offset + ctx.layout.table_offset + 64'(row) * 16;
-
-			if (verify) begin
-				mmio(ctx.target, 0, offset, 16, 0, 0, readback, ok, why);
-				if (!ok) return;
-
-				if (readback !== invalid_entry) begin
-					ok  = 0;
-					why = $sformatf("Notify invalid-row readback mismatch row=%0d offset=0x%016h", row, offset);
-					return;
-				end
-			end else begin
-				write_table_dwords(ctx.target, offset, 16, invalid_entry, ok, why);
-				if (!ok) return;
-			end
-		end
-	end
-
-	ok  = 1;
-	why = "";
 endtask
 
 

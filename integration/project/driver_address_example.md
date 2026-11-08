@@ -222,7 +222,7 @@ endtask
 ```
 
 上述 posted 写成功仅表示发送完成。`dpu.verify_readback=1` 时，`user_verify_vio_configuration()`
-读回 Notify、QSCH、VTX/VRX 参数表，body 另读回单 bank 无效尾部；默认0时跳过这些配置读回。
+读回 Notify 有效项、QSCH、VTX/VRX 参数表；默认0时跳过这些配置读回。
 公共 `user_verify_dpu_configuration()` 仍由平台实现，在同时开启公共配置与读回时调用。
 独立 BDF/MSI-X 的内建读回由 `verify_function_configuration()` 完成，不依赖公共验证 hook；
 MSI-X linear 无效尾部也只在开启读回时检查。
@@ -234,8 +234,9 @@ VTX/VRX 读回位置为 `item.ctx.byte_offset`，与 data staging 端口分别�
 `:1676–1685` 按 `host_id` 和 Notify 基址的组合升序插入，`:1717–1734` 在组内按 pair 编号填入。
 `global_qid` 只作为查找结果写入表项，不能用它直接计算 Notify 表行号。
 当前 cfg 按同一规则生成 `notify_records`，排序后行号为 `0..N-1`，RX/TX 共用一行。
-默认 seq 将其余行填为驱动无效项：type=3，Host/base/local/global qid域全1，reserved=0。
-图片版本保持512行单 bank，不执行驱动的双 bank 切换或 ready 寄存器写入。
+seq 仅写实际队列对的有效项，开启读回也仅访问这些项；同 PF 32对队列对应32行，TX/RX共用一行。
+首次配置前，DUT 须已按 `05.png` 复位为无效项：type=3，Host/base/local/global qid域全1，reserved=0。
+未用项保留复位值；图片版本仍为512行单 bank，不执行双 bank 切换或 ready 寄存器写入。
 
 MSI-X linear 同样按查找键排列：驱动 `af_mng.c:1068–1191` 使用
 `(host_id<<19)|(pfvf_id<<9)` 确定 Function 顺序，再按 local vector 递增。

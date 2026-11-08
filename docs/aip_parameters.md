@@ -251,7 +251,7 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 | `dpu.configure_public` | 默认0；1才额外执行 BAR/PFVF/Completion BDF/Prefix 等公共配置，保留显式非VIO消息；不控制软件BAR分配或VIO所需BDF/MSI-X |
 | `dpu.configure_bdf` | 默认1；独立配置BDF请求身份表，地址为管理BAR+0x108000+bdf_index*4；0用于平台已配置的场景 |
 | `dpu.driver_layouts` | 默认1；补齐 BDF/MSI-X/Notify/QSCH/VTX/VRX 驱动参考地址，已提供布局优先；0时自行声明 |
-| `dpu.verify_readback` | 默认0；配置 seq 只写、不读回。1时验证BDF、所选MSI-X、QSCH模式、Notify/QSCH/队列表及两张查找表尾部，以及已选择的其他公共配置 |
+| `dpu.verify_readback` | 默认0；配置 seq 只写、不读回。1时验证BDF、所选MSI-X、QSCH模式、Notify有效项/QSCH/队列表及MSI-X查找表尾部，以及已选择的其他公共配置 |
 | `dpu.hH.pfP[.vfV].requester/intel_pf/intel_vf/vport` | 软件路由；每 Host 的 PF0/no-VF 默认0/0/-1/0，其余Function显式提供四项或完整 policy；不下发硬件表 |
 | `dpu.hH.pfP[.vfV].bdf_index` | BDF表硬件索引0..127；新生成policy默认取vport，已有显式policy保持其索引；配置seq使用同一身份写表 |
 | `dpu.qsch.configure_controls` | 默认1；配置模式并自动生成缺少的SP/WRR和TC weight项，显式catalog优先 |
@@ -311,7 +311,9 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 以上整数在窄字段赋值前检查越界。VIO/QSCH 模块与间接端口由驱动参考布局提供，
 可在env构建前修改typed cfg；公共PBA/Function表编码/BAR组仍按平台明确声明。
 Notify 按 `{host_id, BAR匹配基址, pair编号}` 排序后分配物理行，global_qid保持实际资源编号。
-默认seq初始化512行单bank及无效尾部；`dpu.verify_readback=1` 时通过真实Memory Read验证。
+Notify 保持512行单bank容量，但seq只写实际队列对的有效项；同PF 32对写32项，TX/RX共用每对的一项。
+`dpu.verify_readback=1` 也只通过真实Memory Read验证有效项，不访问未用行。
+首次配置前DUT须已按 `05.png` 复位，未用项type=3、lookup key/global_qid全1、reserved=0。
 Notify目录使用统一管理BAR；参考布局短目标默认Host0，可用`vio.notify_table.reg_target`改为完整目标。
 `dpu.notify.bank/auto_bank/full_bank`、legacy `dpu.msix.rate/packets/emit_interval`
 与 legacy QSCH generator 不是项目执行策略；项目 notify 只支持单bank逐项写。

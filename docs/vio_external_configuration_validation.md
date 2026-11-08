@@ -599,3 +599,42 @@ table-only策略没有额外Function控制写。三条正例从seq启动到首�
 本轮仍是模型端点与实际Intel VIP路径的配置验证，不宣称真实DUT报文处理或中断业务完成。
 生产filelist/package、参考env接线、核心VIO、`dpu_common`和`pcie_work`均未修改。
 源码导出一致性与 `git diff --check` 通过；本地构建证据不加入Git。
+
+## 2026-11-08：Notify 仅配置实际队列对
+
+本增量删除 Notify 未用行的写入及读回，保留每对一项、TX/RX 共用、Host/BAR/pair
+全局排序及每项高 DWORD→低 DWORD 写序。首次配置前，DUT 必须已按 `05.png`
+复位未用项：type=3，lookup key/global_qid 全1，reserved=0。
+MSI-X 线性表的尾部初始化未改动；以上历史验证数据保持原样。
+
+仅运行本轮4项聚焦验证，没有重跑历史矩阵。VCS 在 `ubuntu@10.11.10.53` 执行，
+版本 `W-2024.09-SP1_Full64`，远端目录为
+`/home/ubuntu/ryan/project_config_notify_vcs_20261108.B07JHL`。
+编译、strict compile及4项仿真/strict均返回0；每项成功marker和请求数量断言通过，
+UVM W/E/F及PCIe SCB mismatch/unexpected/timeout均为0。
+
+| 测试：`project_bare_config_test` | 配置写／读 | 检查结果 |
+| --- | --- | --- |
+| 默认 Packed 单 VTX | 23／0 | Notify仅1项4笔写；BDF、QSCH、VTX与首次512B TX Notify通过 |
+| `+dpu.verify_readback=1` | 23／9 | 仅实际有效表项和QSCH模式读回；没有未用Notify行访问 |
+| `+PROJECT_BARE_PAIRS=32 +PROJECT_BARE_RX +dpu.caps.af_extra_queue_count=0` | 1027／0 | 同PF32对TX/RX对应32个Notify项、共128笔Notify写；两方向队列配置与使能通过 |
+| `+PROJECT_CUSTOM` | 23／0 | Custom模式与有效Notify项配置、首次业务Notify通过 |
+
+32对场景使用已有 `af_extra_queue_count=0` 参数释放默认AF额外11对占用；没有放宽
+资源容量检查。模型在接收每一笔Notify Memory Read/Write时检查整个请求范围只能落在
+实际 `pairs × 16` 字节内，访问任意未用行即失败；同时核对连续有效行、每行4笔高到低
+写序、每对映射字段和TX/RX去重。没有为未用Notify RAM新增存储模型。
+
+证据目录为 `build/vio_external_config_validation/remote_evidence/notify_active_vcs_final/`。
+21项冻结源码与本地源码一致，38项证据SHA核对通过；`accepted_results.tsv` 保存本轮
+4项返回码、strict、marker、请求数量与UVM/SCB汇总，4个仿真日志哈希单独归档。
+
+| 证据文件 | SHA-256 |
+| --- | --- |
+| `source_manifest.sha256` | `fefecb496398431db8d3e6c72faba642628cb1addd206e726c8bb93651d24613` |
+| `accepted_results.tsv` | `d518c814a385ab5135ce7b0eec9908b0eb5096dc6c60a084b118defe0225686d` |
+| `SHA256SUMS` | `adc44f9a17230244e42d8cb59e232e3f4ecb044ec69fabde5b54f12eedd36749` |
+
+最终源码技术复审、源码导出一致性及 `git diff --check` 通过。本轮验证使用模型端点和
+实际Intel VIP路径，确认配置请求及首次业务Notify；未验证真实RTL的复位值、查找行为、
+报文消费或完成。生产filelist/package、cfg、env、核心VIO、`dpu_common`和`pcie_work`均未修改。

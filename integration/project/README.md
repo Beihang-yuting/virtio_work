@@ -123,7 +123,7 @@ cfg 的 `use_driver_reference_layouts()` 只补缺少的 VIO/QSCH 布局，保�
 其余公共表布局仍由平台声明。
 
 日常测试默认 `dpu.verify_readback=0`：保留完整写表、使能、参数检查和写请求结果检查，
-省去 BDF、所选 MSI-X、QSCH 模式、VIO/QSCH 表及两张查找表无效尾部的全部配置读回。
+省去 BDF、所选 MSI-X、QSCH 模式、VIO/QSCH 有效表项及 MSI-X 查找表无效尾部的配置读回。
 调试时使用 `+dpu.verify_readback=1` 恢复上述验证，也启用公共配置已选时的平台验证 hook。
 关闭读回后的 READY 表示配置写入流程完成；DUT 实际应用结果由业务检查确认。
 显式调用 `verify_function_configuration()`、`verify_vio_configuration()` 或
@@ -166,8 +166,9 @@ Notify 表行号 = 排序后的位置 0..N-1
 ```
 
 `cfg.notify_records` 可查看排序后的行、owner、BAR 匹配基址和 global qid。RX/TX 共用一条 pair 项。
-默认完整初始化将剩余槽位写为驱动无效项（type=3、key/global_qid 全1、reserved=0），
-维持图片规定的 512 行单 bank；不发送 bank-select/ready。开启读回时，有效项及无效尾部都经真实 Memory Read 校验。
+Notify 只写实际有效项：同 PF 开32对队列就写32项，TX/RX共用每对的一项；开启读回也只验证这些有效项。
+首次配置前，DUT 必须已按 `05.png` 复位：未用项 type=3、lookup key/global_qid 全1、reserved=0。
+表容量仍为512行单 bank；环境不访问未用槽位，也不发送 bank-select/ready。
 独立调用 `configure_vio_notify(selection,...)` 只写选中有效项，使用已发布行号，不重排其他 scope。
 Notify 全局单 bank 必须使用统一管理窗口；参考布局的短目标默认选 Host0。
 可显式设置 `vio.notify_table.reg_target=h0.pf0.bar0`，其他表仍可按各自 Host 访问。
