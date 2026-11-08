@@ -695,3 +695,61 @@ mismatch/unexpected/timeout均为0。
 最终Tcl脚本SHA-256为 `d2c39531321ed7f82805529ded996a560d08f1c06e2cfa9b6fe1be8e9ba2e637`。
 最终技术审查、完整源码导出一致性和 `git diff --check` 通过；验证对象为Intel模型端点，
 不代表真实RTL寄存器副作用已验证，构建证据不加入Git。
+
+## 2026-11-08：AF 状态同步与逐请求读值比较
+
+本轮为默认配置 seq 补齐 AF 同步：向环境分配的 Host0/PF0 BAR0+`0x1010`
+写 `0x5555aaaa` 后，立即单次读取同地址并等待 Completion，状态必须为8。
+此后每成功完成100次完整DWORD配置写，再执行同样的状态读；每次start独立计数，
+不轮询、不补尾读，也不受普通表项 `verify_readback` 开关控制。
+单次传输失败或状态不为8立即停止，不能继续配置或提交READY。
+
+PCIe新增默认开启的逐请求 `check_read_data`，AF状态读将其设0，仅跳过SCB历史RAM
+写值比较，保留Completion协议检查。寄存器访问固定TC0、attr0；普通RW流量保留原
+随机属性。AIP寄存器宏增加可选五参数映射，Tcl支持 `check_read_data=0/1`，省略时
+每次恢复1。旧三/四参数注册仍编译；未映射时显式传该选项在启动前报错。
+Tcl读取只返回原始值，状态等于8的判断由自动配置seq负责。
+
+VCS在 `ubuntu@10.11.10.53` 运行，版本 `W-2024.09`，目录为
+`/home/ubuntu/ryan/project_config_notify_vcs_20261108.B07JHL`。
+PCIe/AIP依赖使用本轮冻结文件重新构建；最终Project、AIP编译和strict compile均通过。
+AIP首次使用Makefile的非必要 `-lca` 选项产生usage warning并被strict拒绝；
+去掉该runner选项后，同一源码重编无warning/error，没有为此修改产品源码。
+
+| 聚焦场景 | 配置写／读或Memory请求 | 检查结果 |
+| --- | --- | --- |
+| 固定单队列seq，Packed256/Polling/VTX | 24写／1读 | AF状态8后继续，290项检查；另产生一次512B TX业务Notify |
+| 默认seq，16对TX-only | 324写／4读 | 首次及第100/200/300次DWORD写后读取AF，3109项检查；另产生一次业务Notify |
+| 初始AF状态错误7 | 1写／1读 | 准确停在declare_af，无后续写或轮询，不进入READY |
+| 初始AF Completion返回UR | 1写／1读 | 准确停在declare_af，SCB保留1次协议失配，证明关闭数据比较不关闭协议检查 |
+| 16对队列，第2次AF读返回7 | 101写／2读 | 准确停在configure_qsch，无后续配置或READY |
+| reg_acc SV命令入口 | 26请求，12写／14读 | 145项检查，opt-out读返回8；显式1及下一次省略均恢复RAM比较 |
+| reg_acc真实Tcl/UCLI入口 | 26请求，12写／14读 | Tcl13项及SV131项检查；逐次策略、非法值与范围错误回传正确 |
+| AIP test_reg_wide | 不发PCIe请求 | 38项检查；旧注册兼容、五参数普通/严格宏、0/1/默认/非法值覆盖 |
+
+设备模型故意延迟AF Completion 50ns，期间检查不能收到后续配置写；该延迟仅在测试
+模型中，产品seq没有固定等待。真实Intel请求逐笔检查TC0/attr0、BAR绝对地址及完整
+DWORD边界。单队列/16对正例SCB mismatch、unexpected、timeout均为0。
+错值负例SCB也保持0，由seq自身校验寄存器状态失败。
+
+UR负例故意保留SCB mismatch=1；reg_acc两例分别故意保留mismatch=2，来自两笔
+开启RAM比较的AF状态读（读值8与写magic不同）。这些计数不清零、不屏蔽全局SCB。
+精确catcher和 `check_matrix.sh` 同时校验预期错误次数、成功marker、请求数量和
+零unexpected/timeout；其余错误仍按失败处理。通用strict对这三例非零失配的拒绝日志
+保留，由专用负例检查接受。全部8例最终UVM WARNING/ERROR/FATAL汇总均为0。
+
+证据位于 `build/vio_external_config_validation/remote_evidence/af_status_vcs_final/`，
+包含8例日志、编译日志、通用strict与专用接受结果、冻结源码和依赖身份。
+最终独立复核13项冻结源码SHA与本地一致、81项证据SHA正确；验证期间未改产品源码。
+
+| 证据文件 | SHA-256 |
+| --- | --- |
+| `source_manifest.sha256` | `836862e7905b2515d369a16c802d3f33cccbf22f2fd5e16bc5306e405216d333` |
+| `accepted_results.tsv` | `85d31ee196e292b21e50884e39976d77bc6b9f68f79599e765210427620c4aae` |
+| `SHA256SUMS` | `567364cd2ec590a826cb7caf00559a4494b842d317e01090fed6b16f97132a88` |
+
+最终技术审查确认请求元数据经reg→RW→TLP→TX快照→SCB传播，复制与adapter重编码
+保留策略；失败传播、顺序约束与每100次写同步均有对应验证。三仓库 `git diff --check`
+及12份源码导出一致性检查通过。env/env_cfg、核心VIO、dpu_common和生产filelist/package
+未修改。上述验证覆盖模型端点与实际Intel VIP配置链路，不证明真实RTL的AF副作用、
+Notify查表、DMA报文消费或完成已经验证；真实DUT须按约定返回AF状态8。

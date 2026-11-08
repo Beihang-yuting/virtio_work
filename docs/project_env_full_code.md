@@ -16,8 +16,10 @@ DPU、net_packet、host_mem、PCIe TL、VIO、AIP glue、Intel interface/adapter
 
 默认采用驱动参考 BDF/MSI-X/VIO/QSCH 布局，配置 seq 已实现这些表的写入和可选真实读回。
 第一笔配置写为 AF 声明：经 Host0 RC 向已分配的 h0.pf0.bar0.base+0x1010 写32'h5555_aaaa。
-declare_af() 复用 pcie_tl_reg_seq，仅发送一个4B Memory Write，失败立即停止；不读回，
-不受 configure_public 控制，与 PROJECT_AF 表独立，也不执行驱动后续读回/Host-ID 握手。
+declare_af() 复用 pcie_tl_reg_seq，发送4B Memory Write后单次读同地址，等待Completion并要求状态8。
+随后每100次完整DWORD配置写再读一次状态；无轮询、无尾读，任一步失败停止。
+AF读关闭SCB历史RAM比较，保留协议检查及状态8校验；与PROJECT_AF表独立，不执行额外Host-ID协商。
+所有寄存器访问固定TC0/attr0；AF同步不受configure_public或verify_readback控制。
 BDF默认开启，MSI-X按实际完成模式选择；其余公共表默认关闭。
 默认 dpu.verify_readback=0；设为1时增加配置读回。
 Notify 仅写/读实际队列对的有效项；首次配置前 DUT 须按05.png复位未用项
@@ -4459,7 +4461,7 @@ endfunction
 
 ## `integration/project/project_pcie_reg_seq.sv`
 
-SHA-256: `a5d581d27cccf9771ea82046d2498998f0e42e3b0ae3132fa86fabbaaf92cf15`
+SHA-256: `49e222e952ee52c175c273ca9228a054f805e2d0e35b9d451c0e349a1f78c80e`
 
 ```systemverilog
 // integration/project：供 AIP reg_acc 使用的 PF0 BAR0 相对地址访问 sequence。
@@ -4521,12 +4523,13 @@ task project_pcie_reg_seq::body();
 		"h0.pf0.bar0 base=0x%016h + offset=0x%016h = address=0x%016h len=%0d write=%0b rc=%0d",
 		target.bar_lease.base, addr, absolute_address, len, is_write, target.rc_slot), UVM_LOW)
 	request = new("pf0_bar0_request");
-	request.is_write      = is_write;
-	request.addr          = absolute_address;
-	request.len           = len;
-	request.mask          = mask;
-	request.wdata         = wdata;
-	request.rb_timeout_ns = rb_timeout_ns;
+	request.is_write        = is_write;
+	request.addr            = absolute_address;
+	request.len             = len;
+	request.mask            = mask;
+	request.wdata           = wdata;
+	request.rb_timeout_ns   = rb_timeout_ns;
+	request.check_read_data = check_read_data;
 	request.start(cfg.rc_sequencers[target.rc_slot], this);
 	rdata       = request.rdata;
 	status      = request.status;
@@ -4537,14 +4540,14 @@ endtask
 
 ## `integration/project/project_dut_config_seq.sv`
 
-SHA-256: `e73c62a62eb3c4505334d896bfd09cfc01c30172baaf8956d0e59b0770fced40`
+SHA-256: `2750f747e6cd9ca5ab43b5566ec236856e084880328ed6577a9cf1ceba9b7a47`
 
 ```systemverilog
 // integration/project：可直接 start 的 DUT 表配置 sequence，使用同一个 project_env_cfg。
 // 依赖 cfg 中的真实 BAR/队列视图与 PCIe RC sequencer；不创建第二套 context 或 env。
 // task/hook 属于本 sequence，cfg 保存参数、资源与表项数据；ring/BAR 不归 seq 所有。
 // 所有硬件访问复用 pcie_tl_reg_seq，经实际目标 RC、Intel bind 发往 DUT。
-// 默认 body 先声明 Host0/PF0 为 AF，再配置 BDF、VIO/QSCH；MSI-X 按完成模式选择。
+// 默认 body 先声明 Host0/PF0 为 AF 并单次读回状态8，再配置 BDF、VIO/QSCH；MSI-X 按完成模式选择。
 // 已知表按图片字段和 cfg 地址真实写入；读回可选，失败报告 fatal 并保留 DMA 资源。
 // Notify 仅访问实际队列对的有效项；首次配置前 DUT 已按 05.png 复位为无效项：
 // type=3，lookup key/global_qid 全1，reserved=0。未用槽位保持该复位值，不由 seq 写入或读回。
@@ -4555,6 +4558,8 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 	project_vio_selection_t	selection;
 	bit			success;
 	string			error_msg;
+	// 当前 seq 自上次成功 AF 状态读之后完成的完整 DWORD 写数；每次 start 独立计数。
+	protected int unsigned	writes_since_af_read;
 
 	// 对象只保存本次执行结果；运行期共享状态始终在 cfg，不随 sequence 销毁。
 	extern function new(
@@ -4567,8 +4572,14 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 	// 平台先等待复位就绪；AF 声明先于写表，VIO 在写入、所选验证和 commit 后成功。
 	extern virtual task body();
 
-	// 固定向 Host0/PF0 BAR0+0x1010 写一个声明 DWORD；失败停止，不读回、不遍历 Host。
+	// 固定向 Host0/PF0 BAR0+0x1010 写声明后读一次状态8；不轮询，任一步失败停止。
 	extern virtual task declare_af(
+		output bit	ok,
+		output string	why
+	);
+
+	// 单次读取固定状态寄存器并要求8；成功后清写计数，失败保留原因，不轮询。
+	extern protected task read_af_status(
 		output bit	ok,
 		output string	why
 	);
@@ -4663,7 +4674,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 全部四态检查在两态 registry/sequence 转换前执行，保留小端 byte lane 和 skip-mask 语义。
+	// 全部四态检查在转换前执行；check_read_data 仅为状态读关闭 SCB 的 RAM 写值比较。
 	extern protected task mmio(
 		input project_bar_target_t	target,
 		input bit			writing,
@@ -4673,7 +4684,8 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		input logic [31:0]		byte_skip_mask,
 		output logic [127:0]		result,
 		output bit			ok,
-		output string			why
+		output string			why,
+		input bit			check_read_data = 1
 	);
 
 	// 统一表项写序；保留原始 mmio 的宽度/掩码语义，禁止先发送再发现越界。
@@ -5247,6 +5259,7 @@ endfunction
 task project_dut_config_seq::pre_start();
 	success = 0;
 	error_msg = "";
+	writes_since_af_read = 0;
 	if (m_sequencer == null) begin
 		`uvm_fatal("PROJECT_CONFIG_SEQ", "start configuration on the project's PCIe RC sequencer")
 	end
@@ -5359,13 +5372,38 @@ task project_dut_config_seq::body();
 endtask
 
 
-// 用真实租约解析 BAR 基址和 Host0 RC；固定 32bit 写，不受公共表开关或读回开关影响。
-// 复用 pcie_tl_reg_seq 的 Memory Write 路径；posted 成功只表示发送完成，不证明 DUT 已生效。
+// 通过真实 Host0 RC 先写 magic，再同步读一次4B状态；必须返回8才允许后续表配置。
+// 状态寄存器不按写入值比较，只关闭该次读的 RAM 数据比较；Completion 失败仍原样上传。
+// 不受 configure_public/verify_readback 控制，不轮询、不执行驱动其余 Host-ID 流程。
 task project_dut_config_seq::declare_af(
 	output bit	ok,
 	output string	why
 );
 	pcie_bar_write_by_name("h0.pf0.bar0", 64'h1010, 4, 128'h5555_aaaa, 32'h0, ok, why);
+	if (!ok) return;
+	read_af_status(ok, why);
+endtask
+
+
+// 首次声明和每100笔完整DWORD配置写复用同一同步状态读；真实Completion返回前不能继续写。
+// 只有该读跳过 RAM 写值比较；单次值不为8或传输失败立即终止，不插固定延迟或额外尾读。
+task project_dut_config_seq::read_af_status(
+	output bit	ok,
+	output string	why
+);
+	project_bar_target_t	target;
+	logic [127:0]		status_data;
+
+	ok = 0;
+	if (!cfg.bar_registry.resolve_name("h0.pf0.bar0", target, why)) return;
+	mmio(target, 0, 64'h1010, 4, '0, '0, status_data, ok, why, 0);
+	if (!ok) return;
+	if (status_data[31:0] !== 32'h8) begin
+		ok = 0;
+		why = $sformatf("AF status expected 0x00000008, got 0x%08h", status_data[31:0]);
+		return;
+	end
+	writes_since_af_read = 0;
 endtask
 
 
@@ -5978,7 +6016,8 @@ task project_dut_config_seq::mmio(
 	input logic [31:0]		byte_skip_mask,
 	output logic [127:0]		result,
 	output bit			ok,
-	output string			why
+	output string			why,
+	input bit			check_read_data
 );
 	pcie_tl_reg_seq	seq;
 	bit [63:0]	address;
@@ -6000,10 +6039,16 @@ task project_dut_config_seq::mmio(
 	seq.len = length;
 	seq.mask = byte_skip_mask;
 	seq.wdata = data;
+	seq.check_read_data = check_read_data;
 	seq.start(cfg.rc_sequencers[target.rc_slot], this);
 	ok = seq.status == PCIE_RW_OK;
 	why = seq.error_msg;
 	result = seq.rdata;
+	// 当前表写均为完整4B；宽访问和部分/全屏蔽访问不冒充一个完整DWORD，也不额外拆包。
+	if (ok && writing && length == 4 && byte_skip_mask == 0 && seq.issued_tlps.size() != 0) begin
+		writes_since_af_read++;
+		if (writes_since_af_read == 100) read_af_status(ok, why);
+	end
 endtask
 
 

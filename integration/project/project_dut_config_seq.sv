@@ -2,7 +2,7 @@
 // 依赖 cfg 中的真实 BAR/队列视图与 PCIe RC sequencer；不创建第二套 context 或 env。
 // task/hook 属于本 sequence，cfg 保存参数、资源与表项数据；ring/BAR 不归 seq 所有。
 // 所有硬件访问复用 pcie_tl_reg_seq，经实际目标 RC、Intel bind 发往 DUT。
-// 默认 body 先声明 Host0/PF0 为 AF，再配置 BDF、VIO/QSCH；MSI-X 按完成模式选择。
+// 默认 body 先声明 Host0/PF0 为 AF 并单次读回状态8，再配置 BDF、VIO/QSCH；MSI-X 按完成模式选择。
 // 已知表按图片字段和 cfg 地址真实写入；读回可选，失败报告 fatal 并保留 DMA 资源。
 // Notify 仅访问实际队列对的有效项；首次配置前 DUT 已按 05.png 复位为无效项：
 // type=3，lookup key/global_qid 全1，reserved=0。未用槽位保持该复位值，不由 seq 写入或读回。
@@ -13,6 +13,8 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 	project_vio_selection_t	selection;
 	bit			success;
 	string			error_msg;
+	// 当前 seq 自上次成功 AF 状态读之后完成的完整 DWORD 写数；每次 start 独立计数。
+	protected int unsigned	writes_since_af_read;
 
 	// 对象只保存本次执行结果；运行期共享状态始终在 cfg，不随 sequence 销毁。
 	extern function new(
@@ -25,8 +27,14 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 	// 平台先等待复位就绪；AF 声明先于写表，VIO 在写入、所选验证和 commit 后成功。
 	extern virtual task body();
 
-	// 固定向 Host0/PF0 BAR0+0x1010 写一个声明 DWORD；失败停止，不读回、不遍历 Host。
+	// 固定向 Host0/PF0 BAR0+0x1010 写声明后读一次状态8；不轮询，任一步失败停止。
 	extern virtual task declare_af(
+		output bit	ok,
+		output string	why
+	);
+
+	// 单次读取固定状态寄存器并要求8；成功后清写计数，失败保留原因，不轮询。
+	extern protected task read_af_status(
 		output bit	ok,
 		output string	why
 	);
@@ -121,7 +129,7 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		output string			why
 	);
 
-	// 全部四态检查在两态 registry/sequence 转换前执行，保留小端 byte lane 和 skip-mask 语义。
+	// 全部四态检查在转换前执行；check_read_data 仅为状态读关闭 SCB 的 RAM 写值比较。
 	extern protected task mmio(
 		input project_bar_target_t	target,
 		input bit			writing,
@@ -131,7 +139,8 @@ class project_dut_config_seq extends uvm_sequence #(pcie_tl_tlp);
 		input logic [31:0]		byte_skip_mask,
 		output logic [127:0]		result,
 		output bit			ok,
-		output string			why
+		output string			why,
+		input bit			check_read_data = 1
 	);
 
 	// 统一表项写序；保留原始 mmio 的宽度/掩码语义，禁止先发送再发现越界。
@@ -705,6 +714,7 @@ endfunction
 task project_dut_config_seq::pre_start();
 	success = 0;
 	error_msg = "";
+	writes_since_af_read = 0;
 	if (m_sequencer == null) begin
 		`uvm_fatal("PROJECT_CONFIG_SEQ", "start configuration on the project's PCIe RC sequencer")
 	end
@@ -817,13 +827,38 @@ task project_dut_config_seq::body();
 endtask
 
 
-// 用真实租约解析 BAR 基址和 Host0 RC；固定 32bit 写，不受公共表开关或读回开关影响。
-// 复用 pcie_tl_reg_seq 的 Memory Write 路径；posted 成功只表示发送完成，不证明 DUT 已生效。
+// 通过真实 Host0 RC 先写 magic，再同步读一次4B状态；必须返回8才允许后续表配置。
+// 状态寄存器不按写入值比较，只关闭该次读的 RAM 数据比较；Completion 失败仍原样上传。
+// 不受 configure_public/verify_readback 控制，不轮询、不执行驱动其余 Host-ID 流程。
 task project_dut_config_seq::declare_af(
 	output bit	ok,
 	output string	why
 );
 	pcie_bar_write_by_name("h0.pf0.bar0", 64'h1010, 4, 128'h5555_aaaa, 32'h0, ok, why);
+	if (!ok) return;
+	read_af_status(ok, why);
+endtask
+
+
+// 首次声明和每100笔完整DWORD配置写复用同一同步状态读；真实Completion返回前不能继续写。
+// 只有该读跳过 RAM 写值比较；单次值不为8或传输失败立即终止，不插固定延迟或额外尾读。
+task project_dut_config_seq::read_af_status(
+	output bit	ok,
+	output string	why
+);
+	project_bar_target_t	target;
+	logic [127:0]		status_data;
+
+	ok = 0;
+	if (!cfg.bar_registry.resolve_name("h0.pf0.bar0", target, why)) return;
+	mmio(target, 0, 64'h1010, 4, '0, '0, status_data, ok, why, 0);
+	if (!ok) return;
+	if (status_data[31:0] !== 32'h8) begin
+		ok = 0;
+		why = $sformatf("AF status expected 0x00000008, got 0x%08h", status_data[31:0]);
+		return;
+	end
+	writes_since_af_read = 0;
 endtask
 
 
@@ -1436,7 +1471,8 @@ task project_dut_config_seq::mmio(
 	input logic [31:0]		byte_skip_mask,
 	output logic [127:0]		result,
 	output bit			ok,
-	output string			why
+	output string			why,
+	input bit			check_read_data
 );
 	pcie_tl_reg_seq	seq;
 	bit [63:0]	address;
@@ -1458,10 +1494,16 @@ task project_dut_config_seq::mmio(
 	seq.len = length;
 	seq.mask = byte_skip_mask;
 	seq.wdata = data;
+	seq.check_read_data = check_read_data;
 	seq.start(cfg.rc_sequencers[target.rc_slot], this);
 	ok = seq.status == PCIE_RW_OK;
 	why = seq.error_msg;
 	result = seq.rdata;
+	// 当前表写均为完整4B；宽访问和部分/全屏蔽访问不冒充一个完整DWORD，也不额外拆包。
+	if (ok && writing && length == 4 && byte_skip_mask == 0 && seq.issued_tlps.size() != 0) begin
+		writes_since_af_read++;
+		if (writes_since_af_read == 100) read_af_status(ok, why);
+	end
 endtask
 
 

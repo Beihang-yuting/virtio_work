@@ -29,11 +29,12 @@ Custom 使用私有 descriptor/CQ，512B 报文不带 Virtio header。
 4. 平台等待 DUT 复位释放、Intel 接口可用后，启动一个配置 seq。
    默认 body 执行 AF 声明→BDF→按完成模式配置 MSI-X→准备 ring→排序并初始化单 bank Notify→QSCH→VTX/VRX→使能→确认。
    AF 声明固定经 Host0 RC 向环境分配的 `h0.pf0.bar0.base + 0x1010` 写 `32'h5555_aaaa`，
-   使用 `pcie_tl_reg_seq` 发送一个 4B Memory Write；发送失败立即停止，不读回、不遍历 Host。
-   `dpu.verify_readback=1` 才增加配置读回；默认0，不发送配置 Memory Read。
+   使用 `pcie_tl_reg_seq` 发送一个 4B Memory Write，随后从同地址读一次并等待 Completion，要求状态为8；任一步失败立即停止，不遍历 Host。
+   之后每成功发送100次完整 DWORD 配置写，再执行一次相同状态读；计数属于本次 seq，不补尾读、不轮询。
+   `dpu.verify_readback=1` 才增加普通表项读回；默认0跳过普通表项读回，AF同步读始终执行。
    `dpu.configure_public=1` 才额外执行 BAR/PFVF/Completion BDF/Prefix 等配置；默认关闭。
    AF 声明、默认开启的 BDF 和 MSI-X 中断模式均不依赖这个公共开关。
-   `declare_af()` 与可选的 `PROJECT_AF` 表 hook 独立；此处仅发送声明值，不执行驱动后续读回/Host-ID 握手。
+   `declare_af()` 与可选的 `PROJECT_AF` 表 hook 独立；此处仅检查固定状态8，不执行额外的 Host-ID 协商。AF状态读不受 `dpu.verify_readback` 控制，关闭的只是SCB历史RAM写值比较，Completion错误及状态值仍检查。
    任何一步失败在 sequence 的 `post_start()` 报告 fatal，直接通过 AIP 启动也不会静默 done。
 5. 配置成功后 `env.register_aip_commands()`，进入 `aip_tcl_bridge::run_loop()`。
    业务结束后平台停止 DUT DMA，再用 `cfg.release_vio_resources()` 释放 ring。
@@ -100,8 +101,8 @@ BDF、Notify、QSCH、VTX 的驱动地址与策略，不要求 `table_layouts/fr
 `dpu.driver_layouts=0` 也可使用。原 `project_dut_config_seq` 保持原来的平台布局要求。
 
 这一入口固定只配置 Host0/PF0、一对队列中的 VTX：Packed、深度256、Polling，
-不启用 VRX、不写 MSI-X/BAR/PFVF 公共表、不做配置读回。
-顺序为 AF→BDF→Notify→QSCH→VTX初始化→VTX使能，共24笔32bit Memory Write。
+不启用 VRX、不写 MSI-X/BAR/PFVF 公共表、不做普通表项读回；AF状态读仍执行。
+顺序为 AF→BDF→Notify→QSCH→VTX初始化→VTX使能，共24笔32bit Memory Write、1笔AF状态 Memory Read。
 表地址和策略覆盖 cfg 中的相应输入/冻结值；BAR基址、global qid、ring IOVA仍取环境实际分配值。
 后续改硬件地址或固定字段，直接修改新 seq 的 `prepare_fixed_configuration()`。
 
@@ -316,17 +317,17 @@ if (!ok) return;
 接口；这里 `addr` 是 **Host0/PF0 BAR0 内偏移**。实际地址由环境已分配的 BAR0.base 加偏移得到，
 随后使用对应 Host 的原生 PCIe RC 发 Memory 请求，不启动 DUT 配置 seq。
 
-把已有 `reg_acc` 注册中的类型换成新类，并使用第四参数返回错误。以下沿用工程已有的真实 RC 句柄：
+把已有 `reg_acc` 注册中的类型换成新类，第四参数返回错误，第五参数映射逐次读比较开关。以下沿用工程已有的真实 RC 句柄：
 
 ```systemverilog
-`aip_cmd_reg(reg_acc, project_pcie_reg_seq, virtual_sqr::pcie_rc_sqr, seq.error_msg)
+`aip_cmd_reg(reg_acc, project_pcie_reg_seq, virtual_sqr::pcie_rc_sqr, seq.error_msg, seq.check_read_data)
 ```
 
 环境已经向 PCIe sequencer 发布 `env_cfg`，因此 Tcl 只需传偏移和值：
 
 ```tcl
 reg_acc write 0x1010 4 0x5555aaaa
-reg_acc read 0x1010
+reg_acc read 0x1010 check_read_data=0  ;# AF状态寄存器返回8，不与magic写值比较
 reg_acc op=write addr=0x3000 len=16 data=0x112233445566778899aabbccddeeff00
 reg_acc op=read addr=0x3000 len=16
 ```
@@ -336,6 +337,11 @@ reg_acc op=read addr=0x3000 len=16
 `len` 支持4/8/12/16字节，默认4；`mask` 默认0，bit i为1表示跳过第i字节，稀疏mask沿用原生拆分逻辑。
 范围或读写失败通过 `status/error_msg` 返回，第四参数使 Tcl 的 `aip_check_status` 非零。
 posted写成功表示发送完成；是否读回由用户后续命令决定。
+Tcl `reg_acc read` 返回原始读值，不自动判断是否等于8；自动配置seq的AF同步读才执行这个状态校验。
+`check_read_data` 每条命令默认1，仅接受0/1；设置0只关闭本次读取的SCB历史RAM写值比较，
+不关闭tag/长度/Completion状态/超时检查。下一条省略此参数自动恢复1。
+旧三/四参数注册仍可编译；未映射第五参数时显式传此选项会在启动前报错。
+所有寄存器请求固定TC0、attr=0（关闭RO/IDO），保证posted写与后续状态读遵循顺序。
 
 也可在 SV 中显式传入已有 cfg；不赋值时自动从启动 sequencer 的 `env_cfg` 获取：
 

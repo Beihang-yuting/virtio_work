@@ -57,12 +57,13 @@ task project_pcie_reg_seq::body();
 		"h0.pf0.bar0 base=0x%016h + offset=0x%016h = address=0x%016h len=%0d write=%0b rc=%0d",
 		target.bar_lease.base, addr, absolute_address, len, is_write, target.rc_slot), UVM_LOW)
 	request = new("pf0_bar0_request");
-	request.is_write      = is_write;
-	request.addr          = absolute_address;
-	request.len           = len;
-	request.mask          = mask;
-	request.wdata         = wdata;
-	request.rb_timeout_ns = rb_timeout_ns;
+	request.is_write        = is_write;
+	request.addr            = absolute_address;
+	request.len             = len;
+	request.mask            = mask;
+	request.wdata           = wdata;
+	request.rb_timeout_ns   = rb_timeout_ns;
+	request.check_read_data = check_read_data;
 	request.start(cfg.rc_sequencers[target.rc_slot], this);
 	rdata       = request.rdata;
 	status      = request.status;

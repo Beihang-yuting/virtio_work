@@ -9,8 +9,12 @@ proc check_project_reg {condition text} {
 }
 reg_acc write 0x1010 4 0x5555aaaa
 check_project_reg [expr {[aip_check_status] == 0}] "PF0 BAR0 offset write"
+reg_acc read 0x1010 check_read_data=0
+check_project_reg [expr {[aip_read_result] eq "rdata=0x8"}] "AF status bypasses RAM comparison"
+reg_acc read 0x1010 check_read_data=1
+check_project_reg [expr {[aip_read_result] eq "rdata=0x8"}] "explicit RAM comparison remains enabled"
 reg_acc read 0x1010
-check_project_reg [expr {[aip_read_result] eq "rdata=0x5555aaaa"}] "DWORD readback"
+check_project_reg [expr {[aip_read_result] eq "rdata=0x8"}] "omitted option restores default comparison"
 reg_acc op=write addr=0x3000 len=16 data=0x112233445566778899aabbccddeeff00
 check_project_reg [expr {[aip_check_status] == 0}] "128bit write"
 reg_acc read 0x3000 16
@@ -21,6 +25,10 @@ reg_acc op=read addr=0x3000 len=16 mask=0x5555
 check_project_reg [expr {[aip_read_result] eq "rdata=0xff00ff00ff00ff00ff00ff00ff00ff00"}] "masked read lanes"
 reg_acc read 0x3000 16
 check_project_reg [expr {[aip_read_result] eq "rdata=0xff22ff44ff66ff88ffaaffccffeeff00"}] "masked bytes retained"
+reg_acc read 0x1010 check_read_data=2
+check_project_reg [expr {[aip_check_status] != 0}] "invalid read policy rejected"
+reg_acc read 0x1010 check_read_data=-1
+check_project_reg [expr {[aip_check_status] != 0}] "negative read policy rejected"
 reg_acc read 0xfffffffffffff000 16
 check_project_reg [expr {[aip_check_status] != 0}] "BAR range error propagated"
 check_project_reg [expr {[aip_read_result] eq "ERROR: reg reg_acc: BAR access crosses lease boundary or overflows 64-bit address"}] "range error text"

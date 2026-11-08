@@ -47,8 +47,10 @@ DPU、net_packet、host_mem、PCIe TL、VIO、AIP glue、Intel interface/adapter
 
 默认采用驱动参考 BDF/MSI-X/VIO/QSCH 布局，配置 seq 已实现这些表的写入和可选真实读回。
 第一笔配置写为 AF 声明：经 Host0 RC 向已分配的 h0.pf0.bar0.base+0x1010 写32'h5555_aaaa。
-declare_af() 复用 pcie_tl_reg_seq，仅发送一个4B Memory Write，失败立即停止；不读回，
-不受 configure_public 控制，与 PROJECT_AF 表独立，也不执行驱动后续读回/Host-ID 握手。
+declare_af() 复用 pcie_tl_reg_seq，发送4B Memory Write后单次读同地址，等待Completion并要求状态8。
+随后每100次完整DWORD配置写再读一次状态；无轮询、无尾读，任一步失败停止。
+AF读关闭SCB历史RAM比较，保留协议检查及状态8校验；与PROJECT_AF表独立，不执行额外Host-ID协商。
+所有寄存器访问固定TC0/attr0；AF同步不受configure_public或verify_readback控制。
 BDF默认开启，MSI-X按实际完成模式选择；其余公共表默认关闭。
 默认 dpu.verify_readback=0；设为1时增加配置读回。
 Notify 仅写/读实际队列对的有效项；首次配置前 DUT 须按05.png复位未用项

@@ -30,7 +30,7 @@ VTX/VRX 的 ring 地址 = prepare 导出的 item.entry.desc_addr / dsc_addr
 
 | 表或端口 | BAR 内地址 | 每项字节 | 索引来源 / 说明 |
 | --- | --- | ---: | --- |
-| AF 声明 | Host0 PF0 BAR0 `0x1010` | 4 | 默认 seq 首笔写 `32'h5555_aaaa`，不读回；独立于可选 `PROJECT_AF` 表 |
+| AF 声明 | Host0 PF0 BAR0 `0x1010` | 4 | 默认 seq 首笔写 `32'h5555_aaaa`，随后单次读要求状态8；独立于可选 `PROJECT_AF` 表 |
 | PFVF map | `0x088000 + i*4` | 4 | 驱动 `host*16+pf`；本例 Host0 |
 | BDF map | `0x108000 + i*4` | 4 | Function 对应的全局表索引 |
 | Completion BDF | `0x098000 + i*4` | 4 | 驱动用 srcid；当前由 `completion_index` 显式声明 |
@@ -75,13 +75,14 @@ base/limit 表每项8B，size-code 每项4B。归档中找到了这些寄存器�
 `+dpu.driver_layouts=0`。修改现有地址只需在 env 构建前修改 `cfg.table_layouts`，
 无需复制这些方法或手填 BAR 物理地址。
 
-当前默认先发送 AF 声明，再独立下发 BDF，MSI-X 按完成模式选择。AF 仅包含 magic 写，
-不执行驱动后续读回/Host-ID 握手，也不受 `dpu.configure_public` 或 `dpu.driver_layouts` 控制。
-基类已在 `declare_af()` 中调用以下 helper；只展示写法，使用默认 body 时不要再调用一遍：
+当前默认先写 AF magic，再单次读同址并要求状态8，然后独立下发 BDF；MSI-X 按完成模式选择。
+其后每100次完整DWORD配置写再读一次AF状态；无轮询、无尾部补读，不执行额外Host-ID协商。
+AF读写不受 `dpu.configure_public`、`dpu.driver_layouts` 或 `dpu.verify_readback` 控制。
+基类已在 `declare_af()` 中实现以下完整步骤；使用默认 body 时不要再调用一遍：
 
 ```systemverilog
-// 配置 seq 内复用真实 BAR 租约和 Host0 RC；ok/why 接收发送结果，失败由调用方立即停止。
-pcie_bar_write_by_name("h0.pf0.bar0", 64'h1010, 4, 128'h5555_aaaa, 32'h0, ok, why);
+// 已复用真实BAR和RC：magic写→等待同址4B读Completion→验证8；任一步失败立即停止。
+declare_af(ok, why);
 ```
 
 以下其余公共地址仅在需要时添加；可在已有 cfg 中增加

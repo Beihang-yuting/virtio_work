@@ -14,7 +14,34 @@ package project_pcie_reg_test_pkg;
 	class project_reg_test_context;
 		static uvm_sequencer_base	sqr;
 	endclass
-	`aip_cmd_reg(reg_acc, project_pcie_reg_seq, project_reg_test_context::sqr, seq.error_msg)
+	`aip_cmd_reg(reg_acc, project_pcie_reg_seq, project_reg_test_context::sqr, seq.error_msg, seq.check_read_data)
+
+	// 仅接收两笔刻意开启RAM比较的AF状态读错误；协议错误及其他地址仍正常报错。
+	class project_reg_expected_data_error extends uvm_report_catcher;
+		bit [63:0]	addr;
+		int unsigned	count;
+		// 捕获器由测试持有，保留到report以精确接收两次预期错误的汇总。
+		extern function new();
+		// 地址、字节值、错误次数均固定，禁止吞掉真实配置/Completion故障。
+		extern virtual function action_e catch();
+	endclass
+
+	function project_reg_expected_data_error::new();
+		super.new("reg_expected_data_error");
+	endfunction
+
+	function uvm_report_catcher::action_e project_reg_expected_data_error::catch();
+		if (get_id() == "SCB" && get_severity() == UVM_ERROR) begin
+			if (count < 2 && get_message() == $sformatf(
+				"Data mismatch at addr=0x%016h: expected=0xaa got=0x08", addr)) begin
+				count++;
+				return CAUGHT;
+			end
+			if (count == 2 && get_message() == "FAIL: 2 mismatches, 0 unexpected completions")
+				return CAUGHT;
+		end
+		return THROW;
+	endfunction
 
 	// 复用现有build的Intel连接，独立run不启动父类DUT配置或发包。
 	class project_pcie_reg_test extends project_bare_config_test;
@@ -52,6 +79,7 @@ package project_pcie_reg_test_pkg;
 			offset = pcie_tl_mem_wire_addr(request) - management.bar_lease.base;
 			require_true(host == 0 && (offset == 'h1010 || offset == 'h2000 ||
 				(offset >= 'h3000 && offset < 'h3010)), "request did not use assigned Host0 PF0 BAR0");
+			require_true(request.tc == 0 && request.attr == 0, "register request allowed reordering");
 			requests++;
 			if (request.kind == TLP_MEM_WR) begin
 				writes++;
@@ -78,6 +106,8 @@ package project_pcie_reg_test_pkg;
 				foreach (completion.payload[i])
 					completion.payload[i] = mmio_bytes[host].exists(pcie_tl_mem_wire_addr(request)+i) ?
 						mmio_bytes[host][pcie_tl_mem_wire_addr(request)+i] : 0;
+				// AF为状态寄存器，读值8独立于此前写入的声明magic。
+				if (offset == 'h1010) completion.payload = '{8'h08, 8'h00, 8'h00, 8'h00};
 				apps[host].send(completion);
 			end
 		end
@@ -95,6 +125,7 @@ package project_pcie_reg_test_pkg;
 
 	// 两模式都先核对显式cfg注入及重复start；之后reg_acc自动从真实RC的config_db取得同一cfg。
 	task project_pcie_reg_test::run_phase(uvm_phase phase);
+		project_reg_expected_data_error	expected_error;
 		project_pcie_reg_seq	access;
 		project_pcie_reg_seq	missing;
 		string			why;
@@ -104,6 +135,9 @@ package project_pcie_reg_test_pkg;
 		phase.raise_objection(this);
 		require_true(cfg.bar_registry.resolve_name("h0.pf0.bar0", management, why), why);
 		project_reg_test_context::sqr = cfg.rc_sequencers[cfg.tl_slot_by_host[0]];
+		expected_error = new();
+		expected_error.addr = management.bar_lease.base + 'h1010;
+		uvm_report_cb::add(null, expected_error);
 		fork app_receive(0); join_none
 		#100ns;
 
@@ -139,7 +173,10 @@ package project_pcie_reg_test_pkg;
 			aip_tcl_bridge::run_loop();
 		end else begin
 			command("reg_acc write 0x1010 4 0x5555aaaa", 1);
-			command("reg_acc read 0x1010", 1, "rdata=0x5555aaaa");
+			command("reg_acc read 0x1010 check_read_data=0", 1, "rdata=0x8");
+			require_true(expected_error.count == 0, "opt-out still compared AF with RAM write history");
+			command("reg_acc read 0x1010 check_read_data=1", 1, "rdata=0x8");
+			command("reg_acc read 0x1010", 1, "rdata=0x8");
 			command("reg_acc op=write addr=0x3000 len=16 data=0x112233445566778899aabbccddeeff00", 1);
 			command("reg_acc read 0x3000 16", 1, "rdata=0x112233445566778899aabbccddeeff00");
 			command("reg_acc write 0x3000 16 0xffffffffffffffffffffffffffffffff mask=0x5555", 1);
@@ -147,13 +184,19 @@ package project_pcie_reg_test_pkg;
 				"rdata=0xff00ff00ff00ff00ff00ff00ff00ff00");
 			command("reg_acc read 0x3000 16", 1, "rdata=0xff22ff44ff66ff88ffaaffccffeeff00");
 			before_requests = requests;
+			command("reg_acc read 0x1010 check_read_data=2", 0,
+				"ERROR: reg reg_acc: check_read_data must be 0 or 1");
+			command("reg_acc read 0x1010 check_read_data=-1", 0,
+				"ERROR: reg reg_acc: check_read_data must be 0 or 1");
 			command("reg_acc read 0xfffffffffffff000 16", 0,
 				"ERROR: reg reg_acc: BAR access crosses lease boundary or overflows 64-bit address");
 			require_true(requests == before_requests, "Tcl-compatible range error sent a Memory request");
 		end
 		#100ns;
-		require_true(requests == 24 && writes == 12 && reads == 12,
+		require_true(requests == 26 && writes == 12 && reads == 14,
 			$sformatf("missing/extra requests: total=%0d writes=%0d reads=%0d", requests, writes, reads));
+		require_true(expected_error.count == 2 && env.pcie_env.scbs[0].mismatched == 2,
+			"explicit/default read comparison or per-call opt-out did not behave independently");
 		wide_value = table_value('h3000, 16);
 		require_true(wide_value == 128'hff22ff44ff66ff88ffaaffccffeeff00 &&
 			table_value('h1010, 4) == 'h5555aaaa && table_value('h2000, 4) == 'h11223344,

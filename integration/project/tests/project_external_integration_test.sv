@@ -538,6 +538,8 @@ package project_external_integration_test_pkg;
 			pcie_tl_tlp	t;
 			pcie_tl_mem_tlp	m;
 			pcie_tl_cpl_tlp	c;
+			project_bar_target_t	af_target;
+			string		why;
 			wait (apps[host].rx_queue.size() != 0);
 			apps[host].receive(t);
 			if (t == null) continue;
@@ -561,6 +563,9 @@ package project_external_integration_test_pkg;
 				c.lower_addr = m.addr[6:0] + pcie_tl_mem_first_valid_in_range(m,0,pcie_tl_mem_dw_count(m)*4);
 				c.payload = new[pcie_tl_mem_dw_count(m)*4];
 				foreach (c.payload[i]) c.payload[i] = mmio_bytes[host].exists(pcie_tl_mem_wire_addr(m)+i) ? mmio_bytes[host][pcie_tl_mem_wire_addr(m)+i] : 0;
+				if (host == 0 && cfg.bar_registry.resolve_name("h0.pf0.bar0", af_target, why) &&
+					pcie_tl_mem_wire_addr(m) == af_target.bar_lease.base + 'h1010)
+					c.payload = '{8'h08, 8'h00, 8'h00, 8'h00};
 				apps[host].send(c);
 			end
 		end
@@ -757,6 +762,9 @@ package project_external_integration_test_pkg;
 		int unsigned	count;
 		string		message;
 		string		expected_stage;
+		bit		expect_completion_error;
+		int unsigned	completion_errors;
+		int unsigned	read_warnings;
 		// 捕获器仅在负例 seq.start 周围注册，不吞整个仿真的错误。
 		extern function new();
 		// 精确匹配生产配置序列的 fatal，保存阶段用于 run_phase 二次断言。
@@ -770,6 +778,20 @@ package project_external_integration_test_pkg;
 
 	// 返回 CAUGHT 允许负例继续检查 READY；错误 ID 或严重级别不同则继续上报。
 	function uvm_report_catcher::action_e project_bare_expected_failure::catch();
+		if (expect_completion_error) begin
+			if (get_id() == "SCB_CPL_STATUS" && get_severity() == UVM_ERROR &&
+				uvm_is_match("Completion status mismatch:*expected=CPL_STATUS_SC got=CPL_STATUS_UR*", get_message())) begin
+				completion_errors++;
+				return CAUGHT;
+			end
+			if (get_id() == "RW_SEQ" && get_severity() == UVM_WARNING &&
+				uvm_is_match("READ completed with status=CPL_STATUS_UR *", get_message())) begin
+				read_warnings++;
+				return CAUGHT;
+			end
+			if (get_id() == "SCB" && get_severity() == UVM_ERROR && completion_errors == 1 &&
+				get_message() == "FAIL: 1 mismatches, 0 unexpected completions") return CAUGHT;
+		end
 		if (get_id() == "PROJECT_CONFIG_SEQ" && get_severity() == UVM_FATAL &&
 			uvm_is_match({expected_stage, ":*"}, get_message())) begin
 			count++;
@@ -891,6 +913,11 @@ package project_external_integration_test_pkg;
 		bit			missing_layout;
 		bit			missing_message;
 		bit			fail_af_write;
+		bit			bad_af_status;
+		bit			bad_af_completion;
+		int unsigned		af_fail_read = 1;
+		int unsigned		af_reads;
+		int unsigned		completed_af_reads;
 		bit			corrupt_bdf;
 		bit			corrupted;
 		bit			business_notify_enabled;
@@ -906,7 +933,7 @@ package project_external_integration_test_pkg;
 		extern function bit [127:0] table_value(input bit [63:0] offset, input int unsigned bytes);
 		// 模拟固定驱动端口：四次高到低 data、clear、trigger 后原子提交表项。
 		extern function void capture_write(input pcie_tl_mem_tlp request);
-		// 真正接收 Intel Memory 请求并发送 Completion；负例只篡改一次 Notify 读值。
+		// 真正接收 Intel Memory 请求并发送 Completion；负例按指定位置篡改AF状态/Completion或表读值。
 		extern virtual task app_receive(input int unsigned host);
 		// 无读回时等待真实应用侧收到所有预期 posted 写；限时且不注入额外 MemRead。
 		extern task await_configuration_writes();
@@ -942,14 +969,23 @@ package project_external_integration_test_pkg;
 		msix_mode = $test$plusargs("PROJECT_BARE_MSIX") || missing_message;
 		missing_layout = $test$plusargs("PROJECT_BARE_MISSING_LAYOUT");
 		fail_af_write = $test$plusargs("PROJECT_BARE_AF_WRITE_FAIL");
-		require_true(int'(corrupt_readback)+int'(missing_layout)+int'(missing_message)+int'(fail_af_write) <= 1,
+		bad_af_status = $test$plusargs("PROJECT_BARE_AF_BAD_STATUS");
+		bad_af_completion = $test$plusargs("PROJECT_BARE_AF_CPL_ERROR");
+		void'($value$plusargs("PROJECT_BARE_AF_FAIL_READ=%d", af_fail_read));
+		require_true(af_fail_read >= 1, "AF failure read index must be positive");
+		// 周期负例固定16对、TX-only/Polling；第100次写位于QSCH，避免阶段期望随场景漂移。
+		if ((bad_af_status || bad_af_completion) && af_fail_read > 1)
+			require_true(af_fail_read == 2 && pairs == 16 && tx_only && !msix_mode,
+				"periodic AF failure fixture requires read2, 16 pairs, TX-only and polling");
+		require_true(int'(corrupt_readback)+int'(missing_layout)+int'(missing_message)+int'(fail_af_write)+
+			int'(bad_af_status)+int'(bad_af_completion) <= 1,
 			"select one bare failure per run");
 		if (fail_af_write) begin
 			pcie_tl_reg_seq::type_id::set_type_override(project_config_fault_seq::get_type());
 			project_config_fault_seq::calls = 0;
 			project_config_fault_seq::fail_on_call = 1;
 		end
-		// 故障必须经可选的真实读回路径观察；普通正例保留产品默认零读请求。
+		// 故障必须经可选的真实读回路径观察；普通正例仅执行首笔及每100次DWORD写后的AF状态读。
 		if (corrupt_readback) aip_cmdline_override::set_val("dpu.verify_readback", "1");
 
 		aip_cmdline_override::set_val("dpu.hosts", "1");
@@ -1060,6 +1096,10 @@ package project_external_integration_test_pkg;
 		end
 		write_offsets.push_back(offset);
 		write_values.push_back(value);
+		if (write_offsets.size() > 1) begin
+			require_true(completed_af_reads == 1 + (write_offsets.size()-2)/100,
+				"configuration write crossed AF initial/100-DWORD status-read boundary");
+		end
 		for (int unsigned i = 0; i < 4; i++)
 			mmio_bytes[0][management.bar_lease.base+offset+i] = request.payload[i];
 
@@ -1122,9 +1162,11 @@ package project_external_integration_test_pkg;
 			if (t == null) continue;
 			require_true($cast(m, t), "bare configuration issued non-Memory request");
 			offset = pcie_tl_mem_wire_addr(m) - management.bar_lease.base;
+			if (!business_notify_enabled)
+				require_true(m.tc == 0 && m.attr == 0, "configuration request allowed relaxed ordering or a different TC");
 			if (offset == 'h1010) begin
-				require_true(host == 0 && m.kind == TLP_MEM_WR,
-					"AF declaration must use Host0 RC Memory Write without readback");
+				require_true(host == 0 && pcie_tl_mem_valid_bytes(m) == 4,
+					"AF declaration/status must use Host0 RC complete DWORD access");
 			end
 			// DUT 未用 Notify 行由复位提供无效值；配置过程只可访问实际 pair，读写共用此边界检查。
 			if (offset >= 'ha0000 && offset < 'ha2000) begin
@@ -1153,6 +1195,24 @@ package project_external_integration_test_pkg;
 						mmio_bytes[host][pcie_tl_mem_wire_addr(m)+i] : 0;
 				end
 				offset = pcie_tl_mem_wire_addr(m) - management.bar_lease.base;
+				if (offset == 'h1010) begin
+					af_reads++;
+					require_true(write_offsets.size() == 1 + (af_reads-1)*100,
+						"AF status read was missing/extra or not at the initial/100-write boundary");
+					c.payload = '{8'h08, 8'h00, 8'h00, 8'h00};
+					if (bad_af_status && af_reads == af_fail_read) c.payload[0] = 7;
+					if (bad_af_completion && af_reads == af_fail_read) begin
+						c.kind = TLP_CPL;
+						c.fmt = FMT_3DW_NO_DATA;
+						c.cpl_status = CPL_STATUS_UR;
+						c.length = 0;
+						c.byte_count = 0;
+						c.payload = new[0];
+					end
+					// 设备模型故意延迟响应，期间不得已有后续配置写越过该同步读。
+					#50ns;
+					require_true(apps[host].rx_queue.size() == 0, "configuration continued before AF Completion");
+				end
 				if (corrupt_readback && !corrupted &&
 					(corrupt_bdf ? offset == 'h108000 : (offset >= 'ha0000 && offset < 'ha2000))) begin
 					int unsigned	slot;
@@ -1173,6 +1233,7 @@ package project_external_integration_test_pkg;
 					corrupted = 1;
 				end
 				apps[host].send(c);
+				if (offset == 'h1010) completed_af_reads++;
 			end
 		end
 	endtask
@@ -1214,10 +1275,12 @@ package project_external_integration_test_pkg;
 			"default configuration did not declare AF before table writes");
 		require_true(indirect_transactions[0] == pairs*2, "VTX needs initial write and enabled rewrite per pair");
 		require_true(indirect_transactions[1] == (tx_only ? 0 : pairs*2), "VRX enabled rewrite count");
+		require_true(af_reads == 1 + (write_offsets.size()-1)/100 && completed_af_reads == af_reads,
+			"AF initial/periodic read count differs from completed DWORD writes");
 		if (cfg.verify_readback)
-			require_true(read_requests > 0, "enabled readback performed no real MemRead verification");
+			require_true(read_requests > af_reads, "enabled table readback performed no extra MemRead");
 		else
-			require_true(read_requests == 0, "default configuration unexpectedly issued MemRead");
+			require_true(read_requests == af_reads, "default configuration read beyond required AF status reads");
 		require_true(table_value('hb001c0, 4) == 0, "QSCH mode is not VNET");
 
 		foreach (cfg.records[name]) begin
@@ -1290,7 +1353,7 @@ package project_external_integration_test_pkg;
 		require_true(notify_writes == pairs*4, "Notify must contain exactly one written row per queue pair");
 		if (cfg.verify_readback && !msix_mode) begin
 			// 每个唯一表项读一次，加 QSCH mode 一次；不存在未用 Notify 行的额外读回。
-			require_true(read_requests == cfg.records.num() + (cfg.qsch_configure_controls ? 1 : 0),
+			require_true(read_requests == af_reads + cfg.records.num() + (cfg.qsch_configure_controls ? 1 : 0),
 				"configuration read count includes missing/extra table reads");
 		end
 	endfunction
@@ -1431,22 +1494,35 @@ package project_external_integration_test_pkg;
 		fork app_receive(0); join_none
 		#100ns;
 		catcher = new();
-		catcher.expected_stage = fail_af_write ? "declare_af" : missing_message ? "select_msix_scope" :
+		catcher.expected_stage = (bad_af_status || bad_af_completion) ?
+			(af_fail_read == 1 ? "declare_af" : "configure_qsch") : fail_af_write ? "declare_af" : missing_message ? "select_msix_scope" :
 			(corrupt_bdf ? "verify_function_configuration" :
 			(corrupt_readback ? "verify_vio_configuration" : "prepare_vio_configuration"));
-		if (corrupt_readback || missing_layout || missing_message || fail_af_write) uvm_report_cb::add(null, catcher);
+		catcher.expect_completion_error = bad_af_completion;
+		if (corrupt_readback || missing_layout || missing_message || fail_af_write || bad_af_status || bad_af_completion)
+			uvm_report_cb::add(null, catcher);
 		started = $time;
 		bare_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[0]]);
-		if (corrupt_readback || missing_layout || missing_message || fail_af_write) uvm_report_cb::delete(null, catcher);
+		if (corrupt_readback || missing_layout || missing_message || fail_af_write || bad_af_status)
+			uvm_report_cb::delete(null, catcher);
 		selection = bare_seq.selection;
 		require_true(bare_seq.cfg == cfg, "bare sequence did not retrieve the same env_cfg");
 
-		if (corrupt_readback || missing_layout || missing_message || fail_af_write) begin
+		if (corrupt_readback || missing_layout || missing_message || fail_af_write || bad_af_status || bad_af_completion) begin
 			require_true(catcher.count == 1 && !bare_seq.success && bare_seq.error_msg != "",
 				"configuration failure did not report exactly one fatal");
 			if (fail_af_write) begin
 				require_true(project_config_fault_seq::calls == 1 && write_offsets.size() == 0 && read_requests == 0,
 					"AF send failure did not stop all following Memory requests");
+			end else if (bad_af_status || bad_af_completion) begin
+				#100ns;
+				require_true(write_offsets.size() == 1 + (af_fail_read-1)*100 && af_reads == af_fail_read &&
+					read_requests == af_fail_read, "AF read failure allowed later requests or polling");
+				if (bad_af_status) require_true(uvm_is_match("*AF status expected 0x00000008, got 0x00000007", bare_seq.error_msg),
+					"wrong AF value did not stop configuration");
+				if (bad_af_completion) require_true(catcher.completion_errors == 1 && catcher.read_warnings == 1 &&
+					env.pcie_env.scbs[cfg.tl_slot_by_host[0]].mismatched == 1,
+					"skipping data comparison suppressed Completion status checking");
 			end else if (corrupt_readback) begin
 				require_true(corrupted && read_requests > 0 && $time > started, "negative readback never reached Intel completion");
 			end else if (missing_message) begin
@@ -1511,7 +1587,7 @@ package project_external_integration_test_pkg;
 			bare_seq = project_single_queue_config_seq::type_id::create("fixed_seq");
 	endfunction
 
-	// 旧入口负例只允许 AF 写，精确 BDF fatal 后不生成 ring；其余场景沿用完整正常/故障验证。
+	// 旧入口负例只允许 AF 写及状态读，精确 BDF fatal 后不生成 ring；其余沿用正常/故障验证。
 	task project_single_queue_config_test::run_phase(uvm_phase phase);
 		project_bare_expected_failure	catcher;
 		string				why;
@@ -1537,7 +1613,7 @@ package project_external_integration_test_pkg;
 			"original sequence no longer reports its missing BDF layout");
 		for (int unsigned attempt = 0; attempt < 1000 && write_offsets.size() < 1; attempt++) #10ns;
 		#100ns;
-		require_true(write_offsets.size() == 1 && write_offsets[0] == 'h1010 && read_requests == 0,
+		require_true(write_offsets.size() == 1 && write_offsets[0] == 'h1010 && read_requests == 1,
 			"original sequence sent configuration after the missing BDF failure");
 		require_true(bare_seq.selection.setups.num() == 0, "original failure allocated VIO rings");
 		foreach (cfg.vio_envs[h]) cfg.vio_envs[h].host_mem.leak_check();
