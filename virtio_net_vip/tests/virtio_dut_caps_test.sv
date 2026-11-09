@@ -808,7 +808,7 @@ class virtio_dut_caps_test extends uvm_test;
         input int unsigned qpairs_per_function = 1
     );
         virtio_test_device_builder builder;
-        dpu_device_env_config device_cfg;
+        dpu_env_cfg	device_cfg;
         dpu_device_env device_env;
         dpu_function_cfg function_cfg;
         dpu_function_key_t vio_devices[$];
@@ -858,7 +858,7 @@ class virtio_dut_caps_test extends uvm_test;
             request.device_constraints.push_back(count_rule);
         end
         device_cfg = builder.make_env_config();
-        uvm_config_db#(dpu_device_env_config)::set(
+        uvm_config_db#(dpu_env_cfg)::set(
             this, name, "cfg", device_cfg);
         device_env = dpu_device_env::type_id::create(name, this);
         return device_env;

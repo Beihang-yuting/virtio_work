@@ -52,7 +52,7 @@ class virtio_transaction extends uvm_sequence_item;
     uvm_object               packets[$];       // packet_item list (TX input)
     uvm_object               received_pkts[$]; // packet_item list (RX output)
     int unsigned             expected_count;
-    int unsigned             timeout_ns;       // for wait operations
+    int unsigned		timeout_ns;       // RX等待或本包TX空间等待预算
 
     // ===== Control plane fields =====
     rand virtio_ctrl_class_e ctrl_class;
@@ -85,6 +85,11 @@ class virtio_transaction extends uvm_sequence_item;
 
     // ===== TX-specific =====
     virtio_net_hdr_t         net_hdr;
+    // 每包请求由 AIP/SV sequence 按值提交；实际队列的 ops 统一生成线格式。
+    virtio_tx_offload_t	tx_offload;
+    virtio_tx_seg_t		tx_seg;
+    // 当前包提交后检查并发出通知；AIP在批末/最后一包置1，默认为每包通知。
+    bit			tx_notify;
     uvm_object               pkt;              // single packet_item
     bit                      indirect;
     int unsigned             desc_id;          // output: assigned descriptor
@@ -99,93 +104,14 @@ class virtio_transaction extends uvm_sequence_item;
     // 50us 超时、256 队列深度、split ring、NAPI budget 64),避免未赋值
     // 字段以 X/随机残留进入 driver;monitor_bar_id 用全 F 表示"未提供
     // BAR 身份"的哨兵值。
-    function new(string name = "virtio_transaction");
-        super.new(name);
-        txn_type = VIO_TXN_INIT;
-        is_monitor_event = 0;
-        monitor_event = VIRTIO_MON_BAR_ACCESS;
-        monitor_error = 0;
-        monitor_addr = '0;
-        monitor_length = 0;
-        monitor_is_write = 0;
-        monitor_data = '0;
-        monitor_bar_offset = 0;
-        monitor_bar_id = 32'hffff_ffff;
-        monitor_bdf = '0;
-        monitor_host_id = 0;
-        monitor_segment_id = 0;
-        status_old = '0;
-        interrupt_vector = 0;
-        irq_mode = IRQ_MSIX_PER_QUEUE;
-        num_vfs = 0;
-        queue_id = 0;
-        expected_count = 0;
-        timeout_ns = 50000;  // 50us default
-        queue_size = 256;
-        vq_type = VQ_SPLIT;
-        num_pairs = 1;
-        indirect = 0;
-        budget = 64;
-        num_bufs = 0;
-        success = 0;
-    endfunction
+    extern function new(string	name = "virtio_transaction");
 
     // ===== UVM methods =====
 
     // 字段级浅拷贝:标量/结构按值复制,packets 等对象队列只复制句柄
     // (与"事务不拥有报文对象"的约定一致)。cast 失败时静默跳过本类字段,
     // 仅保留 super 拷贝的基类部分。新增字段必须同步维护此列表。
-    virtual function void do_copy(uvm_object rhs);
-        virtio_transaction rhs_t;
-        super.do_copy(rhs);
-        if ($cast(rhs_t, rhs)) begin
-            txn_type       = rhs_t.txn_type;
-            is_monitor_event = rhs_t.is_monitor_event;
-            monitor_event  = rhs_t.monitor_event;
-            monitor_error  = rhs_t.monitor_error;
-            monitor_addr   = rhs_t.monitor_addr;
-            monitor_length = rhs_t.monitor_length;
-            monitor_is_write = rhs_t.monitor_is_write;
-            monitor_data = rhs_t.monitor_data;
-            monitor_bar_offset = rhs_t.monitor_bar_offset;
-            monitor_bar_id = rhs_t.monitor_bar_id;
-            monitor_bdf = rhs_t.monitor_bdf;
-            monitor_host_id = rhs_t.monitor_host_id;
-            monitor_segment_id = rhs_t.monitor_segment_id;
-            status_old     = rhs_t.status_old;
-            interrupt_vector = rhs_t.interrupt_vector;
-            irq_mode       = rhs_t.irq_mode;
-            num_vfs        = rhs_t.num_vfs;
-            queue_id       = rhs_t.queue_id;
-            packets        = rhs_t.packets;
-            received_pkts  = rhs_t.received_pkts;
-            expected_count = rhs_t.expected_count;
-            timeout_ns     = rhs_t.timeout_ns;
-            ctrl_class     = rhs_t.ctrl_class;
-            ctrl_cmd       = rhs_t.ctrl_cmd;
-            ctrl_data      = rhs_t.ctrl_data;
-            ctrl_ack       = rhs_t.ctrl_ack;
-            queue_size     = rhs_t.queue_size;
-            vq_type        = rhs_t.vq_type;
-            features       = rhs_t.features;
-            status_val     = rhs_t.status_val;
-            num_pairs      = rhs_t.num_pairs;
-            rss_cfg        = rhs_t.rss_cfg;
-            snapshot       = rhs_t.snapshot;
-            atomic_op      = rhs_t.atomic_op;
-            vq_error_type  = rhs_t.vq_error_type;
-            status_error   = rhs_t.status_error;
-            feature_error  = rhs_t.feature_error;
-            net_hdr        = rhs_t.net_hdr;
-            pkt            = rhs_t.pkt;
-            indirect       = rhs_t.indirect;
-            desc_id        = rhs_t.desc_id;
-            budget         = rhs_t.budget;
-            num_bufs       = rhs_t.num_bufs;
-            completed_pkts = rhs_t.completed_pkts;
-            success        = rhs_t.success;
-        end
-    endfunction
+    extern virtual function void do_copy(uvm_object	rhs);
 
     // 单行摘要:monitor 事件打事件/地址/错误位,命令事务只打类型+队列,
     // 供日志快速定位;详细字段展开走 do_print。
@@ -217,5 +143,96 @@ class virtio_transaction extends uvm_sequence_item;
     endfunction
 
 endclass
+
+// 初始化事务的逐包参数及既有默认值，不拥有报文或 DMA。
+function virtio_transaction::new(string	name = "virtio_transaction");
+    super.new(name);
+    txn_type = VIO_TXN_INIT;
+    is_monitor_event = 0;
+    monitor_event = VIRTIO_MON_BAR_ACCESS;
+    monitor_error = 0;
+    monitor_addr = '0;
+    monitor_length = 0;
+    monitor_is_write = 0;
+    monitor_data = '0;
+    monitor_bar_offset = 0;
+    monitor_bar_id = 32'hffff_ffff;
+    monitor_bdf = '0;
+    monitor_host_id = 0;
+    monitor_segment_id = 0;
+    status_old = '0;
+    interrupt_vector = 0;
+    irq_mode = IRQ_MSIX_PER_QUEUE;
+    num_vfs = 0;
+    queue_id = 0;
+    expected_count = 0;
+    timeout_ns = 50000;  // 50us default
+    queue_size = 256;
+    vq_type = VQ_SPLIT;
+    num_pairs = 1;
+    indirect = 0;
+    budget = 64;
+    num_bufs = 0;
+    success = 0;
+    tx_offload = '0;
+    tx_seg = '0;
+    tx_notify = 1;
+endfunction
+
+// 复制逐包参数值与报文句柄，保持同一包的 offload/SG/Notify 设置。
+function void virtio_transaction::do_copy(uvm_object	rhs);
+    virtio_transaction	rhs_t;
+    super.do_copy(rhs);
+    if ($cast(rhs_t, rhs)) begin
+        txn_type       = rhs_t.txn_type;
+        is_monitor_event = rhs_t.is_monitor_event;
+        monitor_event  = rhs_t.monitor_event;
+        monitor_error  = rhs_t.monitor_error;
+        monitor_addr   = rhs_t.monitor_addr;
+        monitor_length = rhs_t.monitor_length;
+        monitor_is_write = rhs_t.monitor_is_write;
+        monitor_data = rhs_t.monitor_data;
+        monitor_bar_offset = rhs_t.monitor_bar_offset;
+        monitor_bar_id = rhs_t.monitor_bar_id;
+        monitor_bdf = rhs_t.monitor_bdf;
+        monitor_host_id = rhs_t.monitor_host_id;
+        monitor_segment_id = rhs_t.monitor_segment_id;
+        status_old     = rhs_t.status_old;
+        interrupt_vector = rhs_t.interrupt_vector;
+        irq_mode       = rhs_t.irq_mode;
+        num_vfs        = rhs_t.num_vfs;
+        queue_id       = rhs_t.queue_id;
+        packets        = rhs_t.packets;
+        received_pkts  = rhs_t.received_pkts;
+        expected_count = rhs_t.expected_count;
+        timeout_ns     = rhs_t.timeout_ns;
+        ctrl_class     = rhs_t.ctrl_class;
+        ctrl_cmd       = rhs_t.ctrl_cmd;
+        ctrl_data      = rhs_t.ctrl_data;
+        ctrl_ack       = rhs_t.ctrl_ack;
+        queue_size     = rhs_t.queue_size;
+        vq_type        = rhs_t.vq_type;
+        features       = rhs_t.features;
+        status_val     = rhs_t.status_val;
+        num_pairs      = rhs_t.num_pairs;
+        rss_cfg        = rhs_t.rss_cfg;
+        snapshot       = rhs_t.snapshot;
+        atomic_op      = rhs_t.atomic_op;
+        vq_error_type  = rhs_t.vq_error_type;
+        status_error   = rhs_t.status_error;
+        feature_error  = rhs_t.feature_error;
+        net_hdr        = rhs_t.net_hdr;
+        tx_offload     = rhs_t.tx_offload;
+        tx_seg         = rhs_t.tx_seg;
+        tx_notify      = rhs_t.tx_notify;
+        pkt            = rhs_t.pkt;
+        indirect       = rhs_t.indirect;
+        desc_id        = rhs_t.desc_id;
+        budget         = rhs_t.budget;
+        num_bufs       = rhs_t.num_bufs;
+        completed_pkts = rhs_t.completed_pkts;
+        success        = rhs_t.success;
+    end
+endfunction
 
 `endif

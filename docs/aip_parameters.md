@@ -14,7 +14,7 @@ net_packet/host_mem/PCIe、Virtio，最后是 `integration/aip/virtio_aip_pkg.sv
 使用 AIP update 的 `src/sv/aip_core_pkg.sv`，同一个 package 只编译一次。
 这里沿用 net_packet 的 `AIP_CMDLINE_SV` 可见性约定：在同一编译调用中先编译
 AIP，后编译各配置类。不要手工预定义这个 include guard 再编译 AIP 自身。
-不启用 AIP 时，原配置类的 `load_params()` 保留为空操作。
+不启用 AIP 时，低层配置类不读取命令行；组合入口仍根据默认值创建拓扑。
 
 ### `virtio_aip_pkg.sv` 找不到 `get_all_trailers_length`
 
@@ -60,8 +60,8 @@ rg -n 'net_packet_pkg\.sv|core/packet\.sv' compile.log
 | `virtio_net_vip/src/dpu_priv/dpu_priv_driver_config.sv` | 私有 Function 与单队列各自 `load_params` |
 | 外部 `dpu_common/src/dpu_device_cfg.sv` | Host/domain/MMIO/function/BAR/AF 等原类加载；不根据数量创建拓扑 |
 | 外部 `dpu_common/src/dpu_placement_cfg.sv` | 资源池、候选过滤与 placement request 加载 |
-| 外部 `dpu_common/src/dpu_vio_reg_plan_types.sv` | notify/MSI-X policy 加载 |
-| 外部 `dpu_common/src/dpu_vio_qsch_topology.sv` | QSCH generator 加载；生成结果仍需接入实际 dataplane plan extension |
+| 外部 `dpu_common/src/dpu_env_cfg.sv` | 默认拓扑、公共布局/MSI-X、VIO/QSCH 硬件策略；接收核心 VIO 已缓存的 service 需求 |
+| 外部 `dpu_common/src/dpu_vio_qsch_topology.sv` | 独立 QSCH topology generator 加载；不自动执行 DUT 配置 |
 | 外部 `dpu_common/src/dpu_dut_caps.sv` | 可选能力上限加载 |
 | 外部 `pcie_work/pcie_tl_vip/src/env/pcie_tl_env_config.sv` | 原配置类 `load_params("pcie_cfg")` 加载实际 TL 组件消费的行为策略，字段名保持不变 |
 | `examples/virtio_system_env/virtio_system_env_example_test.sv` | `author_param_config` 创建拓扑，`virtio_system_env_config.load_params` 设置内存创建策略 |
@@ -81,6 +81,7 @@ rg -n 'net_packet_pkg\.sv|core/packet\.sv' compile.log
 | `vio.queue_type` | `VQ_SPLIT`，亦可选择实际支持的队列格式 |
 | `vio.features` | 64 位 driver feature 掩码；默认全 1，最终仍需设备协商 |
 | `vio.napi_budget` / `vio.rx_refill` | 默认 64 / 16，正整数 |
+| `vio.rx_buf_size` | 标准 RX 单个 buffer 的报文容量，**不含 `virtio_net_hdr`**；环境按最终特性加头。未设置时保留原有总容量，当前 external Packed 默认 1526B |
 | `vio.exec_mode` | `VIRTIO_EXEC_MODEL` 或 `VIRTIO_EXEC_REAL_DUT` |
 | `vio.completion_mode` | `VIRTIO_COMPLETION_MSIX` 或 `VIRTIO_COMPLETION_POLLING` |
 | `vio.scb` / `vio.coverage` | 默认 1 / 0，属于 Host env，不能按 VF 创建另一份验证组件 |
@@ -90,6 +91,23 @@ rg -n 'net_packet_pkg\.sv|core/packet\.sv' compile.log
 | `vio.wait.reset_ns` / `queue_reset_ns` | 默认 5000 / 5000 ns |
 | `vio.wait.vf_ready_ns` / `flr_ns` | 默认 10000 / 10000 ns |
 | `vio.wait.multiplier` / `max_polls` | 默认 1 / 10000，正整数 |
+
+标准模式可以设置 `+vio.rx_buf_size=2048`，当前 external Packed 使用 12B 头，
+实际描述符长度为 2060B。旧标准协议按最终协商特性使用 10/12/20B 头。
+该值表示整个以太网报文的容量；以太网/IP/TCP 等报文头已经包含在参数值内。
+RX DMA 的分配长度另按 DWORD 对齐，描述符长度不因对齐扩大。
+
+同样支持 `vio.hN.rx_buf_size` 和 `vio.hN.pfN[.vfN].iN.rx_buf_size` 覆盖。
+例如 `'+vio.rx_buf_size=[2048:4096]'` 使用 AIP 原有范围语法，随配置加载采样，
+本次队列配置沿用该容量，不是每个接收 buffer 重新随机。显式 0、负值及会造成
+32 位加头/对齐溢出的值在加载时报错；实际大包能力仍由 DUT 和 Host memory 决定。
+
+Tcl 可以在配置加载前写入 `set_param path=vio.rx_buf_size value=2048`；
+已加载的环境需沿用现有 `load_params` 重载入口，并满足其无活动队列的前提，
+然后重新配置队列。该参数不会就地修改已经投递给 DUT 的描述符。
+旧 SV 字段 `default_rx_buf_size`/`rx_buf_size` 仍表示含头总容量；新的原始报文容量
+单独保存，避免继承、重复查询和恢复后重载时再次加头。Custom 继续使用
+`vio.private.rx_buf_size`，不增加标准 Virtio 头。
 
 全局配置只加载一次，然后复制出各 Host 的配置再覆盖，例如：
 
@@ -203,8 +221,6 @@ pcie_cfg.load_params("pcie_cfg"); // 此后再创建消费它的 PCIe env
 | `dpu.candidate_kind/device_policy/ordering/placement_seed` | 选择 PF/VF、固定/自动放置、排序和候选 shuffle seed |
 | `dpu.host_ids/vf_ids/parent_pfs/functions/fixed_devices` | 候选过滤/固定设备集合，按完整 Function 身份声明 |
 | `dpu.lan_msix` | 每 Function LAN 向量数，0 表示按分配到的 qpair 数量 |
-| `dpu.notify.bank/auto_bank/type/offset/verify/retries/interval_ns/full_bank` | **legacy register-plan** policy；`retries` 表示包含首次操作的总尝试次数 |
-| `dpu.msix.rate/packets/self_mask/emit_interval` | **legacy register-plan** 策略；project 使用下节 interval 字段，self_mask 为同名显式项目输入 |
 | `dpu.qsch.mode/max_groups/max_ports/max_tc/shared_group/include_af` | **legacy** QSCH generator 约束，需显式调用 generator.load_params 后再生成拓扑 |
 | `dpu.caps.*` | DUT 能力边界；不能把声明上限当成实际已创建数量 |
 
@@ -214,8 +230,8 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 多个 placement request 的路径是 `dpu.requestN.*`；每个 request 的 qpairs
 是该 request 的总量。完整 DPU 字段/集合映射见外部 `dpu_common/README.md`。
 
-修改 notify/MSI-X/QSCH 输入并不会自动重写已运行硬件。平台应在相应计划生成前
-加载、校验并应用；配置示例只验证对象与快照，不执行这些寄存器计划。
+修改 MSI-X/QSCH 输入不会自动重写硬件。当前项目使用下节 `dpu_env_cfg` 和
+`vio_dpu_cfg_seq`，加载配置后显式执行 sequence；独立 topology generator 仍只是数据构造工具。
 
 ### 私有队列
 
@@ -241,28 +257,30 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 入口是 `project_env_cfg::load_params()`；它调用原配置类并在生成 topology/placement
 前解析最终 service 需求，重复调用不再加载。默认1 Host/1 PF/0 VF、REAL_DUT、
 `external_configuration=1`；默认 AF PF0 的额外资源仍占每 Function 容量。
-`dpu.hosts/pfs_per_host/vfs_per_pf/mem_mode/mem_granule/reg_target/print_bar_map`
-在 `integration/project/project_env_cfg.sv` 注册；DPU/PCIe/核心 VIO 原字段仍在各自拥有类注册。
+`dpu.hosts/pfs_per_host/vfs_per_pf/reg_target/print_bar_map` 和公共表参数由
+`dpu_common/src/dpu_env_cfg.sv` 加载；参考 cfg 仅组合对象，并加载 Host memory 的
+`dpu.mem_mode/mem_granule/mem_policy`。PCIe/核心 VIO 字段仍由各自拥有类加载。
+DPU 与 VIO 共用最终 service 采样值，不分别随机生成第二份队列要求。
 
 | 参数 | 拥有类 / 确切行为 |
 | --- | --- |
-| `dpu.reg_target` | `project_env_cfg`；默认 `pf0.bar0`，只是访问窗口，不改变条目 owner |
-| `dpu.print_bar_map` | `project_env_cfg`；默认1，发布后逐代打印真实 BAR，不发 TLP |
+| `dpu.reg_target` | `dpu_env_cfg`；默认 `pf0.bar0`，只是访问窗口，不改变条目 owner |
+| `dpu.print_bar_map` | `dpu_env_cfg`；默认1，发布后逐代打印真实 BAR，不发 TLP |
 | `dpu.configure_public` | 默认0；1才额外执行 BAR/PFVF/Completion BDF/Prefix 等公共配置，保留显式非VIO消息；不控制软件BAR分配或VIO所需BDF/MSI-X |
 | `dpu.configure_bdf` | 默认1；独立配置BDF请求身份表，地址为管理BAR+0x108000+bdf_index*4；0用于平台已配置的场景 |
 | `dpu.driver_layouts` | 默认1；补齐 BDF/MSI-X/Notify/QSCH/VTX/VRX 驱动参考地址，已提供布局优先；0时自行声明 |
-| `dpu.verify_readback` | 默认0；配置 seq 只写、不读回。1时验证BDF、所选MSI-X、QSCH模式、Notify有效项/QSCH/队列表及MSI-X查找表尾部，以及已选择的其他公共配置 |
+| `dpu.verify_readback` | 默认0；省略普通表读回，AF 首读及周期状态读仍执行。1时验证BDF、所选MSI-X、QSCH模式、Notify有效项/QSCH/队列表及MSI-X查找表尾部，以及已选择的其他公共配置 |
 | `dpu.hH.pfP[.vfV].requester/intel_pf/intel_vf/vport` | 软件路由；每 Host 的 PF0/no-VF 默认0/0/-1/0，其余Function显式提供四项或完整 policy；不下发硬件表 |
 | `dpu.hH.pfP[.vfV].bdf_index` | BDF表硬件索引0..127；新生成policy默认取vport，已有显式policy保持其索引；配置seq使用同一身份写表 |
 | `dpu.qsch.configure_controls` | 默认1；配置模式并自动生成缺少的SP/WRR和TC weight项，显式catalog优先 |
 | `dpu.qsch.mode/mode_offset` | 默认0/0xb001c0；mode为0=VNET、1=ETS，须与service的ets一致；offset为管理BAR内字节偏移 |
 | `dpu.qsch.spwrr/tc_weight` | 默认0xff/0x11111111；分别8位SP/WRR选择、32位TC权重，每个实际net_id生成一项 |
-| `dpu.<category>.reg_target` | `project_env_cfg::load_platform_params`；覆盖该类别访问窗口，类别见下表 |
+| `dpu.<category>.reg_target` | `dpu_env_cfg::load_platform_params`；覆盖该类别访问窗口，类别见下表 |
 | `dpu.bar_map.reg_target` / `dpu.msix.reg_target` / `dpu.qsch.reg_target` | 同类；BAR/MSI-X/QSCH 家族默认，详细类别覆盖家族 |
 | `vio.vtx.reg_target` / `vio.vrx.reg_target` / `vio.notify_table.reg_target` | 同类；分别最后覆盖 `dpu.vtx/vrx/vio_notify.reg_target` |
 | `vio.enabled` / `tx_enable` / `rx_enable` | `virtio_net_env_config::load_external_requirement`；0/1，默认均1；禁用服务不删除公共 Function，启用服务至少开一个方向 |
 | `vio.pairs/queue_size/queue_type` | 核心同类；先求最终需求再 placement，不静默减小。项目使用 `VQ_PACKED` 或 `VQ_CUSTOM`；实际深度同时受VIP和图片约束 |
-| `vio.features` | 核心同类；external Packed 默认 VERSION_1 与 RING_PACKED，二者必需；另只允许 NOTIFICATION_DATA、IN_ORDER、RING_EVENT_IDX、ACCESS_PLATFORM。Custom 强制0，显式非零拒绝，不执行设备协商 |
+| `vio.features` | 核心同类；external Packed 默认 VERSION_1 与 RING_PACKED，二者必需；另允许 NOTIFICATION_DATA、IN_ORDER、RING_EVENT_IDX、ACCESS_PLATFORM、CSUM、HOST_TSO4/6、HOST_USO。TSO/USO依赖CSUM；声明能力不自动启用每包offload。Custom 强制0，显式非零拒绝，不执行设备协商 |
 | `vio.completion_mode` | 核心同类；`VIRTIO_COMPLETION_POLLING` 或 `VIRTIO_COMPLETION_MSIX`，MSI-X 无轮询兜底 |
 | `vio.notify_bar/notify_base/notify_stride/notify_encoding` | 核心同类；真实 doorbell 的偶数 BAR、BAR内offset/队列步长/`VIO_NOTIFY_QID16`、`VIO_NOTIFY_DATA32`、`VIO_NOTIFY_DPU32`。提供 notify_base 标记布局有效，不能拿 notify lookup 表偏移替代 |
 
@@ -276,10 +294,10 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 `msix_info`、`msix_interval`、`msix_control`、`msix_table`、`msix_function`、
 `vio_notify`、`qsch_q2tc`、`qsch_n2g`、`qsch_g2p`、`qsch_spwrr`、
 `qsch_tc_weight`、`vtx`、`vrx`、`queue_aux`、`rdma_notify`、`qsch_rnet`。
-默认驱动布局覆盖 VIO/QSCH；其他未提供的表布局在使用时仍失败，reg_target 只选访问窗口。完整 `hH.pfP[.vfV].barB`
+默认驱动布局覆盖 BDF/MSI-X/VIO/QSCH；其他未提供的表布局在使用时仍失败，reg_target 只选访问窗口。完整 `hH.pfP[.vfV].barB`
 自带访问 Host；多 Host 短路径必须由 typed layout 指定访问 Host 或明确采用 owner Host。
 
-公共 MSI-X 参数由 `project_env_cfg::load_platform_params` 拥有，不依赖 VIO service。
+公共 MSI-X 参数由 `dpu_env_cfg::load_platform_params` 拥有，不依赖 VIO service。
 路径依次为 `dpu.msix → dpu.hH.msix → dpu.hH.pfP[.vfV].msix`，后者覆盖前者：
 
 | 相对该路径的字段 | 含义与校验 |
@@ -293,7 +311,7 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 | `table_only_enable` | 参考默认1，仅靠table mask使能；设为0时提供 Function control catalog/hook |
 | `vN.msg_addr/vN.msg_data/vN.masked` | 按local vector N逐项覆盖模板；data32位，masked为0/1 |
 
-项目队列表策略也在 `project_env_cfg::load_platform_params` 注册。
+项目队列表策略也在 `dpu_env_cfg::load_platform_params` 注册。
 除 QSCH 额外先读 `dpu.qsch.*` 外，优先级是
 `vio → vio.hH → vio.hH.pfP[.vfV].i0`。下表字段相对上述 VIO 路径：
 
@@ -306,7 +324,7 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 | `fpga` | 0/1，限制global qpair/VRX RAM高位容量 |
 | `prefetch_ram/prefetch_start/prefetch_slots` | RAM名字表示真实共享域，起点/容量单位是descriptor槽；同名RAM跨Host也检查重叠 |
 | `notify_net_pair5` | 0/1，明确采用单bank net pair5编码 |
-| `notify_table_bar/notify_table_offset` | notify lookup base的owner BAR/offset；提供offset才标记存在，与核心doorbell不同 |
+| `notify_table_bar/notify_table_offset` | 可选的 Notify 查找基址覆盖；未提供时取实际 doorbell `[60:7]`。任一项显式提供即启用覆盖，并检查地址高位一致 |
 
 以上整数在窄字段赋值前检查越界。VIO/QSCH 模块与间接端口由驱动参考布局提供，
 可在env构建前修改typed cfg；公共PBA/Function表编码/BAR组仍按平台明确声明。
@@ -315,8 +333,15 @@ Notify 保持512行单bank容量，但seq只写实际队列对的有效项；同
 `dpu.verify_readback=1` 也只通过真实Memory Read验证有效项，不访问未用行。
 首次配置前DUT须已按 `05.png` 复位，未用项type=3、lookup key/global_qid全1、reserved=0。
 Notify目录使用统一管理BAR；参考布局短目标默认Host0，可用`vio.notify_table.reg_target`改为完整目标。
-`dpu.notify.bank/auto_bank/full_bank`、legacy `dpu.msix.rate/packets/emit_interval`
-与 legacy QSCH generator 不是项目执行策略；项目 notify 只支持单bank逐项写。
+旧 `dpu.notify.bank/auto_bank/full_bank` 和旧 MSI-X plan policy 已随生产 builder 删除；
+独立 QSCH generator 仍保留。每批 VIO/RDMA Notify 成功后，每个管理 BAR 写一次
+`+0x80044=1`，无 bank 参数；空批次或表写失败不发使能。
+
+运行期 `load_params` 用 `aip_cmd_task(load_params, project_load_params)` 在顶层注册一次，
+不为每个 cfg 注册同名命令，也不手写命令适配类。seq 注册类型改为 `vio_dpu_cfg_seq`，
+`reg_acc` 改为 `dpu_bar_reg_seq`；从 sequencer 取得公共 `dpu_cfg`，不依赖用户 env_cfg 类型。
+恢复后先重新 source AIP loader，再 `load_params`、`dut_config`。重载边界和完整接入见
+[项目参考](../integration/project/README.md#快照恢复后重新加载配置)。
 
 项目运行时只调用 `env.register_aip_commands()`，内部使用
 `virtio_aip_registry::register_business_commands()`；公共无VIO用途跳过注册。
@@ -348,16 +373,141 @@ Tcl `end_test` 使其返回，再释放 objection。参考 `virtio_aip_driver_te
 | `vio.target` | 完整服务身份，如 `h0.pf0.vf1.i0`；只有一个目标时可省略 |
 | `vio.tx.target` / `vio.rx.target` | 本次 TX/RX 目标，缺省继承 `vio.target` |
 | `vio.tx.pair` | 活动队列对下标，默认 0，禁止当 raw queue ID 使用 |
-| `vio.tx.kind` | `packet_template_e` 名称，默认 `ETH_IPV4_TCP`，每次命令采样一次 |
-| `vio.tx.len` / `len_min` / `len_max` | 默认 64 字节，含协议头；min/max 指定时逐包选长度，必须容纳完整头和尾 |
-| `vio.tx.gap_ns` | 包间隔，默认 0 |
-| `vio.tx.hdr.*` | 交给已有 packet.load_params，例如 `eth.dst_mac/ipv4.src_addr/udp.dst_port`，逐包读取后重新 pack |
+| `vio.tx.kind` | `packet_template_e` 名称或逗号候选列表，默认 `ETH_IPV4_TCP`；每包通过 `aip_enum` 重新读取并抽样 |
+| `vio.tx.len` / `len_min` / `len_max` | 每包重新取值，默认64字节（含协议头）；支持候选/范围表达式，保留min/max用法，必须容纳完整头和尾 |
+| `vio.tx.gap_ns` | 每包重新取值的包间隔，默认0；作用于本包提交到下一包生成之间 |
+| `vio.tx.timeout_ns` | 本包因ring空间不足而等待的预算，默认10000ns，乘以`vio.wait.multiplier`；不限制整条多包命令总时长 |
+| `vio.tx.notify_batch` | 每批抽样一次的目标包数，默认1；支持固定值/候选/范围。批末、命令尾包或空间不足时通知，不能为0 |
+| `vio.tx.desc_count` | 每包通过 `aip_int` 抽样的总描述符数，包含标准 header 或 Custom TSO 扩展项；省略时取当前格式所需的最少数量，显式0非法 |
+| `vio.tx.seg_mode` | `VIO_SEG_EQUAL`（默认）或 `VIO_SEG_RANDOM`，每包通过 `aip_enum` 取值；只切分报文数据，保持 header/扩展项完整 |
+| `vio.tx.csum` / `gso` / `mss` | 每包通过 `aip_int` 重新读取，默认0/0/1460；GSO隐含checksum，payload超过MSS才产生分段请求。报文与请求按同一transaction提交，实际队列决定标准/Custom编码 |
+| `vio.tx.hdr.*` | 复用packet.load_params，逐包读取协议头和payload；例如`eth.dst_mac/ipv4.src_addr/udp.dst_port/payload_mode/payload_fixed_val/payload_pattern` |
 | `vio.rx.expected/timeout_ns` | 默认 1 / 50000 ns；只等待，不产生网络侧激励 |
 | `vio.mq.target/pairs` | 动态 MQ 命令，必须服从当前已分配资源上限 |
 | `vio.rss.target/hash_types/hash_key_size/hash_key[i]/table_size/indirection_table[i]` | RSS 控制输入；设备须已协商对应功能 |
 
 单条设置使用 `set_param path=<参数路径> value=<值>`；直接写
 `set_param <参数路径> <值>` 会因缺少命名字段 `path` 而报错。
+
+VTX offload 的协议、头长和偏移来自本包最终字节，经现有 `net_packet` parser
+解析；当前支持普通 IPv4/IPv6 TCP/UDP，包含 VLAN 和 IPv4/TCP options，暂不支持
+隧道、IP分片及IPv6扩展头的offload。无offload的普通发包不受此限制。
+三个键均未指定时，Custom继续使用 `vio.private.*` 的队列默认checksum控制；
+指定任一键后采用本包请求，`csum=0,gso=0` 可显式关闭本包的checksum控制。
+不同TX别名使用注册时的独立参数路径；不需要额外注册reload task。
+
+上述参数也可在启动时通过命令行传入，随后直接执行 `vio_start`/`vio_tx`：
+
+```bash
+./simv \
+  +vio.tx.kind=ETH_IPV4_TCP,ETH_IPV6_TCP \
+  '+vio.tx.len=[2048:4096]' '+vio.tx.notify_batch=[16:32]' \
+  +vio.tx.csum=1 +vio.tx.gso=1 +vio.tx.mss=512 \
+  +vio.tx.timeout_ns=10000
+```
+
+`vio_tx count=100` 会在候选类型中逐包重新选择；列表使用逗号分隔，不加数组方括号。
+同一路径的 `set_param` 优先于命令行，可在包间修改候选、包长、协议头、payload和offload。
+无需额外调用load_params；等待ring空位时保留当前已生成包，不重新取参或随机化。
+批大小在下一批开始时重新读取，当前批的目标保持不变。
+
+标准Packed在准备队列前通过 `vio.features` 声明能力。例如
+`+vio.features=0x500001801` 包含 VERSION_1/PACKED/CSUM/HOST_TSO4/HOST_TSO6；
+若还需要UDP分段，使用 `0x100000500001801` 加上 HOST_USO。
+保留原有其他feature位；恢复快照后只在已声明能力内改每包请求。
+Custom的 `vio.features` 仍为0，checksum写入私有描述符，GSO额外占一个16B扩展槽；
+MSS上限16383，头长还受驱动描述符的2B/4B单位和位宽约束。
+私有 checksum 使能按驱动同时置 `l3_cs/l4_cs/i_l3_cs/i_l4_cs`，IPv4/IPv6一致。
+GSO的校验控制仅放在扩展描述符；后续数据描述符保留路由和数据字段，四个校验位清零。
+
+```tcl
+# DUT已经完成配置并执行vio_start；以下开关同时适用于Packed和Custom。
+set_param path=vio.tx.kind value=ETH_IPV4_TCP
+set_param path=vio.tx.len value=4096
+set_param path=vio.tx.csum value=1
+set_param path=vio.tx.gso value=1
+set_param path=vio.tx.mss value=512
+vio_tx count=1
+
+# 下一包关闭offload；不会改写已经提交的包或共享env_cfg。
+set_param path=vio.tx.csum value=0
+set_param path=vio.tx.gso value=0
+set_param path=vio.tx.len value=512
+vio_tx count=1
+```
+
+标准模式仍为 `[virtio_net_hdr][packet]` 两个直接描述符；Custom普通包为一个
+data描述符，GSO大包为 `[TSO extension][data]`，扩展槽计入notify尾指针和完成回收。
+只修改DMA发送副本中的partial-checksum初始值，保留原始net_packet报文供比对。
+
+`count` 是累计提交包数，ring深度是描述符槽数。未指定`desc_count`时，常规包的
+Packed路径占2槽，Custom普通包占1槽、GSO大包占2槽；Custom还需留1个空槽。完成回收后槽位
+可重复使用，因此累计发包数可以超过ring深度。当前空闲槽不足时，先通知已提交部分，
+再通过原完成路径等待和回收；有足够空位后提交
+同一个包。等待不分配本包DMA，也不覆盖旧描述符。只有超过`vio.tx.timeout_ns`仍不足时
+报告`VIO_TX_TIMEOUT`并停止后续发送。完成仍遵循配置的轮询/MSI-X机制，不绕过中断许可。
+`vio_start`启动后台完成回收；受阻的发送也复用同一回收入口。
+
+显式指定 `desc_count=N` 时，标准模式为 `[完整 virtio_net_hdr][N-1 条 data]`；
+Custom 普通发送为 N 条 data，实际生成 TSO 扩展项时为 `[extension][N-1 条 data]`。
+当前 Custom 最多7条 data，每条不超过65536B；标准数量还受实际 ring 容量约束，
+接真实 DUT 时也要服从设备的链长度能力。当前参数控制直接描述符；MANUAL 调用中的
+indirect 原有默认行为保留，但不与显式 `desc_count` 混用。
+
+均分时将除法余数分给前几段，每段长度最多相差1B；随机时每段长度为正，且为后续段
+保留合法长度。所有 data 长度之和严格等于本包长度。512B报文、标准总数9时，均分为
+一条header加8条64B data。各data引用同一报文DMA的不同偏移，不额外复制或分配每段。
+SG切分不改变报文内容；checksum/GSO仍按同一包的最终字节和原有offload参数生成。
+
+参数每包采样后固定；等待 ring 空位不重抽数量/长度。抽到非法数量、超过格式或容量
+上限、无法保证各段非零等情况，在本包DMA分配和描述符发布前报 `UVM_FATAL/VIO_TX_SEG`，
+不裁剪、不重抽、不发送本包Notify。已发送的前序包不回撤。临时空位不足仍正常等待。
+
+```bash
+# Packed标准模式：每包8..10条总描述符、随机切分报文；启动参数无需先调用set_param。
+./simv '+vio.tx.desc_count=[8:10]' +vio.tx.seg_mode=VIO_SEG_RANDOM +vio.tx.len=512
+```
+
+```tcl
+set_param path=vio.tx.desc_count {value=[8:10]}
+set_param path=vio.tx.seg_mode value=VIO_SEG_EQUAL
+vio_tx count=200
+
+# Custom普通包改为1..7；实际启用TSO扩展项时可选择2..8条总描述符。
+set_param path=vio.tx.desc_count {value=[1:7]}
+```
+
+Packed链尾携带该包的Buffer ID；当前所有链槽写同一个ID，完成时使用本地记录释放
+全部槽，不依赖设备保留NEXT。完成判断同时核对AVAIL/USED与当前wrap；链记录包含在
+队列迁移快照及校验中。`send_packets count=1`逐事务信息降为`UVM_HIGH`，普通运行保留
+AIP命令的提交数量汇总。
+
+`notify_batch=32`时，1000包正常分成31个完整批次及最后8包，尾批同样通知。
+ring空间不足会提前拆批，因此实际DB数可能多于32次；批大小超过ring容量也能继续运行。
+Custom发出当前实际尾指针，Packed保留device event suppression规则。指针按实际描述符
+槽数推进，GSO扩展槽也计数，跨ring末尾翻转wrap，用户不填写tail/wrap。
+这里的批大小按送入VIP的包数计算；GSO大包按一个输入包计数，不按DUT分段后的包数计数。
+
+```tcl
+# 固定32包一次DB；最后8包也会通知。
+set_param path=vio.tx.notify_batch value=32
+vio_tx count=1000
+
+# 每批在8/16/32中随机选目标；每包独立选择长度和payload字节。
+set_param path=vio.tx.notify_batch value=8,16,32
+set_param path=vio.tx.len {value=[512:1514]}
+set_param path=vio.tx.hdr.payload_mode value=PAYLOAD_FIXED
+set_param path=vio.tx.hdr.payload_fixed_val {value=[0:255]}
+vio_tx count=1000
+
+# 连续范围也可用；Tcl中用花括号保护方括号，避免触发Tcl命令替换。
+set_param path=vio.tx.notify_batch {value=[16:32]}
+```
+
+对照上传的`prj1_v2_dpu_kernel_eth_driver`：`txrx.c`中自定义TX（1762行）和标准TX
+（1935行）当前均逐包调用`dpu_update_tail_ptr`；RX补buffer（1132行）按批通知。
+`txrx.h`的637行将`wrap<<31 | tail<<16 | local_qid`写到notify地址。
+新增批量参数保留该编码和描述符发布顺序，只减少TX的DB次数；真实DUT批量消费仍需平台验证。
 
 ```tcl
 set_param path=vio.target value=h0.pf0.i0
@@ -378,8 +528,8 @@ end_test
 
 计数只用 `count=`，不另设 `vio.tx.count`。当前适配器拒绝 `time=`，以免把强制
 杀 seq 当成完成；结束按平台的 monitor/scoreboard 检查器判断。TX 返回成功只说明
-提交完成，RX 还需要网络侧送包。运行中的整数 `set_param` 使用字面值；随机长度
-使用 len_min/len_max，随机整数表达式可放在启动 plusargs 中。
+提交完成，RX还需要网络侧送包。使用已支持运行期表达式的新版AIP后，命令行与
+`set_param`均可使用候选、范围或权重表达式；VIO复用AIP的类型参数入口，不另写解析器。
 
 独立发包流可调用 `register_tx_command("vio_tx0", "vio.tx0", why)` 注册别名。
 同名命令由 AIP 检查 BUSY；同一 service 上允许 TX/TX 逐事务仲裁，控制/RX 命令

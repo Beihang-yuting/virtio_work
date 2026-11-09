@@ -1,3 +1,6 @@
+// tests：验证 PF 复位的 worker 停止顺序与 TX/RX DMA 所有权回收。
+// 依赖真实 ops/FSM/Host memory，transport 只替代设备复位确认；测试持有独立资源。
+// 分配失败测试先建立可用 ring，再耗尽报文内存，不能以未分配的 ring 绕过流控。
 `ifndef VIRTIO_PF_LIFECYCLE_RESET_TEST_SV
 `define VIRTIO_PF_LIFECYCLE_RESET_TEST_SV
 
@@ -19,7 +22,15 @@ class virtio_pf_lifecycle_tracking_mem extends host_mem_manager;
     function int unsigned outstanding_allocations();
         return alloc_table.size();
     endfunction
+
+    // 只读剩余容量，供测试精确保留一个 header 分配块；不修改分配器行为。
+    extern function longint unsigned available_bytes();
 endclass : virtio_pf_lifecycle_tracking_mem
+
+// 返回当前空闲字节数；ring 和压力分配仍通过公开 alloc/free 管理。
+function longint unsigned virtio_pf_lifecycle_tracking_mem::available_bytes();
+    return free_size;
+endfunction
 
 class virtio_pf_lifecycle_tracking_iommu extends virtio_iommu_model;
     `uvm_object_utils(virtio_pf_lifecycle_tracking_iommu)
@@ -235,7 +246,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
 
     dpu_device_env                    device_env;
     virtio_test_device_builder        device_builder;
-    dpu_device_env_config             device_cfg;
+    dpu_env_cfg	device_cfg;
     virtio_net_env_config             cfg;
     virtio_net_env                    env;
     virtio_function_instance          pf_function;
@@ -282,7 +293,7 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
         concurrency_timeout_vf = virtio_pf_lifecycle_blocking_vf::type_id::create(
             "concurrency_timeout_vf", this
         );
-        uvm_config_db#(dpu_device_env_config)::set(
+        uvm_config_db#(dpu_env_cfg)::set(
             this, "device_env", "cfg", device_cfg);
         device_env = dpu_device_env::type_id::create("device_env", this);
         uvm_config_db#(virtio_net_env_config)::set(
@@ -644,55 +655,8 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
                 "verified reset did not retire normal DMA, free rings, and destroy queues")
     endtask
 
-    // Allocate exactly one minimum-sized header block, then force the packet
-    // allocation to fail.  The TX submission must roll back that header
-    // allocation without attempting any DMA map or queue notification.
-    task test_tx_second_allocation_failure_releases_header();
-        virtio_mock_transport  transport;
-        virtio_atomic_ops                    ops;
-        virtio_pf_lifecycle_tracking_mem     mem;
-        virtio_pf_lifecycle_tracking_iommu   iommu;
-        virtio_vq_test_kit                   kit;
-        virtio_net_hdr_t                     hdr;
-        virtio_pf_lifecycle_test_packet      pkt;
-        virtio_pf_lifecycle_tx_alloc_error_catcher catcher;
-        int unsigned                         desc_id;
-        int unsigned                         allocation_baseline;
-
-        transport = virtio_mock_transport::type_id::create(
-            "tx_second_alloc_fail_transport");
-        ops = virtio_atomic_ops::type_id::create("tx_second_alloc_fail_ops");
-        mem = virtio_pf_lifecycle_tracking_mem::type_id::create(
-            "tx_second_alloc_fail_mem");
-        iommu = virtio_pf_lifecycle_tracking_iommu::type_id::create(
-            "tx_second_alloc_fail_iommu");
-
-        // The basic 10-byte virtio header rounds to this manager's 16-byte
-        // minimum block.  No space remains for the minimum 64-byte packet.
-        mem.init_region(64'h6200_0000, 64'h6200_000F);
-        allocation_baseline = mem.outstanding_allocations();
-        transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0040));
-        kit = virtio_vq_test_kit::create_kit(
-            "tx_second_alloc_fail", mem, iommu, transport.bdf);
-        // 16 字节的 Host memory 只够 header，队列只登记不分配 ring。
-        assert(kit.vq_mgr.create_queue(0, 8, VQ_SPLIT) != null)
-            else `uvm_fatal("PF_LIFECYCLE", "failed to create TX allocation rollback queue")
-        void'(kit.make_ops(transport, "", ops));
-        hdr = '{default: 0};
-        pkt = virtio_pf_lifecycle_test_packet::type_id::create(
-            "tx_second_alloc_fail_packet");
-
-        catcher = new("tx_second_alloc_fail_catcher");
-        uvm_report_cb::add(null, catcher);
-        ops.tx_submit(0, hdr, pkt, 0, desc_id);
-        uvm_report_cb::delete(null, catcher);
-
-        assert(desc_id == '1 && catcher.caught_count == 2 &&
-               mem.outstanding_allocations() == allocation_baseline &&
-               iommu.active_mapping_count() == 0 && transport.kick_count == 0)
-            else `uvm_fatal("PF_LIFECYCLE",
-                "TX second-allocation failure leaked the header or submitted DMA work")
-    endtask
+    // ring 必须先分配就绪，随后仅留 16B 让 header 成功、payload 失败；核对回滚。
+    extern task test_tx_second_allocation_failure_releases_header();
 
     task test_failed_reset_retains_pf_runtime();
         virtio_pf_lifecycle_reset_owner          reset_owner;
@@ -772,5 +736,60 @@ class virtio_pf_lifecycle_reset_test extends uvm_test;
                 "set_active bypassed the failed PF reset state")
     endtask
 endclass : virtio_pf_lifecycle_reset_test
+
+
+// 真实 ring 提供空闲槽，压力分配只保留一个 16B 块；payload 失败不得遗留 header/DMA。
+task virtio_pf_lifecycle_reset_test::test_tx_second_allocation_failure_releases_header();
+    virtio_mock_transport			transport;
+    virtio_atomic_ops				ops;
+    virtio_pf_lifecycle_tracking_mem		mem;
+    virtio_pf_lifecycle_tracking_iommu		iommu;
+    virtio_vq_test_kit				kit;
+    virtio_net_hdr_t				hdr;
+    virtio_pf_lifecycle_test_packet		pkt;
+    virtio_pf_lifecycle_tx_alloc_error_catcher	catcher;
+    int unsigned				desc_id;
+    int unsigned				allocation_baseline;
+    bit [63:0]					pressure[$];
+    bit [63:0]					addr;
+
+    transport = virtio_mock_transport::type_id::create("tx_second_alloc_fail_transport");
+    ops = virtio_atomic_ops::type_id::create("tx_second_alloc_fail_ops");
+    mem = virtio_pf_lifecycle_tracking_mem::type_id::create("tx_second_alloc_fail_mem");
+    iommu = virtio_pf_lifecycle_tracking_iommu::type_id::create("tx_second_alloc_fail_iommu");
+    mem.init_region(64'h6200_0000, 64'h6200_3fff);
+    transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0040));
+    kit = virtio_vq_test_kit::create_kit("tx_second_alloc_fail", mem, iommu, transport.bdf);
+    void'(kit.add_split(0, 8));
+    void'(kit.make_ops(transport, "", ops));
+
+    // 最小粒度填充避免把碎片或随机分配策略当成故障条件；最后 16B 留给 header。
+    while (mem.available_bytes() > 16) begin
+        addr = mem.alloc(16);
+        assert(addr != '1)
+            else `uvm_fatal("PF_LIFECYCLE", "failed to establish memory pressure")
+        pressure.push_back(addr);
+    end
+    assert(mem.available_bytes() == 16)
+        else `uvm_fatal("PF_LIFECYCLE", "header allocation requires exactly one free 16-byte block")
+    allocation_baseline = mem.outstanding_allocations();
+    hdr = '{default:0};
+    pkt = virtio_pf_lifecycle_test_packet::type_id::create("tx_second_alloc_fail_packet");
+
+    catcher = new("tx_second_alloc_fail_catcher");
+    uvm_report_cb::add(null, catcher);
+    ops.tx_submit(0, hdr, pkt, 0, desc_id);
+    uvm_report_cb::delete(null, catcher);
+    assert(desc_id == '1 && catcher.caught_count == 2 &&
+           mem.outstanding_allocations() == allocation_baseline &&
+           iommu.active_mapping_count() == 0 && transport.kick_count == 0)
+        else `uvm_fatal("PF_LIFECYCLE",
+            "TX second-allocation failure leaked the header or submitted DMA work")
+
+    foreach (pressure[i]) mem.free(pressure[i]);
+    kit.vq_mgr.destroy_all();
+    assert(mem.outstanding_allocations() == 0)
+        else `uvm_fatal("PF_LIFECYCLE", "allocation rollback fixture retained memory")
+endtask
 
 `endif // VIRTIO_PF_LIFECYCLE_RESET_TEST_SV

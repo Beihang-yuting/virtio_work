@@ -26,8 +26,6 @@ VIRTIO_MAINTAINED_TESTS=(
   dpu_device_resolver_test
   dpu_placement_test
   dpu_resource_resolver_test
-  dpu_device_bootstrap_plan_test
-  dpu_vio_reg_plan_test
   virtio_dut_caps_test
   virtio_execution_mode_test
   virtio_real_dut_iova_dma_test
@@ -100,7 +98,7 @@ _validate_virtio_test_manifest() {
     seen["$test_name"]=1
   done
 
-  for required in dpu_device_resolver_test dpu_placement_test dpu_resource_resolver_test dpu_device_bootstrap_plan_test; do
+  for required in dpu_device_resolver_test dpu_placement_test dpu_resource_resolver_test; do
     count=0
     for test_name in "${VIRTIO_MAINTAINED_TESTS[@]}"; do
       [[ "$test_name" == "$required" ]] && count=$((count + 1))
@@ -169,31 +167,23 @@ _validate_global_dpu_static_contracts() {
     return 1
   fi
 
-  builder="$DPU_COMMON_ROOT/src/dpu_device_bootstrap_plan_builder.sv"
-  definition_count="$(awk '
-      $0 == "localparam bit [63:0] DPU_AF_DECLARATION_ADDR = 64\047h1010;" {
-        count++
-      }
-      END { print count + 0 }
-    ' "$builder")"
-  named_use_count="$(grep -c \
-    '^[[:space:]]*DPU_AF_DECLARATION_ADDR);$' "$builder" || true)"
-  literal_count="$(grep -c "64'h1010" "$builder" || true)"
-  if [[ "$definition_count" -ne 1 || "$named_use_count" -ne 3 ||
-        "$literal_count" -ne 1 ]]; then
-    echo "production AF declaration contract requires one definition and three named uses" >&2
+  builder="$DPU_COMMON_ROOT/integration/pcie/dpu_cfg_seq.sv"
+  if [[ ! -f "$builder" ]] ||
+     ! grep -q 'task dpu_cfg_seq::enable_notify' "$builder" ||
+     ! grep -q "64'h0008_0044, 4, 128'h1" "$builder"; then
+    echo "DPU configuration sequence must enable the completed Notify batch" >&2
     return 1
   fi
 
   executor_input_count="$(grep -c \
-    '^function void configure_devices(input dpu_reg_executor injected_executor);$' \
+    '^function void configure_executor(input dpu_reg_executor injected_executor);$' \
     "$manifest_root/README.md" || true)"
   executor_assignment_count="$(grep -c \
-    '^global_cfg.executor = injected_executor;' \
+    '^[[:space:]]*injected_executor.bind_topology(device_env.get_snapshot());$' \
     "$manifest_root/README.md" || true)"
   if [[ "$executor_input_count" -ne 1 ||
         "$executor_assignment_count" -ne 1 ]]; then
-    echo "README executor example requires one explicit input and one injection" >&2
+    echo "README executor example requires one explicit input and one snapshot binding" >&2
     return 1
   fi
 

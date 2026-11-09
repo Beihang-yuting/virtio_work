@@ -4,7 +4,10 @@ virtio_net_vip/tests/virtio_test_device_builder.sv
 virtio_net_vip/tests/virtio_real_driver_flow_fixture.sv
 examples/virtio_system_env/virtio_system_env_example_test.sv
 integration/aip/virtio_aip_params_test.sv
+virtio_net_vip/tests/virtio_rx_buffer_params_test.sv
 integration/aip/pcie_aip_params_test.sv
 integration/aip/virtio_aip_command_test.sv
+virtio_net_vip/tests/virtio_tx_offload_test.sv
+virtio_net_vip/tests/virtio_tx_segments_test.sv
 examples/aip/virtio_aip_driver_test.sv
 virtio_net_vip/tests/virtio_tb_top.sv

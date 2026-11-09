@@ -1407,16 +1407,12 @@ if (!vio_cfg.add_service_config(vf0_vio, behavior, why))
 这个 override 由全 service key 索引，不使用 VF 队列位置。VIO build 只接受精确
 frozen snapshot pair 和 pair-seeded manager；`virtio_resource_client` 按 service
 导入不可变 qpair mapping，`virtio_vf_resource_pool` 提供同一 mapping 的 service-keyed
-local/global queue lookup。Global config 与 VIO config 分别通过 `uvm_config_db`
-传入 `dpu_device_env` 及其 VIO child；bootstrap plan 只读 device snapshot，
-`dpu_reg_executor` 在 `dpu_device_env_config.executor` 中与 plan construction 分开
-注入。仓库提供 `pcie_tl_dpu_reg_backend`/`pcie_tl_dpu_reg_executor` 作为 PCIe-TL
-实现：backend 绑定 `pcie_tl_virtual_sequencer` 和 frozen `dpu_device_snapshot`，将
-配置空间写入、BAR-relative MMIO 写入/回读转换为真实 PCIe TLP。MMIO 执行时按
-`BDF + BAR id` 从 snapshot 解析绝对地址 `BAR base + operation.address`，posted
-Memory Write 不等待不存在的 Completion，读回和显式 barrier 用于建立可观察顺序；
-Completion status、读回值和 4KB TLP 边界都会检查。用户平台可继承同一 backend，或
-直接替换 executor；未注入 executor 时仍报告 `NOT_EXECUTED`。
+local/global queue lookup。DPU config 与 VIO config 分别通过 `uvm_config_db` 传入资源 env 和 VIO child。
+当前资源 cfg 为 `dpu_env_cfg`；`dpu_device_env` 只解析/发布快照。
+通用计划由调用方显式 `executor.bind_topology(device_env.get_snapshot())` 后交给
+orchestrator 执行，保留 PCIe config/MMIO、domain 路由、Completion 及读比较能力。
+当前图片版外部 DUT 配置使用 `vio_dpu_cfg_seq`，详见
+[集成参考](../integration/project/README.md)，不再使用旧 env executor 字段。
 
 VIO behavior 可配置参数：
 
@@ -1727,158 +1723,25 @@ real-DUT AF notify table 的 logical match 是：
 {host_id, notify_addr[60:7], local_pair_id} -> global_qpair_id
 ```
 
-`dpu_vio_register_plan_builder` 在 placement freeze 后读取该 matching domain 和
-binding，生成 VIO service 范围内的 real-DUT BDF/MSI-X/notify lowering；placement 本身仍不执行 PCIe
-访问。builder 先合并 BAR/AF bootstrap，再按 DAG 顺序写 BDF map、MSI-X linear/info/
-interval 和选定 inactive notify bank，最后写 `BAR0 + 0x20044` 的 ready/select
-commit。notify entry 是 16 字节（两个 64-bit write），匹配字段严格为
-`{host_id, notify_addr[60:7], local_qid}`；其中 `local_qid` 使用驱动
-`txrx_queues[]` 的连续 pair index，placement 的 sparse `local_pair_id` 仅用于
-资源命名和约束。并把 snapshot 的 explicit `global_qpair_id` 放入 payload；不会用
-稀疏 local ID 推导 global ID。PBA 是 DUT
-运行时状态，不由配置 plan 伪写。notify entries 按驱动的 host/address key 排序；
-`select_inactive_notify_bank` 默认开启并选择活动 bank 的另一份 shadow bank。冷启动
-默认把 bank0 视为 active，因此第一次 setup 写 bank1；若 attach 到运行中的 DUT，必须
-在 build 前通过 `dpu_device_env_config.vio_policy.active_notify_bank` 输入硬件的实际
-active bank。`dpu_device_env` 仅在 plan 成功执行并完成 commit 后更新 tracked active
-bank；仅 build、`NOT_EXECUTED`、preflight failure 或执行失败都不会推进 bank 状态。
-`emit_full_notify_bank` 默认开启：有效项之后写入 driver-compatible invalid entries，
-形成完整 128-entry shadow。每个 entry 的 low/high 写入完成后，builder 生成两次
-`POLL_UNTIL` readback，默认最多 5 次、间隔 5 us；notify commit 直接依赖每项最终
-verify。聚焦测试可以显式关闭完整 shadow 或 readback，但真实 DUT 默认路径不会依赖
-上电残留状态恰好为空。
+当前硬件表以图片定义为准，由 `dpu_env_cfg` 生成、`dpu_cfg_seq` 下发，
+`vio_dpu_cfg_seq` 连接实际 ring 的准备/导出/确认/释放。旧双 bank register builder、
+policy 和 dataplane extension 已删除，不再提供旧 build/apply/teardown API。
 
-真实驱动的 `DPU_QID_MAP_TABLE_ENTRIES`/`DPU_MAX_TXRX_QUEUE` 是 128，因此默认
-shadow bank 只生成或清理 128 项；1024 只是模型支持的编码上限。普通 VIO 和
-AF extra queue 的 notify entries 使用同一排序和 commit。extra queue 从 frozen
-snapshot 的显式 binding 生成自己的 BDF dependency、MSI-X linear/info/interval
-以及 notify low/high operation，不在 builder 中重新分配 qid 或 vector。
-resource manager 将 11 个 extra queue 导入为选中 AF 的 function-owned frozen
-lease，防止其 global qpair ID 被动态资源再次使用；它们不进入 service lease，
-因此 `virtio_resource_client` 看不到这些驱动控制队列。
+Notify 采用512行单 bank，仅写实际 qpair 的有效项；TX/RX 共用一项。
+排序按 Host、BAR匹配基址和连续 pair 编号，global qid 保留为映射结果。
+每批 VIO/RDMA 表成功后，每个管理 BAR 写一次 `+0x80044=1`。
+BDF/MSI-X/QSCH/VTX/VRX 的字段和地址见
+[驱动地址对照](../integration/project/driver_address_example.md)。
+多 DWORD 高到低写，VTX/VRX 四次数据写后再触发；AF 初始及每100次 DWORD 写的状态读保留。
+平台控制真实停机后再释放 ring；PBA 是 DUT 维护状态，不伪造初始化写。
 
-环境层调用方式：
+AF extra queue 仍是独立的 function-owned frozen binding，不属于 VIO service，
+资源解析保留默认11项及其占用保护。当前 VIO 配置不会为没有实际 ring 的 extra queue
+生成 Notify；单 AF PF0 配32对业务需显式设置 `dpu.caps.af_extra_queue_count=0`。
 
-```systemverilog
-dpu_reg_plan plan;
-dpu_execution_report report;
-string why;
-if (!device_env.build_vio_register_plan(plan, why))
-  `uvm_fatal("DPU_CFG", why)
-device_env.apply_vio_register_plan(plan, report);
-```
-
-配置成功进入 `DPU_DEVICE_ACTIVE` 后，独立的 teardown API 使用同一对 frozen
-snapshots，且不重新分配任何 ID：
-
-```systemverilog
-dpu_reg_plan teardown_plan;
-if (!device_env.build_vio_teardown_plan(teardown_plan, why))
-  `uvm_fatal("DPU_CFG", why)
-device_env.apply_vio_teardown_plan(teardown_plan, report);
-```
-
-teardown 先把完整 invalid notify shadow 写入 inactive bank 并以 ready=0 commit，
-随后只对普通 VIO/AF-extra binding 实际拥有的 global vector、function/local vector
-和 function，依次清零 MSI-X info、MSI-X linear 与 BDF map。成功后状态回到
-`RESOLVED`；`NOT_EXECUTED`、plan invalid 或 preflight failure 保持 `ACTIVE`，执行中
-失败进入 `FAILED`。
-
-setup 与 teardown 从相同的普通 VIO/AF-extra bindings 构造 VIO-owned function 集合。
-没有这些 queue ownership 的 PF/VF 不由 VIO plan 写入或清理 BDF map；BAR bootstrap
-属于公共 PCIe topology 配置，仍覆盖 snapshot 中的完整 function/BAR 集合，不随 VIO
-BDF ownership 收窄。
-
-`dpu_vio_register_plan_policy` 提供 notify bank/type、MSI-X interval 和 self-mask
-策略；这些字段不会改变 frozen topology。`dpu_device_env_config.executor` 是唯一
-真实下发扩展点，`apply_vio_register_plan` 会先 freeze 和调用 executor preflight，
-preflight 失败不会产生 PCIe 写入。用户可继承 `dpu_reg_executor` 将每个
-`dpu_reg_op` 翻译成平台 PCIe config/MMIO TLP；仓库不绑定某一具体 PCIe VIP transport。
-
-当前仓库已提供与 53 号机真实驱动一致的
-`dpu_vio_driver_dataplane_extension`。它从 frozen resource snapshot 派生
-Host/function/MSI-X 字段，写入 QSCH init、Q2TC/N2G/G2P/SPWRR、可选的 TC0..TC7
-WRR weight，以及 VTX/VRX queue-parameter RAM 的 content、RAM select 和
-0→1 write-enable；AF BAR0 aperture
-和所有字段宽度在 plan 阶段检查。驱动没有初始化的 VTX context、VRX tail、QSCH
-链表/调度树节点仍不会被伪造。场景可直接填充 extension 的
-`qsch_queues`、`qsch_functions`、`vtx_queues` 和 `vrx_queues`，也可以继承基类覆盖
-以下 hook：
-
-`qsch_functions` 中的 `weight_valid` 置 1 时，`tc_weight[0:7]` 会按驱动的
-`qsch_tc_wgt_cfg_table_entry`（每个 TC 4 bit）生成
-`DSCH_QSCH_BASE + 0x14000 + global_func_id*4` 写入；不置 1 则保持驱动默认权重，
-不会增加额外写操作。
-QSCH G2P 的 `src_port` 按 `dpu_snd1.ko` 的实际一位编码处理：驱动源码中的
-`QSCH_PORT_HOST0 + host_id` 在写入结构体时被截断为低位，因此 plan 不会写入
-超出该字段的逻辑端口值。
-
-### QSCH 逻辑拓扑与随机 lowering
-
-QSCH 不直接从寄存器字段反向随机，而是先在 `dpu-common` 生成逻辑图，再 lowering
-到真实 DUT 配置。`dpu_qsch_topology_generator` 的输入是已经冻结的
-`dpu_device_snapshot` 和 `dpu_resource_snapshot`，输出为
-`dpu_qsch_topology_cfg`：
-
-```text
-Function/global_func_id ──> net ──> group ──> port
-global_qpair_id ────────────────> TC/net
-                                  │
-                                  └── traffic_classes[0..7]
-```
-
-支持的模式为 `DPU_QSCH_TOPOLOGY_RANDOM_VALID` 和
-`DPU_QSCH_TOPOLOGY_RANDOM_STRESS`。随机使用仿真全局 seed，因此同一仿真 seed 可以
-复现同一张图，不需要环境额外维护 seed。net ID 不是独立随机数，而是对应 Function
-的 `global_func_id`；随机的是 group/port 节点、qpair 的 TC、net 的 SP/WRR 与可选
-TC weight。生成器保证 qpair owner、net、group、port 引用完整且字段范围合法，每个
-生成的 group 至少有一个 net。需要覆盖多 Function 共享调度组时设置
-`generator.require_shared_group = 1`；只要存在两个以上 Function，生成器就会约束
-group 数量小于 net 数量，并让剩余 net 继续随机挂接，从而保证至少一个 group 被多个
-net-device 共享。
-
-```systemverilog
-dpu_qsch_topology_generator generator;
-dpu_qsch_topology_cfg topology;
-generator = dpu_qsch_topology_generator::type_id::create("qsch_generator");
-generator.mode = DPU_QSCH_TOPOLOGY_RANDOM_VALID;
-if (!generator.build_random(device_snapshot, resource_snapshot, topology, why))
-  `uvm_fatal("QSCH", why)
-
-driver_extension.set_qsch_topology(topology);
-```
-
-`set_qsch_topology()` 在 lowering 前再次校验 snapshots 和关系，随后沿用已审计的
-Q2TC/N2G/G2P/SPWRR/weight 地址和位域。由于 53 号真实驱动的 N2G/G2P 表项仍按
-`global_func_id` 寻址，随机 group 写入 N2G 的 group 字段，group 的 port 写入该 net
-的 G2P 字段；当前不会凭空增加未经驱动确认的独立 group-table 或硬件链表寄存器。
-拓扑对象本身就是验证期望模型，可用于后续 DUT readback/数据面检查。
-
-```systemverilog
-class my_vio_dataplane_extension extends dpu_vio_dataplane_plan_extension;
-  `uvm_object_utils(my_vio_dataplane_extension)
-
-  virtual function bit contribute_qsch(
-      dpu_device_snapshot devices,
-      dpu_resource_snapshot resources,
-      dpu_reg_plan plan,
-      output string why);
-    // 从 frozen resources 读取 qpair/MSI-X/AF-extra binding，向 plan 追加
-    // 已由用户核实的 scheduler node/table operations 和 dependencies。
-    why = "";
-    return 1;
-  endfunction
-endclass
-
-env_cfg.vio_dataplane_extension =
-    my_vio_dataplane_extension::type_id::create("vio_dataplane_extension");
-```
-
-builder 固定按 `contribute_qsch()`、`contribute_vtx()`、`contribute_vrx()` 顺序，
-在核心 BDF/MSI-X/notify commit operation 已存在后调用这些 hook。三者获得同一对
-frozen snapshots 和仍可追加 operation/dependency 的 plan；任一 hook 返回 0，
-plan build 整体失败且 executor 不会运行。QSCH 与 DSCH 调度树可先统一从
-`contribute_qsch()` lowering，后续字段核实后再拆分专用 builder。
+独立 `dpu_qsch_topology_generator` 继续保留逻辑拓扑和合法随机化能力，
+但不再导入旧 driver extension。当前表策略用 `dpu_env_cfg.vio_policies/platform_controls`
+声明，访问 `configure_qsch` / `write_qsch_*` 使用同一实际资源。
 
 冻结 snapshot 中的 VIO qpair capabilities 是硬件上限，并在以下边界执行：
 
@@ -1907,16 +1770,10 @@ mailbox 和 64 KiB MSI-X table/PBA；VF 的对应大小为 16 KiB、16 KiB 和
 在 domain 的 MMIO windows 中检查 role、size、alignment、overflow 和 overlap，
 并将完整解析结果发布到冻结的 `dpu_device_snapshot`。
 
-当前边界已包含 resolved PCI BAR、AF declaration/bootstrap plan lowering 和 PCIe-TL
-executor。当前 plan 已包含 11 个 AF extra queue
-的 BDF dependency、MSI-X internal mapping 和 notify lowering，以及上述驱动证据充分
-的 QSCH/VTX/VRX queue-parameter lowering；AF mailbox/MAC-age/PTP-stamp 等非 queue
-control interrupt及标准 PCIe MSI-X table address/data 初始化仍由后续专用 builder
-或平台集成处理。现有 teardown 已覆盖 snapshot-owned notify、MSI-X info/linear 和
-BDF map；不会写 PBA、BAR4 MSI-X table、interval 或无 VIO queue 的其他 function。
-PBA 是 DUT-maintained pending state，应通过读/检查验证而不是由配置层清零。只有测试或集成环境显式
-注入 `dpu_reg_executor` 后才会访问硬件；未注入时报告
-`NOT_EXECUTED`，不伪报硬件成功。
+当前边界包含唯一 BDF/BAR 解析、AF 声明与同步、公共 MSI-X/BDF 表、
+实际 VIO Notify/QSCH/VTX/VRX，以及可独立扩展的类别入口。
+没有提供布局或必要硬件身份的可选表会明确失败，不能报告配置成功。
+通用 register plan/executor 也继续独立可用，见 PCIe executor 测试。
 
 `cosim_control` 与 BAR2/3 mailbox command delivery 是
 [real-DUT service configuration design](superpowers/specs/2026-08-25-real-dut-service-configuration-design.md)
@@ -1932,7 +1789,7 @@ make regression
 `scripts/test_manifest.sh` 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的
 单一事实源。该入口按清单顺序运行 `dpu_resource_manager_test`、
 `dpu_reg_plan_test`、`dpu_pcie_reg_executor_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
-`dpu_resource_resolver_test`、`dpu_device_bootstrap_plan_test`、`dpu_vio_reg_plan_test`、`virtio_dut_caps_test`、
+`dpu_resource_resolver_test`、`virtio_dut_caps_test`、
 `virtio_execution_mode_test`、`virtio_real_dut_iova_dma_test`、
 `virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_vdev_unit_test`、
 `virtio_host_mem_reclaim_test`、`virtio_queue_semantics_test`、
@@ -1948,7 +1805,7 @@ make regression
 `host_mem_random_test`、
 `virtio_pcie_host_mem_test`、`dpu_pcie_tl_executor_integration_test`、
 `dpu_priv_driver_flow_test` 和 `dpu_priv_ring_contract_test`，
-共 41 项。该入口
+共 39 项。该入口
 要求 `make check-deps` 先通过；无 VCS 环境时它应在编译前报告 VCS 依赖错误。
 
 其中 `virtio_host_mem_reclaim_test`、`virtio_queue_semantics_test`、

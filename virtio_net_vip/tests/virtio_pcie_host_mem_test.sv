@@ -58,7 +58,7 @@ class virtio_pcie_host_mem_test extends uvm_test;
     localparam int unsigned DMA_BYTES = 64;
 
     virtio_test_device_builder device_builder;
-    dpu_device_env_config      device_cfg;
+    dpu_env_cfg	device_cfg;
     dpu_device_env             device_env;
     virtio_net_env_config      vio_cfg;
     virtio_net_env             vio_env;
@@ -237,7 +237,7 @@ class virtio_pcie_host_mem_test extends uvm_test;
 
         device_cfg = device_builder.make_env_config();
         device_cfg.host_mem_pool_ref = host_mem_owners;
-        uvm_config_db#(dpu_device_env_config)::set(
+        uvm_config_db#(dpu_env_cfg)::set(
             this, "device_env", "cfg", device_cfg);
         uvm_config_db#(virtio_net_env_config)::set(
             this, "device_env.vio_env", "cfg", vio_cfg);

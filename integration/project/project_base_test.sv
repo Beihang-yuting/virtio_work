@@ -4,11 +4,11 @@
 // 防止空 hook 假装平台已准备好。派生 test 用 factory 注册，本虚类不注册 factory。
 virtual class project_base_test extends uvm_test;
 	project_env_cfg	cfg;
-	project_env	env;
+	project_env		env;
 
 	// 构造 test 壳；构建参数由 cfg.load_params 负责，无需在 new 重复逐项赋值。
 	extern function new(
-		string		name,
+		string			name,
 		uvm_component	parent
 	);
 
@@ -25,35 +25,29 @@ virtual class project_base_test extends uvm_test;
 	pure virtual task finish_platform();
 
 	// 支持 top 提供预建 cfg 或使用 factory；单一参数入口后只下发同一 cfg 句柄。
-	extern virtual function void build_phase(
-		uvm_phase	phase
-	);
+	extern virtual function void build_phase(uvm_phase	phase);
 
 	// 配置 sequence 失败即停止参考流程，已导出资源留给平台 quiesce/release。
 	extern function void require_success(
-		input bit	ok,
+		input bit		ok,
 		input string	why
 	);
 
 	// 唯一运行顺序：平台就绪→独立表配置/可选读回→VIO 确认→业务命令→Tcl→业务收尾。
 	// 运行期 Tcl 只能改变下一条命令采样的参数，不能改写已冻结拓扑。
-	extern virtual task run_phase(
-		uvm_phase	phase
-	);
+	extern virtual task run_phase(uvm_phase	phase);
 endclass
 
 // 构造 test 外壳，不读取设备。
 function project_base_test::new(
-	string		name,
+	string			name,
 	uvm_component	parent
 );
 	super.new(name, parent);
 endfunction
 
 // 唯一参数加载后注入平台句柄，再构建同一个 env。
-function void project_base_test::build_phase(
-	uvm_phase	phase
-);
+function void project_base_test::build_phase(uvm_phase	phase);
 	super.build_phase(phase);
 	if (!uvm_config_db#(project_env_cfg)::get(this, "", "project_cfg", cfg))
 		cfg = project_env_cfg::type_id::create("cfg");
@@ -66,7 +60,7 @@ endfunction
 
 // 配置失败立即停止参考流程，资源仍由平台显式回收。
 function void project_base_test::require_success(
-	input bit	ok,
+	input bit		ok,
 	input string	why
 );
 	if (!ok) `uvm_fatal("PROJECT_TEST", why)
@@ -74,23 +68,21 @@ endfunction
 
 // 平台就绪后启动一个配置 sequence；失败不进入业务，成功才注册发包命令。
 // 参考 VIO/QSCH 布局可直接使用基类；平台特殊访问才需 factory override 单项 hook。
-task project_base_test::run_phase(
-	uvm_phase	phase
-);
-	project_dut_config_seq	config_seq;
-	int unsigned		host;
+task project_base_test::run_phase(uvm_phase	phase);
+	vio_dpu_cfg_seq	config_seq;
+	int unsigned	host;
 
 	phase.raise_objection(this);
 	prepare_platform();
 
-	config_seq = project_dut_config_seq::type_id::create("config_seq");
+	config_seq = vio_dpu_cfg_seq::type_id::create("config_seq");
 	if (!cfg.tl_slot_by_host.first(host)) begin
 		`uvm_fatal("PROJECT_TEST", "no PCIe Host configured")
 	end
-	config_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[host]]);
+	config_seq.start(env.pcie_env.rc_agents[cfg.tl_slot_by_host[host]].sequencer);
 	require_success(config_seq.success, config_seq.error_msg);
 
-	if (cfg.vio_setups.num() != 0) begin
+	if (cfg.dpu_cfg.queues_by_host.num() != 0) begin
 		env.register_aip_commands();
 		aip_tcl_bridge::run_loop();
 	end

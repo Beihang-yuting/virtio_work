@@ -124,6 +124,7 @@
         virtqueue_base	vq;
         uvm_object	tokens[$];
 
+        tx_notify_pending.delete(queue_id);
         vq = vq_mgr.get_queue(queue_id);
         if (vq != null) begin
             vq.queue_enable = 0;

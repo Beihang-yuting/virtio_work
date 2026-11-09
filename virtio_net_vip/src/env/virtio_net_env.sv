@@ -1135,6 +1135,15 @@ class virtio_net_env extends uvm_env;
         `uvm_info("VIRTIO_ENV", "========== End Environment Report ==========", UVM_LOW)
     endfunction
 
+    // 导出真实已分配 ring 的 DPU 写表值；不分配资源，不改变 VIO 生命周期。
+    extern function bit export_dpu_queues(
+        input vio_external_setup	setup,
+        input vio_config_scope		scope,
+        output dpu_vio_queue_t		queues[$],
+        output string				why
+    );
+    // 借用当前 setup；只读句柄不能绕过核心确认/释放校验。
+    extern function vio_external_setup get_external_setup();
 endclass : virtio_net_env
 
 // 准备阶段不调用任何设备配置后端；先验证全部目标，再分配真实 ring 和本地接收规则。
@@ -1686,6 +1695,45 @@ function bit virtio_net_env::revoke_external_configuration(input vio_external_se
 		external_confirmed.delete(dpu_service_key_name(p.service_key));
 	end
 	return 1;
+endfunction
+
+// 当前代仅由本 env 管理；调用方不可替换或释放其内部对象。
+function vio_external_setup virtio_net_env::get_external_setup();
+    return live_external_setup;
+endfunction
+
+// 对照核心实际导出逐项投影；scope 与 ring 句柄先校验，失败不返回半份结果。
+function bit virtio_net_env::export_dpu_queues(
+    input vio_external_setup	setup,
+    input vio_config_scope		scope,
+    output dpu_vio_queue_t		queues[$],
+    output string				why
+);
+    vio_queue_setup_t	records[$];
+    dpu_vio_queue_t	queue;
+
+    queues.delete();
+    if (!preflight_external_configuration(setup, scope, why)) return 0;
+    setup.list_queues(records);
+    foreach (records[i]) begin
+        if (scope != null && !scope.selects(records[i].service_key)) continue;
+        queue.snapshot         = device_snapshot;
+        queue.service_key      = records[i].service_key;
+        queue.qpair            = records[i].qpair;
+        queue.generation       = setup.get_generation();
+        queue.virtio_mode      = records[i].queue_type == VQ_PACKED;
+        queue.msix_enable      = records[i].completion_mode == VIRTIO_COMPLETION_MSIX;
+        queue.tx_mode          = records[i].tx_mode;
+        queue.local_qid        = records[i].notification.local_qid;
+        queue.queue_size       = records[i].queue_size;
+        queue.allocated_qpairs = records[i].allocated_qpairs;
+        queue.desc_iova        = records[i].desc_iova;
+        queue.notify_address   = records[i].notify_address;
+        queue.notify_bar_base  = records[i].notify_bar_base;
+        queue.notify_bar_size  = records[i].notify_bar_size;
+        queues.push_back(queue);
+    end
+    return 1;
 endfunction
 
 `endif // VIRTIO_NET_ENV_SV

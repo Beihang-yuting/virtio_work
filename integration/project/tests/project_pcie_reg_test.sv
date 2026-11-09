@@ -7,6 +7,9 @@ package project_pcie_reg_test_pkg;
 	import pcie_tl_pkg::*;
 	import intel_pcie_adapter_pkg::*;
 	import project_env_pkg::*;
+	import virtio_dpu_pkg::*;
+	import dpu_pcie_pkg::*;
+	import dpu_resource_pkg::*;
 	import project_external_integration_test_pkg::*;
 	`include "uvm_macros.svh"
 
@@ -14,7 +17,7 @@ package project_pcie_reg_test_pkg;
 	class project_reg_test_context;
 		static uvm_sequencer_base	sqr;
 	endclass
-	`aip_cmd_reg(reg_acc, project_pcie_reg_seq, project_reg_test_context::sqr, seq.error_msg, seq.check_read_data)
+	`aip_cmd_reg(reg_acc, dpu_bar_reg_seq, project_reg_test_context::sqr, seq.error_msg, seq.check_read_data)
 
 	// 仅接收两笔刻意开启RAM比较的AF状态读错误；协议错误及其他地址仍正常报错。
 	class project_reg_expected_data_error extends uvm_report_catcher;
@@ -126,15 +129,15 @@ package project_pcie_reg_test_pkg;
 	// 两模式都先核对显式cfg注入及重复start；之后reg_acc自动从真实RC的config_db取得同一cfg。
 	task project_pcie_reg_test::run_phase(uvm_phase phase);
 		project_reg_expected_data_error	expected_error;
-		project_pcie_reg_seq	access;
-		project_pcie_reg_seq	missing;
+		dpu_bar_reg_seq	access;
+		dpu_bar_reg_seq	missing;
 		string			why;
 		bit [127:0]		wide_value;
 		int unsigned		before_requests;
 
 		phase.raise_objection(this);
-		require_true(cfg.bar_registry.resolve_name("h0.pf0.bar0", management, why), why);
-		project_reg_test_context::sqr = cfg.rc_sequencers[cfg.tl_slot_by_host[0]];
+		require_true(cfg.dpu_cfg.bar_map.resolve_name("h0.pf0.bar0", management, why), why);
+		project_reg_test_context::sqr = env.pcie_env.rc_agents[cfg.tl_slot_by_host[0]].sequencer;
 		expected_error = new();
 		expected_error.addr = management.bar_lease.base + 'h1010;
 		uvm_report_cb::add(null, expected_error);
@@ -146,7 +149,7 @@ package project_pcie_reg_test_pkg;
 		require_true(missing.status == PCIE_RW_ERR && missing.error_msg != "" &&
 			missing.issued_tlps.size() == 0, "missing cfg did not return a clean zero-request error");
 		access = new("explicit_cfg");
-		access.cfg      = cfg;
+		access.cfg      = cfg.dpu_cfg;
 		access.addr     = 'h2000;
 		access.is_write = 1;
 		access.wdata    = 'haabbccdd;
@@ -201,7 +204,7 @@ package project_pcie_reg_test_pkg;
 		require_true(wide_value == 128'hff22ff44ff66ff88ffaaffccffeeff00 &&
 			table_value('h1010, 4) == 'h5555aaaa && table_value('h2000, 4) == 'h11223344,
 			"actual Intel writes did not preserve 128bit values or masked bytes");
-		require_true(cfg.records.num() == 0 && cfg.vio_setups.num() == 0,
+		require_true(cfg.dpu_cfg.records.num() == 0 && cfg.dpu_cfg.queues_by_host.num() == 0,
 			"register access unexpectedly configured DUT tables or allocated rings");
 		`uvm_info("PROJECT_REG_ACC_PASS", $sformatf("tcl=%0b requests=%0d writes=%0d reads=%0d checks=%0d",
 			$test$plusargs("AIP_TCL"), requests, writes, reads, checks), UVM_LOW)

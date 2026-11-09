@@ -13,56 +13,44 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCES = (
     "filelists/project_integration.f",
     "integration/project/project_env_pkg.sv",
-    "integration/project/project_bar_registry.sv",
-    "integration/project/project_dut_config.sv",
-    "integration/project/project_vio_config.sv",
-    "integration/project/project_pcie_rc_driver.sv",
     "integration/project/project_env_cfg.sv",
-    "integration/project/project_pcie_reg_seq.sv",
-    "integration/project/project_dut_config_seq.sv",
-    "integration/project/project_single_queue_config_seq.sv",
     "integration/project/project_env.sv",
     "integration/project/project_base_test.sv",
+    "integration/project/project_single_queue_config_seq.sv",
 )
 OUTPUT = ROOT / "docs/project_env_full_code.md"
 
 
 def render():
     """逐字节读源码并列出哈希/包含顺序；不推断缺失平台布局或硬件行为。"""
-    parts = ["""# 项目外部配置完整源码
+    parts = ["""# 项目 env / env_cfg 完整参考代码
 
-本文件由 `python3 scripts/render_project_code.py` 自动生成，禁止手工修改代码块。
-运行 `python3 scripts/render_project_code.py --check` 检查是否与最终源码一致。
-最短接入顺序、平台 hook/布局和 Intel bind 见 [README](../integration/project/README.md)。
+本文件由 `python3 scripts/render_project_code.py` 从实际源码生成；使用 `--check` 检查一致性。
+接入流程、参数和 Intel bind 见 [README](../integration/project/README.md)。
 
-保留一个 env、一个 cfg；辅助 typed/registry/driver 文件是必要依赖，不可只复制两个类。
-下列 `.sv` 文件由 `project_env_pkg.sv` 按其 include 顺序包含，不得重复单独编译。
-按需替换项目类名前缀时，同步更新 extern 定义的类限定名。
+用户自己的 env_cfg 直接组合 `dpu_env_cfg`、`virtio_net_env_config`、`pcie_tl_env_config`，
+不需要继承参考 cfg。env 直接创建三个组件，借用平台已有 VIF 和每 Host 的唯一 memory manager。
+参考 `project_*` 只承担组装；公共实现通过 package 复用，不复制到用户 env。
 
-外部 package 顺序由 `filelists/project_integration.f` → `filelists/aip_integration.f`
-→ `filelists/dpu_common.f` / `filelists/virtio_net.f` 明确声明：AIP (`src/sv`布局)、
-DPU、net_packet、host_mem、PCIe TL、VIO、AIP glue、Intel interface/adapter，再到本包。
-依赖版本与 package SHA-256 见 [验证记录](vio_external_configuration_validation.md)。
-生产 VIO filelist 不包含本目录；模型测试需另外添加 `filelists/project_tests.f`。
+| 编译入口 | 提供的能力 |
+| --- | --- |
+| `$DPU_COMMON_ROOT/filelists/dpu_common.f` | 资源、BAR、表类型与 `dpu_env_cfg` |
+| `$DPU_COMMON_ROOT/filelists/dpu_pcie.f` | `dpu_cfg_seq`、`dpu_bar_reg_seq`、PCIe 路由 |
+| `integration/dpu/virtio_dpu_pkg.sv` | `vio_dpu_cfg_seq`、`vio_pcie_rc_driver` |
+| `integration/project/project_env_pkg.sv` | 本文的 env/cfg/base_test 与单队列示例 |
 
-默认采用驱动参考 BDF/MSI-X/VIO/QSCH 布局，配置 seq 已实现这些表的写入和可选真实读回。
-第一笔配置写为 AF 声明：经 Host0 RC 向已分配的 h0.pf0.bar0.base+0x1010 写32'h5555_aaaa。
-declare_af() 复用 pcie_tl_reg_seq，发送4B Memory Write后单次读同地址，等待Completion并要求状态8。
-随后每100次完整DWORD配置写再读一次状态；无轮询、无尾读，任一步失败停止。
-AF读关闭SCB历史RAM比较，保留协议检查及状态8校验；与PROJECT_AF表独立，不执行额外Host-ID协商。
-所有寄存器访问固定TC0/attr0；AF同步不受configure_public或verify_readback控制。
-BDF默认开启，MSI-X按实际完成模式选择；其余公共表默认关闭。
-默认 dpu.verify_readback=0；设为1时增加配置读回。
-Notify 仅写/读实际队列对的有效项；首次配置前 DUT 须按05.png复位未用项
-（type=3、lookup key/global_qid全1、reserved=0）。MSI-X 线性表尾部初始化保持原流程。
-BAR 编码、公共验证及实际复位/接口绑定仍由平台负责。
-base_test 显式启动一个配置 seq，共用 env_cfg 中的资源完成写表、使能、所选验证和确认。
-ring 在写队列表前准备；不自动执行 Virtio capability 发现、协商或复位。
-单队列联调可改用 project_single_queue_config_seq：在独立 seq 内固定 BDF/Notify/QSCH/VTX
-布局和策略，实际 BAR/ring 继续由 env 分配；原 project_dut_config_seq 行为不变。
-Host0/PF0/no-VF、一对 Packed256/Polling/TX-only 和 DPU32 Notify 必须在 env 构建前选定。
-独立寄存器访问可用 project_pcie_reg_seq 注册 aip_cmd_reg：addr 为 Host0/PF0 BAR0 偏移，
-cfg 来自显式句柄或启动 sequencer 的 env_cfg；实际 BAR 基址和 RC 由环境解析。
+顺序为 AIP → DPU/host_mem/net_packet/PCIe TL → VIO/AIP → Intel → DPU PCIe 集成 → VIO DPU 集成 → 用户包。
+同一个 package 只编译一次。参考 project 不加入生产核心 filelist/package。
+
+配置 seq 从实际 PCIe sequencer 的 `dpu_cfg` 键获取公共配置；VIO env 以 `vio_env_hN` 发布。
+`vio_dpu_cfg_seq` 先执行 AF 声明和状态读，再配置 BDF/所选 MSI-X、准备实际 ring、
+写 Notify/QSCH/VTX/VRX，最后确认 VIO。每批 VIO/RDMA Notify 表成功后，
+每个管理 BAR 写一次 `+0x80044 = 1`。空批次不写，失败停止；不增加 bank 切换或使能读回。
+原有每100次完整 DWORD 写后的 AF 状态读保持不变。
+
+Tcl 名称仍为 `dut_config`、`reg_acc`、`load_params`；其中 reg_acc 注册 `dpu_bar_reg_seq`，
+addr 为 Host0/PF0 BAR0 内偏移。load_params 用 AIP 命令宏注册一次，顶层统一刷新允许字段。
+完整快照恢复说明和边界见 README，源码变更后需重新编译并保存快照。
 
 """]
     for relative in SOURCES:

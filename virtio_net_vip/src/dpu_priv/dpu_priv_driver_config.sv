@@ -20,6 +20,9 @@ class dpu_priv_queue_config extends uvm_object;
     bit	i_l4_cs;
     bit [1:0] fwd = 1;
 
+    // 从已采样的默认控制继承显式字段，不重新随机，不覆盖队列自己的 local_qid。
+    extern function void inherit_params(input dpu_priv_queue_config	source, input string	path);
+
     // 参数归属：vio.private.* 默认控制字段或其 q<qid> 子路径覆盖。
     // 先用 64 位数值检查位宽，避免负数/高位被窄字段静默截断；不持有运行态 ring。
     function void	load_params(string	path = "vio.private", bit	load_local_qid = 1);
@@ -136,6 +139,44 @@ class dpu_priv_queue_config extends uvm_object;
     endfunction
 endclass
 
+// 运行期默认控制只取一次；队列继承已采样字段后，再读取自己的 qN 覆盖。
+// 缺失字段保留当前队列值，通知显式标志只随对应字段传播，不修改源对象。
+function void dpu_priv_queue_config::inherit_params(
+    input dpu_priv_queue_config	source,
+    input string	path
+);
+`ifdef AIP_CMDLINE_SV
+    bit	present;
+
+    `DPU_AIP_PRESENT(path, "notify_bar", present)
+    if (present) notify_bar = source.notify_bar;
+    notify_bar_present |= present;
+    `DPU_AIP_PRESENT(path, "notify_offset", present)
+    if (present) notify_offset = source.notify_offset;
+    notify_offset_present |= present;
+    `DPU_AIP_PRESENT(path, "dport_info", present)
+    if (present) dport_info = source.dport_info;
+    `DPU_AIP_PRESENT(path, "dport_id", present)
+    if (present) dport_id = source.dport_id;
+    `DPU_AIP_PRESENT(path, "dport_type", present)
+    if (present) dport_type = source.dport_type;
+    `DPU_AIP_PRESENT(path, "cpu_tx_cos", present)
+    if (present) cpu_tx_cos = source.cpu_tx_cos;
+    `DPU_AIP_PRESENT(path, "rss_lag", present)
+    if (present) rss_lag = source.rss_lag;
+    `DPU_AIP_PRESENT(path, "l3_cs", present)
+    if (present) l3_cs = source.l3_cs;
+    `DPU_AIP_PRESENT(path, "l4_cs", present)
+    if (present) l4_cs = source.l4_cs;
+    `DPU_AIP_PRESENT(path, "i_l3_cs", present)
+    if (present) i_l3_cs = source.i_l3_cs;
+    `DPU_AIP_PRESENT(path, "i_l4_cs", present)
+    if (present) i_l4_cs = source.i_l4_cs;
+    `DPU_AIP_PRESENT(path, "fwd", present)
+    if (present) fwd = source.fwd;
+`endif
+endfunction
+
 // 每 Function 独立配置：env_cfg 按完整 service key 注册它，再交给该 Function 的
 // 私有驱动协议与配置后端。默认映射 local_qid_base+queue_id；单队列覆盖允许独立路由/通知。
 class dpu_priv_driver_config extends uvm_object;
@@ -149,40 +190,8 @@ class dpu_priv_driver_config extends uvm_object;
     // 参数归属：vio.private.queue_size/rx_buf_size/local_qid_base 及默认控制字段。
     // 必须在 Function bind_private 冻结副本前调用；仅覆盖已声明的 queues，
     // qid 唯一性与方向仍由 validate(pairs, why) 联合检查，不擅自创建/扩容队列。
-    function void	load_params(string	path = "vio.private");
-`ifdef AIP_CMDLINE_SV
-        longint unsigned	queue_size;
-        longint unsigned	rx_buf_size;
-        longint unsigned	local_qid_base;
-
-        `DPU_AIP_UINT(path, longint unsigned, queue_size, default_queue_size);
-        `DPU_AIP_UINT(path, longint unsigned, rx_buf_size, this.rx_buf_size);
-        `DPU_AIP_UINT(path, longint unsigned, local_qid_base, this.local_qid_base);
-        if ((queue_size < 2) || (queue_size > 4096) ||
-            ((queue_size & (queue_size - 1)) != 0) ||
-            (rx_buf_size < 64) || (rx_buf_size > 16383) ||
-            (local_qid_base > 254) || ((local_qid_base & 1) != 0)) begin
-            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ": 队列几何/本地队列起点非法"})
-            return;
-        end
-        if (defaults == null) begin
-            `uvm_fatal("VIO_PRIVATE_PARAM", {path, ": 缺少默认队列配置"})
-            return;
-        end
-        // 默认队列的 local_qid 由 local_qid_base+qid 推导；只有单队列覆盖读此字段。
-        defaults.load_params(path, 0);
-        foreach (queues[qid]) begin
-            if (queues[qid] == null) begin
-                `uvm_fatal("VIO_PRIVATE_PARAM", {path, ": 队列覆盖对象为空"})
-                return;
-            end
-            queues[qid].load_params($sformatf("%s.q%0d", path, qid));
-        end
-        default_queue_size = int'(queue_size);
-        this.rx_buf_size   = int'(rx_buf_size);
-        this.local_qid_base = int'(local_qid_base);
-`endif
-    endfunction
+    // load_queues=0 先只采样默认值，供外层按队列合并已采样控制后单独读取 qN。
+    extern function void load_params(string	path = "vio.private", bit	load_queues = 1);
 
     // 创建本 Function 的默认队列配置。
     function new(string name = "dpu_priv_driver_config");
@@ -250,4 +259,47 @@ class dpu_priv_driver_config extends uvm_object;
         return 1;
     endfunction
 endclass
+
+// 只解析默认控制或已有队列；可分两步合并运行期默认值，避免 qN 参数被重复抽样。
+function void dpu_priv_driver_config::load_params(
+    string	path,
+    bit	load_queues
+);
+`ifdef AIP_CMDLINE_SV
+    longint unsigned	queue_size;
+    longint unsigned	rx_buf_size;
+    longint unsigned	local_qid_base;
+
+    `DPU_AIP_UINT(path, longint unsigned, queue_size, default_queue_size);
+    `DPU_AIP_UINT(path, longint unsigned, rx_buf_size, this.rx_buf_size);
+    `DPU_AIP_UINT(path, longint unsigned, local_qid_base, this.local_qid_base);
+    if ((queue_size < 2) || (queue_size > 4096) ||
+        ((queue_size & (queue_size - 1)) != 0) ||
+        (rx_buf_size < 64) || (rx_buf_size > 16383) ||
+        (local_qid_base > 254) || ((local_qid_base & 1) != 0)) begin
+        `uvm_fatal("VIO_PRIVATE_PARAM", {path, ": 队列几何/本地队列起点非法"})
+        return;
+    end
+    if (defaults == null) begin
+        `uvm_fatal("VIO_PRIVATE_PARAM", {path, ": 缺少默认队列配置"})
+        return;
+    end
+    // 默认队列的 local_qid 由 local_qid_base+qid 推导；只有单队列覆盖读此字段。
+    defaults.load_params(path, 0);
+    if (load_queues) begin
+        foreach (queues[qid]) begin
+            if (queues[qid] == null) begin
+                `uvm_fatal("VIO_PRIVATE_PARAM", {path, ": 队列覆盖对象为空"})
+                return;
+            end
+            queues[qid].load_params($sformatf("%s.q%0d", path, qid));
+        end
+    end
+
+    default_queue_size  = int'(queue_size);
+    this.rx_buf_size    = int'(rx_buf_size);
+    this.local_qid_base = int'(local_qid_base);
+`endif
+endfunction
+
 `endif

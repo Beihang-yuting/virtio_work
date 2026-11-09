@@ -186,7 +186,7 @@ class virtio_monitor_routing_test extends uvm_test;
     virtio_net_env                 virtio_env;
     pcie_tl_env_config             pcie_cfg;
     pcie_tl_env_config             reused_pcie_cfg;
-    dpu_device_env_config          device_env_cfg;
+    dpu_env_cfg	device_env_cfg;
     virtio_net_env_config          virtio_cfg;
     virtio_test_device_builder     device_builder;
     virtio_tlm_completion_adapter  tlm_adapter;
@@ -331,8 +331,8 @@ class virtio_monitor_routing_test extends uvm_test;
         dpu_resource_snapshot resource_snapshot;
         dpu_resource_snapshot alternate_resource_snapshot;
         dpu_resource_snapshot unfrozen_resource_snapshot;
-        dpu_device_env_config env_cfg;
-        dpu_device_env_config alternate_env_cfg;
+        dpu_env_cfg	env_cfg;
+        dpu_env_cfg	alternate_env_cfg;
         dpu_resource_manager manager;
         dpu_resource_manager alternate_manager;
         dpu_function_key_t parent_key;
@@ -375,7 +375,7 @@ class virtio_monitor_routing_test extends uvm_test;
         input bit add_vf_bars,
         output dpu_device_snapshot snapshot,
         output dpu_resource_snapshot resource_snapshot,
-        output dpu_device_env_config env_cfg,
+        output dpu_env_cfg env_cfg,
         output dpu_resource_manager manager,
         output dpu_function_key_t parent_key,
         ref dpu_service_key_t service_keys[$],
@@ -437,7 +437,7 @@ class virtio_monitor_routing_test extends uvm_test;
     protected function bit make_empty_resource_pair(
         input string label,
         input dpu_device_snapshot snapshot,
-        input dpu_device_env_config env_cfg,
+        input dpu_env_cfg env_cfg,
         output dpu_resource_snapshot empty_resource,
         output dpu_resource_manager manager
     );
@@ -484,7 +484,7 @@ class virtio_monitor_routing_test extends uvm_test;
         dpu_device_snapshot snapshot;
         dpu_resource_snapshot resolved_resource;
         dpu_resource_snapshot empty_resource;
-        dpu_device_env_config env_cfg;
+        dpu_env_cfg	env_cfg;
         dpu_resource_manager resolved_manager;
         dpu_resource_manager manager;
         dpu_function_key_t parent_key;
@@ -516,7 +516,7 @@ class virtio_monitor_routing_test extends uvm_test;
     protected function bit check_late_bar_failure_is_atomic();
         dpu_device_snapshot snapshot;
         dpu_resource_snapshot resource_snapshot;
-        dpu_device_env_config env_cfg;
+        dpu_env_cfg	env_cfg;
         dpu_resource_manager manager;
         dpu_function_key_t parent_key;
         dpu_service_key_t service_keys[$];
@@ -551,8 +551,8 @@ class virtio_monitor_routing_test extends uvm_test;
         dpu_device_snapshot alternate_snapshot;
         dpu_resource_snapshot resource_snapshot;
         dpu_resource_snapshot alternate_resource_snapshot;
-        dpu_device_env_config env_cfg;
-        dpu_device_env_config alternate_env_cfg;
+        dpu_env_cfg	env_cfg;
+        dpu_env_cfg	alternate_env_cfg;
         dpu_resource_manager manager;
         dpu_resource_manager alternate_manager;
         dpu_function_key_t parent_key;
@@ -722,7 +722,7 @@ class virtio_monitor_routing_test extends uvm_test;
             return;
         end
 
-        uvm_config_db#(dpu_device_env_config)::set(
+        uvm_config_db#(dpu_env_cfg)::set(
             this, "device_env", "cfg", device_env_cfg);
         device_env = dpu_device_env::type_id::create("device_env", this);
         uvm_config_db#(virtio_net_env_config)::set(

@@ -5,7 +5,7 @@
 // 依赖 virtqueue_base、host_mem_manager 与驱动 txrx.h、txrx.c 的小端位域布局。
 // 所有权：本队列独占连续 desc+CQ 分配，free_rings 归还；SG 地址、token、数据 DMA
 // 由 ops 持有，本队列只在完成或 detach 前借用 token。复位保留 ring 分配。
-// 适用边界：普通 TX data desc 与单 buffer RX；不支持 DPU_TSO 扩展描述符、间接描述符、
+// 适用边界：普通 TX/TSO 扩展描述符与单 buffer RX；不支持间接描述符、
 // RX 多 buffer、迁移与错误注入。通知字由 ops 经配置后端写 doorbell。
 `ifndef CUSTOM_VIRTQUEUE_SV
 `define CUSTOM_VIRTQUEUE_SV
@@ -22,7 +22,8 @@ class custom_virtqueue extends virtqueue_base;
     bit	legacy_rx_cq = 1;
     int unsigned local_qid;
 
-    // TX 首个 data desc 的路由和校验控制；后续 SG 描述符只携带数据字段。
+    // TX 首个 data desc 的路由和普通包校验控制；GSO校验由前置扩展项承载。
+    // 后续 SG 描述符只携带数据字段。
     bit [11:0] dport_info;
     bit [9:0]  dport_id;
     bit [2:0]  dport_type;
@@ -294,141 +295,27 @@ class custom_virtqueue extends virtqueue_base;
         reset_queue();
     endfunction
 
-    // 预检整个 SG 请求后再改 Host 内存，失败返回 '1，索引、CQ 和内存均不变。
-    // TX 允许多个出向 SG data desc，并仿驱动 DPU_TXD_DATALEN_MAX=65536 将
-    // 过长 SG 拆成连续 64KiB data desc；首描述符写控制，链尾 next=0。
-    // 驱动对超过 7 个 data desc 的 skb 先做 linearize；队列没有 skb 字节所有权，
-    // 不能安全合并 SG，故直接拒绝拆分后超过 7 项的请求。
-    // RX 仅允许一条入向 buffer。indirect/is_indirect、0 长度、RX 超过 18 位的
-    // 长度、地址溢出、方向错误或空间不足均拒绝。DPU_TSO 无编码入口。
-    virtual function int unsigned add_buf(virtio_sg_list sgs[],
-                                          int unsigned n_out_sgs,
-                                          int unsigned n_in_sgs,
-                                          uvm_object token,
-                                          bit indirect);
-        int unsigned list_count;
-        int unsigned needed;
-        longint unsigned byte_total;
-        int unsigned head_index;
-        int unsigned write_index;
-        bit write_wrap;
-        int unsigned ordinal;
-        int unsigned segment_count;
-        int unsigned segment_len;
-        int unsigned remaining_len;
-        longint unsigned sg_len64;
-        bit [63:0] segment_addr;
-        bit [31:0] word1;
-        bit [31:0] word2;
-        pending_record_t record;
+    // 默认入口沿用队列控制；SG/token 借用至完成，非法输入不修改 ring。
+    extern virtual function int unsigned add_buf(
+        virtio_sg_list	sgs[], int unsigned	n_out_sgs, int unsigned	n_in_sgs,
+        uvm_object	token, bit	indirect
+    );
 
-        if (!binding_ok("add_buf"))
-            return '1;
-        if (indirect || (n_out_sgs > (32'hffff_ffff - n_in_sgs))) begin
-            `uvm_error("DPU_PRIV_RING", "add_buf: 不支持 indirect 或 SG 数量溢出")
-            return '1;
-        end
+    // 每包 TX 控制按值传入，不改队列默认值；GSO 扩展项参与槽位/完成/通知计数。
+    extern function int unsigned add_tx_buf(
+        virtio_sg_list	sgs[], int unsigned	n_out_sgs, uvm_object	token,
+        bit	indirect, vio_private_tx_offload_t	offload
+    );
 
-        list_count = n_out_sgs + n_in_sgs;
-        if ((list_count > sgs.size()) ||
-            (allocated_tx_mode && ((n_out_sgs == 0) || (n_in_sgs != 0))) ||
-            (!allocated_tx_mode && ((n_out_sgs != 0) || (n_in_sgs != 1)))) begin
-            `uvm_error("DPU_PRIV_RING", "add_buf: SG 列表个数或 TX/RX 方向不合法")
-            return '1;
-        end
+    // 公共发布实现：预检全部SG及额外扩展槽后才写内存，失败返回'1。
+    // TX最多7条data desc，RX单buffer；扩展项不占data上限，但占ring空闲槽。
+    extern protected function int unsigned add_request(
+        virtio_sg_list	sgs[], int unsigned	n_out_sgs, int unsigned	n_in_sgs,
+        uvm_object	token, bit	indirect, vio_private_tx_offload_t	offload
+    );
 
-        needed = 0;
-        byte_total = 0;
-        for (int unsigned s = 0; s < list_count; s++) begin
-            if (sgs[s].entries.size() == 0) begin
-                `uvm_error("DPU_PRIV_RING", "add_buf: SG 列表不可为空")
-                return '1;
-            end
-            for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
-                sg_len64 = sgs[s].entries[e].len;
-                if (sgs[s].entries[e].is_indirect ||
-                    (sgs[s].entries[e].len == 0) ||
-                    (!allocated_tx_mode &&
-                     (sgs[s].entries[e].len > 32'h0003_ffff)) ||
-                    (sgs[s].entries[e].addr >
-                     (64'hffff_ffff_ffff_ffff - (sg_len64 - 1)))) begin
-                    `uvm_error("DPU_PRIV_RING", "add_buf: 间接 SG、RX 长度或 SG 地址范围不合法")
-                    return '1;
-                end
-                segment_count = allocated_tx_mode ?
-                    int'((sg_len64 + 65535) / 65536) : 1;
-                needed += segment_count;
-                byte_total += sgs[s].entries[e].len;
-                if ((needed > allocated_queue_size - 1) ||
-                    (byte_total > 64'h0000_0000_ffff_ffff)) begin
-                    `uvm_error("DPU_PRIV_RING", "add_buf: 单包描述符或字节数超限")
-                    return '1;
-                end
-            end
-        end
-
-        if ((allocated_tx_mode && (needed > 7)) ||
-            (!allocated_tx_mode && (needed != 1)) ||
-            (needed > get_free_count())) begin
-            `uvm_error("DPU_PRIV_RING",
-                "add_buf: TX 最多 7 条 data desc、RX 单 buffer，且 ring 需留空一槽")
-            return '1;
-        end
-
-        head_index = producer_index;
-        write_index = producer_index;
-        write_wrap = producer_wrap;
-        ordinal = 0;
-        for (int unsigned s = 0; s < list_count; s++) begin
-            for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
-                remaining_len = sgs[s].entries[e].len;
-                segment_addr = sgs[s].entries[e].addr;
-                while (remaining_len != 0) begin
-                    segment_len = (allocated_tx_mode && (remaining_len > 65536)) ?
-                                  65536 : remaining_len;
-                    word1 = 0;
-                    word2 = 0;
-                    word1[17:0] = segment_len[17:0];
-                    if (allocated_tx_mode && (ordinal == 0)) begin
-                        word1[29:18] = dport_info;
-                        word1[31:30] = dport_id[1:0];
-                        word2[7:0] = dport_id[9:2];
-                        word2[10:8] = dport_type;
-                        word2[11] = rss_lag;
-                        word2[14:12] = cpu_tx_cos;
-                        word2[17] = l3_cs;
-                        word2[18] = l4_cs;
-                        word2[20:19] = fwd;
-                        word2[24] = i_l3_cs;
-                        word2[25] = i_l4_cs;
-                    end
-                    word2[15] = 0; // DPU_DATA_DESC；扩展/TSO 描述符不在当前实现内。
-                    word2[16] = allocated_tx_mode && (ordinal + 1 < needed);
-                    word2[23] = write_wrap;
-                    word2[31] = ~write_wrap;
-
-                    write_descriptor(write_index, segment_addr, word1, word2);
-                    advance_slot(write_index, write_wrap);
-                    remaining_len -= segment_len;
-                    if (remaining_len != 0)
-                        segment_addr += segment_len;
-                    ordinal++;
-                end
-            end
-        end
-
-        record.head_index = head_index;
-        record.desc_count = needed;
-        record.byte_count = int'(byte_total);
-        record.token = token;
-        pending.push_back(record);
-        producer_index = write_index;
-        producer_wrap = write_wrap;
-        pending_desc_count += needed;
-        unnotified_desc_count += needed;
-        total_add_buf_ops++;
-        return head_index;
-    endfunction
+    // 组装首项的路由/checksum字段；valid=0使用队列默认，返回值不含wrap/next。
+    extern protected function bit [31:0] tx_control_word(vio_private_tx_offload_t	offload);
 
     // TX 按 CQ head_index 回收已完整越过的 SG 包；RX 按 CQ wrapper、pkt_len
     // 回收下一条已投递 buffer。成功返回原 token 和整包字节数；无完成返回 0。
@@ -632,5 +519,187 @@ class custom_virtqueue extends virtqueue_base;
         return VQ_CUSTOM;
     endfunction
 endclass : custom_virtqueue
+
+// 标准虚接口不携带每包offload，保留现有调用者和私有队列参数的行为。
+function int unsigned custom_virtqueue::add_buf(
+    virtio_sg_list	sgs[], int unsigned	n_out_sgs, int unsigned	n_in_sgs,
+    uvm_object	token, bit	indirect
+);
+    return add_request(sgs, n_out_sgs, n_in_sgs, token, indirect, '0);
+endfunction
+
+// ops调用此TX入口；所有控制都是本次值副本，不污染下一包或其他队列。
+function int unsigned custom_virtqueue::add_tx_buf(
+    virtio_sg_list	sgs[], int unsigned	n_out_sgs, uvm_object	token,
+    bit	indirect, vio_private_tx_offload_t	offload
+);
+    return add_request(sgs, n_out_sgs, 0, token, indirect, offload);
+endfunction
+
+// 路由继续来自队列；显式每包请求覆盖checksum位，普通入口保留四个独立默认位。
+function bit [31:0] custom_virtqueue::tx_control_word(vio_private_tx_offload_t	offload);
+    bit [31:0]	word2;
+
+    word2 = '0;
+    word2[7:0]   = dport_id[9:2];
+    word2[10:8]  = dport_type;
+    word2[11]    = rss_lag;
+    word2[14:12] = cpu_tx_cos;
+    word2[17]    = offload.valid ? offload.l3_cs : l3_cs;
+    word2[18]    = offload.valid ? offload.l4_cs : l4_cs;
+    word2[20:19] = fwd;
+    word2[24]    = offload.valid ? offload.l3_cs : i_l3_cs;
+    word2[25]    = offload.valid ? offload.l4_cs : i_l4_cs;
+    return word2;
+endfunction
+
+// 先计算data数量和总字节，再计入可选TSO槽；pending与notify共用同一总槽数。
+// 与txrx.c一致：有扩展项时checksum位只写扩展项，data首项仍保留路由字段。
+function int unsigned custom_virtqueue::add_request(
+    virtio_sg_list	sgs[], int unsigned	n_out_sgs, int unsigned	n_in_sgs,
+    uvm_object	token, bit	indirect, vio_private_tx_offload_t	offload
+);
+    int unsigned	list_count;
+    int unsigned	needed;
+    int unsigned	data_count;
+    longint unsigned	byte_total;
+    int unsigned	head_index;
+    int unsigned	write_index;
+    bit			write_wrap;
+    int unsigned	ordinal;
+    int unsigned	segment_count;
+    int unsigned	segment_len;
+    int unsigned	remaining_len;
+    longint unsigned	sg_len64;
+    bit [63:0]		segment_addr;
+    bit [31:0]		word1;
+    bit [31:0]		word2;
+    pending_record_t	record;
+
+    if (!binding_ok("add_buf"))
+        return '1;
+    if (indirect || (n_out_sgs > (32'hffff_ffff - n_in_sgs))) begin
+        `uvm_error("DPU_PRIV_RING", "add_buf: 不支持 indirect 或 SG 数量溢出")
+        return '1;
+    end
+
+    list_count = n_out_sgs + n_in_sgs;
+    if ((list_count > sgs.size()) ||
+        (allocated_tx_mode && ((n_out_sgs == 0) || (n_in_sgs != 0))) ||
+        (!allocated_tx_mode && ((n_out_sgs != 0) || (n_in_sgs != 1)))) begin
+        `uvm_error("DPU_PRIV_RING", "add_buf: SG 列表个数或 TX/RX 方向不合法")
+        return '1;
+    end
+
+    needed = 0;
+    byte_total = 0;
+    for (int unsigned s = 0; s < list_count; s++) begin
+        if (sgs[s].entries.size() == 0) begin
+            `uvm_error("DPU_PRIV_RING", "add_buf: SG 列表不可为空")
+            return '1;
+        end
+        for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
+            sg_len64 = sgs[s].entries[e].len;
+            if (sgs[s].entries[e].is_indirect ||
+                (sgs[s].entries[e].len == 0) ||
+                (!allocated_tx_mode &&
+                 (sgs[s].entries[e].len > 32'h0003_ffff)) ||
+                (sgs[s].entries[e].addr >
+                 (64'hffff_ffff_ffff_ffff - (sg_len64 - 1)))) begin
+                `uvm_error("DPU_PRIV_RING", "add_buf: 间接 SG、RX 长度或 SG 地址范围不合法")
+                return '1;
+            end
+            segment_count = allocated_tx_mode ?
+                int'((sg_len64 + 65535) / 65536) : 1;
+            needed += segment_count;
+            byte_total += sgs[s].entries[e].len;
+            if ((needed > allocated_queue_size - 1) ||
+                (byte_total > 64'h0000_0000_ffff_ffff)) begin
+                `uvm_error("DPU_PRIV_RING", "add_buf: 单包描述符或字节数超限")
+                return '1;
+            end
+        end
+    end
+
+    if ((allocated_tx_mode && (needed > 7)) ||
+        (!allocated_tx_mode && (needed != 1)) ||
+        (needed > get_free_count())) begin
+        `uvm_error("DPU_PRIV_RING",
+            "add_buf: TX 最多 7 条 data desc、RX 单 buffer，且 ring 需留空一槽")
+        return '1;
+    end
+
+    data_count = needed;
+    if (offload.tso) begin
+        if (!allocated_tx_mode || !offload.valid || dport_info[11] ||
+            byte_total > 18'h3ffff || needed + 1 > get_free_count()) begin
+            `uvm_error("DPU_PRIV_RING", "TSO 扩展描述符空间或字段超限")
+            return '1;
+        end
+        needed++;
+    end
+
+    head_index = producer_index;
+    write_index = producer_index;
+    write_wrap = producer_wrap;
+    ordinal = 0;
+
+    if (offload.tso) begin
+        word1 = {dport_id[1:0], 1'b0, dport_info[10:0], byte_total[17:0]};
+        word2 = tx_control_word(offload);
+        word2[15] = 1;
+        word2[16] = 1;
+        word2[23] = write_wrap;
+        word2[31] = ~write_wrap;
+        write_descriptor(write_index, offload.extension, word1, word2);
+        advance_slot(write_index, write_wrap);
+    end
+
+    for (int unsigned s = 0; s < list_count; s++) begin
+        for (int unsigned e = 0; e < sgs[s].entries.size(); e++) begin
+            remaining_len = sgs[s].entries[e].len;
+            segment_addr = sgs[s].entries[e].addr;
+            while (remaining_len != 0) begin
+                segment_len = (allocated_tx_mode && (remaining_len > 65536)) ?
+                              65536 : remaining_len;
+                word1 = 0;
+                word2 = 0;
+                word1[17:0] = segment_len[17:0];
+                if (allocated_tx_mode && (ordinal == 0)) begin
+                    word1[29:18] = dport_info;
+                    word1[31:30] = dport_id[1:0];
+                    word2 = tx_control_word(offload);
+                    if (offload.tso) begin
+                        word2[18:17] = '0;
+                        word2[25:24] = '0;
+                    end
+                end
+                word2[15] = 0; // DPU_DATA_DESC，扩展项已在本包首槽写入。
+                word2[16] = allocated_tx_mode && (ordinal + 1 < data_count);
+                word2[23] = write_wrap;
+                word2[31] = ~write_wrap;
+
+                write_descriptor(write_index, segment_addr, word1, word2);
+                advance_slot(write_index, write_wrap);
+                remaining_len -= segment_len;
+                if (remaining_len != 0)
+                    segment_addr += segment_len;
+                ordinal++;
+            end
+        end
+    end
+
+    record.head_index = head_index;
+    record.desc_count = needed;
+    record.byte_count = int'(byte_total);
+    record.token = token;
+    pending.push_back(record);
+    producer_index = write_index;
+    producer_wrap = write_wrap;
+    pending_desc_count += needed;
+    unnotified_desc_count += needed;
+    total_add_buf_ops++;
+    return head_index;
+endfunction
 
 `endif // CUSTOM_VIRTQUEUE_SV

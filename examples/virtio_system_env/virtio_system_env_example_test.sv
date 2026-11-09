@@ -35,7 +35,7 @@ class virtio_system_env_config extends uvm_object;
     `uvm_object_utils(virtio_system_env_config)
 
     // Global DPU authoring and resolver policy.
-    dpu_device_env_config dpu_cfg;
+    dpu_env_cfg	dpu_cfg;
 
     // Single-host convenience configuration.  For more than one Host, fill
     // vio_cfg_by_host explicitly so every child has an unambiguous scope.
@@ -62,7 +62,7 @@ class virtio_system_env_config extends uvm_object;
     // 按名称创建 DPU 和默认单 Host 行为配置；可选 PCIe 与外部内存池保持空句柄，供调用方后续填写。
     function new(string name = "virtio_system_env_config");
         super.new(name);
-        dpu_cfg = dpu_device_env_config::type_id::create({name, "_dpu_cfg"});
+        dpu_cfg = dpu_env_cfg::type_id::create({name, "_dpu_cfg"});
         default_vio_cfg = virtio_net_env_config::type_id::create(
             {name, "_default_vio_cfg"});
         pcie_cfg = null;
@@ -456,7 +456,7 @@ class virtio_system_env extends uvm_env;
         end
 
         cfg.dpu_cfg.host_mem_pool_ref = host_mem_pool_ref;
-        uvm_config_db#(dpu_device_env_config)::set(
+        uvm_config_db#(dpu_env_cfg)::set(
             this, "dpu_env", "cfg", cfg.dpu_cfg);
         dpu_env = dpu_device_env::type_id::create("dpu_env", this);
 
@@ -830,7 +830,6 @@ class virtio_system_env_example_test extends uvm_test;
         system_cfg.dpu_cfg.placement_cfg.vio_requests.push_back(request);
         // 唯一全局 request 保证 dpu.qpairs 表示整个系统的分配总量。
         system_cfg.dpu_cfg.placement_cfg.load_params("dpu");
-        system_cfg.dpu_cfg.vio_policy.load_params("dpu");
         if (!system_cfg.validate(why))
             `uvm_fatal("SYSTEM_PARAM", why)
         parameterized_config = 1;

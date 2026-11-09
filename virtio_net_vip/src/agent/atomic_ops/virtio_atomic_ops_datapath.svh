@@ -1,188 +1,44 @@
-    // 本文件是 virtio_atomic_ops 类体的一部分（TX/RX 数据路径），只由
-    // agent/virtio_atomic_ops.sv 在类定义内部 `include；不得单独编译或在类外包含。
+    // src/agent/atomic_ops：virtio_atomic_ops 类体中的 TX/RX 数据路径，由
+    // agent/virtio_atomic_ops.sv 在类定义内部 include，不单独编译。
+    // 依赖 packet adapter、virtqueue、Host memory 和 IOMMU；ops 拥有每包 DMA，
+    // 发布失败时回滚，成功后随队列完成释放。报文对象只借用，发送字节使用副本。
 
     // ========================================================================
     // TX Data Path
     // ========================================================================
 
     // ------------------------------------------------------------------------
-    // tx_submit -- Submit a packet for transmission
-    //
-    // Steps:
-    //   1. Pack virtio_net_hdr to bytes
-    //   2. Get wire bytes (net_packet adapter, else do_pack)
-    //   3. Allocate host_mem for hdr + data buffers
-    //   4. Write hdr and data to host_mem
-    //   5. Map through IOMMU (DMA_TO_DEVICE)
-    //   6. Build scatter-gather lists
-    //   7. add_buf to virtqueue
-    //   8. Kick if needed
-    //   9. Return desc_id
+    // tx_submit：读取本包真实字节，按请求生成标准 header 或 Custom 控制，随后
+    // 等待空位后分配并映射DMA、发布SG、通知设备。desc_id返回队列首槽，失败保持'1。
+    // timeout_ns只限制本包等待空位的时间；0使用wait_policy默认值。
+    // notify=0允许合并DB；空间不足时仍先通知已提交部分，避免双方互等。
+    // tx_offload.valid=0 保留调用方显式 net_hdr/私有队列默认值；显式请求在
+    // DMA 分配前完成协议与能力检查，不修改原始 packet 或 Function 的配置。
     // ------------------------------------------------------------------------
-    virtual task tx_submit(
-        int unsigned     queue_id,
-        virtio_net_hdr_t net_hdr,
-        uvm_object       pkt,
-        bit              use_indirect,
-        ref int unsigned desc_id
+    extern virtual task tx_submit(
+        int unsigned		queue_id,
+        virtio_net_hdr_t		net_hdr,
+        uvm_object		pkt,
+        bit			use_indirect,
+        ref int unsigned	desc_id,
+        input virtio_tx_offload_t	tx_offload = '0,
+        input int unsigned		timeout_ns = 0,
+        input bit			notify = 1,
+        input virtio_tx_seg_t	tx_seg = '0
     );
-        virtqueue_base   vq;
-        byte unsigned    hdr_bytes[$];
-        byte unsigned    pkt_bytes[];
-        int unsigned     hdr_size;
-        int unsigned     hdr_dma_size;
-        int unsigned     pkt_size;
-        int unsigned     pkt_dma_size;
-        int              hdr_idx;
-        int              pkt_idx;
-        virtio_sg_list   sgs[2];
-        virtio_sg_entry  hdr_entry;
-        virtio_sg_entry  pkt_entry;
-        byte             hdr_data[];
-        byte             pkt_data[];
-        byte unsigned    wire_bytes[$];
-        virtio_dma_buffer_set dma_set;
-        int unsigned     n_out;
 
-        desc_id = '1;
-        if (!external_queue_ready(queue_id)) return;
-        if (use_indirect &&
-            !negotiated_features[VIRTIO_F_RING_INDIRECT_DESC]) begin
-            `uvm_error("ATOMIC_OPS", $sformatf(
-                "tx_submit: queue %0d requested indirect descriptors without negotiating VIRTIO_F_RING_INDIRECT_DESC",
-                queue_id))
-            return;
-        end
-
-        `uvm_info("ATOMIC_OPS",
-            $sformatf("tx_submit: queue_id=%0d", queue_id), UVM_HIGH)
-
-        vq = vq_mgr.get_queue(queue_id);
-        if (vq == null) begin
-            `uvm_error("ATOMIC_OPS",
-                $sformatf("tx_submit: queue %0d not found", queue_id))
-            return;
-        end
-
-        // 1. Pack net_hdr to bytes.  队列格式不带 virtio-net header（DPU 私有环）时只发
-        // 原始帧，header 中的 offload 请求无处承载，显式拒绝。
-        hdr_size = vq.net_hdr_bytes(negotiated_features);
-        if ((hdr_size == 0) && ((net_hdr.flags != 0) ||
-                                (net_hdr.gso_type != VIRTIO_NET_HDR_GSO_NONE))) begin
-            `uvm_error("ATOMIC_OPS", $sformatf(
-                "tx_submit: queue %0d carries no virtio-net header; offload request rejected",
-                queue_id))
-            return;
-        end
-        if (hdr_size != 0) begin
-            virtio_net_hdr_util::pack_hdr(net_hdr, negotiated_features, hdr_bytes);
-            hdr_size = hdr_bytes.size();
-        end
-        // PCIe Memory Read completions are DWORD based.  Keep the descriptor
-        // length byte-accurate, but give the model/RC responder a DWORD-padded
-        // backing allocation so a final partial DWORD never crosses an exact
-        // host_mem block boundary.
-        hdr_dma_size = (hdr_size + 3) & ~3;
-
-        // 2. Get wire bytes.  packet_item.do_pack() 带 32-bit UVM 长度前缀，不是
-        // 线速帧，先经 adapter 取 raw_data；其他对象保留原 do_pack 字节流。
-        if (virtio_net_packet_adapter::pack(pkt, wire_bytes)) begin
-            pkt_bytes = new[wire_bytes.size()];
-            foreach (wire_bytes[i]) pkt_bytes[i] = wire_bytes[i];
-        end else begin
-            uvm_packer packer;
-            packer = new();
-            pkt.do_pack(packer);
-            packer.get_bytes(pkt_bytes);
-        end
-        pkt_size = pkt_bytes.size();
-
-        // If packet has no data from do_pack, use minimum Ethernet frame size
-        if (pkt_size == 0)
-            pkt_size = 64;
-        // Keep the backing allocation DWORD padded after the minimum-size
-        // fallback as well; otherwise an empty packet would request a
-        // zero-byte host_mem allocation even though the descriptor carries
-        // the 64-byte minimum frame.
-        pkt_dma_size = (pkt_size + 3) & ~3;
-
-        // 3. Allocate host_mem for hdr + data buffers.  A failed second
-        //    allocation rolls back the first; nothing is mapped yet.
-        dma_set = new("tx_dma");
-        dma_set.bind_domain(mem, iommu, get_iommu_host_id(transport), transport.bdf);
-        hdr_idx = (hdr_size == 0) ? -1 : dma_set.alloc(hdr_dma_size);
-        pkt_idx = ((hdr_size != 0) && (hdr_idx < 0)) ? -1 : dma_set.alloc(pkt_dma_size);
-        if (pkt_idx < 0) begin
-            dma_set.release_all();
-            `uvm_error("ATOMIC_OPS",
-                $sformatf("tx_submit: host_mem alloc failed for queue %0d", queue_id))
-            return;
-        end
-
-        // 4. Write hdr and data to host_mem
-        if (hdr_size != 0) begin
-            hdr_data = new[hdr_size];
-            foreach (hdr_bytes[i]) hdr_data[i] = hdr_bytes[i];
-            dma_set.write(hdr_idx, hdr_data);
-        end
-
-        if (pkt_bytes.size() > 0) begin
-            pkt_data = new[pkt_size];
-            foreach (pkt_bytes[i]) pkt_data[i] = pkt_bytes[i];
-            dma_set.write(pkt_idx, pkt_data);
-        end
-
-        // 5. Map through IOMMU (DMA_TO_DEVICE -- device reads these buffers)
-        if ((hdr_size != 0) && !dma_set.map(hdr_idx, DMA_TO_DEVICE)) begin
-            dma_set.release_all();
-            `uvm_error("ATOMIC_OPS", $sformatf(
-                "tx_submit: failed to map header for queue %0d", queue_id))
-            return;
-        end
-        if (!dma_set.map(pkt_idx, DMA_TO_DEVICE)) begin
-            dma_set.release_all();
-            `uvm_error("ATOMIC_OPS", $sformatf(
-                "tx_submit: failed to map payload for queue %0d", queue_id))
-            return;
-        end
-
-        // 6. Build scatter-gather lists: [hdr_sg(out)] [data_sg(out)]；无 header 时只有 data。
-        n_out = 0;
-        if (hdr_size != 0) begin
-            hdr_entry.addr = dma_set.get_iova(hdr_idx);
-            hdr_entry.len  = hdr_size;
-            sgs[n_out].entries.push_back(hdr_entry);
-            n_out++;
-        end
-
-        pkt_entry.addr = dma_set.get_iova(pkt_idx);
-        pkt_entry.len  = pkt_size;
-        sgs[n_out].entries.push_back(pkt_entry);
-        n_out++;
-
-        // 7. Add buffers to virtqueue (n_out=2, n_in=0).  The data buffers
-        //    belong to this operation, not to add_buf(); a rejected chain
-        //    rolls back and never reaches the completion map or notify path.
-        desc_id = vq.add_buf(sgs, n_out, 0, pkt, use_indirect);
-        if (desc_id == '1) begin
-            dma_set.release_all();
-            return;
-        end
-
-        // Hand the ownership records (hdr first, matching tx_complete's
-        // per-packet retirement count) to completion/reset before notifying.
-        if (!tx_dma_map.exists(queue_id))
-            tx_dma_map[queue_id] = {};
-        adopt_dma_set(dma_set, tx_dma_map[queue_id]);
-
-        // 8. Kick if device needs notification
-        if (vq.needs_notification())
-            kick_with_fault(vq, queue_id);
-
-        `uvm_info("ATOMIC_OPS",
-            $sformatf("tx_submit: queue_id=%0d desc_id=%0d hdr_iova=0x%016h pkt_iova=0x%016h",
-                      queue_id, desc_id, hdr_entry.addr, pkt_entry.addr), UVM_HIGH)
-    endtask
+    // 只计算本包分段，不分配资源；非法参数返回原因，由 tx_submit 在发布前 fatal。
+    extern protected function bit plan_tx_segments(
+        virtqueue_base	vq,
+        int unsigned	packet_length,
+        int unsigned	header_size,
+        bit		tso,
+        bit		indirect,
+        virtio_tx_seg_t	request,
+        output int unsigned	lengths[$],
+        output int unsigned	needed,
+        output string	why
+    );
 
     // ------------------------------------------------------------------------
     // tx_complete -- Poll used ring for completed TX buffers
@@ -237,7 +93,7 @@
     // rx_refill -- Pre-fill receive queue with empty buffers
     // ------------------------------------------------------------------------
     // buf_size 为描述符可写长度（含 virtio-net header）；0 表示默认 header+1514，
-    // dataplane 引擎传入其配置容量。所有覆写须保持同一签名。
+    // dataplane 引擎传入其配置容量。只累计实际投递数，满环不重复打印；分配/映射错误保留。
     virtual task rx_refill(
         int unsigned     queue_id,
         int unsigned     num_bufs,
@@ -309,22 +165,20 @@
                 rx_dma_map[queue_id] = {};
             adopt_dma_set(dma_set, rx_dma_map[queue_id]);
             filled++;
+            rx_posted_buffers++;
         end
 
         // Kick if device needs notification
         if (filled > 0 && vq.needs_notification())
             kick_with_fault(vq, queue_id);
 
-        `uvm_info("ATOMIC_OPS",
-            $sformatf("rx_refill: queue_id=%0d filled=%0d/%0d", queue_id, filled, num_bufs),
-            UVM_HIGH)
     endtask
 
     // ------------------------------------------------------------------------
     // rx_receive_frames -- Poll used ring and return header + payload frames
     //
     // 每个 used 项按 MRG_RXBUF 语义合并后续 buffer；每个描述符的 IOVA/GPA
-    // 所有权在复制后立即退休。帧追加到 frames，不解析报文协议。
+    // 所有权在复制后立即退休。帧追加到 frames，不解析报文协议；空轮询仅计数。
     // ------------------------------------------------------------------------
     virtual task rx_receive_frames(
         int unsigned          queue_id,
@@ -341,6 +195,7 @@
         vq = vq_mgr.get_queue(queue_id);
         if (vq == null) return;
 
+        if (max_budget != 0) rx_polls++;
         hdr_size = vq.net_hdr_bytes(negotiated_features);
 
         while (count < max_budget) begin
@@ -405,11 +260,15 @@
                 end
 
                 frames.push_back(frame);
+                rx_packets++;
+                rx_bytes += frame.payload.size();
                 count++;
             end else begin
                 break;
             end
         end
+
+        if (max_budget != 0 && count == 0) rx_empty_polls++;
 
         if (rx_dma_map.exists(queue_id) &&
             (rx_dma_map[queue_id].size() == 0))
@@ -421,6 +280,7 @@
     // rx_receive -- Poll used ring for received packets
     //
     // 合法以太网帧解析为 packet_item；解析失败时若 used 项带 token 则返回 token。
+    // 帧数与空轮询统一由 rx_receive_frames 计数，此适配入口不重复输出日志。
     // ------------------------------------------------------------------------
     virtual task rx_receive(
         int unsigned     queue_id,
@@ -437,8 +297,4 @@
             else if (frames[i].token != null)
                 received_pkts.push_back(frames[i].token);
         end
-
-        if (frames.size() > 0)
-            `uvm_info("ATOMIC_OPS",
-                $sformatf("rx_receive: queue_id=%0d received=%0d", queue_id, frames.size()), UVM_HIGH)
     endtask

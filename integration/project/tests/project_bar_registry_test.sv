@@ -5,6 +5,8 @@ package project_bar_registry_test_pkg;
     import dpu_resource_pkg::*;
     import pcie_tl_pkg::*;
     import project_env_pkg::*;
+	import virtio_dpu_pkg::*;
+	import dpu_pcie_pkg::*;
     import intel_pcie_adapter_pkg::*;
     `include "uvm_macros.svh"
 
@@ -12,7 +14,7 @@ package project_bar_registry_test_pkg;
     class project_bar_registry_test extends uvm_test;
         `uvm_component_utils(project_bar_registry_test)
         int unsigned					checks;
-        project_pcie_rc_driver			driver;
+        vio_pcie_rc_driver			driver;
         pcie_tl_if_adapter				adapter;
         uvm_sequencer #(pcie_tl_tlp)	sequencer;
 
@@ -41,7 +43,7 @@ package project_bar_registry_test_pkg;
 
         // 核对对象语义与线上报头一致；错误字段不得留下 route，高地址必须以 4DW 编码。
         extern task	check_wire_contract(
-            project_bar_registry	registry,
+            dpu_pcie_bar_map	registry,
             intel_pcie_avst_codec	intel_codec
         );
 
@@ -64,7 +66,7 @@ package project_bar_registry_test_pkg;
         uvm_phase	phase
     );
         super.build_phase(phase);
-        driver = project_pcie_rc_driver::type_id::create("driver", this);
+        driver = vio_pcie_rc_driver::type_id::create("driver", this);
         adapter = pcie_tl_if_adapter::type_id::create("adapter", this);
         driver.adapter = adapter;
         driver.codec = pcie_tl_codec::type_id::create("codec");
@@ -147,7 +149,7 @@ package project_bar_registry_test_pkg;
 
     // 核对对象语义与线上报头一致；错误字段不得留下 route，高地址必须以 4DW 编码。
     task	project_bar_registry_test::check_wire_contract(
-        project_bar_registry	registry,
+        dpu_pcie_bar_map	registry,
         intel_pcie_avst_codec	intel_codec
     );
         pcie_tl_mem_tlp		mem;
@@ -156,7 +158,7 @@ package project_bar_registry_test_pkg;
         pcie_tl_tlp			sent;
         pcie_tl_tlp			decoded;
         intel_pcie_packet	packet;
-        project_bar_target_t	high_target;
+        dpu_bar_target_t	high_target;
         tlp_kind_e			memory_kinds[3];
         tlp_kind_e			completion_kinds[4];
         string				why;
@@ -244,12 +246,12 @@ package project_bar_registry_test_pkg;
         uvm_phase	phase
     );
         dpu_device_snapshot		snapshot;
-        project_bar_registry	registry;
-        project_bar_registry	other;
-        project_bar_registry	single;
+        dpu_pcie_bar_map	registry;
+        dpu_pcie_bar_map	other;
+        dpu_pcie_bar_map	single;
         dpu_device_snapshot		single_snapshot;
-        project_bar_target_t	target;
-        project_bar_target_t	again;
+        dpu_bar_target_t	target;
+        dpu_bar_target_t	again;
         dpu_function_key_t		keys[$];
         pcie_tl_cq_route_t		route;
         pcie_tl_mem_tlp			mem;
@@ -264,11 +266,11 @@ package project_bar_registry_test_pkg;
         string					bad_names[$];
         phase.raise_objection(this);
         snapshot = make_snapshot();
-        registry = project_bar_registry::type_id::create("registry");
+        registry = dpu_pcie_bar_map::type_id::create("registry");
         expect_true(!registry.resolve_name("pf0.bar0", target, why), "unready query accepted");
         expect_true(!registry.print_bar_map(why), "unready final map printed");
         single_snapshot = make_snapshot(1);
-        single = project_bar_registry::type_id::create("single");
+        single = dpu_pcie_bar_map::type_id::create("single");
         expect_true(single.initialize(single_snapshot, 1, why), why);
         expect_true(single.bind_host(0, 0, why), why);
         expect_true(single.bind_function('{0, 0, DPU_FUNCTION_PF, 0}, 0, -1, 0, why), why);
@@ -276,7 +278,7 @@ package project_bar_registry_test_pkg;
         expect_true(single.resolve_name("pf0.bar0", again, why), why);
         expect_true(again.canonical_name == "h0.pf0.bar0", "single Host shorthand wrong");
         single_snapshot = make_snapshot(1, 1);
-        single = project_bar_registry::type_id::create("empty_host");
+        single = dpu_pcie_bar_map::type_id::create("empty_host");
         expect_true(single.initialize(single_snapshot, 1, why), why);
         expect_true(single.bind_host(0, 0, why), why);
         expect_true(!single.freeze(why), "missing functionless Host binding accepted");
@@ -299,16 +301,18 @@ package project_bar_registry_test_pkg;
         expect_true(registry.freeze(why), why);
         expect_true(!registry.bind_host(0, 0, why), "frozen mutation accepted");
         expect_true(registry.resolve_name("h1.pf1.vf0.bar4", target, why), why);
-        expect_true(target.rc_slot == 0 && target.bar_lease.even_bar_id == 4 &&
-            target.route.pf_index == 6 && target.route.vf_index == 101, "wrong explicit route or BAR id");
+        expect_true(registry.get_route(target, route, why), why);
+        expect_true( target.bar_lease.even_bar_id == 4 &&
+            route.pf_index == 6 && route.vf_index == 101, "wrong explicit route or BAR id");
         expect_true(registry.resolve_function(target.function_key, 4, again, why), why);
         expect_true(again.canonical_name == target.canonical_name, "function/name mismatch");
         expect_true(registry.resolve_base(1, 0, target.bar_lease.base, again, why), why);
         expect_true(again.canonical_name == target.canonical_name, "base/name mismatch");
         expect_true(registry.resolve_base(0, 0, target.bar_lease.base, again, why), why);
-        expect_true(again.function_key.host_id == 0 && again.rc_slot == 1, "same numeric base crossed Host domain");
+        expect_true(again.function_key.host_id == 0, "same numeric base crossed Host domain");
         expect_true(registry.resolve_name("h1.pf0.vf0.bar4", again, why), why);
-        expect_true(again.function_key.pf_id == 0 && again.route.vf_index == 100 &&
+        expect_true(registry.get_route(again, route, why), why);
+        expect_true(again.function_key.pf_id == 0 && route.vf_index == 100 &&
             again.bar_lease.base != target.bar_lease.base, "same VF id lost parent PF identity");
         expect_true(!registry.resolve_base(1, 0, target.bar_lease.base + 4, again, why), "interior base accepted");
         expect_true(!registry.resolve_name("pf0.bar0", again, why), "ambiguous Host accepted");
@@ -328,7 +332,7 @@ package project_bar_registry_test_pkg;
         expect_true(!registry.check_range(target, 'hffd, 4, address, why), "tail crossing accepted");
         expect_true(!registry.check_range(target, 64'hfffffffffffffffc, 8, address, why), "overflow accepted");
         expect_true(!registry.check_range(target, 0, 0, address, why), "zero size accepted");
-        other = project_bar_registry::type_id::create("other");
+        other = dpu_pcie_bar_map::type_id::create("other");
         expect_true(other.initialize(snapshot, 2, why), why);
         expect_true(other.bind_host(0, 1, why) && other.bind_host(1, 0, why), why);
         expect_true(other.freeze(why), why);
@@ -339,7 +343,9 @@ package project_bar_registry_test_pkg;
         again = target;
         again.snapshot = make_snapshot();
         expect_true(!registry.check_range(again, 0, 4, address, why), "different snapshot identity accepted");
-        expect_true(!other.resolve_name("h0.pf0.bar0", again, why), "unbound Intel route accepted");
+        // BAR 查询独立于传输；只有真正获取 Intel 路由时才要求已绑定 Function。
+        expect_true(other.resolve_name("h0.pf0.bar0", again, why), why);
+        expect_true(!other.get_route(again, route, why), "unbound Intel route accepted");
         expect_true(!registry.route_memory(1, 1, target.bar_lease.base, 4, route, why), "unsupported segment accepted");
         expect_true(registry.route_memory(1, 0, target.bar_lease.base + 'hffc, 4, route, why), why);
         expect_true(route.pf_index == 6 && route.vf_index == 101 && route.bar_id == 4, "memory route wrong");

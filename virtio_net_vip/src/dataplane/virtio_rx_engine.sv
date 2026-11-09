@@ -3,7 +3,7 @@
 // （rx_refill / rx_receive_frames）执行；引擎只做可选的 RX checksum 校验、把帧
 // 转为 packet_item（或 wrapper）、维护统计与自动补充门限。私有 Function 注入
 // 通用 ops，并以 refill_threshold=0 关闭自动补充。host_id/bdf 记录 DMA 身份，
-// 供 fabric 测试断言，收发不读取。
+// 供 fabric 测试断言，收发不读取。轮询和投递统计由 ops 汇总，避免两层重复打印。
 `ifndef VIRTIO_RX_ENGINE_SV
 `define VIRTIO_RX_ENGINE_SV
 
@@ -84,7 +84,7 @@ class virtio_rx_engine extends uvm_object;
     endfunction : get_rx_buf_size
 
     // 向 queue_id 最多补充 count 个可写 buffer（容量取 get_rx_buf_size()），受空闲
-    // 描述符限制；分配、映射、所有权登记与真实 notify 由 ops 执行。队列不存在则报错。
+    // 描述符限制；分配、映射、所有权登记、notify 和投递统计由 ops 执行。队列不存在则报错。
     virtual task refill_buffers(
         int unsigned queue_id,
         int unsigned count
@@ -96,14 +96,10 @@ class virtio_rx_engine extends uvm_object;
             return;
         end
         ops.rx_refill(queue_id, count, get_rx_buf_size());
-        `uvm_info("RX_ENG",
-            $sformatf("refill_buffers: queue=%0d requested=%0d buf_size=%0d",
-                      queue_id, count, get_rx_buf_size()),
-            UVM_HIGH)
     endtask : refill_buffers
 
     // 经 ops 取得至多 budget 个帧（ops 完成合包与 DMA 回收），可选校验 RX checksum，
-    // 合法帧返回 packet_item、非法帧返回 wrapper；之后按 free-count 门限补充。
+    // 合法帧返回 packet_item、非法帧返回 wrapper；之后按 free-count 门限补充，不逐次打印。
     virtual task receive_packets(
         int unsigned      queue_id,
         int unsigned      budget,
@@ -138,10 +134,6 @@ class virtio_rx_engine extends uvm_object;
             total_rx_packets++;
             total_rx_bytes += frames[i].payload.size();
         end
-
-        `uvm_info("RX_ENG",
-            $sformatf("receive_packets: queue=%0d received=%0d", queue_id, frames.size()),
-            UVM_HIGH)
 
         // Auto-refill if free count drops below threshold
         if (vq.get_free_count() < refill_threshold)

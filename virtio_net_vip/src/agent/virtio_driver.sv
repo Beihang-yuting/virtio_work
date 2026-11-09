@@ -24,7 +24,7 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     virtio_atomic_ops   ops;
     virtio_auto_fsm     fsm;
     // Function 提交绑定时注入；为空时（standalone/测试）按标准 virtio 处理。
-    virtio_driver_protocol protocol;
+    virtio_driver_protocol	protocol;
 
     // ========================================================================
     // Constructor
@@ -63,51 +63,8 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // Routes each transaction type to the appropriate ops/fsm method.
     // ========================================================================
 
-    // 按事务类型调用统一 API；复位语义（是否先停 worker 并确认停 DMA）由驱动协议决定。
-    protected virtual task process_transaction(virtio_transaction req);
-        bit setup_ok;
-        virtio_driver_protocol proto;
-        proto = active_protocol();
-
-        case (req.txn_type)
-            // ----- Lifecycle -----
-            VIO_TXN_INIT:       fsm.full_init();
-            VIO_TXN_RESET:      proto.reset(ops, fsm, req);
-            VIO_TXN_SHUTDOWN:   fsm.stop_dataplane();
-
-            // ----- Data plane (AUTO mode) -----
-            VIO_TXN_SEND_PKTS:  fsm.send_packets(req.packets, req.queue_id);
-            VIO_TXN_WAIT_PKTS:  fsm.wait_packets(req.expected_count, req.received_pkts, req.timeout_ns);
-            VIO_TXN_START_DP:   fsm.start_dataplane();
-            VIO_TXN_STOP_DP:    fsm.stop_dataplane();
-
-            // ----- Control plane -----
-            VIO_TXN_CTRL_CMD:   ops.ctrl_send(req.ctrl_class, req.ctrl_cmd, req.ctrl_data, req.ctrl_ack);
-            VIO_TXN_SET_MQ:     fsm.configure_mq(req.num_pairs);
-            VIO_TXN_SET_RSS:    fsm.configure_rss(req.rss_cfg);
-
-            // ----- Atomic ops (MANUAL mode) -----
-            VIO_TXN_ATOMIC_OP:  dispatch_atomic_op(req);
-
-            // ----- Migration -----
-            VIO_TXN_FREEZE:     fsm.freeze_for_migration(req.snapshot);
-            VIO_TXN_RESTORE:    fsm.restore_from_migration(req.snapshot, req.success);
-
-            // ----- Queue management -----
-            VIO_TXN_RESET_QUEUE: fsm.reset_single_queue(req.queue_id);
-            VIO_TXN_SETUP_QUEUE: begin
-                ops.setup_queue(req.queue_id, req.queue_size, req.vq_type, setup_ok);
-                req.success = setup_ok;
-            end
-
-            // ----- Error injection -----
-            VIO_TXN_INJECT_ERROR: dispatch_error_injection(req);
-
-            default:
-                `uvm_error("VIRTIO_DRV",
-                    $sformatf("Unknown txn_type: %s", req.txn_type.name()))
-        endcase
-    endtask
+    // 按事务调用统一API，TX携带本包offload与空间等待预算；复位语义由协议决定。
+    extern protected virtual task process_transaction(virtio_transaction	req);
 
     // ========================================================================
     // Atomic Operation Dispatcher (MANUAL mode)
@@ -116,61 +73,7 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // ========================================================================
 
     // MANUAL 操作仍受所选协议约束；私有 kick/poll 经 ops 保留通知与回收语义。
-    protected virtual task dispatch_atomic_op(virtio_transaction req);
-        bit setup_ok;
-        virtio_driver_protocol proto;
-
-        // 协议不允许标准状态访问时（私有环由 AF/mailbox 后端控制状态）显式拒绝，
-        // 其余请求继续分派到同一 Function 的 ops，保持 DMA 所有权一致。
-        proto = active_protocol();
-        if (!proto.allows_status_access() &&
-            ((req.atomic_op == ATOMIC_SET_STATUS) ||
-             (req.atomic_op == ATOMIC_READ_STATUS))) begin
-            req.success = 0;
-            `uvm_error("VIRTIO_DRV", "私有驱动不能访问标准 Virtio status 寄存器")
-            return;
-        end
-
-        case (req.atomic_op)
-            ATOMIC_SET_STATUS:
-                ops.write_device_status(req.status_val);
-
-            ATOMIC_READ_STATUS:
-                ops.read_device_status(req.status_val);
-
-            ATOMIC_SETUP_QUEUE: begin
-                ops.setup_queue(req.queue_id, req.queue_size, req.vq_type, setup_ok);
-                req.success = setup_ok;
-            end
-
-            ATOMIC_TX_SUBMIT:
-                ops.tx_submit(req.queue_id, req.net_hdr, req.pkt,
-                              req.indirect, req.desc_id);
-
-            ATOMIC_TX_COMPLETE:
-                ops.tx_complete(req.queue_id, req.completed_pkts, req.budget);
-
-            ATOMIC_RX_REFILL:
-                ops.rx_refill(req.queue_id, req.num_bufs);
-
-            ATOMIC_RX_RECEIVE:
-                ops.rx_receive(req.queue_id, req.received_pkts, req.budget);
-
-            ATOMIC_KICK:
-                proto.kick(ops, req.queue_id);
-
-            ATOMIC_POLL_USED:
-                proto.poll_used(ops, req);
-
-            ATOMIC_CTRL_SEND:
-                ops.ctrl_send(req.ctrl_class, req.ctrl_cmd,
-                              req.ctrl_data, req.ctrl_ack);
-
-            default:
-                `uvm_error("VIRTIO_DRV",
-                    $sformatf("Unknown atomic_op: %s", req.atomic_op.name()))
-        endcase
-    endtask
+    extern protected virtual task dispatch_atomic_op(virtio_transaction	req);
 
     // ========================================================================
     // Error Injection Dispatcher
@@ -179,7 +82,7 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     // ========================================================================
 
     // 将故障注入委托给目标队列；私有队列对不支持的错误类型显式报错，不猜位布局。
-    protected virtual task dispatch_error_injection(virtio_transaction req);
+    protected virtual task dispatch_error_injection(virtio_transaction	req);
         virtqueue_base vq;
         vq = ops.vq_mgr.get_queue(req.queue_id);
 
@@ -195,5 +98,112 @@ class virtio_driver extends uvm_driver #(virtio_transaction);
     endtask
 
 endclass : virtio_driver
+
+// 按事务类型派发；TX 参数随报文一起传入 FSM，不重新采样。
+task virtio_driver::process_transaction(virtio_transaction	req);
+    bit			setup_ok;
+    virtio_driver_protocol	proto;
+
+    proto = active_protocol();
+
+    case (req.txn_type)
+        // ----- Lifecycle -----
+        VIO_TXN_INIT:       fsm.full_init();
+        VIO_TXN_RESET:      proto.reset(ops, fsm, req);
+        VIO_TXN_SHUTDOWN:   fsm.stop_dataplane();
+
+        // ----- Data plane (AUTO mode) -----
+        VIO_TXN_SEND_PKTS:  fsm.send_packets(req.packets, req.queue_id,
+                                           req.tx_offload, req.timeout_ns, req.tx_notify,
+                                           req.tx_seg);
+        VIO_TXN_WAIT_PKTS:  fsm.wait_packets(req.expected_count, req.received_pkts, req.timeout_ns);
+        VIO_TXN_START_DP:   fsm.start_dataplane();
+        VIO_TXN_STOP_DP:    fsm.stop_dataplane();
+
+        // ----- Control plane -----
+        VIO_TXN_CTRL_CMD:   ops.ctrl_send(req.ctrl_class, req.ctrl_cmd, req.ctrl_data, req.ctrl_ack);
+        VIO_TXN_SET_MQ:     fsm.configure_mq(req.num_pairs);
+        VIO_TXN_SET_RSS:    fsm.configure_rss(req.rss_cfg);
+
+        // ----- Atomic ops (MANUAL mode) -----
+        VIO_TXN_ATOMIC_OP:  dispatch_atomic_op(req);
+
+        // ----- Migration -----
+        VIO_TXN_FREEZE:     fsm.freeze_for_migration(req.snapshot);
+        VIO_TXN_RESTORE:    fsm.restore_from_migration(req.snapshot, req.success);
+
+        // ----- Queue management -----
+        VIO_TXN_RESET_QUEUE: fsm.reset_single_queue(req.queue_id);
+        VIO_TXN_SETUP_QUEUE: begin
+            ops.setup_queue(req.queue_id, req.queue_size, req.vq_type, setup_ok);
+            req.success = setup_ok;
+        end
+
+        // ----- Error injection -----
+        VIO_TXN_INJECT_ERROR: dispatch_error_injection(req);
+
+        default:
+            `uvm_error("VIRTIO_DRV",
+                $sformatf("Unknown txn_type: %s", req.txn_type.name()))
+    endcase
+endtask
+
+// MANUAL 操作与 AUTO 发送复用同一个分段和完成入口。
+task virtio_driver::dispatch_atomic_op(virtio_transaction	req);
+    bit			setup_ok;
+    virtio_driver_protocol	proto;
+
+    // 协议不允许标准状态访问时（私有环由 AF/mailbox 后端控制状态）显式拒绝，
+    // 其余请求继续分派到同一 Function 的 ops，保持 DMA 所有权一致。
+    proto = active_protocol();
+    if (!proto.allows_status_access() &&
+        ((req.atomic_op == ATOMIC_SET_STATUS) ||
+         (req.atomic_op == ATOMIC_READ_STATUS))) begin
+        req.success = 0;
+        `uvm_error("VIRTIO_DRV", "私有驱动不能访问标准 Virtio status 寄存器")
+        return;
+    end
+
+    case (req.atomic_op)
+        ATOMIC_SET_STATUS:
+            ops.write_device_status(req.status_val);
+
+        ATOMIC_READ_STATUS:
+            ops.read_device_status(req.status_val);
+
+        ATOMIC_SETUP_QUEUE: begin
+            ops.setup_queue(req.queue_id, req.queue_size, req.vq_type, setup_ok);
+            req.success = setup_ok;
+        end
+
+        ATOMIC_TX_SUBMIT:
+            ops.tx_submit(req.queue_id, req.net_hdr, req.pkt,
+                          req.indirect, req.desc_id, req.tx_offload,
+                          req.timeout_ns, req.tx_notify, req.tx_seg);
+
+        ATOMIC_TX_COMPLETE:
+            ops.tx_complete(req.queue_id, req.completed_pkts, req.budget);
+
+        ATOMIC_RX_REFILL:
+            ops.rx_refill(req.queue_id, req.num_bufs);
+
+        ATOMIC_RX_RECEIVE:
+            ops.rx_receive(req.queue_id, req.received_pkts, req.budget);
+
+        ATOMIC_KICK:
+            proto.kick(ops, req.queue_id);
+
+        ATOMIC_POLL_USED:
+            proto.poll_used(ops, req);
+
+        ATOMIC_CTRL_SEND:
+            ops.ctrl_send(req.ctrl_class, req.ctrl_cmd,
+                          req.ctrl_data, req.ctrl_ack);
+
+        default:
+            `uvm_error("VIRTIO_DRV",
+                $sformatf("Unknown atomic_op: %s", req.atomic_op.name()))
+    endcase
+endtask
 
 `endif // VIRTIO_DRIVER_SV

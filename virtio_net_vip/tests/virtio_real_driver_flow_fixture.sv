@@ -22,7 +22,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     virtio_net_env             m_virtio_env;
     pcie_tl_env                m_pcie_env;
     virtio_test_device_builder device_builder;
-    dpu_device_env_config      device_cfg;
+    dpu_env_cfg	device_cfg;
     virtio_net_env_config      virtio_cfg;
     pcie_tl_env_config         pcie_cfg;
     host_mem_pool              host_mem_owners;
@@ -219,7 +219,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
 
         device_cfg = device_builder.make_env_config();
         device_cfg.host_mem_pool_ref = host_mem_owners;
-        uvm_config_db#(dpu_device_env_config)::set(
+        uvm_config_db#(dpu_env_cfg)::set(
             this, "device_env", "cfg", device_cfg);
         device_env = dpu_device_env::type_id::create("device_env", this);
         uvm_config_db#(virtio_net_env_config)::set(

@@ -753,3 +753,188 @@ UR负例故意保留SCB mismatch=1；reg_acc两例分别故意保留mismatch=2�
 及12份源码导出一致性检查通过。env/env_cfg、核心VIO、dpu_common和生产filelist/package
 未修改。上述验证覆盖模型端点与实际Intel VIP配置链路，不证明真实RTL的AF副作用、
 Notify查表、DMA报文消费或完成已经验证；真实DUT须按约定返回AF状态8。
+
+## 2026-11-08：恢复快照后显式重载参数
+
+新增Tcl `load_params` 在已构建的同一project env/cfg上重采样允许字段，
+纯候选通过全Host及RC消息预检后才原地提交；命令不分配ring、不发送DUT配置。
+后续仍使用 `project_dut_config_seq` 下表。核心VIO service需求、FSM行为、
+自动Custom私有配置、等待策略、冻结表目录及RC的MSI-X识别目录一并更新。
+Host/PF/VF、队列对数、协议类型/features、BAR/BDF及内存资源保持build时不变；
+本轮不重新加载 `pcie_cfg.*`，也不修改AIP、dpu_common或pcie_work源码。
+
+在 `ubuntu@10.11.10.53` 使用VCS `W-2024.09-SP1`，隔离目录为
+`/home/ubuntu/ryan/project_restore_load_params_vcs_20261108.c7bvH8`。
+从空csrc全量编译项目及测试，compile和strict均通过。Packed与Custom分别执行
+两个独立进程：首次在1100ns、env已构建且DUT写为0时保存；第二次携带新CLI
+启动同一simv，restore后立即重新source AIP loader，再执行真实Tcl重载和配置。
+
+两组均从256深度/轮询恢复为512深度/MSI-X；Notify偏移变为`0x80`，
+v0消息地址/数据变为`0xa00000000000/0x24681357`，未重新提供的v1保留旧值；
+QSCH SPWRR变为`0x55`，VTX dma_info变为5。Custom另验证私有dport_id变为`0x23`。
+各例检查同一cfg/Host cfg/registry/资源快照及原BAR/BDF句柄和值保持不变，
+修改pairs被拒绝且原值不变，合法重复重载不累积条目，活动代重载被拒绝且READY不变。
+
+| 最终场景 | 实际配置写／读 | SV检查 | Tcl检查 | 结果 |
+| --- | --- | --- | --- | --- |
+| Packed独立save/restore | 4132／42 | 21083 | 11 | 新表值、新Notify及新MSI-X完成均通过 |
+| Custom独立save/restore | 4132／42 | 21084 | 11 | 同上，另验证私有控制字段刷新 |
+
+实际Intel请求覆盖配置写/读、512B TX Notify、模型返回的完成DMA及新MSI-X。
+在中断到达前不能取出完成报文，中断后正确返回原packet，证明更新后的MSI-X未被当作DMA。
+两例SCB均为4177请求、42 Completion，mismatched/unexpected/timeout均为0，
+UVM WARNING/ERROR/FATAL均为0；最终四进程均首次通过，无超时重试。
+该验证使用Intel模型端点，不代表真实RTL的报文消费与寄存器副作用已经验证。
+
+首次功能运行时runner的可执行文件自动探测指向VCS ucli，因此额外修正runner：
+保存与恢复均显式设置 `::aip_simv_path`，再重跑上述四进程作为最终证据。
+这是快照元数据绑定修正，未修改产品源码或AIP；两份最终meta均记录同一个实际simv
+绝对路径、size=`1275480`、mtime=`1794129194`及保存时刻1100ns。
+
+证据位于 `build/vio_external_config_validation/remote_evidence/restore_load_params_vcs_final/`，
+最终日志仅取 `packed_final`、`custom_final`，并包含编译/strict、runner及冻结7文件SHA。
+独立审查已核对归档SHA、7份实际测试源码身份、四进程返回码、成功marker、UVM汇总和两份meta。
+
+| 证据文件 | SHA-256 |
+| --- | --- |
+| `restore_load_params_summary.tar.gz` | `6f9bcda6340e764ebcdb45fee52afae8a990a12ac7aa93aef001f8bc61c378ee` |
+| `results.tsv` | `da583110db8d6bde5c3540993b21d064494c476847fe9afa9999b45167b5e0dc` |
+| `runtime_reload_format_audit/manifest.json` | `277abfde2c3001d3e0f58341e8213445b313753bbc452ce2e3ca0fce1e221089` |
+
+仿真完成后，仅对新增方法参数的类型/名称间隔改用Tab，并撤销核心文件4处无关旧格式差异。
+因此最终core cfg、project env、project RC及测试文件与实际仿真版本的字节SHA不同，
+其余3份冻结文件完全一致；全部7份文件去空白内容相同，没有功能变更。
+原始7文件及前后SHA保存在 `build/vio_external_config_validation/runtime_reload_format_audit/`；
+没有将最终格式版本宣称为字节相同的仿真输入。最终源码导出12项一致性及
+`git diff --check`通过，生产filelist/package和原base_test运行顺序保持不变。
+
+
+## 2026-11-09：公共配置迁入 dpu_common、Notify 后置使能
+
+本节为当前实现。此前 `project_dut_config_seq`、`project_pcie_reg_seq`、旧 registry 等
+名称仅属于历史记录；当前入口为 `vio_dpu_cfg_seq`、`dpu_bar_reg_seq` 和 `dpu_env_cfg`。
+DPU 核心不依赖 PCIe/VIO，可选 PCIe 包只依赖公共 DPU 和原生 PCIe TL。
+参考 env/cfg 保留组装、共享内存和 Intel bind，公共类型/表生成/写序不再重复实现。
+
+新增 `dpu_cfg_seq::enable_notify()`：本批 VIO/RDMA Notify 表全成功后，按管理 BAR 去重，
+每个目标以4B Memory Write写 `BAR+0x80044=1`。偏移不叠加模块基址、不设置 bank 位，
+不额外读回；空批次不写、表失败不使能、使能失败不报告成功。该写计入每100笔 DWORD
+之后的 AF 状态读计数。BAR/Host memory 共用一个分配结果，VIO 导出实际 ring/IOVA。
+
+仿真使用 `10.11.10.53` 的 VCS `W-2024.09-SP1`，隔离目录 `/tmp/dpu_cfg_sr8q0qy7`。
+正常场景进程退出成功、strict检查通过；预期故障逐项核对失败原因、写入数量及未进入READY。
+
+| 验证范围 | 结果 |
+| --- | --- |
+| DPU 核心，无 PCIe/VIO | 独立编译及6项资源/plan/executor测试通过 |
+| 硬件字段 | BDF32、MSI-X linear64、VTX/VRX/Notify128位检查通过 |
+| 可选 PCIe 集成，无 VIO | 编译及通用 PCIe executor测试通过 |
+| 完整项目、BAR、普通寄存器访问 | 编译/地址路由通过；寄存器读比较负例单独接受，见下文 |
+| 单 PF0/一对 Packed VTX | 25笔配置写、1笔AF读，真实Intel业务DB匹配；配置与512B提交通过 |
+| Packed/Custom × polling/MSI-X | 四组合合同及四组合生命周期均通过，包含释放后重新准备 |
+| 双 Host、多 VF、混合格式、ETS | 7125项检查通过，含实际descriptor导出、共享Host manager和512B RX |
+| Notify批次 | VIO/RDMA、管理目标去重、多目标、空批次、表写/使能失败通过 |
+| 可选公共控制/驱动端口 | 2668项检查通过，保留PBA只读和独立W1C能力 |
+| 失败停止 | 缺Notify布局、VTX第2笔/VRX第5笔发送失败通过，未继续配置或确认READY |
+| 旧私有驱动/原生TLM executor/AIP参数 | 定向回归通过，通用executor仍可独立使用 |
+
+最终代码与“已增加Notify使能、尚未做架构迁移”的基线使用相同seed17和参数，
+从实际Intel接收端抽取事务。比较完整原始顺序，不排序，不忽略AF读或业务DB：
+
+| 场景 | 事务数 | 逐笔内容及顺序 |
+| --- | ---: | --- |
+| 一对Packed/轮询 | 27 | 完全一致 |
+| 一对Custom/轮询 | 27 | 完全一致 |
+| 32对Packed/轮询，AF extra=0 | 653 | 完全一致 |
+| 一对Packed/MSI-X | 4236 | 完全一致 |
+
+比较字段为Host、目标BAR/base、offset、方向、字节数、first/last BE、payload。
+32对场景显式提供 `+dpu.caps.af_extra_queue_count=0`：未提供时原版和新版都因默认
+11个AF额外队列占用32对上限而拒绝。没有为了让测试通过而改变资源默认值。
+
+最终 `verified/simv` 对Packed和Custom分别进行两个独立进程的保存/恢复。
+在1100ns保存未下DUT配置的环境；恢复进程用新CLI，并在restore后立即重新source AIP loader。
+`load_params` 由 `aip_cmd_task` 注册，保持原cfg/BAR/BDF/Host资源句柄，更新队列深度、
+Notify、MSI-X、QSCH、VTX策略；Custom另更新私有dport_id。非法pairs修改不改变原状态，
+重复合法重载不累积资源，活动代重载被拒绝。随后真实配置、新DB和新MSI-X路径均通过。
+
+| 独立恢复 | 配置写/读 | SV检查 | Tcl检查 | SCB |
+| --- | --- | ---: | ---: | --- |
+| Packed | 4133/42 | 21088 | 11 | mismatch/unexpected/timeout均0 |
+| Custom | 4133/42 | 21089 | 11 | mismatch/unexpected/timeout均0 |
+
+`project_pcie_reg_test` 的两次 SCB RAM 数据不匹配是测试显式注入的期望负例，用于比较
+`check_read_data` 默认/开启与关闭的行为。测试完成26次请求，精确catcher核对两次不匹配
+及最终汇总，UVM ERROR/FATAL为0；通用strict会拒绝 `Mismatched: 2`，因此此项单独接受，
+不宣称它是普通strict零不匹配通过。其他仿真不使用这个豁免。
+
+本轮发现并修正通用executor测试的快照注入，以及缺布局失败后已分配ring的收尾范围。
+后者在返回失败时保留可释放selection，既不确认READY，也不隐含释放DMA；平台确认停机后
+测试显式释放，最终strict无资源泄漏告警。初次失败日志保留在证据中。
+
+本地证据目录：`build/dpu_cfg_sr8q0qy7/`。`remote_evidence/` 保存编译/运行日志，
+`verified_compare_results.json`、`verified_restore_results.json` 记录最终事务与恢复结果，
+`remote_audit.json` 核对提交到VCS主机的234份源码/脚本、simv和两份checkpoint身份及外部依赖哈希。
+`final_sources.tar.gz` 为提交到VCS主机的源码/脚本，`final_working_sources.tar.gz` 为最终工作区源码；
+最后19个文件仅整理Tab空白，`final_format_audit.json` 逐项证明去注释/空白后的token相同。
+`preexisting_packet_audit.json` 确认16个已有报文/等待实现与实施前逐字节相同。
+源码导出6文件一致性、测试清单静态合同和四仓库diff空白检查均通过。
+
+上述验证包含Intel VIP接口模型、DPU资源与真实驱动格式合同；没有宣称真实RTL的
+AF副作用、Notify查表、DMA消费或业务完成已在本轮验证。集成时同步新公共包与用户参考，
+重新编译并保存快照；本轮未提交或推送远程。
+
+## 2026-11-09：配置复审修复与当前源码回归
+
+本轮在原 cfg/seq 和 AIP 宏中修复参数采样、Notify 基址与失败清理问题。
+显式加载的 VIO 全局/Host 参数只采样一次，service 和运行期候选继承该结果；
+精确 service 覆盖仍有效，重载缺失项保留当前值。Custom 私有默认控制先合并再传给队列，
+随后应用各层 qN 覆盖，首次构建与重载使用相同顺序。
+
+Notify 默认从实际导出的 doorbell `[60:7]` 生成查找基址，
+`notify_table_bar/notify_table_offset` 改为可选覆盖；显式基址仍检查范围、128B 对齐和高位一致。
+多 Host prepare 部分成功后返回可释放的 selection，供原释放入口清理并重试。
+公共 publish 先核对 device/resources/BAR map 的同源冻结身份，全部预检成功后才发布；
+失败保留旧状态。PCIe RC/EP 拓扑由 cfg 确定，env 只校验并绑定。
+
+验证在 `ubuntu@10.11.10.53` 的 `/tmp/dpu_cfg_fix_20261109` 使用 VCS
+`W-2024.09-SP1` 进行。六个编译组全部通过严格日志检查；20 项普通用例和
+两组独立 save/restore 通过，共22个逻辑场景、24次成功仿真。
+本节使用当前源码重新编译，不把上一节旧归档结果计入本轮覆盖。
+
+| 验证范围 | 本轮结果 |
+| --- | --- |
+| DPU 核心与公共发布 | 6项核心用例及1项独立类型/发布测试通过；覆盖未冻结、跨快照、首次/再次发布失败和修正后重试 |
+| PCIe 可选集成，无 VIO | 独立编译及 TL executor 用例通过 |
+| VIO 相关集成 | 私有驱动、外部队列配置、DPU PCIe TL executor 共3项通过 |
+| AIP 与 TX/RX | 5项通过；参数543项检查、RX buffer 204项检查；TX offload 及分段通过，分段覆盖12000包/71993个descriptor |
+| Project 定向测试 | 4项通过；Notify 296项检查、Packed/Custom合同2499/2497项检查，双Host中途失败后释放与重试通过 |
+| Packed 独立保存/恢复 | DUT检查21088项、Tcl检查11项，通过 |
+| Custom 独立保存/恢复 | DUT检查21089项、Tcl检查11项，通过 |
+
+Notify 用例覆盖非零实际基址、显式地址低7位不同但高位一致、高位冲突拒绝及原排序规则。
+参数用例包含12轮全局/Host随机值继承，以及Custom单队列覆盖优先级和缺失字段保留。
+恢复用例在独立进程中使用新CLI，检查重载、实际写表、新Notify和MSI-X完成；
+非法pairs修改、重复合法重载、活动代拒绝均按原合同验证。
+Host/PF/VF、队列对数、协议类型/features等快照固定边界没有扩展。
+
+独立类型测试运行退出码为0，出现 `DPU_TABLE_TYPES_PASS` 且无Warning/Error/Fatal；
+它是standalone module，不生成UVM Report Summary。其他场景均通过对应UVM/严格日志检查。
+
+证据位于 `build/dpu_cfg_fix_20261109/`，结果见 `VALIDATION_RESULT.md`，
+复现步骤见 `FINAL_INPUTS.execute.md`。实际输入由v2基包、三文件增量和正确的
+`aip_core_set_param_expr`依赖组成；不能只使用旧v2包复现。
+AIP依赖HEAD为 `a0367231fd9568f68547123b7173d49b586b84f6`，工作树干净；
+Tcl bridge在53主机从该源码构建。最终输入2445个文件已逐项核对本地与53一致。
+
+| 证据文件 | SHA-256 |
+| --- | --- |
+| `final_inputs_v5.sha256` | `5e3ea777f7c0e3152b2d8c74f2f08abf72fb04a5d3d1ca437508477476741f49` |
+| `final_evidence_bundle.tar.gz` | `dda257f1e9aba0cb286fe540ed52338dd3f24e3baaa6a0ea75253a269cfb1e90` |
+
+证据保留了修正前的测试枚举告警、错误AIP依赖根和缺少生成Tcl bridge的日志，
+通过结论只使用修正后的编译与运行结果。提交检查时仅移除
+`dpu_common/src/dpu_bar_map.sv` 和 `integration/pcie/dpu_pcie_bar_map.sv` 各一行末尾空行；
+其余源码保持验证时的字节内容。`commit_format_audit.json` 记录两份文件前后SHA，
+并确认差异只有末尾换行；本节验证记录也在核对后补充。
+本轮是模型端点和软件集成的针对性验证，不代表整仓全量回归或真实RTL DUT验证。

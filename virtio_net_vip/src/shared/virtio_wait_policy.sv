@@ -28,6 +28,10 @@
 class virtio_wait_policy extends uvm_object;
     `uvm_object_utils(virtio_wait_policy)
 
+    // 等待一轮统一轮询间隔，不超过调用者的剩余预算；不足1ns的预算仍精确保留。
+    // 不报告超时，由外层持有具体条件和整体截止时间，避免重复报错。
+    extern task wait_poll_interval(realtime	remaining_ns);
+
     // ------------------------------------------------------------------
     // Timeout configuration (all values in nanoseconds)
     // ------------------------------------------------------------------
@@ -361,5 +365,15 @@ class virtio_wait_policy extends uvm_object;
     endtask
 
 endclass
+
+// 单次延时总为正且有上界；零/负预算直接返回，外层据此结束等待。
+task virtio_wait_policy::wait_poll_interval(realtime	remaining_ns);
+    realtime	interval_ns;
+
+    if (remaining_ns <= 0) return;
+    interval_ns = (default_poll_interval_ns == 0) ? 1 : default_poll_interval_ns;
+    if (interval_ns > remaining_ns) interval_ns = remaining_ns;
+    #(interval_ns * 1ns);
+endtask
 
 `endif // VIRTIO_WAIT_POLICY_SV

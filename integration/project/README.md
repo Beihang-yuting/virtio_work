@@ -1,435 +1,262 @@
-# 外部配置 VIO：一个 env、一个 cfg
+# 外部配置 VIO：直接组合一个 env 和 env_cfg
 
-把本目录的 [project_env_cfg.sv](project_env_cfg.sv) 与
-[project_env.sv](project_env.sv) 合入已有大 cfg/env，保留类内 `extern` 声明和类外实现。
-已有 env 仍 `extends uvm_env`，不需要再包一层项目 env，也不继承 DPU env。
-[完整源码导出](../../docs/project_env_full_code.md) 包含依赖类型、BAR registry、RC driver、
-cfg、env、配置 seq 与 base_test；修改源码后运行 `python3 scripts/render_project_code.py` 更新。
-[驱动地址与逐表写入示例](driver_address_example.md) 给出 VTX/VRX、QSCH、公共映射、
-MSI-X 和 BAR 窗口的可替换偏移。BAR 物理地址由环境分配、解析，不需要用户手填。
+把 [project_env_cfg.sv](project_env_cfg.sv) 和 [project_env.sv](project_env.sv) 的组装部分
+合入自己的 cfg/env 即可；不要求继承参考 cfg，也不继承 `dpu_device_env`。
+公共配置已移到 `dpu_common`，无需复制整套表定义或配置 seq。
+[完整源码](../../docs/project_env_full_code.md) 由实际文件生成，包含 filelist、package、
+env_cfg、env、base_test 和固定单队列示例。
 
-每 Host 一个 segment 0、一个 RC 与 Intel `HARD_IP` wrapper；同 Host 的 PF/VF 共用端口。
-DPU 快照拥有 BDF/BAR/队列资源身份，VIO 拥有 ring/DMA，平台拥有 RTL 配置与停机判断。
-项目配置只发 Memory Read/Write，不发现 capability、不协商、不自动执行 Virtio reset/init。
-准备和软件确认不访问 DUT。Packed 使用标准 12B `virtio_net_hdr`，512B 报文另计；
-Custom 使用私有 descriptor/CQ，512B 报文不带 Virtio header。
+每 Host 一个 RC、一个 Intel HARD_IP wrapper、一份 Host memory manager；同 Host 的
+PF/VF 共用端口。DPU 分配 Function/BDF/BAR/qpair/vector，VIO 分配实际 ring/IOVA，
+PCIe 使用同一份 BAR 和内存结果。设备配置只走 Memory Read/Write，不执行 PCI capability
+发现、feature 协商或 Virtio reset/init。
 
-## 最短接入顺序
+## 文件职责与编译顺序
 
-1. 编译参考入口 [project_integration.f](../../filelists/project_integration.f)，或者按
-   [project_env_pkg.sv](project_env_pkg.sv) 顺序包含到已有 package。`project_dut_config_seq.sv`
-   放在 cfg 后、base_test 前；普通 `.sv` include 不要再次单独编译。
-   生产 VIO filelist/package 保持独立，integration 只作项目参考。
-2. base_test 创建 cfg，`cfg.load_params()` 自动准备驱动参考 VIO/QSCH 布局、无 IP 的 PF0 软件路由；随后绑定 VIF，
-   将同一对象 `set(this, "env", "cfg", cfg)`，再创建 env。Intel bind 接法见后文。
-3. env 构建 DPU、PCIe、VIO；connect 将 `cfg.dpu_setup`、`cfg.bar_registry`、
-   `cfg.rc_sequencers[slot]`、`cfg.vio_envs[h]` 填好，并把同一个 cfg 以 `env_cfg` 键
-   发布到 `pcie_env.*`。config_db 传递句柄，seq 能看到 connect 后生成的资源。
-   合入你自己的 cfg 类型时，同步替换 seq 与 `config_db` 中的类型名，get/set 使用同一类型。
-4. 平台等待 DUT 复位释放、Intel 接口可用后，启动一个配置 seq。
-   默认 body 执行 AF 声明→BDF→按完成模式配置 MSI-X→准备 ring→排序并初始化单 bank Notify→QSCH→VTX/VRX→使能→确认。
-   AF 声明固定经 Host0 RC 向环境分配的 `h0.pf0.bar0.base + 0x1010` 写 `32'h5555_aaaa`，
-   使用 `pcie_tl_reg_seq` 发送一个 4B Memory Write，随后从同地址读一次并等待 Completion，要求状态为8；任一步失败立即停止，不遍历 Host。
-   之后每成功发送100次完整 DWORD 配置写，再执行一次相同状态读；计数属于本次 seq，不补尾读、不轮询。
-   `dpu.verify_readback=1` 才增加普通表项读回；默认0跳过普通表项读回，AF同步读始终执行。
-   `dpu.configure_public=1` 才额外执行 BAR/PFVF/Completion BDF/Prefix 等配置；默认关闭。
-   AF 声明、默认开启的 BDF 和 MSI-X 中断模式均不依赖这个公共开关。
-   `declare_af()` 与可选的 `PROJECT_AF` 表 hook 独立；此处仅检查固定状态8，不执行额外的 Host-ID 协商。AF状态读不受 `dpu.verify_readback` 控制，关闭的只是SCB历史RAM写值比较，Completion错误及状态值仍检查。
-   任何一步失败在 sequence 的 `post_start()` 报告 fatal，直接通过 AIP 启动也不会静默 done。
-5. 配置成功后 `env.register_aip_commands()`，进入 `aip_tcl_bridge::run_loop()`。
-   业务结束后平台停止 DUT DMA，再用 `cfg.release_vio_resources()` 释放 ring。
+| 实现位置 | 职责 |
+| --- | --- |
+| `dpu_common/src/dpu_env_cfg.sv` | 拓扑输入、布局、表策略、资源查询及实际队列的表项生成 |
+| `dpu_common/src/dpu_table_types.sv`、`dpu_vio_table_types.sv` | 当前图片版本的 packed 字段、布局、上下文和中性队列导出 |
+| `dpu_common/src/dpu_bar_map.sv` | 查询真实 BAR 租约、范围检查和分组打印 |
+| `dpu_common/integration/pcie/dpu_pcie_bar_map.sv` | 在同一 BAR 对象上增加 Host→RC/Intel 路由 |
+| 同目录 `dpu_cfg_seq.sv`、`dpu_bar_reg_seq.sv` | 写表、AF 同步、独立 BAR 相对寄存器访问 |
+| `integration/dpu/vio_dpu_cfg_seq.sv` | 准备/导出/确认/释放实际 VIO ring，复用公共写表 |
+| `integration/dpu/vio_pcie_rc_driver.sv` | 复用 PCIe RC，补齐 Function IOMMU、DMA 和 MSI-X 接收 |
+| `project_env_cfg.sv`、`project_env.sv` | 组合三个 cfg，创建组件、绑定接口和发布句柄 |
+| `project_base_test.sv` | 平台就绪后启动配置，再运行 Tcl 业务 |
 
-[project_base_test.sv](project_base_test.sv) 已包含创建/启动配置 seq 的代码。
-平台仍实现 `bind_platform_handles()`、`prepare_platform()`、`finish_platform()` 三个方法，
-负责真实接口、复位等待和业务结束检查。当前单 PF0、轮询场景可直接启动
-`project_dut_config_seq`，基类已经实现 VIO/QSCH 写表和读回，不必再派生一层只转调 helper。
-平台寄存器存在只写/自清零等特殊行为时，仍可覆写对应单项 hook 或验证 task。
+[project_integration.f](../../filelists/project_integration.f) 是可选完整入口。
+已有工程按依赖顺序增补缺少的包，不能重复编译 package 或其中 include 的 `.sv`：
 
-如果直接使用已有 base_test，run_phase 中的平台等待之后写：
+```text
+AIP → DPU / host_mem / net_packet / PCIe TL → VIO / VIO AIP
+    → Intel interface / adapter
+    → $DPU_COMMON_ROOT/filelists/dpu_pcie.f
+    → integration/dpu/virtio_dpu_pkg.sv
+    → 用户 env package（或参考 project_env_pkg）
+```
+
+DPU 核心不 import PCIe/VIO；DPU PCIe 集成也不依赖 VIO。
+生产核心 filelist/package 不自动引入参考 project，模型测试另加 `project_tests.f`。
+
+## 构建和句柄传递
+
+1. base_test 创建自己的 cfg，调用一次组合入口 `cfg.load_params()`；它加载 DPU 输入，
+   缓存各 Host 的最终 VIO service 需求，再交给 DPU placement，最后加载 PCIe 传输参数。
+   首次加载幂等，env 再调用不会重复随机采样。全局、Host 模板先各自采样，service
+   继承已加载值，只读取精确 service 覆盖；运行期 Host 候选也复用同一份全局采样结果。
+2. 平台绑定现有 Intel/protocol VIF 和可选 Host pool，将同一 cfg 传给自己的 env。
+   env 创建 `dpu_device_env`、`pcie_tl_env` 和每 Host 的 `virtio_net_env`；VIO 放在 DPU
+   子树以读取已解析的快照，整个过程不写 DUT。
+3. connect 建立一份 `dpu_pcie_bar_map`，交给 `cfg.dpu_cfg.bar_map` 和 RC driver；
+   PCIe 与 VIO 绑定同一个 Host manager。BAR 不在 `pcie_cfg` 中再分配一次。
+4. 发布以下句柄，配置 seq 就不需要知道用户自己的 env_cfg 类名：
 
 ```systemverilog
-project_dut_config_seq	config_seq;
-int unsigned				host;
+// 在用户 env 中，pcie_env 是实际 PCIe 子环境名。
+uvm_config_db#(dpu_env_cfg)::set(this, "pcie_env.*", "dpu_cfg", cfg.dpu_cfg);
 
-config_seq = project_dut_config_seq::type_id::create("config_seq");
+foreach (vio_envs[h]) begin
+    uvm_config_db#(virtio_net_env)::set(
+        this, "pcie_env.*", $sformatf("vio_env_h%0d", h), vio_envs[h]
+    );
+end
+```
+
+`dpu_cfg` 是公共对象，不是包住三个子 cfg 的新容器。最终资源查询用
+`cfg.dpu_cfg.device_snapshot/resource_snapshot/bar_map`；实际 VIO setup 由
+`env.vio_envs[h].get_external_setup()` 取得，DPU 写表使用其导出的
+`cfg.dpu_cfg.queues_by_host[h]`。导出不再分配 ring，也不重新采样参数。
+
+## base_test 与默认配置流程
+
+[project_base_test.sv](project_base_test.sv) 给出完整构建和运行顺序。平台需要实现
+`bind_platform_handles()`、`prepare_platform()`、`finish_platform()`，分别负责现有
+接口、复位就绪和业务检查/停机；不能把真实 DUT 等待写成空 task。
+自己的 base_test 在平台就绪后启动：
+
+```systemverilog
+vio_dpu_cfg_seq	config_seq;
+int unsigned	host;
+
+config_seq = vio_dpu_cfg_seq::type_id::create("config_seq");
 if (!cfg.tl_slot_by_host.first(host)) begin
-	`uvm_fatal("CONFIG", "no PCIe Host configured")
-end
-config_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[host]]);
-if (!config_seq.success) begin
-	`uvm_fatal("CONFIG", config_seq.error_msg)
+    `uvm_fatal("CONFIG", "no PCIe Host configured")
 end
 
-// 到这里再注册命令、启动 VTX/VRX 业务。
+config_seq.start(env.pcie_env.rc_agents[cfg.tl_slot_by_host[host]].sequencer);
+if (!config_seq.success) begin
+    `uvm_fatal("CONFIG", config_seq.error_msg)
+end
+
 env.register_aip_commands();
 aip_tcl_bridge::run_loop();
 ```
 
-seq 自动从启动用的 PCIe sequencer 取得 `env_cfg`，无需另外传 context 或逐项传地址。
-多个 Host 仍由同一个配置 seq 顺序处理；每笔 Memory 请求根据实际 BAR 目标选择
-`cfg.rc_sequencers[target.rc_slot]`，不把所有 Host 都发到启动用的那个 RC。
-`cfg.vio_setups[h]` 保存导出的队列，`config_seq.selection` 可用于测试结束后的释放。
+默认顺序为：
 
-## cfg、env、seq 各放什么
+```text
+选择需要 MSI-X 的 Function
+    → Host0/PF0 BAR0+0x1010 写 0x5555aaaa、读回状态8
+    → BDF、所选 MSI-X（configure_public=1 时另写公共表）
+    → VIO 准备实际 ring 并导出
+    → Notify 有效项 → 管理 BAR+0x80044 写1
+    → QSCH → VTX/VRX 初始化 → 队列使能
+    → 可选普通表读回 → 确认 VIO 可发包
+```
 
-| 文件 | 内容 |
-| --- | --- |
-| `project_env_cfg.sv` | 参数、表布局、Function/队列策略，以及 env 生成的 BAR、BDF、队列视图和 sequencer 句柄 |
-| `project_env.sv` | 创建 DPU/PCIe/VIO，绑定内存和 Intel 接口，将资源填入 cfg |
-| `project_dut_config_seq.sv` | 配置顺序、每项 `user_configure_*` hook、32-bit 写表和 PCIe Memory 访问 |
-| `project_base_test.sv` | 构建 cfg/env，等待平台就绪，启动配置 seq，成功后运行测试 |
+之后每成功发送 100 次完整 DWORD 配置写，插入一次 AF 状态读；不补尾读、不轮询。
+AF 读关闭 SCB 的历史 RAM 写值比较，但仍检查 Completion 和返回值8。
+`dpu.verify_readback=0` 只省去普通表读回，不关闭 AF 同步。posted 写成功表示已发送，
+真实 DUT 的应用结果还要由业务检查确认。配置失败立即停止，不确认 READY 或释放 DMA 资源。
 
-按单个配置 seq 的正常顺序运行，不维护跨 seq 的并发锁、写版本、重写撤销或恢复状态机。
-地址范围、字段合法性和 PCIe 返回结果仍会检查；配置成功后才确认 VIO 并允许业务发包。
-`cfg.records` 是按硬件项整理的配置数据，供 hook/使能复用，不是另一套执行状态机。
+每批 VIO/RDMA Notify 全部表项成功后，每个不同管理 BAR 写一次 `+0x80044=1`。
+空批次不写；表写失败不使能；使能失败返回失败。这个偏移不再叠加模块地址，也没有 bank 位。
+RDMA 仍通过独立 `configure_rdma_notify(scope, ok, why)` 使用，不自动加入 VIO 默认流程。
 
-从旧参考代码迁移时，调用位置对应如下：
+平台停止 DMA 后可调用同一 `vio_dpu_cfg_seq` 的
+`release_vio_resources(config_seq.selection, 1, ok, why)`；先确认停机，再释放。
 
-| 原调用 | 现在的位置 |
-| --- | --- |
-| `env.configure_*()` / `env.write_*()` / `env.pcie_bar_*()` | 配置 seq 内的同名 task |
-| `env.prepare_vio_configuration()` / `env.commit_vio_configuration()` | `cfg` 的同名方法，默认 seq body 已调用 |
-| `env.release_vio_resources()` | `cfg.release_vio_resources()`，平台收尾时调用 |
-| `env.dpu_setup` / `env.bar_registry` / `env.vio_setups` | `cfg` 中的同名字段 |
-
-
-## 当前一对 VTX 的可执行配置
-
-如果先用写死的单队列基线调通真实 DUT，启动独立的
-[project_single_queue_config_seq](project_single_queue_config_seq.sv)。它在 seq 内固定
-BDF、Notify、QSCH、VTX 的驱动地址与策略，不要求 `table_layouts/frozen_layouts` 已提供；
-`dpu.driver_layouts=0` 也可使用。原 `project_dut_config_seq` 保持原来的平台布局要求。
-
-这一入口固定只配置 Host0/PF0、一对队列中的 VTX：Packed、深度256、Polling，
-不启用 VRX、不写 MSI-X/BAR/PFVF 公共表、不做普通表项读回；AF状态读仍执行。
-顺序为 AF→BDF→Notify→QSCH→VTX初始化→VTX使能，共24笔32bit Memory Write、1笔AF状态 Memory Read。
-表地址和策略覆盖 cfg 中的相应输入/冻结值；BAR基址、global qid、ring IOVA仍取环境实际分配值。
-后续改硬件地址或固定字段，直接修改新 seq 的 `prepare_fixed_configuration()`。
-
-Host/PF/队列模式已在 env 构建时形成合同，seq 不在运行期重建它们。仿真启动前提供：
+## 一对 Packed VTX 的启动参数
 
 ```text
 +dpu.hosts=1 +dpu.pfs_per_host=1 +dpu.vfs_per_pf=0
-+vio.enabled=1 +vio.pairs=1 +vio.tx_enable=1 +vio.rx_enable=0
-+vio.queue_type=VQ_PACKED +vio.queue_size=256 +vio.features=0x0000000500000000
-+vio.completion_mode=VIRTIO_COMPLETION_POLLING
-+vio.notify_bar=0 +vio.notify_base=0 +vio.notify_stride=0 +vio.notify_encoding=VIO_NOTIFY_DPU32
-```
-
-PF0 EP 路由沿用环境默认 `requester=0/intel_pf=0/no-VF/vport=0`；新 seq 校验真实资源后才写寄存器。
-EP requester 编码独立于环境分配的 PCI BDF，`dpu.bdf_first=16` 等起点无需改成0。
-Notify查找表使用PF0的实际BAR0，`net_id/group_id/cos=0`、VNET、SP=`0xff`、TC weight=`0x11111111`
-均由新 seq 固定，无需再提供 Notify table 或 QSCH 参数。接口 bind、等待复位仍由平台完成。
-
-```systemverilog
-// 放在 test 的 run_phase 中：平台复位就绪后，启动独立固定配置入口。
-project_single_queue_config_seq	config_seq;
-
-config_seq = project_single_queue_config_seq::type_id::create("config_seq");
-config_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[0]]);
-```
-
-已有 AIP 命令可只替换注册的 sequence 类型，沿用原来绑定的 RC sequencer 表达式。
-例如原工程已有 `virtual_sqr::pcie_rc_sqr` 指向真实 RC 时：
-
-```systemverilog
-`aip_cmd_user_seq(dut_config_fixed, project_single_queue_config_seq, virtual_sqr::pcie_rc_sqr)
-```
-
-```tcl
-dut_config_fixed
-```
-
-自建 package 时在 `project_dut_config_seq.sv` 后 include 新 `.sv`；参考 `project_env_pkg.sv`
-已包含它。配置成功后再启动发包；实际发送失败继续报告 fatal，不会把错误当作配置成功。
-
-以下为原通用 `project_dut_config_seq` 的参数化用法：
-
-启动参数在 `cfg.load_params()` 时读取；Host/PF/队列/布局参数应在仿真启动前提供。
-默认先声明 Host0/PF0 为 AF，再配置 BDF 和 VIO/QSCH，其他公共表不下发；采用驱动参考地址、QSCH VNET 模式，
-SP/WRR=`0xff`、TC weight=`0x11111111`。
-单 Host PF0/no-VF 的软件接口约定为 `intel_pf=0, intel_vf=-1, requester=0, vport=0`。
-若 DUT 的 Intel sideband/Requester 约定不同，使用 `dpu.h0.pf0.requester/intel_pf/intel_vf/vport` 覆盖。
-启动配置 seq 后会按这些身份写 BDF 表；BAR 映射表仍不自动下发。
-
-```text
-+dpu.hosts=1 +dpu.pfs_per_host=1 +dpu.vfs_per_pf=0
-+dpu.configure_public=0 +dpu.configure_bdf=1 +dpu.driver_layouts=1 +dpu.verify_readback=0
-+dpu.reg_target=h0.pf0.bar0 +dpu.print_bar_map=1
++dpu.configure_public=0 +dpu.configure_bdf=1 +dpu.driver_layouts=1
++dpu.verify_readback=0 +dpu.reg_target=h0.pf0.bar0 +dpu.print_bar_map=1
 +vio.enabled=1 +vio.pairs=1 +vio.tx_enable=1 +vio.rx_enable=0
 +vio.queue_type=VQ_PACKED +vio.queue_size=256
 +vio.features=0x0000000500000000
 +vio.completion_mode=VIRTIO_COMPLETION_POLLING
 +vio.notify_bar=0 +vio.notify_base=0 +vio.notify_stride=0
 +vio.notify_encoding=VIO_NOTIFY_DPU32
-+vio.notify_table_bar=0 +vio.notify_table_offset=0 +vio.notify_net_pair5=1
++vio.notify_net_pair5=1
 +dpu.qsch.net_base=0 +dpu.qsch.net_stride=1 +dpu.qsch.group_id=0
 +dpu.qsch.cos=0 +dpu.qsch.eth_ports=8 +dpu.qsch.ets=0
 ```
 
-QSCH 控制参数可显式修改为 `dpu.qsch.mode`（0=VNET、1=ETS）、`mode_offset`（默认 `0xb001c0`）、
-`spwrr`、`tc_weight`；`configure_controls=0` 关闭自动模式写入及缺省 SP/WRR、TC weight 生成，
-显式 `platform_controls` 仍会执行。`mode` 必须与所选 service 的 `qsch.ets` 一致。
+该配置共 **25 笔 32-bit 配置写和 1 笔 AF 读**，包含新增 Notify 使能，不包含后续业务 DB。
+单 PF0 软件路由默认 `requester=0/intel_pf=0/intel_vf=-1/vport=0`；其他 Function
+需要实际硬件身份。BDF 表默认 `BAR+0x108000+bdf_index*4`，PF0 的值为 `0x00010000`。
 
-cfg 的 `use_driver_reference_layouts()` 只补缺少的 VIO/QSCH 布局，保留已有 `provided` 布局。
-需要改地址时，在 `cfg.load_params()` 后、env 构建前修改 `cfg.table_layouts[kind]`。
-`dpu.driver_layouts=0` 则完全由平台提供布局。默认布局包含 BDF、MSI-X 和 VIO/QSCH，
-其余公共表布局仍由平台声明。
+改 Custom 使用 `+vio.queue_type=VQ_CUSTOM +vio.features=0`，其他关联仍来自同一资源。
+Packed 使用标准12B `virtio_net_hdr`，512B 报文长度另计；Custom 使用私有 descriptor/CQ。
 
-日常测试默认 `dpu.verify_readback=0`：保留完整写表、使能、参数检查和写请求结果检查，
-省去 BDF、所选 MSI-X、QSCH 模式、VIO/QSCH 有效表项及 MSI-X 查找表无效尾部的配置读回。
-调试时使用 `+dpu.verify_readback=1` 恢复上述验证，也启用公共配置已选时的平台验证 hook。
-关闭读回后的 READY 表示配置写入流程完成；DUT 实际应用结果由业务检查确认。
-显式调用 `verify_function_configuration()`、`verify_vio_configuration()` 或
-`verify_dpu_configuration()` 仍执行验证，不受此开关跳过。
+Notify 表的查找基址默认取实际 doorbell 地址的 `[60:7]`，无需再重复指定
+`vio.notify_table_bar/notify_table_offset`。显式提供任一项时，另一项沿用当前值
+（初始为0），环境检查 BAR 范围、128B 对齐以及与实际 doorbell 高位一致；低7位可不同。
+这些参数描述业务地址，写表使用的管理 BAR 仍由 `vio.notify_table.reg_target` 控制。
 
-BDF 默认每个 Function 配置一项，地址为管理 BAR.base + `0x108000 + bdf_index*4`。
-PF0 默认 index=0、requester=0、valid=1，对应32位值 `0x00010000`。
-新生成的 Function policy 默认 `bdf_index=vport`，可用 `dpu.h0.pf0.bdf_index` 等精确路径覆盖。
-若平台已配置 BDF，设置 `dpu.configure_bdf=0`；不影响 VIO/QSCH 下发。
-
-改为 MSI-X 模式时，在上面参数基础上增加以下示例；消息地址/data 应替换为项目实际约定，
-它们是 Host 侧中断目的，不是 DUT BAR 物理地址：
+改 MSI-X 时提供真实 Host 消息地址/data，例如：
 
 ```text
 +vio.completion_mode=VIRTIO_COMPLETION_MSIX
-+dpu.msix.msg_addr_base=0x900000000000
-+dpu.msix.msg_addr_stride=4
-+dpu.msix.msg_data_base=0x13572468
-+dpu.msix.msg_data_stride=0x100
++dpu.msix.msg_addr_base=0x900000000000 +dpu.msix.msg_addr_stride=4
++dpu.msix.msg_data_base=0x13572468 +dpu.msix.msg_data_stride=0x100
 ```
 
-默认初始化 MSI-X linear（`0x0c0000`）、message（`0x120000`）、interval（`0x140000`）、
-info（`0x150000`）四张表。interval=0、self_mask=0、table_only_enable=1；
-真实平台需要额外 Function/control 寄存器时，显式提供控制项并关闭 table_only_enable。
-消息地址/data 未提供时在第一笔配置写之前失败。普通轮询用例不写 MSI-X；
-显式公共配置仍可包含 AF 等非 VIO 消息。
+消息地址不是 DUT BAR 地址；MSI-X 完成必须收到匹配消息，没有轮询兜底。
+VRX 还需要打开 `vio.rx_enable`，设置实际 prefetch RAM/范围，并从平台网络侧送包。
 
-MSI-X linear 按 `{host_id, pfvf_id, local_vector}` 排序，global vector 仅作为映射结果；
-完整流程初始化2048行单 bank，无效尾项的有效字段全1、reserved=0，不写 bank-select/ready。
-`cfg.msix_linear_records` 可查看实际行号，统一管理窗口可由 `dpu.msix_linear.reg_target` 覆盖。
+单 PF0 开 32 对时设置 `+vio.pairs=32 +dpu.caps.af_extra_queue_count=0`。
+当前核心 caps 的 AF 额外队列默认仍为11，会计入每 Function 的32对上限；本次迁移没有改默认能力。
+一个 PF 的32对是32项 Notify，TX/RX 共用每对的一项；不是每个 BAR 仅一项。
+Notify 按 `{Host, BAR匹配基址, pair编号}` 排行，global qid 写入内容。
+首次配置前 DUT 未使用项须已复位为无效；环境不写满512行无效 Notify。
 
-Notify 依照上传驱动 `af_mng.c:1632–1734` 排序：
+固定联调可使用 [project_single_queue_config_seq](project_single_queue_config_seq.sv)，
+它继承 `vio_dpu_cfg_seq`，固定 Host0/PF0、Packed/256/Polling/TX-only 及驱动参考地址；
+BAR 和 ring 地址仍取实际分配值。参数化测试使用 `vio_dpu_cfg_seq`。
 
-```text
-Function 查找 key = (host_id << 61) | (notify_base_address & 0x1fffffffffffff80)
-先按 key 升序，再按 Function 内 pair 编号升序
-Notify 表行号 = 排序后的位置 0..N-1
-表项 global_qid = DPU 实际分配的 global qpair，不因排序而改变
-配置写地址 = 管理 BAR.base + 0x0a0000 + 表行号 * 16
-```
+## 修改表地址和单项写法
 
-`cfg.notify_records` 可查看排序后的行、owner、BAR 匹配基址和 global qid。RX/TX 共用一条 pair 项。
-Notify 只写实际有效项：同 PF 开32对队列就写32项，TX/RX共用每对的一项；开启读回也只验证这些有效项。
-首次配置前，DUT 必须已按 `05.png` 复位：未用项 type=3、lookup key/global_qid 全1、reserved=0。
-表容量仍为512行单 bank；环境不访问未用槽位，也不发送 bank-select/ready。
-独立调用 `configure_vio_notify(selection,...)` 只写选中有效项，使用已发布行号，不重排其他 scope。
-Notify 全局单 bank 必须使用统一管理窗口；参考布局的短目标默认选 Host0。
-可显式设置 `vio.notify_table.reg_target=h0.pf0.bar0`，其他表仍可按各自 Host 访问。
+地址/位域对照见 [driver_address_example.md](driver_address_example.md)。
+`cfg.dpu_cfg.use_driver_reference_layouts()` 默认补齐未提供的 BDF/MSI-X/VIO/QSCH 布局。
+修改地址在 `cfg.load_params()` 后、env 创建前设置 `cfg.dpu_cfg.table_layouts[kind]`。
+`dpu.driver_layouts=0` 表示完全由平台提供；`reg_target` 只选择 BAR，不能代替布局。
 
-## 按实际启用功能补充的输入
+普通表按高 DWORD→低 DWORD 写，DWORD 内保持 little-endian。
+VTX/VRX 先四次32-bit数据写，再清触发、置触发；不会每个 DWORD 触发一次。
+公共 `dpu_cfg_seq` 保留独立 `configure_*`、virtual `write_*` 和 MMIO helper，
+只在访问行为确有差异时覆盖 `write_bdf/write_vtx/...`；无须增加一层同名转发 task。
+平台自定义 BAR 分组/控制项也保留，默认 `configure_public=0` 不依赖这些布局。
 
-| 输入 | 当前使用条件 |
-| --- | --- |
-| `function_policies[Function名]` | 默认各 Host PF0/no-VF 已有软件路由；其他 PF/VF 显式给 requester、Intel PF/VF、vport。公共表索引仍按实际硬件提供 |
-| `validate_pfvf_relationship()`、BAR 分组 | PFVF/MSI-X linear 校验 Function 关系，PF0/no-VF 已有默认规则；其他家族由平台提供。BAR 分组只在执行 BAR 配置时需要 |
-| `table_layouts[kind]` | BDF/MSI-X/VIO/QSCH 已有驱动参考值；其他公共表及项目特有控制项自行声明 |
-| `msix_policies` / `message_templates` | MSI-X 模式需要真实消息地址/data，参考 interval/self-mask/使能策略已有默认值，可显式覆盖 |
-| `vio_policies[service名]` | 上述参数生成 VTX/QSCH/Notify 策略；启用 VRX 时还需实际 descriptor 预取 RAM 布局 |
-| `user_configure_bar_mapping_entry` / `user_verify_dpu_configuration` | 启用公共配置时实现 BAR 编码；公共验证仅在同时开启读回时调用 |
-| `user_verify_vio_configuration` | 开启读回时读取 Notify/QSCH/队列参数表并比较，项目特殊寄存器语义可覆写 |
+## AIP 命令注册和寄存器访问
 
-公共 topology/routes/layout/messages 在 connect 时从 cfg 输入生成。
-`dpu.print_bar_map=1` 打印实际 Host/Function/BDF/BAR base/size/end/RC slot；
-用户不需要把打印的物理地址抄回代码。ring IOVA 在 `prepare_vio_configuration()` 后生成，
-`item.binding`、`item.entry` 包含对应 qid、ring、Packed/Custom mode、depth、vector 等数据。
-
-以下是**显式选择上传驱动地址的 VTX 布局示例**，不能据此认定最终 RTL 地址一致。
-`0x880000` 是 BAR 内模块偏移，`0x10000` 是图片的参数表相对偏移，
-data/control 是模块内共享端口偏移。表宽16B，每次4B；notify 仅单 bank。
+在已有命令注册 package 中替换类型即可，RC 表达式沿用项目已有句柄：
 
 ```systemverilog
-// cfg load 后、env 创建前填写；真实项目逐字段替换为其平台声明。
-project_table_layout_t	vtx_layout;
-vtx_layout = '{
-	provided:1, reg_target:"h0.pf0.bar0",
-	access_host_provided:1, access_host:0, access_uses_owner_host:0,
-	module_offset:64'h0088_0000, table_offset:64'h10000,
-	capacity:2048, entry_bytes:16, index_policy:PROJECT_INDEX_GLOBAL_QPAIR,
-	indirect:1, data_port:64'h134, control_port:64'h130,
-	index_mask:32'h000007ff, control_fixed:0, trigger_mask:32'h00002000,
-	index_shift:0, required:1
-};
-cfg.table_layouts[PROJECT_VTX] = vtx_layout;
+`aip_cmd_user_seq(dut_config, vio_dpu_cfg_seq, virtual_sqr::pcie_rc_sqr)
+`aip_cmd_reg(reg_acc, dpu_bar_reg_seq, virtual_sqr::pcie_rc_sqr, seq.error_msg, seq.check_read_data)
 ```
 
-下面展示基类已有的 VTX 单项写法；只有需要改变平台访问时序时才在自己的 seq 中覆写。
-它使用 cfg 中的实际布局，不负责外围循环。
-
-```systemverilog
-// 类内声明：传入绑定来自冻结 setup；失败原样返回给配置流程。
-extern virtual task user_configure_vtx_queue(
-	input project_vtx_cfg_t	item, output bit	ok, output string	why);
-
-// 类外定义：检查身份/IOVA/深度/mode/vector 后按声明端口序列化发送。
-// posted 成功只表明发送完成；调试时可开启后续读回。
-task my_dut_config_seq::user_configure_vtx_queue(
-	input project_vtx_cfg_t	item, output bit	ok, output string	why);
-	write_vtx(item, ok, why);
-endtask
-```
-
-同一个 VF32 TX+RX 只实现一次 VTX/VRX hook，配置 seq 各调用32次；TX-only 不调用 VRX。
-队列 owner、local pair/qid 和 global qpair 来自 `item.binding`，不能自行移位换算。
-Notify 表行排序与 DWORD 写序分别处理。所有 checked 表项都按高 DWORD→低 DWORD写，
-每次32 bit；VTX/VRX 顺序执行四笔 data→control-clear→control-trigger，共六笔。
-驱动队列代码实际使用低到高的 `wr32_for_each`；这里明确按用户要求采用高位先写。
-PBA/stat 没有初始化写；drop 清除使用独立显式 W1C mask API。
-
-## 如何复用 PCIe 发起真实配置
-
-发送链：`project_dut_config_seq.user_configure_vtx_queue(item)` → `write_vtx()` →
-`checked_write()` → `pcie_tl_reg_seq` → `cfg.rc_sequencers[target.rc_slot]` → Intel bind → DUT。
-BAR 物理地址从 `cfg.bar_registry` 解析；用户只设置 BAR 内寄存器偏移。
-
-平台特有寄存器也放在配置 seq 的 task 中，例如：
-
-```systemverilog
-// 放在你的配置 seq task 内；替换为真实寄存器偏移和位域值。
-logic [127:0]	readback;
-bit					ok;
-string				why;
-
-pcie_bar_write_by_name("h0.pf0.bar0", 'h40, 4, 128'h1234, 0, ok, why);
-if (!ok) return;
-pcie_bar_read_by_name("h0.pf0.bar0", 'h40, 4, 0, readback, ok, why);
-if (!ok) return;
-```
-
-`pcie_table_write_by_name(name, offset, length, data, ok, why)` 支持4/8/12/16B，
-从最高 DWORD 向最低 DWORD，每次4B；失败立即停止，不自动 trigger/readback。
-`pcie_bar_write*` 保留整宽及 byte skip-mask 语义。`dpu.verify_readback=1` 时默认验证执行实际读回；
-覆写验证 hook 时按真实寄存器语义检查。posted 发送完成只表示请求已发出。
-
-## Tcl reg_acc 使用 PF0 BAR0 偏移
-
-[project_pcie_reg_seq](project_pcie_reg_seq.sv) 继承 `pcie_tl_reg_seq`，沿用 `is_write/addr/len/mask/wdata/rdata`
-接口；这里 `addr` 是 **Host0/PF0 BAR0 内偏移**。实际地址由环境已分配的 BAR0.base 加偏移得到，
-随后使用对应 Host 的原生 PCIe RC 发 Memory 请求，不启动 DUT 配置 seq。
-
-把已有 `reg_acc` 注册中的类型换成新类，第四参数返回错误，第五参数映射逐次读比较开关。以下沿用工程已有的真实 RC 句柄：
-
-```systemverilog
-`aip_cmd_reg(reg_acc, project_pcie_reg_seq, virtual_sqr::pcie_rc_sqr, seq.error_msg, seq.check_read_data)
-```
-
-环境已经向 PCIe sequencer 发布 `env_cfg`，因此 Tcl 只需传偏移和值：
+需要 import `dpu_pcie_pkg::*`、`virtio_dpu_pkg::*`。`reg_acc.addr` 是 Host0/PF0 BAR0
+内偏移，seq 自动查询实际 base 和 Host0 RC，不把传入 addr 原地加成绝对地址：
 
 ```tcl
 reg_acc write 0x1010 4 0x5555aaaa
-reg_acc read 0x1010 check_read_data=0  ;# AF状态寄存器返回8，不与magic写值比较
-reg_acc op=write addr=0x3000 len=16 data=0x112233445566778899aabbccddeeff00
-reg_acc op=read addr=0x3000 len=16
+reg_acc read 0x1010 check_read_data=0
 ```
 
-其中 `0x1010` 写对应 `h0.pf0.bar0.base+0x1010`；日志 `PROJECT_REG_ACC` 会打印实际
-`base + offset = address`。`0x3000` 仅展示宽访问格式，使用时替换为 DUT 实际寄存器偏移。
-`len` 支持4/8/12/16字节，默认4；`mask` 默认0，bit i为1表示跳过第i字节，稀疏mask沿用原生拆分逻辑。
-范围或读写失败通过 `status/error_msg` 返回，第四参数使 Tcl 的 `aip_check_status` 非零。
-posted写成功表示发送完成；是否读回由用户后续命令决定。
-Tcl `reg_acc read` 返回原始读值，不自动判断是否等于8；自动配置seq的AF同步读才执行这个状态校验。
-`check_read_data` 每条命令默认1，仅接受0/1；设置0只关闭本次读取的SCB历史RAM写值比较，
-不关闭tag/长度/Completion状态/超时检查。下一条省略此参数自动恢复1。
-旧三/四参数注册仍可编译；未映射第五参数时显式传此选项会在启动前报错。
-所有寄存器请求固定TC0、attr=0（关闭RO/IDO），保证posted写与后续状态读遵循顺序。
+`check_read_data=0` 仅关闭 SCB RAM 历史值比较，适用于寄存器状态读；`reg_acc read` 返回原始值，不自动判断是否等于8。普通内存默认保留比较；完整 `len/mask/wdata/rdata` 沿用原生 `pcie_tl_reg_seq`。
 
-也可在 SV 中显式传入已有 cfg；不赋值时自动从启动 sequencer 的 `env_cfg` 获取：
+在派生配置 seq 内访问其他 Function/BAR，使用：
 
 ```systemverilog
-project_pcie_reg_seq	access;
-
-access = project_pcie_reg_seq::type_id::create("access");
-access.cfg      = cfg;
-access.is_write = 1;
-access.addr     = 'h1010;
-access.len      = 4;
-access.wdata    = 'h5555aaaa;
-access.start(cfg.rc_sequencers[cfg.tl_slot_by_host[0]]);
-```
-
-`access.addr` 执行后仍是偏移，重复启动同一对象不会再次累加 BAR 基址；`issued_tlps` 保存本次实际请求。
-新文件在参考 `project_env_pkg.sv` 中位于 `project_env_cfg.sv` 后，复制到自己的 package 时保持该顺序。
-
-## BAR 目标与32对队列
-
-默认访问目标 `pf0.bar0` 指管理窗口；配置 VF3 的 VTX 表项仍以 PF0 sideband 发出。
-显式访问 VF3 BAR 则用它的真实租约与 VF3 sideband。BAR ID 是真实偶数硬件 BAR
-编号，不是 role 或数组下标；64位 BAR 的奇数高 DWORD不能单独访问。
-
-```systemverilog
-// 路径只选访问窗口；以下offset/data也是示例，不代表任何已验证RTL寄存器。
-pcie_bar_write_by_name("h0.pf0.bar0", 'h40, 4, 128'h1234, 0, ok, why);
 pcie_bar_write_by_name("h0.pf0.vf3.bar2", 'h40, 4, 128'h1234, 0, ok, why);
 ```
 
-`pcie_bar_read_by_name` 返回128位数据和 `ok/why`；支持4/8/12/16B，mask 的1表示
-跳过该字节，稀疏 mask 会拆成连续 Memory TLP 区间。posted 写不会自动读回；
-读 Completion 错误向上传递。多 Host 短目标需显式 `access_host_provided` 或
-`access_uses_owner_host`；手动 by-name 多 Host 访问必须写 `hH`，不静默回退。
+环境按该 Function 的真实 BAR 和 Intel sideband 路由。多 Host 手动访问必须写完整 `hH`。
+`dpu.print_bar_map=1` 分组打印真实地址；无需把打印值重新抄回用例。
 
-单 VF32 的业务参数（布局/身份/MSI-X/notify 仍由平台提供）：
+## 快照恢复后重新加载配置
 
-```text
-+dpu.hosts=1 +dpu.pfs_per_host=1 +dpu.vfs_per_pf=1
-+vio.enabled=0 +vio.h0.pf0.vf0.i0.enabled=1
-+vio.h0.pf0.vf0.i0.pairs=32 +vio.queue_size=512 +vio.queue_type=VQ_PACKED
-+vio.completion_mode=VIRTIO_COMPLETION_POLLING
+参考 env 用一个顶层 task 注册一次命令：
+
+```systemverilog
+`aip_cmd_task(load_params, project_load_params)
 ```
 
-两个 VF 各16对则设 `dpu.vfs_per_pf=2`，分别使能两个精确 service 并各设 `pairs=16`。
-AF PF0 的额外11对计入每 Function 上限，不能把32普通对直接放在默认 AF。
-`vio.enabled` 只控制服务与队列需求，不删除公共 Function/BAR。完整参数和 legacy
-边界见 [参数表](../../docs/aip_parameters.md#项目外部配置参数)。
+宏使用 AIP 自身适配；没有额外的用户命令类，也不让多个 cfg 各注册同名命令。
+合入自己的 env 时保留该 task、指向实际 env 的句柄及 EOE 绑定；只编译一个注册入口。
+各子 cfg 使用 AIP 的 `aip_int/aip_enum/aip_string` 等能力读自己拥有的参数。
+`dpu.*`、`vio.*`、`pcie_cfg.*` 外部路径不变。
 
 ```tcl
-set_param path=vio.target value=h0.pf0.vf0.i0
-vio_start
-set_param path=vio.tx.len value=512
-vio_tx count=10
-# RX需要项目网络侧真实送包，vio_wait_rx只等待。
-set_param path=vio.rx.expected value=10
-set_param path=vio.rx.timeout_ns value=50000
-vio_wait_rx
-vio_stop
-end_test
+aip_restore base
+source $::env(AIP_CORE)/dist/aip_init_so.tcl
+load_params
+dut_config
+# 配置成功后按项目注册并执行 vio_start/vio_tx 等业务。
 ```
 
-MSI-X 模式必须收到注册地址与完整 data 的真实消息后才处理完成，不能用 polling
-兜底。共享 vector 的每条队列分别领取 pending；self-mask 的硬件重新使能由用户
-平台流程负责。
+恢复不会自动修改已保存的 cfg；`load_params` 在现有对象上加载新 CLI 或 `set_param` 值，
+不分配 ring、不写 DUT。只允许首次 prepare 前，或平台已停机并 release 当前代之后使用。
+Host/PF/VF、BAR/BDF、pairs、queue_type、features 保持快照值；支持重载 queue_size、
+TX/RX 方向、完成模式、Notify、MSI-X、QSCH/队列表策略和等待参数。当前不重载 PCIe 拓扑/传输配置。
+失败返回非零 status 和简洁原因，原 cfg 保持不变；活动 ring 不隐含暂停或释放。
+多 Host 准备中途失败时，配置 seq 保留已成功 Host 的 `selection`；平台确认 DUT
+静止后可调用 `release_vio_resources(selection, 1, ok, why)`，再重载或重试。
+
+保存未配置快照时，自己的 base_test 在平台就绪后进入 Tcl，由 Tcl 启动 `dut_config`；
+参考 base_test 默认先自动配置再进入业务 Tcl，两种流程任选其一，不能重复配置同一代。
+修改源码或 package 后要重新编译并保存快照，旧二进制快照不能换成新类布局。
 
 ## 实际组件与接收路径
 
 ```text
 my_env extends uvm_env
   dpu_env : dpu_device_env
-    vio_hH : virtio_net_env       每Host一个，构建时读取父DPU已冻结快照
+    vio_hH : virtio_net_env
   pcie_env : pcie_tl_env
-    rc_agents[slot]               project_pcie_rc_driver factory override
-    rc_adapter_slot              Intel HARD_IP，无主动EP
+    rc_agents[slot] : 使用 vio_pcie_rc_driver
+    rc_adapter_slot : Intel HARD_IP
 ```
 
-同一个 Host manager 交给 VIO 和 RC。项目 RC 根据冻结 wire Requester 映射选择
-Host/Function IOMMU，完整权限预检后临时用原 IOVA proxy 调用父 RC responder；
-保留原 wire Requester/Tag/Completion lower-address 和 Intel PF/VF sideband。
-公共 MSI-X catalog 可在无 VIO 时独立 sink。RC RX monitor 提供 DMA/MSI-X 观察，
-RC driver `tx_ap` 提供实际发出的 doorbell 观察。**不要再挂第二个 Host responder**。
-完整 factory override、bridge、route API 均已在模型的真实 Intel 引脚路径验证；
-用户 RTL 基址、端口语义与线侧收发仍需平台验收。
-
-`tl_slot_by_host[h]` 默认 `h→h`，load 后/build 前可交换，例如
-`cfg.tl_slot_by_host[0]=1; cfg.tl_slot_by_host[1]=0;`。VIF/cfg 始终按物理 slot 填写，
-映射必须完整且一一对应。不同 Host 可有相同 BDF/数值 BAR 地址，访问域仍独立。
+`vio_pcie_rc_driver` 继承原生 RC，依据相同 BAR/Function 视图处理 IOVA、DMA 和 MSI-X；
+不是第二个 PCIe responder。RC monitor 观察入站，driver.tx_ap 观察实际发出的 DB。
+`tl_slot_by_host[h]` 默认 h→h，load 后/build 前可交换；VIF 始终按物理 slot 填写。
+配置日志按 Host/PF/VF/BAR 分组；布局缺失逐行显示表、Function、目标和缺失项。
+RX 空轮询不逐次打印，结束时用每 Function 一行 `RX_STATS` 汇总。
 
 ## Intel 配置放在哪里
 

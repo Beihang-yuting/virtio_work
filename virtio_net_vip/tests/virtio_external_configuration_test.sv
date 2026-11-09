@@ -220,7 +220,7 @@ function void virtio_external_lifecycle_test::build_phase(uvm_phase phase);
     dpu_function_cfg	pf;
     dpu_function_cfg	vf;
     dpu_function_key_t	owners[$];
-    dpu_device_env_config	device_cfg;
+    dpu_env_cfg	device_cfg;
     vio_service_requirement_t	requirement;
     string	why;
 
@@ -265,7 +265,7 @@ function void virtio_external_lifecycle_test::build_phase(uvm_phase phase);
             private_cfg.queues[q].i_l4_cs = 1;
         end
     end
-    uvm_config_db#(dpu_device_env_config)::set(this, "device_env", "cfg", device_cfg);
+    uvm_config_db#(dpu_env_cfg)::set(this, "device_env", "cfg", device_cfg);
     device_env = dpu_device_env::type_id::create("device_env", this);
     uvm_config_db#(virtio_net_env_config)::set(this, "device_env.env", "cfg", cfg);
     uvm_config_db#(uvm_active_passive_enum)::set(this, "device_env.env.*.driver_agent", "is_active", UVM_PASSIVE);

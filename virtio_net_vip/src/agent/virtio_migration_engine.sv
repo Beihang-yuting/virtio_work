@@ -190,6 +190,18 @@ class virtio_migration_engine extends uvm_object;
             foreach (queue_snapshot.packed_free_ids[i])
                 checksum = migration_checksum_word(checksum,
                     {32'h0, queue_snapshot.packed_free_ids[i]});
+            // Packed 链元数据与 ring 一起受校验保护，防止恢复后错误回收槽数。
+            checksum = migration_checksum_word(checksum,
+                {32'h0, queue_snapshot.packed_chains.size()});
+            foreach (queue_snapshot.packed_chains[i]) begin
+                virtqueue_packed_chain_t	chain;
+
+                chain = queue_snapshot.packed_chains[i];
+                checksum = migration_checksum_word(checksum, {32'h0, chain.buffer_id});
+                checksum = migration_checksum_word(checksum, {32'h0, chain.desc_ids.size()});
+                foreach (chain.desc_ids[j])
+                    checksum = migration_checksum_word(checksum, {32'h0, chain.desc_ids[j]});
+            end
         end
 
         checksum = migration_checksum_word(checksum, {32'h0, snap.dirty_pages.size()});

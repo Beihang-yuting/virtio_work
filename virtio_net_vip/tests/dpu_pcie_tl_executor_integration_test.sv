@@ -7,15 +7,14 @@ import dpu_resource_pkg::*;
 import pcie_tl_pkg::*;
 import virtio_net_pkg::*;
 
-// Minimal real-DUT configuration path: dpu-common resolves the device,
-// lowers BAR programming plus AF declaration into a frozen plan, and the
-// concrete executor emits PCIe-TL config/MMIO transactions into a TLM RC/EP
-// link.  No service-specific environment is needed for this boundary test.
+// tests：保留通用寄存器执行器的 PCIe TLM 边界验证，不使用当前 VIO DUT 表布局。
+// DPU env 只解析资源；本测试拥有 plan/backend，并显式借用冻结快照解析 BAR 相对地址。
+// 用真实 RC/EP 检查配置空间、MMIO 和多 domain 路由，不创建 VIO service 或 ring。
 class dpu_pcie_tl_executor_integration_test extends uvm_test;
     `uvm_component_utils(dpu_pcie_tl_executor_integration_test)
 
     virtio_test_device_builder device_builder;
-    dpu_device_env_config      device_cfg;
+    dpu_env_cfg	device_cfg;
     dpu_device_env             device_env;
     dpu_function_cfg           pf_seg0;
     dpu_function_cfg           pf_seg1;
@@ -79,8 +78,7 @@ class dpu_pcie_tl_executor_integration_test extends uvm_test;
         executor.set_backend(backend);
 
         device_cfg = device_builder.make_env_config();
-        device_cfg.executor = executor;
-        uvm_config_db#(dpu_device_env_config)::set(
+        uvm_config_db#(dpu_env_cfg)::set(
             this, "device_env", "cfg", device_cfg);
         device_env = dpu_device_env::type_id::create("device_env", this);
 
@@ -102,6 +100,8 @@ class dpu_pcie_tl_executor_integration_test extends uvm_test;
     virtual function void connect_phase(uvm_phase phase);
         super.connect_phase(phase);
         backend.bind_virtual_sequencer(pcie_env.v_seqr);
+        // 资源 env 不再隐含驱动 executor；通用计划的调用方显式传递同一冻结快照。
+        executor.bind_topology(device_env.get_snapshot());
     endfunction
 
     virtual task run_phase(uvm_phase phase);

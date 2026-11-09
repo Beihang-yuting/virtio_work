@@ -80,7 +80,7 @@ class virtio_aip_params_test extends uvm_test;
 	function void test_defaults();
 		virtio_net_env_config	cfg;
 		dpu_host_cfg	host_cfg;
-		dpu_vio_register_plan_policy	policy;
+		dpu_env_cfg	policy;
 		cfg = new("default_cfg");
 		cfg.default_queue_size = 1024;
 		cfg.default_driver_features = 64'hfedc_ba98_7654_3210;
@@ -98,10 +98,7 @@ class virtio_aip_params_test extends uvm_test;
 		check_param(host_cfg.pcie_domains.size() == 1 && host_cfg.pcie_domains[0].reserved_bdfs.size() == 1,
 		      "无参数不得创建拓扑或清空保留列表");
 		check_param(host_cfg.pcie_domains[0].reserved_bdfs[0] == 16'h101, "保留 BDF 的原值必须保留");
-		policy = new("default_policy");
-		policy.notify_verify_interval = 19ns;
-		policy.load_params("params.absent_policy");
-		check_param(policy.notify_verify_interval == 19ns, "未设置 interval_ns 时不能对 time 做单位往返");
+
 	endfunction
 
 	// 根参数只采样一次，然后复制成 Host 模板；真实 service 查询应用精确路径并缓存结果。
@@ -260,7 +257,7 @@ class virtio_aip_params_test extends uvm_test;
 		dpu_resource_placement_cfg	placement_cfg;
 		dpu_resource_pool_config_t	profile;
 		dpu_vio_placement_request	request_cfg;
-		dpu_vio_register_plan_policy	policy;
+		dpu_env_cfg	policy;
 		dpu_qsch_topology_generator	qsch;
 		dpu_device_cfg	device_cfg;
 		string	why;
@@ -300,22 +297,13 @@ class virtio_aip_params_test extends uvm_test;
 		      request_cfg.candidate_filter.parent_pf_keys[0].pf_id == 2 && request_cfg.fixed_devices.size() == 1 &&
 		      request_cfg.fixed_devices[0].host_id == 1 && request_cfg.fixed_devices[0].kind == DPU_FUNCTION_PF,
 		      "候选与固定设备必须经过真实列表/schema API");
-		policy = new("notify_policy");
-		put("params.policy.notify.bank", "1");
-		put("params.policy.notify.auto_bank", "0");
-		put("params.policy.notify.type", "3");
-		put("params.policy.notify.offset", "0x100");
-		put("params.policy.notify.retries", "7");
-		put("params.policy.notify.interval_ns", "125");
-		put("params.policy.msix.rate", "65535");
-		put("params.policy.msix.packets", "32768");
-		policy.load_params("params.policy");
-		ok = policy.validate(why);
-		check_param(ok, {"notify policy 校验失败：", why});
-		check_param(policy.notify_bank == 1 && !policy.select_inactive_notify_bank && policy.notify_type == 3 &&
-		      policy.notify_verify_attempts == 7 && policy.notify_verify_interval == 125ns &&
-		      policy.msix_interval_rate == 65535 && policy.msix_interval_packets == 32768,
-		      "notify ns 换算、短名及 MSI-X 位宽边界必须正确");
+		policy = new("dut_policy");
+		put("dpu.msix.interval_rate", "65535");
+		put("dpu.msix.interval_packets", "32768");
+		policy.load_params();
+		check_param(policy.msix_policies[dpu_function_key_name('{0, 0, DPU_FUNCTION_PF, 0})].interval_entry == 32'h8000ffff,
+		      "公共 MSI-X interval 必须使用图片定义的两个16位域");
+		aip_cmdline_override::clear_all();
 		qsch = new("qsch_generator");
 		put("params.qsch.mode", "DPU_QSCH_TOPOLOGY_RANDOM_STRESS");
 		put("params.qsch.max_groups", "3");
@@ -344,7 +332,7 @@ class virtio_aip_params_test extends uvm_test;
 		virtio_net_env_config	vio_cfg;
 		dpu_priv_driver_config	private_cfg;
 		dpu_host_cfg	host_cfg;
-		dpu_vio_register_plan_policy	policy;
+		dpu_env_cfg	policy;
 		vio_cfg = new("negative_vio");
 		private_cfg = new("negative_private");
 		host_cfg = make_host("negative_host");
@@ -365,12 +353,21 @@ class virtio_aip_params_test extends uvm_test;
 			"mmio_overflow": begin put("params.bad.mmio_base", "0xfffffffffffff000"); put("params.bad.mmio_size", "0x2000"); host_cfg.load_params("params.bad"); end
 			"bdf_width": begin put("params.bad.bdf_first", "0x10000"); host_cfg.load_params("params.bad"); end
 			"unsigned_list": begin put("params.bad.reserved_bdfs", "-1"); host_cfg.load_params("params.bad"); end
-			"notify_width": begin put("params.bad.notify.type", "4"); policy.load_params("params.bad"); end
-			"msix_width": begin put("params.bad.msix.rate", "65536"); policy.load_params("params.bad"); end
+			"notify_width": begin put("vio.vtx.dma_info", "16"); policy.load_params(); end
+			"msix_width": begin put("dpu.msix.interval_rate", "65536"); policy.load_params(); end
 			default: `uvm_fatal("PARAM_NEGATIVE_UNKNOWN", {"unknown mode: ", mode})
 		endcase
 		`uvm_fatal("PARAM_NEGATIVE_MISSED", {"illegal parameter was accepted: ", mode})
 	endfunction
+
+
+	// 全局和 Host 随机参数只采样一次；service 缓存及重载候选必须复用该结果。
+	// 同时保留精确 service 覆盖、未提供字段的旧值和 Host 独立等待策略。
+	extern function void test_external_sampling();
+
+	// Custom 默认随机控制在每个 service 内共享，重载也先合并默认值再应用单队列覆盖。
+	// 缺失的新参数保留当前队列值；不创建 ring 或访问 DUT。
+	extern function void test_private_sampling();
 
 	// 正例顺序执行后恢复参数并报告计数；负例进程在对应入口 fatal，不伪造正常 PASS。
 	virtual task run_phase(uvm_phase	phase);
@@ -379,6 +376,8 @@ class virtio_aip_params_test extends uvm_test;
 		if ($value$plusargs("PARAM_NEGATIVE=%s", negative_mode)) run_negative(negative_mode);
 		test_defaults();
 		test_vio_layers_and_service();
+		test_external_sampling();
+		test_private_sampling();
 		test_private();
 		test_dpu_hosts();
 		test_dpu_policies();
@@ -387,4 +386,120 @@ class virtio_aip_params_test extends uvm_test;
 		phase.drop_objection(this);
 	endtask
 endclass
+
+// 每轮使用真实 AIP 列表/范围，比较不同 service 和候选的消费值，避免仅验证解析器。
+function void virtio_aip_params_test::test_external_sampling();
+	put("params.sample.queue_type", "VQ_PACKED");
+	put("params.sample.queue_size", "256,512,1024");
+	put("params.sample.napi_budget", "[32:4096]");
+	put("params.sample.notify_base", "0,128,256");
+	put("params.sample.completion_mode", "VIRTIO_COMPLETION_POLLING");
+	put("params.sample.wait.poll_ns", "[1:127]");
+	put("params.sample.h0.queue_size", "128,256,512");
+	put("params.sample.h0.wait.reset_ns", "73");
+
+	for (int unsigned	iteration = 0; iteration < 12; iteration++) begin
+		virtio_net_env_config	root_cfg;
+		virtio_net_env_config	root_candidate;
+		virtio_net_env_config	host_cfg;
+		virtio_net_env_config	host_candidate;
+		vio_service_requirement_t	value;
+		dpu_service_key_t	key;
+		string	path;
+		string	why;
+
+		root_cfg = new("sample_root");
+		root_cfg.external_configuration = 1;
+		root_cfg.load_params("params.sample");
+		check_param(root_cfg.make_runtime_candidate(null, "params.sample", root_candidate, why), why);
+
+		for (int unsigned	h = 0; h < 2; h++) begin
+			path = $sformatf("params.sample.h%0d", h);
+			host_cfg = new("sample_host");
+			host_cfg.copy_defaults_from(root_cfg);
+			host_cfg.host_id = h;
+			host_cfg.load_params(path);
+			host_cfg.enable_service_params("params.sample");
+			put({path, ".pf2.i0.rx_refill"}, "29");
+			key.function_key = '{host_id:h, pf_id:0, kind:DPU_FUNCTION_PF, vf_id:0};
+			key.service_kind = DPU_SERVICE_VIO_NET;
+			key.service_instance_id = 0;
+			for (int unsigned	pf = 0; pf < 3; pf++) begin
+				key.function_key.pf_id = pf;
+				check_param(host_cfg.resolve_final_service_requirement(key, value, why), why);
+				check_param(value.behavior.queue_size == host_cfg.default_queue_size &&
+					value.behavior.napi_budget == root_cfg.default_napi_budget &&
+					value.notify_base == root_cfg.notify_base,
+					"service must reuse sampled global and Host values");
+				if (pf == 2) check_param(value.behavior.rx_refill_threshold == 29,
+					"exact service override must win over inherited defaults");
+			end
+			aip_cmdline_override::clear({path, ".pf2.i0.rx_refill"});
+			check_param(host_cfg.make_runtime_candidate(root_candidate, path, host_candidate, why), why);
+			for (int unsigned	pf = 0; pf < 3; pf++) begin
+				key.function_key.pf_id = pf;
+				check_param(host_cfg.validate_runtime_service(host_candidate, key, why), why);
+				check_param(host_candidate.resolve_final_service_requirement(key, value, why), why);
+				check_param(value.behavior.queue_size == host_candidate.default_queue_size &&
+					value.behavior.napi_budget == root_candidate.default_napi_budget &&
+					value.notify_base == root_candidate.notify_base,
+					"runtime Host/service must reuse the global candidate sample");
+				if (pf == 2) check_param(value.behavior.rx_refill_threshold == 29,
+					"missing runtime override must preserve the current service value");
+			end
+			check_param(host_candidate.wait_policy_cfg.default_poll_interval_ns ==
+				root_candidate.wait_policy_cfg.default_poll_interval_ns,
+				"runtime wait parameters must reuse the global sample");
+			if (h == 0)
+				check_param(host_candidate.wait_policy_cfg.reset_timeout_ns == 73,
+					"Host wait override must remain independent");
+		end
+	end
+endfunction
+
+// 用不相交数值范围检查默认继承和 qN 优先级，避免依赖随机巧合判定重复采样。
+function void virtio_aip_params_test::test_private_sampling();
+	virtio_net_env_config	cfg;
+	virtio_net_env_config	candidate;
+	dpu_priv_driver_config	private_cfg;
+	vio_service_requirement_t	requirement;
+	dpu_service_key_t	key;
+	string	why;
+
+	put("params.custom.queue_type", "VQ_CUSTOM");
+	put("params.custom.features", "0");
+	put("params.custom.pairs", "2");
+	put("params.custom.completion_mode", "VIRTIO_COMPLETION_POLLING");
+	put("params.custom.private.dport_id", "[16:31]");
+	put("params.custom.h0.private.dport_id", "[64:127]");
+	put("params.custom.private.q1.dport_id", "7");
+	put("params.custom.private.q3.cpu_tx_cos", "3");
+	cfg = new("custom_sampling");
+	cfg.external_configuration = 1;
+	cfg.load_params("params.custom");
+	cfg.load_params("params.custom.h0");
+	cfg.enable_service_params("params.custom");
+	key.function_key = '{host_id:0, pf_id:0, kind:DPU_FUNCTION_PF, vf_id:0};
+	key.service_kind = DPU_SERVICE_VIO_NET;
+	key.service_instance_id = 0;
+	check_param(cfg.resolve_final_service_requirement(key, requirement, why), why);
+
+	for (int unsigned	iteration = 0; iteration < 4; iteration++) begin
+		private_cfg = cfg.get_dpu_private_config(key);
+		check_param(private_cfg != null, "Custom service must own its generated private config");
+		if (private_cfg == null) return;
+		foreach (private_cfg.queues[q]) begin
+			check_param(private_cfg.queues[q].dport_id ==
+				(q == 1 ? 7 : private_cfg.defaults.dport_id),
+				"Custom queues must share sampled defaults and preserve qN precedence");
+		end
+		check_param(private_cfg.queues[3].cpu_tx_cos == 3,
+			"missing runtime parameter must preserve the current private queue value");
+		if (iteration == 3) break;
+		aip_cmdline_override::clear("params.custom.private.q3.cpu_tx_cos");
+		check_param(cfg.make_runtime_candidate(null, "params.custom.h0", candidate, why), why);
+		check_param(cfg.validate_runtime_service(candidate, key, why), why);
+		cfg.apply_runtime_candidate(candidate);
+	end
+endfunction
 `endif // VIRTIO_AIP_PARAMS_TEST_SV

@@ -409,7 +409,7 @@ make test TEST=virtio_unit_test
 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的单一事实源；`make regression`
 按该顺序运行 `dpu_resource_manager_test`、`dpu_reg_plan_test`、
 `dpu_pcie_reg_executor_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
-`dpu_resource_resolver_test`、`dpu_device_bootstrap_plan_test`、`dpu_vio_reg_plan_test`、`virtio_dut_caps_test`、
+`dpu_resource_resolver_test`、`virtio_dut_caps_test`、
 `virtio_execution_mode_test`、`virtio_real_dut_iova_dma_test`、
 `virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_vdev_unit_test`、
 `virtio_host_mem_reclaim_test`、`virtio_queue_semantics_test`、
@@ -424,7 +424,7 @@ make test TEST=virtio_unit_test
 `virtio_real_driver_rx_test`、
 `host_mem_random_test`、`virtio_pcie_host_mem_test`、
 `dpu_pcie_tl_executor_integration_test`、`dpu_priv_driver_flow_test` 和
-`dpu_priv_ring_contract_test`，共 41 项。
+`dpu_priv_ring_contract_test`，共 39 项。
 `make check-deps` 会验证 `host_mem` 外部 checkout 固定 SHA、VCS 环境以及
 `dpu_common` 的固定版本；同时要求 `net_packet` 处于 `main`/`origin/main`、
 `pcie_work` 处于 `main`/`origin/main`，并且二者都来自指定远程。
@@ -479,6 +479,11 @@ testbench 使用这套层次，可按平台需求改造示例并显式加入专�
 
 ## Global DPU 配置边界
 
+当前 Intel 外部 DUT 工程优先使用 [project 集成参考](integration/project/README.md)。
+下面保留低层资源 authoring 示例；它不自动注册业务命令或下发 DUT 表。
+本轮跨仓库源码尚未形成新的固定 revision，验证使用匹配的本地工作区；
+不能切回下文历史依赖 SHA 后继续使用新 `dpu_env_cfg/dpu_pcie_pkg` 接口。
+
 `dpu_device_cfg` 与 `dpu_resource_placement_cfg` 是唯一可变的 authoring
 输入：前者声明 host、PCIe domain、显式 PF/VF、可选 VF pool、BDF/BAR request、AF
 和 VIO eligibility；后者声明 `virtio.qpair` profile、请求、选择策略、约束和
@@ -494,11 +499,10 @@ resource manager。VIO 只按完整 `dpu_service_key_t` 导入自己的 frozen b
 只会从该已声明的 inventory 选择候选项。
 
 ```systemverilog
-function void configure_devices(input dpu_reg_executor injected_executor);
+function void configure_devices();
 virtio_test_device_builder b;
 dpu_function_cfg pf0, vf0, vf1, vf2, vf3;
-dpu_device_env_config env_cfg;
-dpu_device_env_config global_cfg;
+dpu_env_cfg env_cfg;
 dpu_resource_placement_cfg placement_cfg;
 dpu_resource_snapshot resource_snapshot;
 dpu_resource_pool_config_t qpair_profile;
@@ -530,7 +534,7 @@ void'(b.allow_vio_service(vf1));
 void'(b.allow_vio_service(vf2));
 void'(b.allow_vio_service(vf3));
 
-env_cfg = dpu_device_env_config::type_id::create("env_cfg");
+env_cfg = dpu_env_cfg::type_id::create("env_cfg");
 env_cfg.device_cfg.copy_from(b.device_cfg);
 placement_cfg = env_cfg.placement_cfg;
 qpair_profile.name = "virtio.qpair";
@@ -554,12 +558,19 @@ vf0_behavior.num_queue_pairs = 8;
 if (!vio_cfg.add_service_config(vf0_vio, vf0_behavior, why))
   `uvm_fatal("CFG", why)
 
-global_cfg = env_cfg;
-global_cfg.executor = injected_executor;
-uvm_config_db#(dpu_device_env_config)::set(
-    this, "device_env", "cfg", global_cfg);
+uvm_config_db#(dpu_env_cfg)::set(
+    this, "device_env", "cfg", env_cfg);
 uvm_config_db#(virtio_net_env_config)::set(
     this, "device_env.virtio_env", "cfg", vio_cfg);
+endfunction
+```
+
+通用寄存器计划仍可使用独立 executor。在 connect 阶段显式绑定已解析的快照，
+随后由调用方的 orchestrator 执行；资源 env 本身不发送配置：
+
+```systemverilog
+function void configure_executor(input dpu_reg_executor injected_executor);
+    injected_executor.bind_topology(device_env.get_snapshot());
 endfunction
 ```
 
@@ -570,10 +581,8 @@ receive that same object through `uvm_config_db`.
 `add_real_dut_bars()` 为每个 function 显式添加三个 request：PF0 为
 BAR0/1 `DPU_BAR_DEVICE_MEMORY` 32 MiB、BAR2/3 `DPU_BAR_MAILBOX` 64 KiB、
 BAR4/5 `DPU_BAR_MSIX` 64 KiB；VF0 的三对分别是 16 KiB、16 KiB 和
-32 KiB。BAR2/3 是 mailbox，不是保留 aperture。AF bootstrap 从冻结
-snapshot 的 PF0 BAR0 生成，其 driver-aligned `DPU_AF_DECLARATION_ADDR`
-为 `0x1010`；有 executor 时由独立注入的 `dpu_reg_executor` 执行，没有
-executor 时报告 `NOT_EXECUTED`，不伪报硬件成功。
+32 KiB。BAR2/3 是 mailbox。当前外部配置的 AF 访问由 `dpu_cfg_seq` 执行：
+查询实际 Host0/PF0 BAR0，在偏移 `0x1010` 写 magic 并读回状态8。
 
 Placement policy is declarative and resolves before VIO construction:
 `PF_ONLY`、`VF_ONLY` 和 `PF_AND_VF` 限定候选类型；auto-minimum 选择满足
@@ -618,106 +627,29 @@ service/local 或 global ID 的 bindings 查询，`dpu_resource_manager` 仅以�
 snapshot pair seed 并维持只读 service lease mapping，`virtio_resource_client` 与
 `virtio_vf_resource_pool` 将该 mapping 按 service key 导入且不可改绑。FLR 只复位
 runtime state；已发布的 service、local/global qpair identity 和 snapshot pair
-保持稳定。`dpu_vio_register_plan_builder` 现在可以把 frozen snapshot pair
-降低为一份 VIO service 的 real-DUT register plan：它先合并 BAR/AF bootstrap，再写 BDF map、
-MSI-X linear/info/interval 和选定 inactive notify bank，最后通过 commit 写提交 bank。
-所有内部表写均以选中 AF 的 BAR0 为 target，notify 的匹配字段为
-`{host_id, notify_addr[60:7], local_qid}`；其中 `local_qid` 使用驱动
-`txrx_queues[]` 的连续 pair index，placement 的 sparse `local_pair_id` 仅用于
-资源命名和约束。global qpair/vector 使用显式或稳定解析结果，不从稀疏 local ID 反推。
-notify entries 按驱动的 host/address key 排序；
-`select_inactive_notify_bank` 默认开启，自动选择当前活动 bank 的另一份 shadow bank。
-冷启动默认把 bank0 视为 active，因此首次 setup 写 bank1；若环境 attach 到已经运行的
-DUT，用户必须在 build 前通过 `dpu_device_env_config.vio_policy.active_notify_bank`
-提供硬件当前实际的 active bank。环境只在 plan 成功执行并完成 commit 后更新 tracked
-active bank；仅 build、`NOT_EXECUTED`、preflight failure 或执行失败均不会推进该状态。
-`emit_full_notify_bank` 默认开启，按真实驱动写满 128 项 shadow，未使用项填入
-driver-compatible invalid image。每个 16-byte entry 按 low/high 两次写入后，以
-5 次、5 us 间隔做 readback polling；全部 entry 校验成功后才允许 commit。仅做
-无残留状态的聚焦测试时可以显式关闭完整镜像或 readback。PBA 是 DUT 维护的 pending
-状态，不在配置 plan 中伪写。
+保持稳定。
 
-```systemverilog
-dpu_reg_plan vio_plan;
-dpu_execution_report report;
-string why;
-if (!device_env.build_vio_register_plan(vio_plan, why))
-  `uvm_fatal("DPU_CFG", why)
-device_env.apply_vio_register_plan(vio_plan, report);
-```
+当前真实 DUT 配置使用 `dpu_env_cfg` + `dpu_cfg_seq`，VIO 通过 `vio_dpu_cfg_seq`
+导出实际 ring 并连接其生命周期。完整接入和参数见
+[单 env/env_cfg 参考](integration/project/README.md)。
+旧 bootstrap/VIO 双 bank builder、policy 和 dataplane extension 已移除，
+不能继续调用旧 `build_vio_register_plan` / `apply_vio_register_plan` 入口。
+通用寄存器 plan/executor/orchestrator 和独立 `dpu_qsch_topology_generator` 保留。
 
-配置成功进入 `ACTIVE` 后，可从同一对 frozen snapshots 生成并执行独立 teardown：
+表格式采用当前图片定义。Notify 为512行单 bank，仅写实际 qpair 的有效项；
+按 Host、BAR 匹配基址和连续 pair 编号排序，global qid 只写入内容。
+每批 VIO/RDMA Notify 成功后，每个管理 BAR 写 `+0x80044=1`。
+VTX/VRX 使用实际 descriptor IOVA，先高到低四次 DWORD 数据写，再操作间接触发端口。
+QSCH 策略从 `dpu_cfg` 生成，不再挂旧的 plan extension。
 
-```systemverilog
-dpu_reg_plan teardown_plan;
-if (!device_env.build_vio_teardown_plan(teardown_plan, why))
-  `uvm_fatal("DPU_CFG", why)
-device_env.apply_vio_teardown_plan(teardown_plan, report);
-```
+实际队列释放前由平台确认 DUT 已停机，再调用 `release_vio_resources`；
+不会自动切换 bank、清 PBA 或猜测硬件 teardown 时序。
+AF extra queue 仍保留为 function-owned 资源，不自动成为 VIO service 的 ring/Notify；
+单 AF PF0 需要32对普通 VIO 时显式设置 `dpu.caps.af_extra_queue_count=0`。
 
-teardown 先向 inactive notify bank 提交完整 invalid shadow，再只对 snapshot 中实际
-拥有普通 VIO 或 AF extra queue 的 function，依次失效 MSI-X info、MSI-X linear 和
-BDF map。setup 与 teardown 使用同一个 VIO-owned function 集合；没有 VIO/AF-extra
-queue 的 function 不由 VIO plan 写入或清理 BDF map。公共 BAR bootstrap 仍覆盖完整
-PCIe topology，不随 VIO BDF ownership 收窄。成功后环境回到 `RESOLVED`；未执行或
-preflight 失败保持 `ACTIVE`。
-
-`dpu_vio_register_plan_policy` 可选择 notify bank、notify type、MSI-X interval 和
-self-mask；它只改变寄存器 lowering，不改变 snapshot 拓扑。`apply_vio_register_plan`
-复用 `dpu_device_env_config.executor` 注入的 `dpu_reg_executor`，先做完整 plan
-freeze/preflight，preflight 失败时不会产生任何 PCIe 写入。用户可继承该 executor
-把 `dpu_reg_op` 转换为真实 PCIe config/MMIO TLP；本仓库仍不提供特定平台的 production
-transport。
-
-真实驱动 profile 的 notify shadow 长度是 128 项；`emit_full_notify_bank` 只清理
-到这 128 项，不把硬件编码上限 1024 误当成软件表长度。AF extra queue 以
-`dpu_af_extra_queue_binding_t` 单独保存在 frozen resource snapshot 中。
-resource manager 会把它们导入为 AF function-owned frozen lease，因而占用并保护
-global qpair ID；它们不会成为 guest VIO service lease，也不会暴露给
-`virtio_resource_client`。普通 VIO 与 extra queue 的 register operations 会按同一
-notify match key 合并排序，并为 extra queue 生成 BDF dependency、MSI-X
-linear/info/interval 和 notify low/high 写入。
-
-已提供基于 53 号机真实驱动 `register.h` 的
-`dpu_vio_driver_dataplane_extension`：它把 QSCH init、Q2TC/N2G/G2P/SPWRR 以及
-可选的 QSCH TC0..TC7 WRR weight、VTX/VRX queue-parameter RAM 的 content 和
-0→1 写使能顺序追加到同一个 register plan。QSCH/VTX/VRX 的地址、字段宽度、
-Host/function/MSI-X 派生关系和 AF BAR0
-aperture 都会校验；没有驱动证据的 context、tail、链表和调度树节点不会被伪造。
-用户可直接向 `qsch_queues`、`qsch_functions`、`vtx_queues`、`vrx_queues` 添加
-场景配置，或继承 `dpu_vio_dataplane_plan_extension` 自定义其他平台寄存器，再通过
-`dpu_device_env_config.vio_dataplane_extension` 注入。三个 hook 按上述顺序在核心
-BDF/MSI-X/notify plan 完整生成后调用，接收同一对 frozen snapshots 和仍可追加
-operation/dependency 的 plan；任一 hook 返回失败，整个 plan build 失败且不会执行。
-`qsch_functions.weight_valid` 为 1 时才写入八个 4-bit `tc_weight`；默认不改硬件
-TC weight。
-注意 QSCH G2P 的驱动结构体 `src_port` 实际只有 1 bit；虽然源码使用
-`QSCH_PORT_HOST0 + host_id` 的逻辑值，编译后的 `dpu_snd1.ko` 最终只保留低位，
-plan 也按该硬件可见编码生成。
-QSCH 的随机拓扑与寄存器 lowering 已分层。`dpu_qsch_topology_generator` 先从
-frozen device/resource snapshots 收集实际存在的 Function 和 global qpair，再按仿真
-全局 seed 生成合法的 `port -> group -> net/function -> qpair` 关系；生成结果保存在
-`dpu_qsch_topology_cfg` 中，支持 `DPU_QSCH_TOPOLOGY_RANDOM_VALID` 和
-`DPU_QSCH_TOPOLOGY_RANDOM_STRESS` 两种模式。net ID 不独立随机，而是固定为对应
-Function 的 `global_func_id`，以避免把不存在的硬件 vport 写入 Q2TC；group、port、TC、
-SP/WRR 和 TC weight 才是受字段范围约束的随机部分。每个 qpair 只能属于其 owner
-Function 的 net，group 必须挂到已声明 port，且每个生成的 group 至少被一个 net 使用。
-如果场景需要覆盖多个 net-device 共享调度组，可将
-`generator.require_shared_group = 1`；当存在两个以上 Function 时，生成器会把
-group 数量限制为小于 net 数量，再随机选择剩余 net 的挂接关系，从而保证至少一个
-group 被多个 net 共享，同时保留 group/port/TC 和策略字段的随机性。
-拓扑还显式记录实际被 qpair 使用的 `traffic_classes[0..7]`，便于后续扩展 DSCH/QSCH
-调度树模型。
-
-拓扑生成后可通过 `dpu_vio_driver_dataplane_extension.set_qsch_topology()` 导入，
-builder 会在生成 Q2TC/N2G/G2P/SPWRR operation 前再次校验同一对 frozen snapshots。
-因此用户可以保存或打印拓扑作为期望模型，再把同一份图 lowering 到 DUT。当前真实
-驱动证据中 N2G/G2P 表项仍按 `global_func_id` 寻址，随机 group 作为 N2G 字段、对应
-group 的 port 作为该 net 的 G2P 字段；没有未经核实的独立 group-table 地址被伪造。
-当前 builder 仍不负责 AF mailbox/MAC-age/PTP-stamp 等非 queue control interrupt、
-标准 PCIe MSI-X table address/data 初始化或 PBA 写入。BAR4 MSI-X address/data 由 Host
-PCIe MSI-X 配置流程产生；teardown 只清理本 snapshot 拥有的 DUT internal BDF、
-MSI-X info/linear 和 notify 映射，不触碰 BAR4 table、PBA 或其他业务 function。
+独立 QSCH topology generator 仍提供逻辑 port/group/net/qpair 图及合法随机化；
+当前图片版表策略由 `dpu_env_cfg.vio_policies/platform_controls` 显式声明。
+逻辑图不会自动经已经删除的 driver extension 写入 DUT。
 
 ---
 

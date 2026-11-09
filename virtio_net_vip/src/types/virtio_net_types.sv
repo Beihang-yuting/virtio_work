@@ -310,6 +310,13 @@ typedef struct {
     uvm_object      token;
 } virtqueue_indirect_snapshot_t;
 
+// Packed 链的本地分配记录。线上各槽携带同一个 buffer_id，不能靠设备回写后的
+// NEXT/id 还原空闲链；desc_ids 保存实际分配的 ID，随快照一并恢复。
+typedef struct {
+    int unsigned	buffer_id;
+    int unsigned	desc_ids[$];
+} virtqueue_packed_chain_t;
+
 typedef struct {
     int unsigned queue_id, queue_size;
     bit [63:0] desc_addr, driver_addr, device_addr;
@@ -324,6 +331,7 @@ typedef struct {
     iommu_mapping_t queue_dma_mappings[$];
     int unsigned split_free_head, split_num_free;
     int unsigned packed_free_ids[$];
+    virtqueue_packed_chain_t	packed_chains[$];
 } virtqueue_snapshot_t;
 
 typedef struct {
@@ -388,12 +396,24 @@ typedef struct {
 } virtio_rss_config_t;
 
 typedef struct {
-    int unsigned num_queue_pairs, queue_size;
-    int unsigned max_vio_net_qpairs_per_device;
-    virtqueue_type_e vq_type; bit [63:0] driver_features;
-    rx_buf_mode_e rx_buf_mode; int unsigned rx_buf_size, rx_refill_threshold;
-    interrupt_mode_e irq_mode; int unsigned napi_budget, coal_max_packets, coal_max_usecs;
-    bit bw_limit_enable; int unsigned bw_limit_mbps; driver_mode_e mode;
+    int unsigned		num_queue_pairs;
+    int unsigned		queue_size;
+    int unsigned		max_vio_net_qpairs_per_device;
+    virtqueue_type_e		vq_type;
+    bit [63:0]			driver_features;
+    rx_buf_mode_e		rx_buf_mode;
+    // rx_buf_size 保留原有总容量；rx_packet_size 为标准模式不含 Virtio 头的
+    // 报文容量，0 表示未覆盖。二态默认零兼容只填写原有字段的 SV 配置。
+    int unsigned		rx_buf_size;
+    bit [31:0]			rx_packet_size;
+    int unsigned		rx_refill_threshold;
+    interrupt_mode_e		irq_mode;
+    int unsigned		napi_budget;
+    int unsigned		coal_max_packets;
+    int unsigned		coal_max_usecs;
+    bit				bw_limit_enable;
+    int unsigned		bw_limit_mbps;
+    driver_mode_e		mode;
 } virtio_driver_config_t;
 
 // 外部配置仅保存值；平台表地址与硬件布局不进入通用 VIO 类型。
@@ -442,6 +462,39 @@ typedef struct packed {
     bit	i_l4_cs;
     bit [1:0]	fwd;
 } vio_private_tx_control_t;
+
+// 每包发送请求的值副本；由 sequence 采样后随 transaction 传递，不修改队列配置。
+// valid=0 保留已有调用者的 header/私有队列默认值；GSO 隐含 checksum 请求。
+typedef struct packed {
+    bit		valid;
+    bit		csum;
+    bit		gso;
+    bit [15:0]	mss;
+} virtio_tx_offload_t;
+
+// 每包 SG 策略只影响报文字节的切分，header/TSO 扩展项始终独占完整描述符。
+typedef enum bit [1:0] {
+    VIO_SEG_EQUAL,
+    VIO_SEG_RANDOM
+} virtio_seg_mode_e;
+
+// count_set 区分省略参数与显式填写 0；总数包含 header/TSO 槽。参数随本包固定，
+// 满环等待不重新抽样，也不修改 Function/队列配置。
+typedef struct packed {
+    bit			count_set;
+    int unsigned	desc_count;
+    virtio_seg_mode_e	mode;
+} virtio_tx_seg_t;
+
+// Custom 首描述符的每包控制；extension 是驱动 dpu_ext_tx_desc 的低64位。
+// 普通数据地址不放入此结构；tso=1 时队列额外发布一个扩展描述符。
+typedef struct packed {
+    bit		valid;
+    bit		l3_cs;
+    bit		l4_cs;
+    bit		tso;
+    bit [63:0]	extension;
+} vio_private_tx_offload_t;
 
 // ring 记录来自真实分配/映射；每一项是值副本，不授予 DMA 资源所有权。
 typedef struct {

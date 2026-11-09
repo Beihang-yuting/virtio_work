@@ -18,8 +18,6 @@ $DPU_COMMON_ROOT/tests/dpu_pcie_reg_executor_test.sv
 $DPU_COMMON_ROOT/tests/dpu_device_resolver_test.sv
 $DPU_COMMON_ROOT/tests/dpu_placement_test.sv
 $DPU_COMMON_ROOT/tests/dpu_resource_resolver_test.sv
-$DPU_COMMON_ROOT/tests/dpu_device_bootstrap_plan_test.sv
-$DPU_COMMON_ROOT/tests/dpu_vio_reg_plan_test.sv
 virtio_net_vip/tests/virtio_unit_test.sv
 virtio_net_vip/tests/virtio_vdev_unit_test.sv
 virtio_net_vip/tests/virtio_shared_mem_fixture.sv

@@ -8,7 +8,7 @@
 //
 // Barriers are no-ops in simulation from a timing perspective, but this
 // class provides three important services:
-//   1. Documentation -- each barrier call records intent and ordering
+//   1. Documentation -- each barrier call site records intent and ordering
 //      requirements at the point where the virtio spec mandates them
 //   2. Statistics -- counts allow test checks for correct barrier usage
 //   3. Error injection -- skip flags allow deliberate barrier omission
@@ -93,6 +93,7 @@ class virtio_memory_barrier_model extends uvm_object;
     // Must be issued before reading the used ring to ensure the driver
     // observes the device's writes to used descriptors in order.
     //
+    // 空轮询同样会调用 rmb，正常调用仅累计到 print_stats；故障注入仍保留现场日志。
     // Skippable via skip_rmb_before_used for error injection.
     // ------------------------------------------------------------------
     function void rmb(string context_msg = "");
@@ -106,11 +107,6 @@ class virtio_memory_barrier_model extends uvm_object;
             return;
         end
         rmb_count++;
-        `uvm_info("MEM_BARRIER",
-            $sformatf("rmb issued at %0t%s",
-                      $realtime,
-                      (context_msg != "") ? $sformatf(" [%s]", context_msg) : ""),
-            UVM_DEBUG)
     endfunction
 
     // ------------------------------------------------------------------

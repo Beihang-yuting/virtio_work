@@ -7,6 +7,8 @@ typedef class virtio_driver_protocol;
 // ============================================================================
 // virtio_atomic_ops
 //
+// 所属src/agent：统一生命周期与TX/RX操作；借用transport/队列管理器，持有
+// 每包DMA直到完成或已确认的复位。TX空间等待不分配DMA，也不改变待发报文。
 // Low-level atomic operations library for the virtio-net driver VIP.
 // One method per real Linux virtio-net driver operation.
 //
@@ -67,6 +69,20 @@ class virtio_atomic_ops extends uvm_object;
     } normal_dma_record_t;
     protected normal_dma_record_t tx_dma_map[int unsigned][$];
     protected normal_dma_record_t rx_dma_map[int unsigned][$];
+
+    // RX 统计归 ops 所有，覆盖 FSM 和 dataplane 两种入口；保留整个对象生命周期累计值。
+    // polls 只计通过完成门禁后的非零预算调用，empty 计其中未交付帧的调用，不打印空轮询。
+    protected longint unsigned	rx_polls          = 0;
+    protected longint unsigned	rx_empty_polls    = 0;
+    protected longint unsigned	rx_posted_buffers = 0;
+    protected longint unsigned	rx_packets        = 0;
+    protected longint unsigned	rx_bytes          = 0;
+
+    // 由 agent 在 report_phase 汇总；未使用 RX 时保持安静，不清零计数或访问 DUT。
+    extern function void print_rx_stats();
+
+    // 只登记尚未检查通知的TX发布；批末、等待空位前清除，队列释放时一并清除。
+    protected bit	tx_notify_pending[int unsigned];
     // Migration payloads are recreated after reset rather than being tied to
     // a pre-freeze queue.  They still have normal DMA ownership and must be
     // retired by every later ordinary device reset.
@@ -99,6 +115,15 @@ class virtio_atomic_ops extends uvm_object;
     local longint unsigned	external_generation;
     local bit	external_active;
     local vio_service_requirement_t	external_requirement;
+
+    // 空位不足时通过原完成入口回收，保留轮询/MSI-X策略；超时只针对当前包。
+    // 不可能容纳的请求立即报错；队列被释放或更换时返回失败，不操作旧ring。
+    extern protected task wait_tx_space(virtqueue_base	vq, int unsigned	needed,
+        int unsigned	timeout_ns, output bit	ready);
+
+    // 将本队列尚未通知的TX一起发布；标准模式遵循event suppression，Custom必发尾指针。
+    // 没有新提交时为空操作，调用方不提供或猜测tail/wrap。
+    extern task flush_tx(int unsigned	queue_id);
 
     // 是否由用户配置设备；协议查询避免运行路径重复类型转换。
     function bit uses_external_configuration();
@@ -448,5 +473,366 @@ class virtio_atomic_ops extends uvm_object;
     `include "agent/atomic_ops/virtio_atomic_ops_ctrl_admin.svh"
 
 endclass : virtio_atomic_ops
+
+// 按真实格式求出总槽数与 data 分段。均分的余数放在前几段；随机每一步都为
+// 剩余段保留合法空间，因此不产生零长度、截断或额外重抽。全部校验先于 DMA 分配。
+function bit virtio_atomic_ops::plan_tx_segments(
+    virtqueue_base	vq,
+    int unsigned	packet_length,
+    int unsigned	header_size,
+    bit		tso,
+    bit		indirect,
+    virtio_tx_seg_t	request,
+    output int unsigned	lengths[$],
+    output int unsigned	needed,
+    output string	why
+);
+    bit			private_format;
+    virtqueue_type_e		format;
+    int unsigned		fixed_slots;
+    int unsigned		capacity;
+    int unsigned		max_length;
+    int unsigned		min_data;
+    int unsigned		max_data;
+    int unsigned		data_count;
+    int unsigned		count;
+    int unsigned		remaining;
+    int unsigned		left;
+    int unsigned		low;
+    int unsigned		high;
+    int unsigned		length;
+    longint unsigned	reserve_limit;
+
+    why = "";
+    needed = 0;
+    lengths.delete();
+    format = vq.descriptor_format();
+    private_format = format == VQ_CUSTOM;
+    fixed_slots = private_format ? int'(tso) : int'(header_size != 0);
+    capacity = private_format ? vq.queue_size - 1 : vq.queue_size;
+    max_length = private_format ? 65536 : 32'hffff_ffff;
+    min_data = int'((longint'(packet_length) + max_length - 1) / max_length);
+    max_data = private_format ? 7 : packet_length;
+    if (max_data > packet_length) max_data = packet_length;
+    if (!indirect && max_data + fixed_slots > capacity)
+        max_data = (capacity > fixed_slots) ? capacity - fixed_slots : 0;
+    count = request.count_set ? request.desc_count : min_data + fixed_slots;
+
+    if (!(request.mode inside {VIO_SEG_EQUAL, VIO_SEG_RANDOM})) begin
+        why = $sformatf("queue=%0d invalid seg_mode=%0d", vq.queue_id, request.mode);
+        return 0;
+    end
+    if (indirect && (private_format || request.count_set)) begin
+        why = $sformatf("queue=%0d desc_count requires direct descriptors", vq.queue_id);
+        return 0;
+    end
+    if (packet_length == 0 || max_data < min_data ||
+        count < min_data + fixed_slots || count > max_data + fixed_slots) begin
+        why = $sformatf(
+            "queue=%0d format=%s packet_length=%0d desc_count=%0d allowed=[%0d:%0d]",
+            vq.queue_id, format.name(), packet_length,
+            count, min_data + fixed_slots, max_data + fixed_slots);
+        return 0;
+    end
+
+    data_count = count - fixed_slots;
+    needed = indirect ? 1 : count;
+    remaining = packet_length;
+    for (int unsigned i = 0; i < data_count; i++) begin
+        left = data_count - i;
+        if (request.mode == VIO_SEG_EQUAL) begin
+            length = packet_length / data_count + int'(i < packet_length % data_count);
+        end else begin
+            reserve_limit = longint'(left - 1) * max_length;
+            low = (remaining > reserve_limit) ? int'(remaining - reserve_limit) : 1;
+            high = remaining - (left - 1);
+            if (high > max_length) high = max_length;
+            length = $urandom_range(high, low);
+        end
+        lengths.push_back(length);
+        remaining -= length;
+    end
+    return 1;
+endfunction
+
+// 每包从参数规划到 SG 发布始终使用同一份报文字节；等待只回收已有完成，不重采样。
+task virtio_atomic_ops::tx_submit(
+    int unsigned		queue_id,
+    virtio_net_hdr_t		net_hdr,
+    uvm_object		pkt,
+    bit			use_indirect,
+    ref int unsigned	desc_id,
+    input virtio_tx_offload_t	tx_offload = '0,
+    input int unsigned		timeout_ns = 0,
+    input bit			notify = 1,
+    input virtio_tx_seg_t	tx_seg = '0
+);
+    virtqueue_base		vq;
+    custom_virtqueue		private_vq;
+    byte unsigned		hdr_bytes[$];
+    byte unsigned		pkt_bytes[];
+    byte unsigned		wire_bytes[$];
+    byte			hdr_data[];
+    byte			pkt_data[];
+    int unsigned		hdr_size;
+    int unsigned		hdr_dma_size;
+    int unsigned		pkt_size;
+    int unsigned		pkt_dma_size;
+    int			hdr_idx;
+    int			pkt_idx;
+    virtio_sg_list		sgs[2];
+    virtio_sg_entry		hdr_entry;
+    virtio_sg_entry		pkt_entry;
+    virtio_dma_buffer_set	dma_set;
+    int unsigned		n_out;
+    vio_private_tx_offload_t	private_control;
+    string			why;
+    bit			private_format;
+    int unsigned		needed;
+    bit			space_ready;
+    int unsigned		segment_lengths[$];
+    int unsigned		packet_offset;
+
+    desc_id = '1;
+    if (!external_queue_ready(queue_id)) return;
+    if (use_indirect &&
+        !negotiated_features[VIRTIO_F_RING_INDIRECT_DESC]) begin
+        `uvm_error("ATOMIC_OPS", $sformatf(
+            "tx_submit: queue %0d requested indirect descriptors without negotiating VIRTIO_F_RING_INDIRECT_DESC",
+            queue_id))
+        return;
+    end
+
+    `uvm_info("ATOMIC_OPS",
+        $sformatf("tx_submit: queue_id=%0d", queue_id), UVM_HIGH)
+
+    vq = vq_mgr.get_queue(queue_id);
+    if (vq == null) begin
+        `uvm_error("ATOMIC_OPS",
+            $sformatf("tx_submit: queue %0d not found", queue_id))
+        return;
+    end
+
+    // 每包offload在取得最终字节后转换；无请求的原子调用保留显式net_hdr语义。
+    hdr_size = vq.net_hdr_bytes(negotiated_features);
+    private_format = $cast(private_vq, vq);
+    private_control = '0;
+    if (!tx_offload.valid && (hdr_size == 0) && ((net_hdr.flags != 0) ||
+                            (net_hdr.gso_type != VIRTIO_NET_HDR_GSO_NONE))) begin
+        `uvm_error("ATOMIC_OPS", $sformatf(
+            "tx_submit: queue %0d carries no virtio-net header; offload request rejected",
+            queue_id))
+        return;
+    end
+    // PCIe Memory Read completions are DWORD based.  Keep the descriptor
+    // length byte-accurate, but give the model/RC responder a DWORD-padded
+    // backing allocation so a final partial DWORD never crosses an exact
+    // host_mem block boundary.
+    hdr_dma_size = (hdr_size + 3) & ~3;
+
+    // 2. Get wire bytes.  packet_item.do_pack() 带 32-bit UVM 长度前缀，不是
+    // 线速帧，先经 adapter 取 raw_data；其他对象保留原 do_pack 字节流。
+    if (virtio_net_packet_adapter::pack(pkt, wire_bytes)) begin
+        pkt_bytes = new[wire_bytes.size()];
+        foreach (wire_bytes[i]) pkt_bytes[i] = wire_bytes[i];
+    end else begin
+        uvm_packer	packer;
+        packer = new();
+        pkt.do_pack(packer);
+        packer.get_bytes(pkt_bytes);
+    end
+    if (tx_offload.valid) begin
+        wire_bytes.delete();
+        foreach (pkt_bytes[i]) wire_bytes.push_back(pkt_bytes[i]);
+        if (!virtio_net_packet_adapter::prepare_tx(wire_bytes, tx_offload,
+                private_format, negotiated_features, net_hdr, private_control, why)) begin
+            `uvm_error("VIO_TX_OFFLOAD", why)
+            return;
+        end
+        foreach (pkt_bytes[i]) pkt_bytes[i] = wire_bytes[i];
+    end
+    if (hdr_size != 0) begin
+        virtio_net_hdr_util::pack_hdr(net_hdr, negotiated_features, hdr_bytes);
+        hdr_size = hdr_bytes.size();
+    end
+    pkt_size = pkt_bytes.size();
+
+    // If packet has no data from do_pack, use minimum Ethernet frame size
+    if (pkt_size == 0)
+        pkt_size = 64;
+    // Keep the backing allocation DWORD padded after the minimum-size
+    // fallback as well; otherwise an empty packet would request a
+    // zero-byte host_mem allocation even though the descriptor carries
+    // the 64-byte minimum frame.
+    pkt_dma_size = (pkt_size + 3) & ~3;
+
+    // 空间不足是正常流控；本包字节和offload已固定，等待期间不占额外DMA。
+    if (!plan_tx_segments(vq, pkt_size, hdr_size, private_control.tso,
+                          use_indirect, tx_seg, segment_lengths, needed, why)) begin
+        `uvm_fatal("VIO_TX_SEG", why)
+        return;
+    end
+    wait_tx_space(vq, needed, timeout_ns, space_ready);
+    if (!space_ready) return;
+
+    // 3. Allocate host_mem for hdr + data buffers.  A failed second
+    //    allocation rolls back the first; nothing is mapped yet.
+    dma_set = new("tx_dma");
+    dma_set.bind_domain(mem, iommu, get_iommu_host_id(transport), transport.bdf);
+    hdr_idx = (hdr_size == 0) ? -1 : dma_set.alloc(hdr_dma_size);
+    pkt_idx = ((hdr_size != 0) && (hdr_idx < 0)) ? -1 : dma_set.alloc(pkt_dma_size);
+    if (pkt_idx < 0) begin
+        dma_set.release_all();
+        `uvm_error("ATOMIC_OPS",
+            $sformatf("tx_submit: host_mem alloc failed for queue %0d", queue_id))
+        return;
+    end
+
+    // 4. Write hdr and data to host_mem
+    if (hdr_size != 0) begin
+        hdr_data = new[hdr_size];
+        foreach (hdr_bytes[i]) hdr_data[i] = hdr_bytes[i];
+        dma_set.write(hdr_idx, hdr_data);
+    end
+
+    if (pkt_bytes.size() > 0) begin
+        pkt_data = new[pkt_size];
+        foreach (pkt_bytes[i]) pkt_data[i] = pkt_bytes[i];
+        dma_set.write(pkt_idx, pkt_data);
+    end
+
+    // 5. Map through IOMMU (DMA_TO_DEVICE -- device reads these buffers)
+    if ((hdr_size != 0) && !dma_set.map(hdr_idx, DMA_TO_DEVICE)) begin
+        dma_set.release_all();
+        `uvm_error("ATOMIC_OPS", $sformatf(
+            "tx_submit: failed to map header for queue %0d", queue_id))
+        return;
+    end
+    if (!dma_set.map(pkt_idx, DMA_TO_DEVICE)) begin
+        dma_set.release_all();
+        `uvm_error("ATOMIC_OPS", $sformatf(
+            "tx_submit: failed to map payload for queue %0d", queue_id))
+        return;
+    end
+
+    // 构建 header 和 data 两组 SG；data 组可包含多个分段，header 不拆分。
+    n_out = 0;
+    if (hdr_size != 0) begin
+        hdr_entry.addr = dma_set.get_iova(hdr_idx);
+        hdr_entry.len  = hdr_size;
+        sgs[n_out].entries.push_back(hdr_entry);
+        n_out++;
+    end
+
+    // 每个 data 段引用同一 DMA 的连续子区间；完成时仍只释放一次报文映射。
+    packet_offset = 0;
+    foreach (segment_lengths[i]) begin
+        pkt_entry.addr = dma_set.get_iova(pkt_idx) + packet_offset;
+        pkt_entry.len  = segment_lengths[i];
+        sgs[n_out].entries.push_back(pkt_entry);
+        packet_offset += segment_lengths[i];
+    end
+    n_out++;
+
+    // 发布只有 OUT 数据的 SG 链；有标准 header 时为两组，否则只有 data 组。
+    // DMA 仍归本次操作，add_buf 失败立即回滚，不登记完成记录或通知设备。
+    if (private_format && private_control.valid)
+        desc_id = private_vq.add_tx_buf(sgs, n_out, pkt, use_indirect, private_control);
+    else
+        desc_id = vq.add_buf(sgs, n_out, 0, pkt, use_indirect);
+    if (desc_id == '1) begin
+        dma_set.release_all();
+        return;
+    end
+
+    // Hand the ownership records (hdr first, matching tx_complete's
+    // per-packet retirement count) to completion/reset before notifying.
+    if (!tx_dma_map.exists(queue_id))
+        tx_dma_map[queue_id] = {};
+    adopt_dma_set(dma_set, tx_dma_map[queue_id]);
+
+    // 8. 批末发布当前真实游标；pending标志只属于本队列，不重复通知空批次。
+    tx_notify_pending[queue_id] = 1;
+    if (notify) flush_tx(queue_id);
+
+    `uvm_info("ATOMIC_OPS",
+        $sformatf("tx_submit: queue_id=%0d desc_id=%0d hdr_iova=0x%016h pkt_iova=0x%016h",
+                  queue_id, desc_id, hdr_entry.addr, sgs[n_out-1].entries[0].addr), UVM_HIGH)
+endtask
+
+
+// 按 Function 输出一次 RX 累计信息；停机回收不会抹掉计数，便于识别有投递但无收包。
+function void virtio_atomic_ops::print_rx_stats();
+    string	identity;
+
+    if (rx_polls == 0 && rx_posted_buffers == 0) return;
+
+    // 日志不引入新的运行期检查；异常清理中即使 transport 已解除绑定，也保留统计。
+    identity = (transport == null) ? "transport=unbound" : $sformatf(
+        "host=%0d bdf=%04h", get_iommu_host_id(transport), transport.bdf);
+    `uvm_info("RX_STATS", $sformatf(
+        "%s posted=%0d polls=%0d empty=%0d packets=%0d bytes=%0d", identity,
+        rx_posted_buffers, rx_polls, rx_empty_polls, rx_packets, rx_bytes), UVM_LOW)
+endfunction
+
+// 每次受阻提交独立计时；回收复用tx_complete，不能直接poll_used绕过DMA释放和中断门禁。
+task virtio_atomic_ops::wait_tx_space(virtqueue_base	vq, int unsigned	needed,
+    int unsigned	timeout_ns, output bit	ready);
+    custom_virtqueue	private_vq;
+    int unsigned	capacity;
+    int unsigned	limit_ns;
+    realtime		deadline;
+    uvm_object		completed[$];
+
+    ready = 0;
+    capacity = vq.queue_size;
+    if ($cast(private_vq, vq)) capacity--;
+    if (needed > capacity) begin
+        `uvm_error("VIO_TX_SPACE", $sformatf(
+            "queue %0d packet needs %0d descriptors but capacity is %0d",
+            vq.queue_id, needed, capacity))
+        return;
+    end
+    if (vq.get_free_count() >= needed) begin
+        ready = 1;
+        return;
+    end
+
+    // 未满一批也必须先通知已有描述符，否则Custom DUT尚未见到新的尾指针。
+    flush_tx(vq.queue_id);
+    limit_ns = wait_pol.effective_timeout(
+        (timeout_ns == 0) ? wait_pol.default_timeout_ns : timeout_ns);
+    deadline = $realtime + limit_ns * 1ns;
+    while (1) begin
+        if (!external_queue_ready(vq.queue_id) || vq_mgr.get_queue(vq.queue_id) != vq) begin
+            `uvm_error("VIO_TX_SPACE", "queue became unavailable while waiting for TX space")
+            return;
+        end
+        completed.delete();
+        tx_complete(vq.queue_id, completed, vq.queue_size);
+        if (vq.get_free_count() >= needed) begin
+            ready = 1;
+            return;
+        end
+        if ($realtime >= deadline) begin
+            `uvm_error("VIO_TX_TIMEOUT", $sformatf(
+                "queue %0d waited %0d ns for %0d descriptors; free=%0d",
+                vq.queue_id, limit_ns, needed, vq.get_free_count()))
+            return;
+        end
+        wait_pol.wait_poll_interval((deadline - $realtime) / 1ns);
+    end
+endtask
+
+// 通知复用生产配置后端和故障钩子；清标志不影响DMA所有权或完成回收。
+task virtio_atomic_ops::flush_tx(int unsigned	queue_id);
+    virtqueue_base	vq;
+
+    if (!tx_notify_pending.exists(queue_id) || !tx_notify_pending[queue_id]) return;
+    vq = vq_mgr.get_queue(queue_id);
+    if (vq == null || !external_queue_ready(queue_id)) return;
+    if (vq.needs_notification()) kick_with_fault(vq, queue_id);
+    tx_notify_pending.delete(queue_id);
+endtask
 
 `endif // VIRTIO_ATOMIC_OPS_SV

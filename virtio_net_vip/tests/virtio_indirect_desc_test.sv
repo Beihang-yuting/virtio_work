@@ -8,6 +8,8 @@ import virtio_net_pkg::*;
 // ============================================================================
 // virtio_indirect_desc_test
 //
+// 所属tests：验证实际ring/ops的间接描述符与失败回收；依赖Host memory fixture，
+// 测试拥有token与transport替身，ops持有DMA直到完成。满环原子发送验证超时后不泄漏。
 // Focused regression for virtio 1.2 indirect descriptors.  Both ring formats
 // must encode three SG entries in a DMA-visible indirect table while consuming
 // exactly one descriptor in their main ring.
@@ -69,14 +71,18 @@ endclass : virtio_dataplane_indirect_feature_error_catcher
 
 class virtio_tx_queue_full_error_catcher extends uvm_report_catcher;
     int unsigned caught_count;
+    string	expected_id = "SPLIT_VQ";
+    string	expected_message = "";
 
     function new(string name = "virtio_tx_queue_full_error_catcher");
         super.new(name);
         caught_count = 0;
     endfunction
 
+    // 满环负例匹配精确超时消息；其他错误不能被预期报告捕获器吞掉。
     virtual function action_e catch();
-        if ((get_id() == "SPLIT_VQ") && (get_severity() == UVM_ERROR)) begin
+        if ((get_id() == expected_id) && (get_severity() == UVM_ERROR) &&
+            (expected_message == "" || get_message() == expected_message)) begin
             caught_count++;
             return CAUGHT;
         end
@@ -630,9 +636,7 @@ class virtio_indirect_desc_test extends uvm_test;
         `uvm_info("INDIRECT_TEST", "dataplane TX indirect feature-gate test PASSED", UVM_LOW)
     endtask
 
-    // A full two-entry split queue rejects a second normal TX chain.  The
-    // rejected atomic submission must leave only the first submission's maps,
-    // token, add count, and notification visible.
+    // 两槽Split环已满时等待25ns再报告超时；首包DMA/token/DB保持原状。
     task test_atomic_tx_queue_full_cleanup();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("atomic_full_iommu");
@@ -674,8 +678,10 @@ class virtio_indirect_desc_test extends uvm_test;
         kicks_before = transport.kick_count;
         desc_id = '1;
         queue_full_error = new("atomic_tx_queue_full_error");
+        queue_full_error.expected_id = "VIO_TX_TIMEOUT";
+        queue_full_error.expected_message = "queue 0 waited 25 ns for 2 descriptors; free=0";
         uvm_report_cb::add(null, queue_full_error);
-        ops.tx_submit(0, net_hdr, rejected_token, 1'b0, desc_id);
+        ops.tx_submit(0, net_hdr, rejected_token, 1'b0, desc_id, '0, 25);
         uvm_report_cb::delete(null, queue_full_error);
         assert(desc_id == '1 &&
                (iommu.total_maps - iommu.total_unmaps) == active_maps_before &&
@@ -697,9 +703,7 @@ class virtio_indirect_desc_test extends uvm_test;
         `uvm_info("INDIRECT_TEST", "atomic TX queue-full cleanup test PASSED", UVM_LOW)
     endtask
 
-    // The dataplane API allocates both TX buffers before it reaches add_buf().
-    // A second direct submission to a full queue must release those temporary
-    // buffers and must not create another tracked packet or success statistic.
+    // dataplane同样委托ops；满环等待预算取wait_policy，超时不得增加DMA或成功统计。
     task test_dataplane_tx_queue_full_cleanup();
         host_mem_manager mem;
         virtio_iommu_model iommu = virtio_iommu_model::type_id::create("dataplane_full_iommu");
@@ -735,6 +739,7 @@ class virtio_indirect_desc_test extends uvm_test;
         transport.configure_pcie_identity(virtio_vq_test_kit::host0_pcie_id(16'h0705));
         ops = kit.make_ops(transport, "dataplane_full_ops");
         ops.negotiated_features = features;
+        ops.wait_pol.default_timeout_ns = 25;
         dataplane.bind_ops(ops);
         filler_token = virtio_dataplane_indirect_test_packet::type_id::create(
             "dataplane_full_filler");
@@ -754,6 +759,8 @@ class virtio_indirect_desc_test extends uvm_test;
         errors_before = dataplane.tx_engine.total_tx_errors;
         desc_id = '1;
         queue_full_error = new("dataplane_tx_queue_full_error");
+        queue_full_error.expected_id = "VIO_TX_TIMEOUT";
+        queue_full_error.expected_message = "queue 0 waited 25 ns for 2 descriptors; free=0";
         uvm_report_cb::add(null, queue_full_error);
         dataplane.tx_engine.submit_packet(0, rejected_token, 1'b0, desc_id);
         uvm_report_cb::delete(null, queue_full_error);
@@ -898,6 +905,11 @@ class virtio_indirect_desc_test extends uvm_test;
         assert(vq.get_pending_count() == 2)
             else `uvm_fatal("INDIRECT_TEST", "RX refill did not post two buffers")
 
+        // 未到包时反复调用真实收包入口，只累计空轮询，不消费或重发已有buffer。
+        repeat (1024) ops.rx_receive(0, received, 1);
+        assert(received.size() == 0 && vq.get_pending_count() == 2)
+            else `uvm_fatal("INDIRECT_TEST", "empty RX polling changed pending buffers")
+
         // Device writes a 12-byte header with num_buffers=2 and a 64-byte
         // frame into buffer 0, then completes only that buffer.
         read_desc(mem, vq.desc_table_addr, 0, addr, len, flags, next);
@@ -933,6 +945,7 @@ class virtio_indirect_desc_test extends uvm_test;
         assert(iommu.total_maps == iommu.total_unmaps)
             else `uvm_fatal("INDIRECT_TEST", "RX num_buffers test leaked mappings")
 
+        ops.print_rx_stats();
         `uvm_info("INDIRECT_TEST", "atomic RX num_buffers without MRG_RXBUF test PASSED", UVM_LOW)
     endtask
 
@@ -999,6 +1012,14 @@ class virtio_indirect_desc_test extends uvm_test;
                 "dataplane RX refill did not notify the device (kicks=%0d pending=%0d)",
                 transport.kick_count, rx_vq.get_pending_count()))
 
+        // 同样覆盖薄适配层；空预算补充不得产生多余notify或重复日志。
+        repeat (1024) begin
+            dataplane.rx_engine.receive_packets(0, 1, received);
+            dataplane.rx_engine.refill_buffers(0, 0);
+        end
+        assert(received.size() == 0 && transport.kick_count == 2)
+            else `uvm_fatal("INDIRECT_TEST", "empty RX engine changed packet or notify state")
+
         read_desc(mem, rx_vq.desc_table_addr, 0, addr, len, flags, next);
         assert(len == 1526)
             else `uvm_fatal("INDIRECT_TEST", $sformatf(
@@ -1018,6 +1039,7 @@ class virtio_indirect_desc_test extends uvm_test;
         assert(iommu.total_maps == iommu.total_unmaps)
             else `uvm_fatal("INDIRECT_TEST", "dataplane notify test leaked mappings")
 
+        ops.print_rx_stats();
         `uvm_info("INDIRECT_TEST", "dataplane engine notify test PASSED", UVM_LOW)
     endtask
 

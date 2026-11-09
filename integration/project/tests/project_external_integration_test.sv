@@ -1,6 +1,7 @@
 // integration/project/tests：真实 Intel 引脚/monitor/bridge 的项目合同模型回归。
 // 应用侧 adapter 仅模拟 DUT 的 BAR MMIO、VTX/VRX 间接表和主动 DMA；Host 仍由项目 RC 唯一响应。
 // 裸 seq 回归不覆写生产 hook，核对 AF 首笔写和发送失败停止，再验证配置、读回及缺布局拒绝。
+// PROJECT_PREPARE_RETRY 复用双 Host 组件，验证后续 Host 准备失败仍能显式释放前序 Host 并重试。
 // 测试拥有 app adapter 和期望值；不向 observer 直接注入，不声称覆盖真实 RTL。
 package project_external_integration_test_pkg;
 	import uvm_pkg::*;
@@ -13,6 +14,8 @@ package project_external_integration_test_pkg;
 	import virtio_aip_pkg::*;
 	import intel_pcie_adapter_pkg::*;
 	import project_env_pkg::*;
+	import virtio_dpu_pkg::*;
+	import dpu_pcie_pkg::*;
 	`include "uvm_macros.svh"
 
 	// 仅回归注入一次发送失败；其余访问调用真实 PCIe sequence。
@@ -25,11 +28,14 @@ package project_external_integration_test_pkg;
 	endclass
 
 	// 构造发送失败观察器，不改变正常寄存器访问参数。
+
 	function project_config_fault_seq::new(string name = "project_config_fault_seq");
 		super.new(name);
 	endfunction
 
+
 	// 在指定调用拒绝发送，支持 AF 首笔或间接 DWORD 故障；之前真实发送的写仍保留。
+
 	task project_config_fault_seq::body();
 		if (fail_on_call != 0) begin
 			calls++;
@@ -41,6 +47,7 @@ package project_external_integration_test_pkg;
 		end
 		super.body();
 	endtask
+
 
 	// 只捕获明确负例的接收拒绝；其他日志保留原严重级别，不能掩盖 HOST_MEM 错误。
 	class project_dma_expected_error extends uvm_report_catcher;
@@ -65,8 +72,8 @@ package project_external_integration_test_pkg;
 		return THROW;
 	endfunction
 
-	// 用户仅实现每类别单项访问；外围循环和写序使用 project_dut_config_seq，配置数据来自 cfg。
-	class project_external_model_seq extends project_dut_config_seq;
+	// 用户仅实现每类别单项访问；外围循环和写序使用 vio_dpu_cfg_seq，配置数据来自 cfg。
+	class project_external_model_seq extends vio_dpu_cfg_seq;
 		`uvm_object_utils(project_external_model_seq)
 		int unsigned	vtx_calls;
 		int unsigned	vrx_calls;
@@ -80,56 +87,61 @@ package project_external_integration_test_pkg;
 		// 故障仅在选定队列的实际 PCIe 发送段注入，整条配置 seq 必须停止。
 		extern function void arm_send_failure(input string	direction);
 		int unsigned	pfvf_calls;
-		project_pfvf_cfg_t	pfvf_items[string];
-		project_vtx_cfg_t	last_vtx;
-		project_vrx_cfg_t	last_vrx;
+		dpu_pfvf_cfg_t	pfvf_items[string];
+		dpu_vtx_cfg_t	last_vtx;
+		dpu_vrx_cfg_t	last_vrx;
 		// 旧分段发送故障由 run_phase 检查；仅该预期失败不交给生产 fatal。
 		extern virtual task post_start();
 		// 构造模型 hook 容器，不修改生产 build/connect。
 		extern function new(string	name = "project_external_model_seq");
 		// BAR 编码没有图片规格，测试只核对真实租约组后作为模型平台报告成功。
-		extern virtual task user_configure_bar_mapping_entry(input project_bar_mapping_cfg_t item, output bit ok, output string why);
+		extern virtual task user_configure_bar_mapping_entry(input dpu_bar_mapping_cfg_t item, output bit ok, output string why);
 		// 显式平台模型 verify，实际 RTL 应覆写为读回/状态检查。
-		extern virtual task user_verify_dpu_configuration(input project_dpu_config_scope scope, output bit ok, output string why);
-		extern virtual task user_verify_vio_configuration(input project_vio_selection_t selection, output bit ok, output string why);
-		extern virtual task user_enable_queue(input project_queue_control_cfg_t item, output bit ok, output string why);
+		extern virtual task user_verify_dpu_configuration(input dpu_cfg_scope scope, output bit ok, output string why);
+		extern virtual task user_verify_vio_configuration(input dpu_cfg_scope selection, output bit ok, output string why);
+		extern virtual task write_enabled_queue(input dpu_queue_control_cfg_t item, output bit ok, output string why);
 		// 单项 bdf 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_bdf_entry(input project_bdf_cfg_t item, output bit ok, output string why);
+		extern virtual task write_bdf(input dpu_bdf_cfg_t item, output bit ok, output string why);
 		// 单项 pfvf 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_pf_vf_entry(input project_pfvf_cfg_t item, output bit ok, output string why);
+		extern virtual task write_pfvf(input dpu_pfvf_cfg_t item, output bit ok, output string why);
 		// 单项 msix_linear 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_msix_linear_entry(input project_msix_linear_cfg_t item, output bit ok, output string why);
+		extern virtual task write_msix_linear(input dpu_msix_linear_cfg_t item, output bit ok, output string why);
 		// 单项 msix_info 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_msix_info_entry(input project_msix_info_cfg_t item, output bit ok, output string why);
+		extern virtual task write_msix_info(input dpu_msix_info_cfg_t item, output bit ok, output string why);
 		// 单项 msix_interval 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_msix_interval_entry(input project_msix_interval_cfg_t item, output bit ok, output string why);
+		extern virtual task write_msix_interval(input dpu_msix_interval_cfg_t item, output bit ok, output string why);
 		// 单项 msix_table 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_msix_table_entry(input project_msix_table_cfg_t item, output bit ok, output string why);
+		extern virtual task write_msix_table(input dpu_msix_table_cfg_t item, output bit ok, output string why);
 		// 单项 qsch_q2tc 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_qsch_q2tc(input project_qsch_q2tc_cfg_t item, output bit ok, output string why);
+		extern virtual task write_qsch_q2tc(input dpu_qsch_q2tc_cfg_t item, output bit ok, output string why);
 		// 单项 qsch_n2g 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_qsch_n2g(input project_qsch_n2g_cfg_t item, output bit ok, output string why);
+		extern virtual task write_qsch_n2g(input dpu_qsch_n2g_cfg_t item, output bit ok, output string why);
 		// 单项 qsch_g2p 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_qsch_g2p(input project_qsch_g2p_cfg_t item, output bit ok, output string why);
+		extern virtual task write_qsch_g2p(input dpu_qsch_g2p_cfg_t item, output bit ok, output string why);
 		// 单项 vtx 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_vtx_queue(input project_vtx_cfg_t item, output bit ok, output string why);
+		extern virtual task write_vtx(input dpu_vtx_cfg_t item, output bit ok, output string why);
 		// 单项 vrx 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_vrx_queue(input project_vrx_cfg_t item, output bit ok, output string why);
+		extern virtual task write_vrx(input dpu_vrx_cfg_t item, output bit ok, output string why);
 		// 单项 vio_notify 使用产品 checked helper，实际经过 Intel 引脚。
-		extern virtual task user_configure_vio_notify_entry(input project_vio_notify_cfg_t item, output bit ok, output string why);
+		extern virtual task write_vio_notify(input dpu_vio_notify_cfg_t item, output bit ok, output string why);
 	endclass
 
 	// UVM 构造，所有硬件访问都在 run 阶段用户入口进行。
+
 	function project_external_model_seq::new(string	name = "project_external_model_seq");
 		super.new(name);
 	endfunction
+
 	// 旧故障矩阵保持可检查失败状态；其他错误仍走生产 post_start 的 fatal。
+
 	task project_external_model_seq::post_start();
 		if (fail_dword != 0 && fault_armed && !success) return;
 		super.post_start();
 	endtask
 
+
 	// 在首次指定方向 hook 前设置 PCIe fault；其余类别仍走正常真实发送。
+
 	function void project_external_model_seq::arm_send_failure(input string	direction);
 		if (fail_dword == 0 || fault_armed || direction != fail_direction) return;
 
@@ -138,121 +150,158 @@ package project_external_integration_test_pkg;
 		project_config_fault_seq::fail_on_call = fail_dword;
 	endfunction
 
+
 	// 没有猜测 BAR payload，模型仅确认完整声明组收到真实租约。
-	task project_external_model_seq::user_configure_bar_mapping_entry(input project_bar_mapping_cfg_t item, output bit ok, output string why);
+
+	task project_external_model_seq::user_configure_bar_mapping_entry(input dpu_bar_mapping_cfg_t item, output bit ok, output string why);
 		bar_calls++;
 		ok = item.members.size() != 0;
 		why = ok ? "" : "empty BAR group";
 	endtask
+
 	// 模型平台明确报告所选公共配置完成；产品仍检查上下文和依赖。
-	task project_external_model_seq::user_verify_dpu_configuration(input project_dpu_config_scope scope, output bit ok, output string why);
+
+	task project_external_model_seq::user_verify_dpu_configuration(input dpu_cfg_scope scope, output bit ok, output string why);
 		ok = 1; why = "";
 	endtask
+
 	// 模型平台明确报告队列配置完成；后续核心 preflight 不能被此成功绕过。
-	task project_external_model_seq::user_verify_vio_configuration(input project_vio_selection_t selection, output bit ok, output string why);
+
+	task project_external_model_seq::user_verify_vio_configuration(input dpu_cfg_scope selection, output bit ok, output string why);
 		ok = !fail_verify; why = ok ? "" : "injected platform verification failure";
 	endtask
+
 	// 使能使用唯一 checked 路径，只允许 enable 位变化。
-	task project_external_model_seq::user_enable_queue(input project_queue_control_cfg_t item, output bit ok, output string why);
-		write_enabled_queue(item, ok, why);
+
+	task project_external_model_seq::write_enabled_queue(input dpu_queue_control_cfg_t item, output bit ok, output string why);
+		super.write_enabled_queue(item, ok, why);
 	endtask
+
 
 	// 单项 bdf 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_bdf_entry(input project_bdf_cfg_t item, output bit ok, output string why);
-		write_bdf(item, ok, why);
+
+	task project_external_model_seq::write_bdf(input dpu_bdf_cfg_t item, output bit ok, output string why);
+		super.write_bdf(item, ok, why);
 	endtask
+
 
 	// 单项 pfvf 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_pf_vf_entry(input project_pfvf_cfg_t item, output bit ok, output string why);
+
+	task project_external_model_seq::write_pfvf(input dpu_pfvf_cfg_t item, output bit ok, output string why);
 		pfvf_calls++;
 		pfvf_items[dpu_function_key_name(item.owner)] = item;
-		write_pfvf(item, ok, why);
+		super.write_pfvf(item, ok, why);
 	endtask
+
 
 	// 单项 msix_linear 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_msix_linear_entry(input project_msix_linear_cfg_t item, output bit ok, output string why);
-		write_msix_linear(item, ok, why);
+
+	task project_external_model_seq::write_msix_linear(input dpu_msix_linear_cfg_t item, output bit ok, output string why);
+		super.write_msix_linear(item, ok, why);
 	endtask
+
 
 	// 单项 msix_info 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_msix_info_entry(input project_msix_info_cfg_t item, output bit ok, output string why);
-		write_msix_info(item, ok, why);
+
+	task project_external_model_seq::write_msix_info(input dpu_msix_info_cfg_t item, output bit ok, output string why);
+		super.write_msix_info(item, ok, why);
 	endtask
+
 
 	// 单项 msix_interval 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_msix_interval_entry(input project_msix_interval_cfg_t item, output bit ok, output string why);
-		write_msix_interval(item, ok, why);
+
+	task project_external_model_seq::write_msix_interval(input dpu_msix_interval_cfg_t item, output bit ok, output string why);
+		super.write_msix_interval(item, ok, why);
 	endtask
+
 
 	// 单项 msix_table 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_msix_table_entry(input project_msix_table_cfg_t item, output bit ok, output string why);
-		write_msix_table(item, ok, why);
+
+	task project_external_model_seq::write_msix_table(input dpu_msix_table_cfg_t item, output bit ok, output string why);
+		super.write_msix_table(item, ok, why);
 	endtask
+
 
 	// 单项 qsch_q2tc 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_qsch_q2tc(input project_qsch_q2tc_cfg_t item, output bit ok, output string why);
-		write_qsch_q2tc(item, ok, why);
+
+	task project_external_model_seq::write_qsch_q2tc(input dpu_qsch_q2tc_cfg_t item, output bit ok, output string why);
+		super.write_qsch_q2tc(item, ok, why);
 	endtask
+
 
 	// 单项 qsch_n2g 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_qsch_n2g(input project_qsch_n2g_cfg_t item, output bit ok, output string why);
-		write_qsch_n2g(item, ok, why);
+
+	task project_external_model_seq::write_qsch_n2g(input dpu_qsch_n2g_cfg_t item, output bit ok, output string why);
+		super.write_qsch_n2g(item, ok, why);
 	endtask
+
 
 	// 单项 qsch_g2p 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_qsch_g2p(input project_qsch_g2p_cfg_t item, output bit ok, output string why);
-		write_qsch_g2p(item, ok, why);
+
+	task project_external_model_seq::write_qsch_g2p(input dpu_qsch_g2p_cfg_t item, output bit ok, output string why);
+		super.write_qsch_g2p(item, ok, why);
 	endtask
 
+
 	// 单项 vtx 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_vtx_queue(input project_vtx_cfg_t item, output bit ok, output string why);
+
+	task project_external_model_seq::write_vtx(input dpu_vtx_cfg_t item, output bit ok, output string why);
 		vtx_calls++;
 		last_vtx = item;
 		if (fail_vtx_call != 0 && vtx_calls == fail_vtx_call) begin ok = 0; why = "injected midway VTX hook failure"; return; end
 		arm_send_failure("vtx");
-		write_vtx(item, ok, why);
+		super.write_vtx(item, ok, why);
 	endtask
 
+
 	// 单项 vrx 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_vrx_queue(input project_vrx_cfg_t item, output bit ok, output string why);
+
+	task project_external_model_seq::write_vrx(input dpu_vrx_cfg_t item, output bit ok, output string why);
 		vrx_calls++;
 		last_vrx = item;
 		arm_send_failure("vrx");
-		write_vrx(item, ok, why);
+		super.write_vrx(item, ok, why);
 	endtask
+
 
 	// 单项 vio_notify 返回真实 helper 结果；不在 hook 中增加外围循环。
-	task project_external_model_seq::user_configure_vio_notify_entry(input project_vio_notify_cfg_t item, output bit ok, output string why);
+
+	task project_external_model_seq::write_vio_notify(input dpu_vio_notify_cfg_t item, output bit ok, output string why);
 		notify_calls++;
-		write_vio_notify(item, ok, why);
+		super.write_vio_notify(item, ok, why);
 	endtask
 
+
 	// 仅此测试模型的明确路由规则，不作为产品硬件默认；实际平台替换此一个纯函数。
-	class project_external_model_cfg extends project_env_cfg;
+	class project_external_model_cfg extends dpu_env_cfg;
 		`uvm_object_utils(project_external_model_cfg)
 		// 构造配置，保留生产参数生成器。
 		extern function new(string name="project_external_model_cfg");
 		// fixture 的 PF0 从 offset1 开始，Pfvf=vf_id+1；完整成员逐项检查，不要求VF连续。
 		// 在 placement 前通过同一生成/需求入口建立稀疏实际 VF。
 		extern function void add_fixture_vf(input int unsigned vf_id);
-		extern virtual function bit validate_pfvf_relationship(input project_pfvf_relationship_t family, output string why);
+		extern virtual function bit validate_pfvf_relationship(input dpu_pfvf_relationship_t family, output string why);
 	endclass
 
 	// fixture 配置仍使用产品解析和资源生成器。
+
 	function project_external_model_cfg::new(string name="project_external_model_cfg");
 		super.new(name);
 	endfunction
 
+
 	// 不改冻结快照；稀疏键和精确需求均在 env build 前加入。
+
 	function void project_external_model_cfg::add_fixture_vf(input int unsigned vf_id);
 		dpu_function_cfg function_cfg;
 		function_cfg = make_function(0, 0, DPU_FUNCTION_VF, vf_id);
-		dpu_cfg.device_cfg.functions.push_back(function_cfg);
-		add_service_request(function_cfg.key);
+		device_cfg.functions.push_back(function_cfg);
 	endfunction
 
+
 	// 测试专用关系规则，绝不作为产品 PFVF 默认。
-	function bit project_external_model_cfg::validate_pfvf_relationship(input project_pfvf_relationship_t family, output string why);
+
+	function bit project_external_model_cfg::validate_pfvf_relationship(input dpu_pfvf_relationship_t family, output string why);
 		int unsigned	pf_count;
 		why = "fixture PFVF relationship mismatch";
 		pf_count = 0;
@@ -268,6 +317,7 @@ package project_external_integration_test_pkg;
 		why = "";
 		return 1;
 	endfunction
+
 
 	// 单 VF32/双 VF16/双 Host/禁 RX/无 VIO 共用同一真实组装路径，plusarg 仅改变场景输入。
 	class project_external_integration_test extends uvm_test;
@@ -287,13 +337,13 @@ package project_external_integration_test_pkg;
 		bit	no_vio;
 		bit	tx_only;
 		bit	msix_mode;
-		project_vio_selection_t	selection;
+		dpu_cfg_scope	selection;
 		// 构造测试组件，不访问设备。
 		extern function new(string name, uvm_component parent);
 		// 精确失败断言，不能让过程 exit0 代替语义检查。
 		extern function void require_true(input bit condition, input string detail);
 		// 显式声明本测试模型布局；图片相对偏移与模块偏移分开。
-		extern function void add_layout(input project_table_kind_e kind, input int unsigned bytes,
+		extern function void add_layout(input dpu_table_kind_e kind, input int unsigned bytes,
 			input int unsigned capacity, input bit [63:0] module_offset, input bit [63:0] table_offset,
 			input bit indirect = 0);
 		// 建立实际 project env 与每 Host 的应用侧物理 adapter。
@@ -306,6 +356,8 @@ package project_external_integration_test_pkg;
 		// 非 identity 双向 DMA、权限/未知 requester、真实 MSI-X sink 与 Completion sideband。
 		extern task check_receive_path();
 
+		// Host1 在实际准备入口失败，检查 Host0 清理范围及双 Host 重试；不发送 DUT 配置。
+		extern task check_prepare_retry();
 
 		// typed hook 中途失败、确认/释放全 Host 预检与 AIP 取消后重准备。
 		extern virtual task run_phase(uvm_phase phase);
@@ -323,9 +375,9 @@ package project_external_integration_test_pkg;
 	endfunction
 
 	// 测试模型端口控制布局明确声明，不能成为产品隐式默认。
-	function void project_external_integration_test::add_layout(input project_table_kind_e kind, input int unsigned bytes,
+	function void project_external_integration_test::add_layout(input dpu_table_kind_e kind, input int unsigned bytes,
 		input int unsigned capacity, input bit [63:0] module_offset, input bit [63:0] table_offset, input bit indirect);
-		project_table_layout_t	l;
+		dpu_table_layout_t	l;
 		l.provided = 1;
 		l.reg_target = "pf0.bar0";
 		l.access_host_provided = 0;
@@ -335,7 +387,7 @@ package project_external_integration_test_pkg;
 		l.table_offset = table_offset;
 		l.capacity = capacity;
 		l.entry_bytes = bytes;
-		l.index_policy = PROJECT_INDEX_GLOBAL_VECTOR;
+		l.index_policy = DPU_INDEX_GLOBAL_VECTOR;
 		l.indirect = indirect;
 		l.data_port = 'h204;
 		l.control_port = 'h200;
@@ -344,7 +396,7 @@ package project_external_integration_test_pkg;
 		l.trigger_mask = 'h10000;
 		l.index_shift = 0;
 		l.required = 1;
-		cfg.table_layouts[kind] = l;
+		cfg.dpu_cfg.table_layouts[kind] = l;
 	endfunction
 
 	// 配置基于真实 DPU 生成器，精确 enabled/pairs 在 placement 前解析。
@@ -363,18 +415,26 @@ package project_external_integration_test_pkg;
 		pairs = vf_count == 2 ? 16 : 32;
 		if ($test$plusargs("PROJECT_SMALL")) pairs = 2;
 		if ($test$plusargs("PROJECT_ONE_PAIR")) pairs = 1;
-		cfg = project_external_model_cfg::type_id::create("cfg");
-		cfg.driver_layouts = 0;
-		cfg.qsch_configure_controls = 0;
-		cfg.configure_public = 1;
-		cfg.verify_readback = 1;
-		cfg.hosts = host_count;
-		cfg.vfs_per_pf = vf_count;
+		// 生命周期负例固定最小双 Host 拓扑，避免依赖额外场景参数才能覆盖部分成功。
+		if ($test$plusargs("PROJECT_PREPARE_RETRY")) begin
+			require_true(!no_vio, "prepare retry requires enabled VIO services");
+			host_count = 2;
+			vf_count   = 1;
+			pairs      = 1;
+		end
+		cfg = project_env_cfg::type_id::create("cfg");
+		cfg.dpu_cfg = project_external_model_cfg::type_id::create("dpu_cfg");
+		cfg.dpu_cfg.driver_layouts = 0;
+		cfg.dpu_cfg.qsch_configure_controls = 0;
+		cfg.dpu_cfg.configure_public = 1;
+		cfg.dpu_cfg.verify_readback = 1;
+		cfg.dpu_cfg.hosts = host_count;
+		cfg.dpu_cfg.vfs_per_pf = vf_count;
 		if ($test$plusargs("PROJECT_PFVF_GUARD")) begin
 			require_true(host_count == 1 && !no_vio, "PFVF guard needs one Host with VIO");
 			vf_count = $test$plusargs("PROJECT_PFVF_SINGLE") ? 1 : 2;
-			cfg.vfs_per_pf = 0;
-			cfg.pfs_per_host = 2;
+			cfg.dpu_cfg.vfs_per_pf = 0;
+			cfg.dpu_cfg.pfs_per_host = 2;
 		end
 		cfg.vio_cfg.enabled = 0;
 		cfg.vio_cfg.default_num_pairs = pairs;
@@ -390,7 +450,7 @@ package project_external_integration_test_pkg;
 		cfg.vio_cfg.iova_base = 'h80000000;
 		cfg.vio_cfg.iova_limit = 'h90000000;
 		cfg.vio_cfg.scb_enable = 0;
-		cfg.bar_mapping_per_lease = 1;
+		cfg.dpu_cfg.bar_mapping_per_lease = 1;
 		for (int unsigned h = 0; h < host_count; h++) begin
 			for (int unsigned v = 0; v < vf_count; v++)
 				aip_cmdline_override::set_val($sformatf("vio.h%0d.pf0.vf%0d.i0.enabled",h,v), no_vio ? "0" : "1");
@@ -403,24 +463,37 @@ package project_external_integration_test_pkg;
 		end
 		cfg.load_params();
 		if ($test$plusargs("PROJECT_PFVF_GUARD")) begin
-			require_true($cast(model_cfg, cfg), "fixture cfg cast");
+			require_true($cast(model_cfg, cfg.dpu_cfg), "fixture cfg cast");
 			model_cfg.add_fixture_vf(0);
 			if (!$test$plusargs("PROJECT_PFVF_SINGLE")) model_cfg.add_fixture_vf(3);
+			foreach (cfg.dpu_cfg.device_cfg.functions[f]) begin
+				dpu_vio_service_t	service;
+				vio_service_requirement_t	requirement;
+				dpu_service_key_t	key;
+				key = '{function_key:cfg.dpu_cfg.device_cfg.functions[f].key,
+					service_kind:DPU_SERVICE_VIO_NET, service_instance_id:0};
+				if (cfg.dpu_cfg.services.exists(dpu_service_key_name(key))) continue;
+				require_true(cfg.vio_cfg_by_host[0].resolve_final_service_requirement(key, requirement, why), why);
+				service = '{service_key:key, enabled:requirement.enabled, tx_enable:requirement.tx_enable,
+					rx_enable:requirement.rx_enable, msix_enable:requirement.completion_mode == VIRTIO_COMPLETION_MSIX,
+					qpairs:requirement.behavior.num_queue_pairs};
+				cfg.dpu_cfg.add_vio_service(service);
+			end
 		end
-		foreach (cfg.vio_policies[name]) begin
+		foreach (cfg.dpu_cfg.vio_policies[name]) begin
 			dpu_function_key_t key;
-			key = cfg.vio_policies[name].service_key.function_key;
-			require_true(cfg.vio_policies[name].cos ==
+			key = cfg.dpu_cfg.vio_policies[name].service_key.function_key;
+			require_true(cfg.dpu_cfg.vio_policies[name].cos ==
 				((key.host_id == 0 && key.pf_id == 0 && key.kind == DPU_FUNCTION_VF && key.vf_id == 0) ? 5 : 3),
 				"dpu.qsch global/service parameter precedence");
 		end
 		foreach (cfg.dpu_cfg.device_cfg.functions[f]) begin
-			project_function_policy_t	p;
-			project_vio_policy_t	q;
+			dpu_function_policy_t	p;
+			dpu_vio_policy_t	q;
 			dpu_function_key_t	key;
 			key = cfg.dpu_cfg.device_cfg.functions[f].key;
 			p.key = key;
-			p.mode = PROJECT_HOST_EP;
+			p.mode = DPU_HOST_EP;
 			p.intel_pf = key.pf_id;
 			p.intel_vf = key.kind == DPU_FUNCTION_VF ? int'(key.vf_id) : -1;
 			p.requester = key.kind == DPU_FUNCTION_VF ? (16'h8000 | (key.vf_id << 4) | key.pf_id) : key.pf_id;
@@ -434,21 +507,21 @@ package project_external_integration_test_pkg;
 			p.prefix_enabled = 0;
 			p.ecrc = 0;
 			p.vdpa = 0;
-			cfg.function_policies[dpu_function_key_name(key)] = p;
+			cfg.dpu_cfg.function_policies[dpu_function_key_name(key)] = p;
 			for (int unsigned v = 0; v < 64; v++) begin
-				project_msix_message_t	m;
+				dpu_msix_message_t	m;
 				m.owner = key;
 				m.local_vector = v;
 				m.global_vector = 0;
 				m.address = 64'h0000900000000000 + p.vport * 'h10000 + v * 4;
 				m.data = 32'h13572468 ^ (v << 8);
 				m.masked = 0;
-				cfg.msix_policies[dpu_function_key_name(key)].table_only_enable = 1;
-				cfg.msix_policies[dpu_function_key_name(key)].interval_present = 1;
-				cfg.msix_policies[dpu_function_key_name(key)].interval_entry = '0;
-				cfg.msix_policies[dpu_function_key_name(key)].self_mask_present = 1;
-				cfg.msix_policies[dpu_function_key_name(key)].self_mask = 0;
-				cfg.message_templates[dpu_function_key_name(key)][v] = m;
+				cfg.dpu_cfg.msix_policies[dpu_function_key_name(key)].table_only_enable = 1;
+				cfg.dpu_cfg.msix_policies[dpu_function_key_name(key)].interval_present = 1;
+				cfg.dpu_cfg.msix_policies[dpu_function_key_name(key)].interval_entry = '0;
+				cfg.dpu_cfg.msix_policies[dpu_function_key_name(key)].self_mask_present = 1;
+				cfg.dpu_cfg.msix_policies[dpu_function_key_name(key)].self_mask = 0;
+				cfg.dpu_cfg.message_templates[dpu_function_key_name(key)][v] = m;
 			end
 			if (key.kind != DPU_FUNCTION_VF) continue;
 			q.service_key = '{function_key:key, service_kind:DPU_SERVICE_VIO_NET, service_instance_id:0};
@@ -470,45 +543,46 @@ package project_external_integration_test_pkg;
 			q.notify_net_pair5 = 1;
 			q.notify_table_base_provided = 1;
 			q.notify_table_bar = 0;
-			q.notify_table_offset = 0;
-			cfg.vio_policies[dpu_service_key_name(q.service_key)] = q;
+			// 本模型的真实 doorbell 位于 BAR+0x100，显式查找基址必须匹配其 [60:7]。
+			q.notify_table_offset = 'h100;
+			cfg.dpu_cfg.vio_policies[dpu_service_key_name(q.service_key)] = q;
 		end
-		add_layout(PROJECT_BDF,4,128,'h100000,'h8000);
-		add_layout(PROJECT_PFVF,4,4,'h200000,'h8000);
-		add_layout(PROJECT_MSIX_LINEAR,8,2048,'h200000,'h40000);
+		add_layout(DPU_TABLE_BDF,4,128,'h100000,'h8000);
+		add_layout(DPU_TABLE_PFVF,4,4,'h200000,'h8000);
+		add_layout(DPU_TABLE_MSIX_LINEAR,8,2048,'h200000,'h40000);
 		// MSI-X linear 与 Notify 同为所有 Host 共用的完整排序单 bank。
-		cfg.table_layouts[PROJECT_MSIX_LINEAR].reg_target = "h0.pf0.bar0";
-		cfg.table_layouts[PROJECT_MSIX_LINEAR].access_host_provided = 0;
-		cfg.table_layouts[PROJECT_MSIX_LINEAR].access_uses_owner_host = 0;
-		add_layout(PROJECT_MSIX_INFO,4,1024,'h100000,'h50000);
-		add_layout(PROJECT_MSIX_INTERVAL,4,1024,'h100000,'h40000);
-		add_layout(PROJECT_MSIX_TABLE,16,1024,'h100000,'h20000);
-		add_layout(PROJECT_NOTIFY,16,512,'h200000,'h20000);
+		cfg.dpu_cfg.table_layouts[DPU_TABLE_MSIX_LINEAR].reg_target = "h0.pf0.bar0";
+		cfg.dpu_cfg.table_layouts[DPU_TABLE_MSIX_LINEAR].access_host_provided = 0;
+		cfg.dpu_cfg.table_layouts[DPU_TABLE_MSIX_LINEAR].access_uses_owner_host = 0;
+		add_layout(DPU_TABLE_MSIX_INFO,4,1024,'h100000,'h50000);
+		add_layout(DPU_TABLE_MSIX_INTERVAL,4,1024,'h100000,'h40000);
+		add_layout(DPU_TABLE_MSIX_TABLE,16,1024,'h100000,'h20000);
+		add_layout(DPU_TABLE_NOTIFY,16,512,'h200000,'h20000);
 		// 所有 Host 共用一份排序 Notify 单 bank，其余表仍按所属 Host 选择管理端口。
-		cfg.table_layouts[PROJECT_NOTIFY].reg_target = "h0.pf0.bar0";
-		cfg.table_layouts[PROJECT_NOTIFY].access_host_provided = 0;
-		cfg.table_layouts[PROJECT_NOTIFY].access_uses_owner_host = 0;
-		add_layout(PROJECT_VTX,16,2048,'h400000,'h10000,1);
-		add_layout(PROJECT_VRX,16,2048,'h500000,'h10000,1);
-		add_layout(PROJECT_Q2TC,4,1024,'h600000,'h10000);
-		add_layout(PROJECT_N2G,4,2048,'h600000,'h12000);
-		add_layout(PROJECT_G2P,4,1024,'h600000,'h14000);
+		cfg.dpu_cfg.table_layouts[DPU_TABLE_NOTIFY].reg_target = "h0.pf0.bar0";
+		cfg.dpu_cfg.table_layouts[DPU_TABLE_NOTIFY].access_host_provided = 0;
+		cfg.dpu_cfg.table_layouts[DPU_TABLE_NOTIFY].access_uses_owner_host = 0;
+		add_layout(DPU_TABLE_VTX,16,2048,'h400000,'h10000,1);
+		add_layout(DPU_TABLE_VRX,16,2048,'h500000,'h10000,1);
+		add_layout(DPU_TABLE_Q2TC,4,1024,'h600000,'h10000);
+		add_layout(DPU_TABLE_N2G,4,2048,'h600000,'h12000);
+		add_layout(DPU_TABLE_G2P,4,1024,'h600000,'h14000);
 
 		// 仅显式参考场景采用上传驱动地址；模型不证明真实 RTL 的地址/位域兼容。
 		// 生产 cfg 不隐含此选择，队列 data/control 的写序仍采用用户要求的高位先写。
 		if ($test$plusargs("PROJECT_DRIVER_PORTS")) begin
-			cfg.table_layouts[PROJECT_VTX].module_offset = 'h880000;
-			cfg.table_layouts[PROJECT_VTX].data_port     = 'h134;
-			cfg.table_layouts[PROJECT_VTX].control_port  = 'h130;
-			cfg.table_layouts[PROJECT_VTX].index_mask    = 'h7ff;
-			cfg.table_layouts[PROJECT_VTX].trigger_mask  = 'h2000;
-			cfg.table_layouts[PROJECT_VTX].index_policy  = PROJECT_INDEX_GLOBAL_QPAIR;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_VTX].module_offset = 'h880000;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_VTX].data_port     = 'h134;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_VTX].control_port  = 'h130;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_VTX].index_mask    = 'h7ff;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_VTX].trigger_mask  = 'h2000;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_VTX].index_policy  = DPU_INDEX_GLOBAL_QPAIR;
 
-			cfg.table_layouts[PROJECT_VRX].module_offset = 'h900000;
-			cfg.table_layouts[PROJECT_VRX].index_policy  = PROJECT_INDEX_GLOBAL_QPAIR;
-			cfg.table_layouts[PROJECT_Q2TC].module_offset = 'hb00000;
-			cfg.table_layouts[PROJECT_N2G].module_offset  = 'hb00000;
-			cfg.table_layouts[PROJECT_G2P].module_offset  = 'hb00000;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_VRX].module_offset = 'h900000;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_VRX].index_policy  = DPU_INDEX_GLOBAL_QPAIR;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_Q2TC].module_offset = 'hb00000;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_N2G].module_offset  = 'hb00000;
+			cfg.dpu_cfg.table_layouts[DPU_TABLE_G2P].module_offset  = 'hb00000;
 		end
 
 		for (int unsigned h = 0; h < host_count; h++) begin
@@ -529,7 +603,7 @@ package project_external_integration_test_pkg;
 		uvm_config_db#(project_env_cfg)::set(this,"env","cfg",cfg);
 		env = project_env::type_id::create("env", this);
 		config_seq = project_external_model_seq::type_id::create("config_seq");
-		config_seq.cfg = cfg;
+		config_seq.cfg = cfg.dpu_cfg;
 	endfunction
 
 	// 实际 Intel RX 返回 sideband 与 payload；模型只管理设备 BAR 存储，不响应 Host DMA。
@@ -538,7 +612,7 @@ package project_external_integration_test_pkg;
 			pcie_tl_tlp	t;
 			pcie_tl_mem_tlp	m;
 			pcie_tl_cpl_tlp	c;
-			project_bar_target_t	af_target;
+			dpu_bar_target_t	af_target;
 			string		why;
 			wait (apps[host].rx_queue.size() != 0);
 			apps[host].receive(t);
@@ -563,7 +637,7 @@ package project_external_integration_test_pkg;
 				c.lower_addr = m.addr[6:0] + pcie_tl_mem_first_valid_in_range(m,0,pcie_tl_mem_dw_count(m)*4);
 				c.payload = new[pcie_tl_mem_dw_count(m)*4];
 				foreach (c.payload[i]) c.payload[i] = mmio_bytes[host].exists(pcie_tl_mem_wire_addr(m)+i) ? mmio_bytes[host][pcie_tl_mem_wire_addr(m)+i] : 0;
-				if (host == 0 && cfg.bar_registry.resolve_name("h0.pf0.bar0", af_target, why) &&
+				if (host == 0 && cfg.dpu_cfg.bar_map.resolve_name("h0.pf0.bar0", af_target, why) &&
 					pcie_tl_mem_wire_addr(m) == af_target.bar_lease.base + 'h1010)
 					c.payload = '{8'h08, 8'h00, 8'h00, 8'h00};
 				apps[host].send(c);
@@ -593,11 +667,11 @@ package project_external_integration_test_pkg;
 
 	// 独立分配 DMA backing，测试不会破坏真实 ring；权限失败检查 backing 与 dirty tracking。
 	task project_external_integration_test::check_receive_path();
-		project_function_record_t	functions[$];
+		dpu_function_record_t	functions[$];
 		project_dma_expected_error	catcher;
 		string	why;
 		catcher = new();
-		cfg.dpu_setup.list_functions(functions);
+		cfg.dpu_cfg.list_functions(functions);
 		foreach (functions[f]) begin
 			bit [63:0]	gpa;
 			bit [63:0]	iova;
@@ -605,11 +679,11 @@ package project_external_integration_test_pkg;
 			bit [63:0]	dirty[$];
 			byte	bytes[];
 			pcie_tl_cpl_tlp	cpl;
-			project_function_policy_t	p;
+			dpu_function_policy_t	p;
 			int unsigned	h;
 			if (functions[f].key.kind != DPU_FUNCTION_VF) continue;
 			h = functions[f].key.host_id;
-			p = cfg.function_policies[dpu_function_key_name(functions[f].key)];
+			p = cfg.dpu_cfg.function_policies[dpu_function_key_name(functions[f].key)];
 			gpa = env.vio_envs[h].host_mem.alloc(4096,4096);
 			iova = env.vio_envs[h].iommu.map_for_host(h,functions[f].pcie_id.bdf,gpa,4096,DMA_BIDIRECTIONAL);
 			require_true(iova != 0 && iova != gpa,"expected nonidentity DMA mapping");
@@ -642,14 +716,14 @@ package project_external_integration_test_pkg;
 		end
 		require_true(catcher.count==2*host_count*vf_count,"DMA permission/requester rejection count");
 		// 无消费者 catalog 验证 RC sink；活动向量以真实 TX 提交和 used DMA 验证，不伪造 SVA credit。
-		foreach (cfg.messages[m]) begin
-			project_msix_message_t message;
+		foreach (cfg.dpu_cfg.messages[m]) begin
+			dpu_msix_message_t message;
 			vio_queue_setup_t rows[$];
 			bit active;
-			message = cfg.messages[m];
+			message = cfg.dpu_cfg.messages[m];
 			active = 0;
-			if (selection.setups.exists(message.owner.host_id)) begin
-				selection.setups[message.owner.host_id].list_queues(rows);
+			if (cfg.dpu_cfg.queues_by_host.exists(message.owner.host_id)) begin
+				env.vio_envs[message.owner.host_id].get_external_setup().list_queues(rows);
 				foreach (rows[q]) begin
 					virtio_function_instance instance;
 					packet_item packet;
@@ -658,7 +732,7 @@ package project_external_integration_test_pkg;
 					byte bytes[];
 					int unsigned desc_id;
 					bit [31:0] word_value;
-					project_function_policy_t policy;
+					dpu_function_policy_t policy;
 					if (!rows[q].tx_mode || !dpu_same_function_key(rows[q].service_key.function_key, message.owner) ||
 						rows[q].qpair.local_msix_vector_id != message.local_vector) continue;
 					active = 1;
@@ -673,7 +747,7 @@ package project_external_integration_test_pkg;
 					hdr = '{default:0};
 					instance.driver_agent.ops.tx_submit(rows[q].notification.local_qid, hdr, packet, 0, desc_id);
 					require_true(desc_id != '1, "real MSI-X submission failed");
-					policy = cfg.function_policies[dpu_function_key_name(message.owner)];
+					policy = cfg.dpu_cfg.function_policies[dpu_function_key_name(message.owner)];
 					if (rows[q].queue_type == VQ_CUSTOM)
 						send_memory(message.owner.host_id, 1, policy.requester, rows[q].device_iova, 32'h8001);
 					else begin
@@ -697,14 +771,68 @@ package project_external_integration_test_pkg;
 		#100ns;
 	endtask
 
+	// 复用生产准备/释放入口，只暂时撤销 Host1 的外部配置许可来触发后序 Host 失败。
+	// 此路径从未写 DUT 或确认队列，模型无 DMA；显式传入静止条件后才能回收前序 Host。
+	task project_external_integration_test::check_prepare_retry();
+		bit		ok;
+		string	why;
+
+		#100ns;
+		config_seq.cfg = cfg.dpu_cfg;
+		config_seq.set_sequencer(env.pcie_env.rc_agents[cfg.tl_slot_by_host[0]].sequencer);
+		cfg.vio_cfg_by_host[1].external_configuration = 0;
+		config_seq.prepare_vio_configuration(selection, ok, why);
+		require_true(!ok && why == "external prepare requires bound nonempty environment without an exported generation",
+			"Host1 did not fail at the actual VIO prepare entry");
+		require_true(selection != null && env.vio_envs[0].get_external_setup() != null &&
+			env.vio_envs[1].get_external_setup() == null,
+			"partial prepare lost the release scope or created an unexpected Host1 generation");
+		require_true(cfg.dpu_cfg.queues_by_host.num() == 0,
+			"partial prepare published incomplete DPU queue exports");
+		foreach (env.vio_envs[h]) foreach (env.vio_envs[h].function_instances[f]) begin
+			require_true(env.vio_envs[h].function_instances[f].driver_agent.fsm.state != FSM_READY,
+				"partial prepare admitted packets before commit");
+		end
+
+		config_seq.release_vio_resources(selection, 1, ok, why);
+		require_true(ok, why);
+		require_true(env.vio_envs[0].get_external_setup() == null &&
+			cfg.dpu_cfg.queues_by_host.num() == 0,
+			"release retained the partially prepared Host generation");
+		foreach (env.vio_envs[h]) env.vio_envs[h].host_mem.leak_check();
+
+		cfg.vio_cfg_by_host[1].external_configuration = 1;
+		config_seq.prepare_vio_configuration(selection, ok, why);
+		require_true(ok && selection != null, why);
+		require_true(env.vio_envs[0].get_external_setup() != null &&
+			env.vio_envs[1].get_external_setup() != null && cfg.dpu_cfg.queues_by_host.num() == 2,
+			"retry did not prepare and export both Host generations");
+		config_seq.release_vio_resources(selection, 1, ok, why);
+		require_true(ok, why);
+		foreach (env.vio_envs[h]) begin
+			require_true(env.vio_envs[h].get_external_setup() == null,
+				"retry cleanup retained a live Host generation");
+			env.vio_envs[h].host_mem.leak_check();
+		end
+		`uvm_info("PROJECT_PREPARE_RETRY_PASS",
+			"Host0 survived Host1 prepare failure, released through returned scope, and both Hosts retried successfully",
+			UVM_LOW)
+	endtask
+
 	// 正常使用方式：只启动一个配置 seq，自动 get 同一 cfg，成功后进入 READY。
 	// 故障行每次仿真只注入一个 DWORD，检查整个 body 停止且不进入发包状态。
+	// 准备重试分支仅执行本地生命周期检查，保留同一真实组件树但不启动 MMIO 模型。
 	task project_external_integration_test::run_phase(uvm_phase	phase);
 		bit				ok;
 		string			why;
 		int unsigned	host;
 
 		phase.raise_objection(this);
+		if ($test$plusargs("PROJECT_PREPARE_RETRY")) begin
+			check_prepare_retry();
+			phase.drop_objection(this);
+			return;
+		end
 		foreach (apps[h]) begin
 			automatic int unsigned	access_host = h;
 
@@ -717,17 +845,17 @@ package project_external_integration_test_pkg;
 		require_true(cfg.tl_slot_by_host.first(host), "Host mapping missing");
 
 		config_seq.cfg = null;
-		config_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[host]]);
+		config_seq.start(env.pcie_env.rc_agents[cfg.tl_slot_by_host[host]].sequencer);
 		selection = config_seq.selection;
-		require_true(config_seq.cfg == cfg, "sequence did not retrieve the shared env_cfg");
+		require_true(config_seq.cfg == cfg.dpu_cfg, "sequence did not retrieve the shared env_cfg");
 		#100ns;
 
 		if (config_seq.fail_dword != 0) begin
 			require_true(!config_seq.success && config_seq.error_msg != "", "send failure was not propagated");
 			require_true(config_seq.fault_armed && project_config_fault_seq::calls == config_seq.fail_dword,
 				"configuration continued sending after failed DWORD");
-			foreach (cfg.vio_envs[h]) foreach (cfg.vio_envs[h].function_instances[f]) begin
-				require_true(cfg.vio_envs[h].function_instances[f].driver_agent.fsm.state != FSM_READY,
+			foreach (env.vio_envs[h]) foreach (env.vio_envs[h].function_instances[f]) begin
+				require_true(env.vio_envs[h].function_instances[f].driver_agent.fsm.state != FSM_READY,
 					"failed configuration entered packet-ready state");
 			end
 			`uvm_info("PROJECT_CONFIG_FAILURE_PASS", $sformatf("direction=%s failure=%0d stopped whole configuration sequence",
@@ -735,11 +863,11 @@ package project_external_integration_test_pkg;
 		end else begin
 			require_true(config_seq.success, config_seq.error_msg);
 			if (!no_vio) begin
-				require_true(selection.setups.num() == host_count, "missing prepared Host");
+				require_true(cfg.dpu_cfg.queues_by_host.num() == host_count, "missing prepared Host");
 				require_true(config_seq.vtx_calls == pairs*vf_count*host_count, "VTX hook count differs from actual queues");
 				require_true(config_seq.vrx_calls == (tx_only ? 0 : pairs*vf_count*host_count), "VRX hook count differs from actual queues");
-				foreach (cfg.vio_envs[h]) foreach (cfg.vio_envs[h].function_instances[f]) begin
-					require_true(cfg.vio_envs[h].function_instances[f].driver_agent.fsm.state == FSM_READY,
+				foreach (env.vio_envs[h]) foreach (env.vio_envs[h].function_instances[f]) begin
+					require_true(env.vio_envs[h].function_instances[f].driver_agent.fsm.state == FSM_READY,
 						"successful configuration did not enable packet admission");
 				end
 			end
@@ -748,11 +876,11 @@ package project_external_integration_test_pkg;
 		end
 
 		// APP fixture 此时没有在途 DMA；真实 DUT 项目应由平台确认停机后再释放。
-		if (selection.setups.num() != 0) begin
-			cfg.release_vio_resources(selection, 1, ok, why);
+		if (selection != null) begin
+			config_seq.release_vio_resources(selection, 1, ok, why);
 			require_true(ok, why);
 		end
-		foreach (cfg.vio_envs[h]) cfg.vio_envs[h].host_mem.leak_check();
+		foreach (env.vio_envs[h]) env.vio_envs[h].host_mem.leak_check();
 		`uvm_info("PROJECT_EXTERNAL_FLOW_PASS", $sformatf("checks=%0d", checks), UVM_LOW)
 		phase.drop_objection(this);
 	endtask
@@ -802,26 +930,29 @@ package project_external_integration_test_pkg;
 	endfunction
 
 	// 排序夹具只隔离 cfg 的纯数据生成，不注册为生产 cfg，也不接管真实环境 ring。
-	// 固定两 PF 的 BAR 顺序与 global_qid 相反，保证发现“用 global_qid 当行号”的回归。
-	class project_notify_sort_fixture extends project_env_cfg;
+	// 固定两 PF 的 BAR 顺序与 global_qid 相反，并用非零 doorbell 覆盖默认/显式查找基址合同。
+	class project_notify_sort_fixture extends dpu_env_cfg;
 		// 构造独立临时 cfg，不 load_params、不创建组件、不发硬件访问。
 		extern function new();
-		// 生成有 RX/TX 重复的两 Function × 两 pair，检查排序、去重及 global_qid 保真。
+		// 检查两 Function × 两 pair 的排序/去重，并验证非零默认基址和显式高位匹配。
 		extern function bit check_sort(output string why);
 	endclass
 
 	// 夹具生命周期仅覆盖一次排序检查，持有自身的快照和只读 setup。
+
 	function project_notify_sort_fixture::new();
 		super.new("notify_sort_fixture");
 	endfunction
 
-	// 所有输入和期望值均固定；两 Function 使用同一管理 PF0 BAR 写表。
+
+	// 两 Function 使用同一管理 PF0 BAR 写表；RX/TX 实际地址低七位不同但匹配同一查找基址。
+	// 先验证未显式指定基址的导出路径，再验证显式匹配和高位冲突拒绝，失败必须清空目录。
+
 	function bit project_notify_sort_fixture::check_sort(output string why);
 		dpu_device_snapshot		snapshot;
 		dpu_dut_caps			caps;
 		dpu_host_info_t			host;
-		vio_queue_setup_t		queues[$];
-		vio_external_setup		setup;
+		dpu_vio_queue_t		queues[$];
 
 		snapshot = new("sort_snapshot");
 		caps = new("sort_caps");
@@ -831,7 +962,7 @@ package project_external_integration_test_pkg;
 			dpu_function_key_t		key;
 			dpu_pcie_function_id_t		identity;
 			dpu_bar_pair_lease_t		bar;
-			project_vio_policy_t		policy;
+			dpu_vio_policy_t		policy;
 
 			key = '{host_id:0, pf_id:f, kind:DPU_FUNCTION_PF, vf_id:0};
 			identity = '{domain:'{host_id:0, segment_id:0}, bdf:16'(f)};
@@ -840,62 +971,86 @@ package project_external_integration_test_pkg;
 			if (f == 0 && !snapshot.set_expected_af(key, why)) return 0;
 			policy.service_key = '{function_key:key, service_kind:DPU_SERVICE_VIO_NET, service_instance_id:0};
 			policy.notify_net_pair5 = 1;
-			policy.notify_table_base_provided = 1;
+			policy.notify_table_base_provided = 0;
 			policy.notify_table_bar = 0;
 			policy.notify_table_offset = 0;
 			frozen_policies[dpu_service_key_name(policy.service_key)] = policy;
 			for (int p = 1; p >= 0; p--) begin
-				vio_queue_setup_t	queue;
+				dpu_vio_queue_t	queue;
 
 				queue.service_key = policy.service_key;
+				queue.snapshot = snapshot;
+				queue.generation = 1;
 				queue.qpair.virtio_pair_index = p;
 				queue.qpair.global_qpair_id = f*2+p;
 				queue.qpair.rx_local_virtqueue_id = p*2;
 				queue.qpair.tx_local_virtqueue_id = p*2+1;
+				queue.notify_address = bar.base + 'h104;
 				queues.push_back(queue);
+				queue.notify_address = bar.base + 'h108;
 				queues.push_back(queue);
 			end
 		end
 		if (!snapshot.freeze(why)) return 0;
-		bar_registry = new("sort_registry");
-		if (!bar_registry.initialize(snapshot, 1, why) || !bar_registry.bind_host(0, 0, why)) return 0;
-		for (int unsigned f = 0; f < 2; f++) begin
-			dpu_function_key_t	key;
-
-			key = '{host_id:0, pf_id:f, kind:DPU_FUNCTION_PF, vf_id:0};
-			if (!bar_registry.bind_function(key, f, -1, 16'(f), why)) return 0;
-		end
-		if (!bar_registry.freeze(why)) return 0;
+		bar_map = new("sort_registry");
+		if (!bar_map.initialize(snapshot, 1, why)) return 0;
+		if (!bar_map.freeze(why)) return 0;
 		device_snapshot = snapshot;
-		dpu_setup = new("sort_dpu_setup", snapshot, bar_registry, 1);
 		use_driver_reference_layouts();
 		frozen_layouts = table_layouts;
 		frozen_reg_target = "h0.pf0.bar0";
-		setup = new("sort_setup", null, snapshot, null, 1, queues);
-		vio_setups[0] = setup;
+		queues_by_host[0] = queues;
 		if (!materialize_notify_records(why)) return 0;
 		if (notify_records.size() != 4) begin
 			why = "Notify pair deduplication did not produce four rows";
 			return 0;
 		end
 		foreach (notify_records[i]) begin
-			project_vio_notify_entry_t	entry;
+			dpu_vio_notify_entry_t	entry;
 			int unsigned			expected_pf;
 			int unsigned			expected_global;
 
-			entry = project_vio_notify_entry_t'(notify_records[i].entry);
+			entry = dpu_vio_notify_entry_t'(notify_records[i].entry);
 			expected_pf = i < 2 ? 1 : 0;
 			expected_global = i < 2 ? i+2 : i-2;
 			if (notify_records[i].ctx.table_index != i || notify_records[i].owner.pf_id != expected_pf ||
 				entry.global_qid != expected_global || entry.local_qid_encoding != ((i%2)*2+1) ||
-				entry.base_addr_60_7 != ((expected_pf == 0 ? 64'h800000 : 64'h400000) >> 7)) begin
+				entry.base_addr_60_7 != ((expected_pf == 0 ? 64'h800100 : 64'h400100) >> 7)) begin
 				why = $sformatf("Notify row %0d does not follow BAR/pair order independent of global_qid", i);
 				return 0;
 			end
 		end
+		// 显式 table offset 对齐到0x100；实际通知为0x104/0x108，硬件不比较低七位。
+		foreach (frozen_policies[name]) begin
+			frozen_policies[name].notify_table_base_provided = 1;
+			frozen_policies[name].notify_table_offset = 'h100;
+		end
+		if (!materialize_notify_records(why)) return 0;
+		if (notify_records.size() != 4) begin
+			why = "explicit matching Notify base changed pair deduplication";
+			return 0;
+		end
+		foreach (notify_records[i]) begin
+			dpu_vio_notify_entry_t	entry;
+
+			entry = dpu_vio_notify_entry_t'(notify_records[i].entry);
+			if (entry.base_addr_60_7 != ((i < 2 ? 64'h400100 : 64'h800100) >> 7)) begin
+				why = "explicit Notify base did not preserve exported doorbell high bits";
+				return 0;
+			end
+		end
+		// 只偏移一个128B查找区间，BAR与范围仍合法，必须由实际doorbell高位检查拒绝。
+		foreach (frozen_policies[name]) frozen_policies[name].notify_table_offset = 'h180;
+		if (materialize_notify_records(why) ||
+			why != "notify table lookup base differs from exported doorbell [60:7]" ||
+			notify_records.size() != 0) begin
+			why = "mismatched explicit Notify base was accepted or retained a partial directory";
+			return 0;
+		end
 		why = "";
 		return 1;
 	endfunction
+
 
 	// 裸配置测试只复用父类的 Intel adapter 容器和断言工具，不调用父类平台配置。
 	// 默认 Host0/PF0、Packed、1 对只启 VTX；所有地址布局和软件身份来自生产 cfg。
@@ -903,8 +1058,8 @@ package project_external_integration_test_pkg;
 	class project_bare_config_test extends project_external_integration_test;
 		`uvm_component_utils(project_bare_config_test)
 
-		project_dut_config_seq	bare_seq;
-		project_bar_target_t	management;
+		vio_dpu_cfg_seq	bare_seq;
+		dpu_bar_target_t	management;
 		bit [63:0]		write_offsets[$];
 		bit [31:0]		write_values[$];
 		int unsigned		indirect_transactions[2];
@@ -921,6 +1076,7 @@ package project_external_integration_test_pkg;
 		bit			corrupt_bdf;
 		bit			corrupted;
 		bit			business_notify_enabled;
+		bit [63:0]		business_notify_offset;
 		pcie_tl_mem_tlp		business_notifications[$];
 
 		// 构造测试组件，不提前创建或复制生产 cfg。
@@ -1031,9 +1187,9 @@ package project_external_integration_test_pkg;
 		cfg = project_env_cfg::type_id::create("cfg");
 		cfg.vio_cfg.scb_enable = 0;
 		cfg.load_params();
-		if (missing_layout) cfg.table_layouts.delete(PROJECT_NOTIFY);
-		require_true(!cfg.configure_public, "bare default unexpectedly enables public tables");
-		require_true(cfg.function_policies.exists(dpu_function_key_name(
+		if (missing_layout) cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_NOTIFY);
+		require_true(!cfg.dpu_cfg.configure_public, "bare default unexpectedly enables public tables");
+		require_true(cfg.dpu_cfg.function_policies.exists(dpu_function_key_name(
 			'{host_id:0, pf_id:0, kind:DPU_FUNCTION_PF, vf_id:0})),
 			"PF0 software route was not generated");
 
@@ -1049,7 +1205,7 @@ package project_external_integration_test_pkg;
 		apps[0] = intel_pcie_if_adapter::type_id::create("app_0", this);
 		uvm_config_db#(project_env_cfg)::set(this, "env", "cfg", cfg);
 		env = project_env::type_id::create("env", this);
-		bare_seq = project_dut_config_seq::type_id::create("bare_seq");
+		bare_seq = vio_dpu_cfg_seq::type_id::create("bare_seq");
 	endfunction
 
 	// 这里只接受配置路径发出的完整 DWORD，不掩盖宽度或 byte-enable 错误。
@@ -1090,7 +1246,7 @@ package project_external_integration_test_pkg;
 
 		offset = pcie_tl_mem_wire_addr(request) - management.bar_lease.base;
 		value = payload_dword(request);
-		if (business_notify_enabled && offset == 0) begin
+		if (business_notify_enabled && offset == business_notify_offset) begin
 			business_notifications.push_back(request);
 			return;
 		end
@@ -1109,12 +1265,12 @@ package project_external_integration_test_pkg;
 				"AF declaration must be the first and only 0x1010 write with data 0x5555aaaa");
 			require_true(pcie_tl_mem_wire_addr(request) == management.bar_lease.base + 64'h1010,
 				"AF declaration did not use allocated PF0 BAR0");
-			require_true(!cfg.configure_public && read_requests == 0,
+			require_true(!cfg.dpu_cfg.configure_public && read_requests == 0,
 				"AF declaration depends on public tables or followed an unexpected read");
 		end
 
 		// 仅允许 AF、必要 BDF 和所选 MSI-X；BAR/PFVF/其他公共表不得被总开关带入。
-		require_true(offset == 'h1010 || offset == 'h108000 ||
+		require_true(offset == 'h1010 || offset == 'h108000 || offset == 'h80044 ||
 			(msix_mode && ((offset >= 'hc0000 && offset < 'hc4000) ||
 				(offset >= 'h120000 && offset < 'h124000) ||
 				(offset >= 'h140000 && offset < 'h141000) ||
@@ -1162,6 +1318,17 @@ package project_external_integration_test_pkg;
 			if (t == null) continue;
 			require_true($cast(m, t), "bare configuration issued non-Memory request");
 			offset = pcie_tl_mem_wire_addr(m) - management.bar_lease.base;
+			// 可选迁移审计只记录实际 Intel 请求；字段独立展开，保留原始事务顺序。
+			if ($test$plusargs("PROJECT_MMIO_TRACE")) begin
+				string	payload;
+
+				payload = "";
+				foreach (m.payload[i]) payload = {payload, $sformatf("%02h", m.payload[i])};
+				$display("MMIO_TRACE host=%0d bar=%0d base=%016h offset=%016h kind=%s bytes=%0d first=%h last=%h payload=%s",
+					host, m.cq_route.bar_id, management.bar_lease.base, offset,
+					m.kind.name(), m.length * 4, m.first_be, m.last_be, payload);
+			end
+
 			if (!business_notify_enabled)
 				require_true(m.tc == 0 && m.attr == 0, "configuration request allowed relaxed ordering or a different TC");
 			if (offset == 'h1010) begin
@@ -1243,12 +1410,12 @@ package project_external_integration_test_pkg;
 	task project_bare_config_test::await_configuration_writes();
 		int unsigned	expected_writes;
 
-		expected_writes = 1 + pairs*4 + (msix_mode ? 2048*2 : 0) + (cfg.qsch_configure_controls ? 1 : 0);
-		foreach (cfg.records[name]) begin
-			case (cfg.records[name].ctx.kind)
-				PROJECT_NOTIFY, PROJECT_MSIX_LINEAR: ;
-				PROJECT_VTX, PROJECT_VRX: expected_writes += 12;
-				default: expected_writes += cfg.records[name].ctx.layout.entry_bytes/4;
+		expected_writes = 2 + pairs*4 + (msix_mode ? 2048*2 : 0) + (cfg.dpu_cfg.qsch_configure_controls ? 1 : 0);
+		foreach (cfg.dpu_cfg.records[name]) begin
+			case (cfg.dpu_cfg.records[name].ctx.kind)
+				DPU_TABLE_NOTIFY, DPU_TABLE_MSIX_LINEAR: ;
+				DPU_TABLE_VTX, DPU_TABLE_VRX: expected_writes += 12;
+				default: expected_writes += cfg.dpu_cfg.records[name].ctx.layout.entry_bytes/4;
 			endcase
 		end
 		for (int unsigned attempt = 0; attempt < 10000 && write_offsets.size() < expected_writes; attempt++) #10ns;
@@ -1262,8 +1429,11 @@ package project_external_integration_test_pkg;
 
 	// 逐项检查最终 enabled 内容；Notify 额外核对所属 Function BAR 与四笔连续写序。
 	function void project_bare_config_test::check_configuration();
-		int unsigned	counts[project_table_kind_e];
+		int unsigned	counts[dpu_table_kind_e];
 		int unsigned	notify_writes;
+		int unsigned	notify_enables;
+		int unsigned	last_notify;
+		int unsigned	first_qsch;
 		int unsigned	bdf_writes;
 		int unsigned	bdf_position;
 		int unsigned	first_queue_trigger;
@@ -1277,51 +1447,51 @@ package project_external_integration_test_pkg;
 		require_true(indirect_transactions[1] == (tx_only ? 0 : pairs*2), "VRX enabled rewrite count");
 		require_true(af_reads == 1 + (write_offsets.size()-1)/100 && completed_af_reads == af_reads,
 			"AF initial/periodic read count differs from completed DWORD writes");
-		if (cfg.verify_readback)
+		if (cfg.dpu_cfg.verify_readback)
 			require_true(read_requests > af_reads, "enabled table readback performed no extra MemRead");
 		else
 			require_true(read_requests == af_reads, "default configuration read beyond required AF status reads");
 		require_true(table_value('hb001c0, 4) == 0, "QSCH mode is not VNET");
 
-		foreach (cfg.records[name]) begin
-			project_config_record_t	r;
+		foreach (cfg.dpu_cfg.records[name]) begin
+			dpu_table_item_t	r;
 
-			r = cfg.records[name];
+			r = cfg.dpu_cfg.records[name];
 			counts[r.ctx.kind]++;
-			require_true(r.ctx.kind inside {PROJECT_NOTIFY, PROJECT_Q2TC, PROJECT_N2G, PROJECT_G2P,
-				PROJECT_SPWRR, PROJECT_TC_WEIGHT, PROJECT_VTX, PROJECT_VRX, PROJECT_BDF,
-				PROJECT_MSIX_LINEAR, PROJECT_MSIX_INFO, PROJECT_MSIX_INTERVAL, PROJECT_MSIX_TABLE}, "unexpected public record");
+			require_true(r.ctx.kind inside {DPU_TABLE_NOTIFY, DPU_TABLE_Q2TC, DPU_TABLE_N2G, DPU_TABLE_G2P,
+				DPU_TABLE_SPWRR, DPU_TABLE_TC_WEIGHT, DPU_TABLE_VTX, DPU_TABLE_VRX, DPU_TABLE_BDF,
+				DPU_TABLE_MSIX_LINEAR, DPU_TABLE_MSIX_INFO, DPU_TABLE_MSIX_INTERVAL, DPU_TABLE_MSIX_TABLE}, "unexpected public record");
 			expected = (r.entry & ~r.enable_mask) | r.enable_value;
 			actual = table_value(r.ctx.byte_offset, r.ctx.layout.entry_bytes);
 			require_true(actual === expected, $sformatf("final table value differs: %s", name));
-			if (r.ctx.kind == PROJECT_BDF) begin
+			if (r.ctx.kind == DPU_TABLE_BDF) begin
 				require_true(r.ctx.byte_offset == 'h108000 && actual == 'h10000,
 					"PF0 BDF mapping differs from valid requester=0");
 			end
-			if (r.ctx.kind == PROJECT_NOTIFY) begin
-				project_vio_notify_entry_t	entry;
+			if (r.ctx.kind == DPU_TABLE_NOTIFY) begin
+				dpu_vio_notify_entry_t	entry;
 
-				entry = project_vio_notify_entry_t'(actual);
+				entry = dpu_vio_notify_entry_t'(actual);
 				require_true(entry.base_addr_60_7 == management.bar_lease.base[60:7], "Notify table does not use assigned PF0 BAR");
 				require_true(entry.local_qid_encoding == (r.binding.qpair.virtio_pair_index << 1 | 1), "Notify local pair encoding");
 				require_true(r.binding.notify_address == management.bar_lease.base, "runtime doorbell differs from assigned BAR");
 			end
-			if (r.ctx.kind == PROJECT_SPWRR) require_true(actual == 'hff, "SPWRR default differs");
-			if (r.ctx.kind == PROJECT_TC_WEIGHT) require_true(actual == 'h11111111, "TC weight default differs");
-			if (r.ctx.kind == PROJECT_VTX) begin
-				project_vtx_entry_t	entry;
+			if (r.ctx.kind == DPU_TABLE_SPWRR) require_true(actual == 'hff, "SPWRR default differs");
+			if (r.ctx.kind == DPU_TABLE_TC_WEIGHT) require_true(actual == 'h11111111, "TC weight default differs");
+			if (r.ctx.kind == DPU_TABLE_VTX) begin
+				dpu_vtx_entry_t	entry;
 
-				entry = project_vtx_entry_t'(actual);
+				entry = dpu_vtx_entry_t'(actual);
 				require_true(entry.q_depth == 8, "VTX depth does not match 256 descriptors");
 				require_true(entry.virtio_mode == ($test$plusargs("PROJECT_CUSTOM") ? 0 : 1), "VTX Packed/Custom mode differs");
 			end
 		end
-		require_true(counts[PROJECT_NOTIFY] == pairs && counts[PROJECT_VTX] == pairs &&
-			counts[PROJECT_Q2TC] == pairs, "queue-derived table count differs");
-		require_true(counts[PROJECT_N2G] != 0 && counts[PROJECT_G2P] != 0 &&
-			counts[PROJECT_SPWRR] != 0 && counts[PROJECT_TC_WEIGHT] != 0, "scheduler tables incomplete");
+		require_true(counts[DPU_TABLE_NOTIFY] == pairs && counts[DPU_TABLE_VTX] == pairs &&
+			counts[DPU_TABLE_Q2TC] == pairs, "queue-derived table count differs");
+		require_true(counts[DPU_TABLE_N2G] != 0 && counts[DPU_TABLE_G2P] != 0 &&
+			counts[DPU_TABLE_SPWRR] != 0 && counts[DPU_TABLE_TC_WEIGHT] != 0, "scheduler tables incomplete");
 
-		require_true(counts[PROJECT_BDF] == 1, "default configuration must contain PF0 BDF exactly once");
+		require_true(counts[DPU_TABLE_BDF] == 1, "default configuration must contain PF0 BDF exactly once");
 		first_queue_trigger = '1;
 		foreach (write_offsets[i]) begin
 			if (write_offsets[i] == 'h108000) begin
@@ -1334,26 +1504,37 @@ package project_external_integration_test_pkg;
 		require_true(bdf_writes == 1 && bdf_position < first_queue_trigger,
 			"BDF was missing/duplicated or written after queue programming");
 		if (msix_mode) begin
-			require_true(counts[PROJECT_MSIX_LINEAR] == cfg.frozen_messages.size() &&
-				counts[PROJECT_MSIX_INFO] == cfg.frozen_messages.size() &&
-				counts[PROJECT_MSIX_INTERVAL] == cfg.frozen_messages.size() &&
-				counts[PROJECT_MSIX_TABLE] == cfg.frozen_messages.size(), "MSI-X table/vector count differs");
+			require_true(counts[DPU_TABLE_MSIX_LINEAR] == cfg.dpu_cfg.frozen_messages.size() &&
+				counts[DPU_TABLE_MSIX_INFO] == cfg.dpu_cfg.frozen_messages.size() &&
+				counts[DPU_TABLE_MSIX_INTERVAL] == cfg.dpu_cfg.frozen_messages.size() &&
+				counts[DPU_TABLE_MSIX_TABLE] == cfg.dpu_cfg.frozen_messages.size(), "MSI-X table/vector count differs");
 			check_msix_tables();
 		end else begin
-			require_true(counts[PROJECT_MSIX_LINEAR]+counts[PROJECT_MSIX_INFO]+counts[PROJECT_MSIX_INTERVAL]+
-				counts[PROJECT_MSIX_TABLE] == 0, "polling unexpectedly generated MSI-X records");
+			require_true(counts[DPU_TABLE_MSIX_LINEAR]+counts[DPU_TABLE_MSIX_INFO]+counts[DPU_TABLE_MSIX_INTERVAL]+
+				counts[DPU_TABLE_MSIX_TABLE] == 0, "polling unexpectedly generated MSI-X records");
 		end
 		notify_writes = 0;
+		first_qsch = '1;
 		foreach (write_offsets[i]) begin
+			if (write_offsets[i] == 'h80044) begin
+				notify_enables++;
+				require_true(notify_writes == pairs*4 && i > last_notify &&
+					write_values[i] == 1 && first_qsch == '1,
+					"Notify enable must follow all rows and precede scheduler configuration");
+			end
+			if (write_offsets[i] == 'hb001c0 ||
+				(write_offsets[i] >= 'hb10000 && write_offsets[i] < 'hb19000)) first_qsch = i;
 			if (write_offsets[i] < 'ha0000 || write_offsets[i] >= 'ha2000) continue;
 			require_true(write_offsets[i] == 'ha0000 + 64'(notify_writes/4)*16 + (3-(notify_writes%4))*4,
 				"Notify rows are not sequential or DWORD writes are not high to low");
 			notify_writes++;
+			last_notify = i;
 		end
+		require_true(notify_enables == 1, "Notify management target must be enabled exactly once");
 		require_true(notify_writes == pairs*4, "Notify must contain exactly one written row per queue pair");
-		if (cfg.verify_readback && !msix_mode) begin
+		if (cfg.dpu_cfg.verify_readback && !msix_mode) begin
 			// 每个唯一表项读一次，加 QSCH mode 一次；不存在未用 Notify 行的额外读回。
-			require_true(read_requests == af_reads + cfg.records.num() + (cfg.qsch_configure_controls ? 1 : 0),
+			require_true(read_requests == af_reads + cfg.dpu_cfg.records.num() + (cfg.dpu_cfg.qsch_configure_controls ? 1 : 0),
 				"configuration read count includes missing/extra table reads");
 		end
 	endfunction
@@ -1362,24 +1543,24 @@ package project_external_integration_test_pkg;
 	// Linear 表独立按 local-vector 顺序检查有效行，并检查全部 2048 行尾部和高到低写序。
 	function void project_bare_config_test::check_msix_tables();
 		vio_queue_setup_t	queues[$];
-		project_msix_message_t	messages[$];
+		dpu_msix_message_t	messages[$];
 		int unsigned		linear_writes;
 
-		messages = cfg.frozen_messages;
+		messages = cfg.dpu_cfg.frozen_messages;
 		messages.sort() with (item.local_vector);
 		require_true(messages.size() != 0, "MSI-X mode published no messages");
 		foreach (messages[i]) begin
-			project_msix_linear_entry_t	linear;
-			project_msix_info_entry_t	info;
-			project_msix_table_entry_t	message;
+			dpu_msix_linear_entry_t	linear;
+			dpu_msix_info_entry_t	info;
+			dpu_msix_table_entry_t	message;
 			bit [63:0]			expected_address;
 			bit [31:0]			expected_data;
 
 			expected_address = 64'h900000000000 + messages[i].local_vector*4;
 			expected_data = 32'h13572468 + messages[i].local_vector*32'h100;
-			linear = project_msix_linear_entry_t'(table_value('hc0000+i*8, 8));
-			info = project_msix_info_entry_t'(table_value('h150000+messages[i].global_vector*4, 4));
-			message = project_msix_table_entry_t'(table_value('h120000+messages[i].global_vector*16, 16));
+			linear = dpu_msix_linear_entry_t'(table_value('hc0000+i*8, 8));
+			info = dpu_msix_info_entry_t'(table_value('h150000+messages[i].global_vector*4, 4));
+			message = dpu_msix_table_entry_t'(table_value('h120000+messages[i].global_vector*16, 16));
 			require_true(linear.global_msix_idx == messages[i].global_vector &&
 				linear.local_msix_idx == messages[i].local_vector && linear.host_id == 0 && linear.pfvf_id == 0,
 				"MSI-X linear row disagrees with actual Function/vector binding");
@@ -1394,7 +1575,7 @@ package project_external_integration_test_pkg;
 				expected_address >= management.bar_lease.base+management.bar_lease.size,
 				"MSI-X Host message address incorrectly aliases DUT BAR");
 		end
-		selection.setups[0].list_queues(queues);
+		env.vio_envs[0].get_external_setup().list_queues(queues);
 		foreach (queues[q]) begin
 			bit	found;
 
@@ -1411,9 +1592,9 @@ package project_external_integration_test_pkg;
 			require_true(found, "queue has no configured MSI-X message");
 		end
 		for (int unsigned row = messages.size(); row < 2048; row++) begin
-			project_msix_linear_entry_t	entry;
+			dpu_msix_linear_entry_t	entry;
 
-			entry = project_msix_linear_entry_t'(table_value('hc0000+row*8, 8));
+			entry = dpu_msix_linear_entry_t'(table_value('hc0000+row*8, 8));
 			require_true(entry.global_msix_idx == '1 && entry.host_id == '1 && entry.pfvf_id == '1 &&
 				entry.local_msix_idx == '1 && entry.reserved_63_35 == 0,
 				"MSI-X linear unused row was not invalid sentinel");
@@ -1439,9 +1620,9 @@ package project_external_integration_test_pkg;
 		int unsigned			descriptor;
 		bit				found;
 		bit [31:0]			notify_word;
-		project_vio_notify_entry_t	lookup;
+		dpu_vio_notify_entry_t	lookup;
 
-		selection.setups[0].list_queues(queues);
+		env.vio_envs[0].get_external_setup().list_queues(queues);
 		foreach (queues[q]) begin
 			if (queues[q].tx_mode && queues[q].qpair.virtio_pair_index == 0) begin
 				tx_queue = queues[q];
@@ -1471,7 +1652,7 @@ package project_external_integration_test_pkg;
 		notify_word = payload_dword(business_notifications[0]);
 		require_true(notify_word[15:0] == tx_queue.notification.local_qid && notify_word[30:16] != 0,
 			"DPU32 business Notify lost local qid or producer position");
-		lookup = project_vio_notify_entry_t'(table_value('ha0000, 16));
+		lookup = dpu_vio_notify_entry_t'(table_value('ha0000, 16));
 		require_true(lookup.host_id == 0 && lookup.base_addr_60_7 == tx_queue.notify_address[60:7] &&
 			lookup.local_qid_encoding == notify_word[6:0] && lookup.global_qid == tx_queue.qpair.global_qpair_id,
 			"business Notify does not resolve through the configured sorted table row");
@@ -1490,7 +1671,7 @@ package project_external_integration_test_pkg;
 		time				started;
 
 		phase.raise_objection(this);
-		require_true(cfg.bar_registry.resolve_name("h0.pf0.bar0", management, why), why);
+		require_true(cfg.dpu_cfg.bar_map.resolve_name("h0.pf0.bar0", management, why), why);
 		fork app_receive(0); join_none
 		#100ns;
 		catcher = new();
@@ -1502,11 +1683,11 @@ package project_external_integration_test_pkg;
 		if (corrupt_readback || missing_layout || missing_message || fail_af_write || bad_af_status || bad_af_completion)
 			uvm_report_cb::add(null, catcher);
 		started = $time;
-		bare_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[0]]);
+		bare_seq.start(env.pcie_env.rc_agents[cfg.tl_slot_by_host[0]].sequencer);
 		if (corrupt_readback || missing_layout || missing_message || fail_af_write || bad_af_status)
 			uvm_report_cb::delete(null, catcher);
 		selection = bare_seq.selection;
-		require_true(bare_seq.cfg == cfg, "bare sequence did not retrieve the same env_cfg");
+		require_true(bare_seq.cfg == cfg.dpu_cfg, "bare sequence did not retrieve the same env_cfg");
 
 		if (corrupt_readback || missing_layout || missing_message || fail_af_write || bad_af_status || bad_af_completion) begin
 			require_true(catcher.count == 1 && !bare_seq.success && bare_seq.error_msg != "",
@@ -1532,8 +1713,8 @@ package project_external_integration_test_pkg;
 				foreach (write_offsets[i]) require_true(write_offsets[i] inside {'h1010, 'h108000},
 					"missing Notify layout allowed dependent configuration writes");
 			end
-			foreach (cfg.vio_envs[h]) foreach (cfg.vio_envs[h].function_instances[f]) begin
-				require_true(cfg.vio_envs[h].function_instances[f].driver_agent.fsm.state != FSM_READY,
+			foreach (env.vio_envs[h]) foreach (env.vio_envs[h].function_instances[f]) begin
+				require_true(env.vio_envs[h].function_instances[f].driver_agent.fsm.state != FSM_READY,
 					"failed configuration entered READY");
 			end
 			`uvm_info("PROJECT_BARE_FAILURE_PASS", catcher.message, UVM_LOW)
@@ -1544,8 +1725,11 @@ package project_external_integration_test_pkg;
 			check_configuration();
 			sort_fixture = new();
 			require_true(sort_fixture.check_sort(why), why);
-			foreach (cfg.vio_envs[h]) foreach (cfg.vio_envs[h].function_instances[f]) begin
-				require_true(cfg.vio_envs[h].function_instances[f].driver_agent.fsm.state == FSM_READY,
+			`uvm_info("PROJECT_NOTIFY_BASE_PASS",
+				"nonzero exported Notify base, matching high bits with different low bits, mismatch rejection and pair sorting passed",
+				UVM_LOW)
+			foreach (env.vio_envs[h]) foreach (env.vio_envs[h].function_instances[f]) begin
+				require_true(env.vio_envs[h].function_instances[f].driver_agent.fsm.state == FSM_READY,
 					"verified bare configuration did not enter READY");
 			end
 			check_tx_notify();
@@ -1554,11 +1738,11 @@ package project_external_integration_test_pkg;
 		end
 
 		#100ns;
-		if (selection.setups.num() != 0) begin
-			cfg.release_vio_resources(selection, 1, ok, why);
+		if (selection != null) begin
+			bare_seq.release_vio_resources(selection, 1, ok, why);
 			require_true(ok, why);
 		end
-		foreach (cfg.vio_envs[h]) cfg.vio_envs[h].host_mem.leak_check();
+		foreach (env.vio_envs[h]) env.vio_envs[h].host_mem.leak_check();
 		phase.drop_objection(this);
 	endtask
 
@@ -1582,7 +1766,7 @@ package project_external_integration_test_pkg;
 	// 构建后删除的是输入布局；真正 frozen 副本仍由产品 env 正常发布，测试不手动回填。
 	function void project_single_queue_config_test::build_phase(uvm_phase phase);
 		super.build_phase(phase);
-		cfg.table_layouts.delete();
+		cfg.dpu_cfg.table_layouts.delete();
 		if (!$test$plusargs("PROJECT_FIXED_ORIGINAL"))
 			bare_seq = project_single_queue_config_seq::type_id::create("fixed_seq");
 	endfunction
@@ -1592,7 +1776,7 @@ package project_external_integration_test_pkg;
 		project_bare_expected_failure	catcher;
 		string				why;
 
-		require_true(cfg.table_layouts.num() == 0 && cfg.frozen_layouts.num() == 0,
+		require_true(cfg.dpu_cfg.table_layouts.num() == 0 && cfg.dpu_cfg.frozen_layouts.num() == 0,
 			"fixed sequence fixture must begin with no input or frozen layouts");
 		if (!$test$plusargs("PROJECT_FIXED_ORIGINAL")) begin
 			super.run_phase(phase);
@@ -1600,24 +1784,265 @@ package project_external_integration_test_pkg;
 		end
 
 		phase.raise_objection(this);
-		require_true(cfg.bar_registry.resolve_name("h0.pf0.bar0", management, why), why);
+		require_true(cfg.dpu_cfg.bar_map.resolve_name("h0.pf0.bar0", management, why), why);
 		fork app_receive(0); join_none
 		#100ns;
 		catcher = new();
 		catcher.expected_stage = "configure_bdf_table";
 		uvm_report_cb::add(null, catcher);
-		bare_seq.start(cfg.rc_sequencers[cfg.tl_slot_by_host[0]]);
+		bare_seq.start(env.pcie_env.rc_agents[cfg.tl_slot_by_host[0]].sequencer);
 		uvm_report_cb::delete(null, catcher);
 		require_true(catcher.count == 1 && !bare_seq.success &&
-			bare_seq.error_msg == "configure_bdf_table: missing platform layout: PROJECT_BDF",
+			uvm_is_match("configure_bdf_table: missing platform layout: DPU_TABLE_BDF\n*", bare_seq.error_msg),
 			"original sequence no longer reports its missing BDF layout");
 		for (int unsigned attempt = 0; attempt < 1000 && write_offsets.size() < 1; attempt++) #10ns;
 		#100ns;
 		require_true(write_offsets.size() == 1 && write_offsets[0] == 'h1010 && read_requests == 1,
 			"original sequence sent configuration after the missing BDF failure");
-		require_true(bare_seq.selection.setups.num() == 0, "original failure allocated VIO rings");
-		foreach (cfg.vio_envs[h]) cfg.vio_envs[h].host_mem.leak_check();
+		require_true(bare_seq.selection == null, "original failure allocated VIO rings");
+		foreach (env.vio_envs[h]) env.vio_envs[h].host_mem.leak_check();
 		`uvm_info("PROJECT_FIXED_ORIGINAL_FAILURE_PASS", catcher.message, UVM_LOW)
+		phase.drop_objection(this);
+	endtask
+
+
+	// 快照回归保留真实Intel模型，延迟首次DUT配置到Tcl命令；不绕过产品load_params注册。
+	typedef class project_runtime_params_test;
+	class project_reload_probe extends aip_cmd;
+		project_runtime_params_test	test;
+		// 测试命令只校验状态/执行配置，正式重载始终调用env注册的load_params。
+		extern function new(input project_runtime_params_test	owner);
+		// stage由Tcl指定，所有失败通过真实UVM断言终止。
+		extern virtual task cmd_exec();
+	endclass
+
+	class project_runtime_params_test extends project_bare_config_test;
+		`uvm_component_utils(project_runtime_params_test)
+		project_env_cfg		saved_cfg;
+		dpu_bar_map	saved_registry;
+		dpu_device_snapshot	saved_device;
+		dpu_resource_snapshot	saved_resources;
+		virtio_net_env_config	saved_host_cfg;
+		bit [63:0]		saved_bar;
+		bit [15:0]		saved_bdf;
+		bit			configured;
+
+		// 父类提供真实Intel模型；此类仅改变测试运行顺序。
+		extern function new(string	name, uvm_component	parent);
+		// 初始消息用单向量模板，证明恢复未提供的新键不会丢掉旧模板。
+		extern virtual function void build_phase(uvm_phase	phase);
+		// 同一对象/地址身份、旧值保持、重载后真实配置和中断链路均在这里检查。
+		extern task probe(input string	stage);
+		// 无 Tcl 时也验证同一命令注册、失败不提交和真实写表；独立 restore 另走 Tcl 分支。
+		extern task check_runtime_reload();
+		// 进入真实Tcl桥并等待checkpoint/restore；结束后释放模型已停机的资源。
+		extern virtual task run_phase(uvm_phase	phase);
+	endclass
+
+	function project_reload_probe::new(input project_runtime_params_test	owner);
+		super.new("reload_probe");
+		test = owner;
+	endfunction
+
+	task project_reload_probe::cmd_exec();
+		test.probe(args_in);
+		status = 0;
+		result_out = "OK";
+	endtask
+
+	function project_runtime_params_test::new(string	name, uvm_component	parent);
+		super.new(name, parent);
+	endfunction
+
+	function void project_runtime_params_test::build_phase(uvm_phase	phase);
+		aip_cmdline_override::set_val("dpu.msix.v0.msg_addr", "0x900000000000");
+		aip_cmdline_override::set_val("dpu.msix.v0.msg_data", "0x13572468");
+		aip_cmdline_override::set_val("dpu.msix.v1.msg_addr", "0x900000000004");
+		aip_cmdline_override::set_val("dpu.msix.v1.msg_data", "0x13572469");
+		super.build_phase(phase);
+	endfunction
+
+	// 独立常量检查新CLI预期，不能以cfg自身值构造总线期望而掩盖旧缓存。
+	task project_runtime_params_test::probe(input string	stage);
+		virtio_function_instance		instance;
+		vio_service_requirement_t	requirement;
+		dpu_bar_target_t		target;
+		string				why;
+
+		instance = env.vio_envs[0].function_instances[0];
+		require_true(cfg == saved_cfg && cfg.dpu_cfg.bar_map == saved_registry &&
+			cfg.dpu_cfg.device_snapshot == saved_device && cfg.dpu_cfg.resource_snapshot == saved_resources &&
+			cfg.vio_cfg_by_host[0] == saved_host_cfg, "reload replaced cfg or frozen resource handles");
+		require_true(cfg.dpu_cfg.bar_map.resolve_name("h0.pf0.bar0", target, why), why);
+		require_true(target.bar_lease.base == saved_bar && instance.pcie_id.bdf == saved_bdf,
+			"reload changed assigned BAR/BDF");
+		require_true(cfg.vio_cfg_by_host[0].resolve_final_service_requirement(instance.service_key, requirement, why), why);
+		if (stage == "before") begin
+			require_true(requirement.behavior.queue_size == 256 &&
+				requirement.completion_mode == VIRTIO_COMPLETION_POLLING && cfg.dpu_cfg.queues_by_host.num() == 0 &&
+				write_offsets.size() == 0 && cfg.dpu_cfg.qsch_spwrr == 'hff &&
+				cfg.dpu_cfg.frozen_messages[0].address == 'h900000000000,
+				"restore/failed reload changed live values or sent DUT configuration");
+			`uvm_info("PROJECT_RELOAD_BEFORE_PASS", "old cached values preserved before explicit load_params", UVM_LOW)
+			return;
+		end
+		require_true(requirement.behavior.queue_size == 512 && requirement.notify_base == 'h80 &&
+			requirement.completion_mode == VIRTIO_COMPLETION_MSIX && instance.drv_cfg.queue_size == 512 &&
+			instance.driver_agent.fsm.drv_cfg.queue_size == 512, "runtime requirement/driver cache was not refreshed");
+		require_true(cfg.dpu_cfg.frozen_messages.size() == 2 && cfg.dpu_cfg.frozen_messages[0].address == 'ha00000000000 &&
+			cfg.dpu_cfg.frozen_messages[0].data == 'h24681357 && cfg.dpu_cfg.frozen_messages[1].address == 'h900000000004 &&
+			cfg.dpu_cfg.frozen_messages[1].data == 'h13572469, "new v0 or omitted v1 message template was lost");
+		require_true(cfg.dpu_cfg.qsch_spwrr == 'h55 && cfg.dpu_cfg.frozen_policies[dpu_service_key_name(instance.service_key)].vtx.dma_info == 5,
+			"platform/frozen table policy did not update");
+		if (stage == "reloaded") begin
+			require_true(write_offsets.size() == 0 && cfg.dpu_cfg.queues_by_host.num() == 0,
+				"load_params sent writes or allocated a ring");
+			`uvm_info("PROJECT_RELOAD_VALUES_PASS", "same cfg contains refreshed service and frozen table values", UVM_LOW)
+			return;
+		end
+		if (stage == "active") begin
+			require_true(configured && cfg.dpu_cfg.queues_by_host.num() == 1 && instance.driver_agent.fsm.state == FSM_READY,
+				"rejected active reload changed prepared state");
+			return;
+		end
+		require_true(stage == "configure" && !configured, "unknown/duplicate reload probe stage");
+		msix_mode = 1;
+		bare_seq.start(env.pcie_env.rc_agents[cfg.tl_slot_by_host[0]].sequencer);
+		require_true(bare_seq.success, bare_seq.error_msg);
+		selection = bare_seq.selection;
+		await_configuration_writes();
+		foreach (cfg.dpu_cfg.records[name]) begin
+			dpu_table_item_t	record;
+			bit [127:0]		actual;
+
+			record = cfg.dpu_cfg.records[name];
+			actual = table_value(record.ctx.byte_offset, record.ctx.layout.entry_bytes);
+			require_true(actual == ((record.entry & ~record.enable_mask) | record.enable_value),
+				{"actual reloaded table differs: ", name});
+			if (record.ctx.kind == DPU_TABLE_VTX) begin
+				dpu_vtx_entry_t	entry;
+
+				entry = dpu_vtx_entry_t'(actual);
+				require_true(entry.q_depth == 9 && entry.dma_info == 5, "actual VTX table retained old depth/policy");
+			end
+			if (record.ctx.kind == DPU_TABLE_SPWRR) require_true(actual == 'h55, "actual QSCH weight retained old value");
+			if (record.ctx.kind == DPU_TABLE_NOTIFY) begin
+				dpu_vio_notify_entry_t	entry;
+
+				entry = dpu_vio_notify_entry_t'(actual);
+				require_true(entry.base_addr_60_7 == ((saved_bar+'h80)>>7), "Notify lookup retained old base");
+			end
+		end
+		begin
+			vio_queue_setup_t	rows[$];
+			packet_item		packet;
+			virtio_net_hdr_t		header;
+			uvm_object		completed[$];
+			byte			bytes[];
+			int unsigned		descriptor;
+			bit [31:0]		word_value;
+			dpu_function_policy_t	policy;
+
+			env.vio_envs[0].get_external_setup().list_queues(rows);
+			require_true(rows.size() == 1 && rows[0].queue_size == 512 &&
+				rows[0].notify_address == saved_bar + 'h80, "prepared queue retained old geometry/Notify binding");
+			if ($test$plusargs("PROJECT_CUSTOM"))
+				require_true(rows[0].private_tx_control.dport_id == 'h23, "Custom private TX control cache was not refreshed");
+			business_notify_enabled = 1;
+			business_notify_offset = 'h80;
+			packet = new("reload_frame512");
+			require_true(packet.pkt.randomize() with {pkt_kind == ETH_IPV4_TCP; pkt_len == 512;}, "reload packet randomization");
+			packet.pkt.do_pack();
+			header = '{default:0};
+			instance.driver_agent.ops.tx_submit(rows[0].notification.local_qid, header, packet, 0, descriptor);
+			require_true(descriptor != '1, "reloaded queue rejected TX");
+			policy = cfg.dpu_cfg.function_policies[dpu_function_key_name(instance.function_key)];
+			if (rows[0].queue_type == VQ_CUSTOM) send_memory(0, 1, policy.requester, rows[0].device_iova, 32'h8001);
+			else begin
+				env.vio_envs[0].host_mem.read_mem(rows[0].desc_gpa + 12, 4, bytes);
+				word_value = {bytes[3],bytes[2],bytes[1],bytes[0]} | 32'h80000000;
+				send_memory(0, 1, policy.requester, rows[0].desc_iova + 12, word_value);
+			end
+			#100ns;
+			instance.driver_agent.ops.tx_complete(rows[0].notification.local_qid, completed, 8);
+			require_true(completed.size() == 0, "reloaded MSI-X queue completed before interrupt");
+			send_memory(0, 1, 16'hffff, 64'ha00000000000, 32'h24681357);
+			#100ns;
+			instance.driver_agent.ops.tx_complete(rows[0].notification.local_qid, completed, 8);
+			require_true(completed.size() == 1 && completed[0] == packet && business_notifications.size() == 1 &&
+				pcie_tl_mem_wire_addr(business_notifications[0]) == saved_bar + 'h80,
+				"new MSI-X message was treated as DMA or reloaded Notify failed");
+		end
+		configured = 1;
+		`uvm_info("PROJECT_RELOAD_DUT_PASS", $sformatf("custom=%0b writes=%0d reads=%0d checks=%0d",
+			$test$plusargs("PROJECT_CUSTOM"), write_offsets.size(), read_requests, checks), UVM_LOW)
+	endtask
+
+	// 参数只写 AIP 的现有 override 表，正式重载仍经宏注册的 load_params 命令执行。
+	task project_runtime_params_test::check_runtime_reload();
+		int	status;
+		string	result;
+
+		probe("before");
+		aip_cmd::exec_result("load_params unexpected", SRC_INTERNAL, status, result);
+		require_true(status != 0 && result == "ERROR: load_params takes no arguments",
+			"macro command lost no-argument validation");
+		aip_cmdline_override::set_val("vio.pairs", "2");
+		aip_cmd::exec_result("load_params", SRC_INTERNAL, status, result);
+		require_true(status != 0, "runtime reload changed allocated pair count");
+		probe("before");
+		aip_cmdline_override::clear("vio.pairs");
+
+		aip_cmdline_override::set_val("vio.queue_size", "512");
+		aip_cmdline_override::set_val("vio.completion_mode", "VIRTIO_COMPLETION_MSIX");
+		aip_cmdline_override::set_val("vio.notify_base", "0x80");
+		aip_cmdline_override::set_val("vio.notify_table_offset", "0x80");
+		aip_cmdline_override::set_val("dpu.msix.v0.msg_addr", "0xa00000000000");
+		aip_cmdline_override::set_val("dpu.msix.v0.msg_data", "0x24681357");
+		aip_cmdline_override::set_val("dpu.qsch.spwrr", "0x55");
+		aip_cmdline_override::set_val("vio.vtx.dma_info", "5");
+		if ($test$plusargs("PROJECT_CUSTOM"))
+			aip_cmdline_override::set_val("vio.private.dport_id", "0x23");
+
+		repeat (2) begin
+			aip_cmd::exec_result("load_params", SRC_INTERNAL, status, result);
+			require_true(status == 0, result);
+			probe("reloaded");
+		end
+		probe("configure");
+		aip_cmd::exec_result("load_params", SRC_INTERNAL, status, result);
+		require_true(status != 0, "runtime reload accepted an active VIO generation");
+		probe("active");
+	endtask
+
+	// 初始参数已构建完毕，再清除测试夹具强制值；快照保留cfg，恢复进程用新CLI重新采样。
+	task project_runtime_params_test::run_phase(uvm_phase	phase);
+		project_reload_probe	command;
+		string			why;
+		bit			ok;
+		string			keys[$] = '{"vio.queue_size", "vio.completion_mode", "vio.notify_base", "vio.notify_table_offset",
+			"dpu.msix.v0.msg_addr", "dpu.msix.v0.msg_data", "dpu.msix.v1.msg_addr", "dpu.msix.v1.msg_data"};
+
+		phase.raise_objection(this);
+		require_true(cfg.dpu_cfg.bar_map.resolve_name("h0.pf0.bar0", management, why), why);
+		saved_cfg = cfg;
+		saved_registry = cfg.dpu_cfg.bar_map;
+		saved_device = cfg.dpu_cfg.device_snapshot;
+		saved_resources = cfg.dpu_cfg.resource_snapshot;
+		saved_host_cfg = cfg.vio_cfg_by_host[0];
+		saved_bar = management.bar_lease.base;
+		saved_bdf = env.vio_envs[0].function_instances[0].pcie_id.bdf;
+		foreach (keys[i]) aip_cmdline_override::clear(keys[i]);
+		command = new(this);
+		fork app_receive(0); join_none
+		#100ns;
+		if ($test$plusargs("AIP_TCL")) aip_tcl_bridge::run_loop();
+		else check_runtime_reload();
+		require_true(configured, "restore script never configured DUT");
+		bare_seq.release_vio_resources(selection, 1, ok, why);
+		require_true(ok, why);
+		env.vio_envs[0].host_mem.leak_check();
+		`uvm_info("PROJECT_RELOAD_TEST_PASS", "restore/reload/configure/new MSI-X completed", UVM_LOW)
 		phase.drop_objection(this);
 	endtask
 

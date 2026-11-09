@@ -565,6 +565,7 @@ class split_virtqueue extends virtqueue_base;
         snap.split_free_head = free_head;
         snap.split_num_free = num_free;
         snap.packed_free_ids.delete();
+        snap.packed_chains.delete();
         save_migration_ownership(snap);
 
         `uvm_info("SPLIT_VQ",

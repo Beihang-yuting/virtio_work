@@ -81,6 +81,7 @@
         // detach_all_queues() releases descriptor ownership only.  After a
         // verified device reset, free every queue's rings and remove its
         // manager entry before the PF can be reinitialized.
+        tx_notify_pending.delete();
         vq_mgr.destroy_all();
 
         // control VQ 的身份和 recovery pending 都属于本次设备生命周期。只有走到这里的

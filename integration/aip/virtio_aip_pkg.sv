@@ -162,11 +162,23 @@ package virtio_aip_pkg;
 		int unsigned			len_min;
 		int unsigned			len_max;
 		int unsigned			gap_ns;
+		int unsigned			notify_batch;
 		int unsigned			expected;
 		int unsigned			timeout_ns;
 		int unsigned			pairs;
 		packet_template_e		kind;
 		virtio_rss_config_t		rss;
+
+		// 每包重新采样长度、类型、间隔和等待预算；非法长度不提交本包。
+		// 协议头与payload继续由net_packet.load_params读取，不重复实现参数解析。
+		extern protected function bit load_tx_packet_params();
+
+		// 每包读取当前AIP值；请求随transaction按值提交，不修改共享env/队列。
+		// 未指定三个键时保留原私有队列默认；显式0可关闭本包checksum/GSO。
+		extern protected function void load_tx_offload(output virtio_tx_offload_t	request);
+
+		// 逐包读取 SG 数量/切分模式；实际模式和长度约束交给 ops 在发布前检查。
+		extern protected function void load_tx_segments(output virtio_tx_seg_t	request);
 
 		// 每次调用重建默认参数，避免运行期 override 清除后沿用前一调用缓存。
 		function new(string	name = "virtio_aip_sequence");
@@ -177,8 +189,8 @@ package virtio_aip_pkg;
 			ok = 0;
 		endfunction
 
-		// 使用 AIP typed scalar 入口：运行期 override 整数仅支持 literal；plusarg
-		// 可沿用 AIP 随机表达式。独立 len_min/len_max 用于运行期可调长度范围。
+		// 复用aip_int所用的typed入口，命令行与运行期override均由AIP解析和采样。
+		// 此处只补无符号32位边界检查，不缓存值或另写随机表达式解析器。
 		protected function int unsigned	scalar(string	name, int unsigned	default_value);
 			longint unsigned	value;
 			string			raw;
@@ -196,13 +208,10 @@ package virtio_aip_pkg;
 			return int'(value);
 		endfunction
 
-		// 加载当前 operation 的参数；target 子路径缺省继承 vio.target。
+		// 加载当前operation的命令级参数；TX包内容和offload留到每包生成时采样。
+		// target 子路径缺省继承 vio.target。
 		// RSS表和密钥使用显式size+逐元素键，拒绝越界，不悄悄截断。
 		function bit	load_params(string	parameter_path);
-			string			value;
-			string			names[$];
-			int			values[$];
-			packet_template_e	enum_value;
 			int unsigned		table_size;
 			int unsigned		byte_value;
 
@@ -214,25 +223,6 @@ package virtio_aip_pkg;
 			case (operation)
 				VIO_TXN_SEND_PKTS: begin
 					pair = scalar("pair", 0);
-					pkt_len = scalar("len", 64);
-					len_min = scalar("len_min", pkt_len);
-					len_max = scalar("len_max", pkt_len);
-					gap_ns = scalar("gap_ns", 0);
-					if (len_min < 14 || len_max < len_min || len_max > 65535) begin
-						result_text = "TX requires 14 <= len_min <= len_max <= 65535";
-						return 0;
-					end
-					value = aip_cmdline#(string)::get_cmdline_string("kind", path);
-					if (value != "") begin
-						enum_value = enum_value.first();
-						forever begin
-							names.push_back(enum_value.name());
-							values.push_back(int'(enum_value));
-							if (enum_value == enum_value.last()) break;
-							enum_value = enum_value.next();
-						end
-						kind = packet_template_e'(aip_cmdline_enum::resolve(value, names, values));
-					end
 				end
 				VIO_TXN_WAIT_PKTS: begin
 					expected = scalar("expected", 1);
@@ -293,12 +283,12 @@ package virtio_aip_pkg;
 			return 1;
 		endfunction
 
-		// 单事务等待保持标准UVM语义；取消时AIP调用kill，不撤回driver已接受工作。
-		protected task submit(virtio_transaction	item);
-			start_item(item);
-			finish_item(item);
-			aip_activity::tick();
-		endtask
+		// 单事务保持标准UVM语义；有限heartbeat覆盖正常TX流控/RX等待，预算后不再tick。
+		// 取消仍由AIP kill处理，不撤回driver已经接受的工作。
+		extern protected task submit(virtio_transaction	item, int unsigned	heartbeat_ns = 0);
+
+		// 正常返回（含参数失败）时通知已提交尾批；取消仍沿用已有stop/reset约定。
+		extern virtual task post_body();
 
 		// kill只撤销sequence线程；driver接受的事务仍可继续，因此下一命令必须先
 		// 传统模式经过reset恢复；外部模式只允许stop，再由平台quiesce/reprepare/verify恢复。
@@ -335,6 +325,7 @@ package virtio_aip_pkg;
 			uvm_report_server	reports;
 			int			errors_before;
 			fsm_state_e		state_before;
+			int unsigned		batch_left;
 
 			ok = 0;
 			if (!ready_binding()) return;
@@ -388,6 +379,7 @@ package virtio_aip_pkg;
 				default: ;
 			endcase
 			if (operation == VIO_TXN_SEND_PKTS) begin
+				batch_left = 0;
 				for (int unsigned	i = 0; i < count; i++) begin
 					// 每次提交都复查pair，不允许底层send_packets的raw queue-id后备路径。
 					if (fsm.state != FSM_RUNNING || pair >= fsm.active_queue_pair_count()) begin
@@ -398,6 +390,17 @@ package virtio_aip_pkg;
 						"external TX cancelled; stop and reprepare after platform quiescence" :
 						"another TX stream was cancelled; target requires reset"; return;
 					end
+					if (!load_tx_packet_params()) return;
+					if (batch_left == 0) begin
+						// 批大小每批抽样一次；剩余不足一批时由最后一个包结束本批。
+						`aip_int(path, int unsigned, notify_batch, 1)
+						if (notify_batch == 0) begin
+							result_text = "TX notify_batch must be positive";
+							return;
+						end
+						batch_left = notify_batch;
+					end
+
 					packet_handle = packet_item::type_id::create($sformatf("packet_%0d", i));
 					packet_handle.pkt = new();
 					packet_handle.pkt.build_from_template(kind);
@@ -417,11 +420,17 @@ package virtio_aip_pkg;
 					item = virtio_transaction::type_id::create("send");
 					item.txn_type = VIO_TXN_SEND_PKTS;
 					item.queue_id = pair;
+					item.timeout_ns = timeout_ns;
+					item.tx_notify = (batch_left == 1) || (i + 1 == count);
+					load_tx_offload(item.tx_offload);
+					load_tx_segments(item.tx_seg);
 					item.packets.push_back(packet_handle);
-					submit(item);
+					submit(item, (target.driver_agent.ops.wait_pol == null) ? timeout_ns :
+						target.driver_agent.ops.wait_pol.effective_timeout(timeout_ns));
 					if (errors_before != reports.get_severity_count(UVM_ERROR) + reports.get_severity_count(UVM_FATAL)) begin
 						result_text = "UVM error/fatal during TX submission; remaining packets not submitted"; return;
 					end
+					batch_left--;
 					if (i+1 < count && gap_ns != 0) active_delay(gap_ns);
 					aip_activity::tick();
 				end
@@ -435,16 +444,7 @@ package virtio_aip_pkg;
 				item.txn_type = VIO_TXN_WAIT_PKTS;
 				item.expected_count = expected;
 				item.timeout_ns = timeout_ns;
-				fork : bounded_rx_wait
-					begin
-						submit(item);
-					end
-					begin
-						active_delay(timeout_ns);
-						wait (0);
-					end
-				join_any
-				disable bounded_rx_wait;
+				submit(item, timeout_ns);
 				ok = item.received_pkts.size() >= expected;
 				result_text = $sformatf("RX %s: received=%0d expected=%0d", ok ? "complete" : "timeout/stopped", item.received_pkts.size(), expected);
 			end else begin
@@ -513,6 +513,82 @@ package virtio_aip_pkg;
 			if (ok && operation == VIO_TXN_INIT) virtio_aip_registry::needs_init[target_path] = 0;
 		endtask
 	endclass
+
+	// 正常尾包已通知时为空操作；前一批后遇到参数错误，也不会遗留未通知的有效包。
+	task virtio_aip_sequence::post_body();
+		if (operation == VIO_TXN_SEND_PKTS && target != null &&
+			target.driver_agent != null && target.driver_agent.ops != null)
+			target.driver_agent.ops.flush_tx(pair * 2 + 1);
+		super.post_body();
+	endtask
+
+	// 取值只发生在本包生成前；ring满时由ops等待，既不重采样也不重建报文。
+	function bit virtio_aip_sequence::load_tx_packet_params();
+		`aip_enum(path, packet_template_e, kind, ETH_IPV4_TCP)
+		pkt_len = scalar("len", 64);
+		len_min = scalar("len_min", pkt_len);
+		len_max = scalar("len_max", pkt_len);
+		gap_ns = scalar("gap_ns", 0);
+		timeout_ns = scalar("timeout_ns", 10000);
+
+		if (len_min < 14 || len_max < len_min || len_max > 65535 || timeout_ns == 0) begin
+			result_text = "TX requires 14 <= len_min <= len_max <= 65535 and positive timeout_ns";
+			return 0;
+		end
+		return 1;
+	endfunction
+
+	// heartbeat只覆盖调用者给出的等待预算；不终止driver，也不把未返回事务当成功。
+	task virtio_aip_sequence::submit(virtio_transaction	item, int unsigned	heartbeat_ns = 0);
+		start_item(item);
+		if (heartbeat_ns == 0)
+			finish_item(item);
+		else begin
+			fork : bounded_item_wait
+				finish_item(item);
+				begin
+					active_delay(heartbeat_ns);
+					wait (0);
+				end
+			join_any
+			disable bounded_item_wait;
+		end
+		aip_activity::tick();
+	endtask
+
+	// 直接复用AIP宏的动态取值、范围/权重抽样和诊断；不维护第二份解析器或缓存。
+	function void virtio_aip_sequence::load_tx_offload(output virtio_tx_offload_t	request);
+		bit		csum;
+		bit		gso;
+		bit [15:0]	mss;
+
+		`aip_int(path, bit, csum, 0)
+		`aip_int(path, bit, gso, 0)
+		`aip_int(path, bit [15:0], mss, 1460)
+
+		request = '0;
+		request.valid =
+			(aip_cmdline#(string)::get_cmdline_string("csum", path) != "") ||
+			(aip_cmdline#(string)::get_cmdline_string("gso", path) != "") ||
+			(aip_cmdline#(string)::get_cmdline_string("mss", path) != "");
+		request.csum = csum;
+		request.gso  = gso;
+		request.mss  = mss;
+	endfunction
+
+	// AIP 原生范围/候选值逐包抽样一次；缺省数量由实际格式决定，不把显式 0 当缺省。
+	function void virtio_aip_sequence::load_tx_segments(output virtio_tx_seg_t	request);
+		int unsigned		desc_count;
+		virtio_seg_mode_e	seg_mode;
+
+		`aip_int(path, int unsigned, desc_count, 0)
+		`aip_enum(path, virtio_seg_mode_e, seg_mode, VIO_SEG_EQUAL)
+
+		request.count_set =
+			(aip_cmdline#(string)::get_cmdline_string("desc_count", path) != "");
+		request.desc_count = desc_count;
+		request.mode = seg_mode;
+	endfunction
 
 	// 动态命令对象只保存操作与参数路径；每次执行均新建sequence，结果写本次handle。
 	// AIP负责同名BUSY和watchdog；不同TX别名共享sequencer的正常逐事务仲裁。

@@ -10,19 +10,15 @@ package project_env_pkg;
 	import aip_core_pkg::*;
 	import host_mem_pkg::*;
 	import dpu_resource_pkg::*;
+	import dpu_pcie_pkg::*;
+	import virtio_dpu_pkg::*;
 	import pcie_tl_pkg::*;
 	import virtio_net_pkg::*;
 	import virtio_aip_pkg::*;
 	import intel_pcie_adapter_pkg::*;
 	`include "uvm_macros.svh"
 
-	`include "project_bar_registry.sv"
-	`include "project_dut_config.sv"
-	`include "project_vio_config.sv"
-	`include "project_pcie_rc_driver.sv"
 	`include "project_env_cfg.sv"
-	`include "project_pcie_reg_seq.sv"
-	`include "project_dut_config_seq.sv"
 	`include "project_single_queue_config_seq.sv"
 	`include "project_env.sv"
 	`include "project_base_test.sv"

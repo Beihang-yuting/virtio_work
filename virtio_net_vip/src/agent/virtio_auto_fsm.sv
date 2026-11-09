@@ -30,6 +30,10 @@ class virtio_auto_fsm extends uvm_report_object;
     virtio_atomic_ops       ops;
     virtio_driver_config_t  drv_cfg;
 
+    // 标准模式按实际特性为报文容量补头；未覆盖或 Custom 时返回 0，
+    // 让 ops 沿用队列后端/默认容量；不改变已投递的 buffer。
+    extern protected function int unsigned rx_buffer_size();
+
     // ===== Background task control =====
     protected bit   dataplane_running = 0;
     protected event stop_event;
@@ -400,100 +404,7 @@ class virtio_auto_fsm extends uvm_report_object;
     //
     // Pre-fills RX buffers and forks all background tasks in a named block.
     // ------------------------------------------------------------------------
-    virtual task start_dataplane();
-        int unsigned run_epoch;
-
-        if (state != FSM_READY) begin
-            `uvm_error("AUTO_FSM",
-                $sformatf("start_dataplane: invalid state %s (expected FSM_READY)", state.name()))
-            return;
-        end
-        if (!mq_pairs_committed) begin
-            `uvm_error("AUTO_FSM",
-                {"start_dataplane: MQ target has not been committed to the ",
-                 "device; configure_mq must complete first"})
-            return;
-        end
-        if ((dataplane_workers_expected != 0) &&
-            (dataplane_workers_completed != dataplane_workers_expected)) begin
-            `uvm_error("AUTO_FSM",
-                "start_dataplane: previous dataplane workers have not stopped")
-            return;
-        end
-
-        `uvm_info("AUTO_FSM", "start_dataplane: starting data plane", UVM_MEDIUM)
-
-        dataplane_epoch++;
-        dataplane_stop_requested = 0;
-        dataplane_workers_expected = 5;
-        dataplane_workers_completed = 0;
-        dataplane_running = 1;
-        run_epoch = dataplane_epoch;
-        state = FSM_RUNNING;
-
-        // Pre-fill RX buffers for all receive queues (even-numbered queues)
-        for (int unsigned i = 0; i < active_num_pairs; i++) begin
-            int unsigned rx_qid = i * 2;
-            if (ops.external_direction_enabled(0))
-                ops.rx_refill(rx_qid, drv_cfg.queue_size);
-        end
-
-        // Fork all background tasks in a named block
-        fork : dataplane_tasks
-            begin : rx_refill_loops
-                for (int unsigned i = 0; i < active_num_pairs; i++) begin
-                    automatic int unsigned rx_qid = i * 2;
-                    fork
-                        if (ops.external_direction_enabled(0))
-                            rx_refill_loop(rx_qid, run_epoch);
-                    join_none
-                end
-                wait fork;
-                complete_dataplane_worker(run_epoch);
-            end
-
-            begin : tx_complete_loops
-                for (int unsigned i = 0; i < active_num_pairs; i++) begin
-                    automatic int unsigned tx_qid = i * 2 + 1;
-                    fork
-                        if (ops.external_direction_enabled(1))
-                            tx_complete_loop(tx_qid, run_epoch);
-                    join_none
-                end
-                wait fork;
-                complete_dataplane_worker(run_epoch);
-            end
-
-            begin
-                if (!ops.uses_external_configuration())
-                    interrupt_handler_loop(run_epoch);
-                complete_dataplane_worker(run_epoch);
-            end
-
-            begin : adaptive_irq_check
-                if (!ops.uses_external_configuration() && drv_cfg.irq_mode == IRQ_POLLING) begin
-                    adaptive_irq_loop(run_epoch);
-                end
-                complete_dataplane_worker(run_epoch);
-            end
-
-            begin
-                if (!ops.uses_external_configuration())
-                    config_change_handler(run_epoch);
-                complete_dataplane_worker(run_epoch);
-            end
-        join_none
-
-        // DEVICE_NEEDS_RESET may be detected by config_change_handler(), one
-        // of the workers above.  Keep recovery outside that worker set so it
-        // can wait for the complete acknowledgement without self-deadlock.
-        fork : dataplane_recovery_watch
-            dataplane_recovery_supervisor(run_epoch);
-        join_none
-
-        `uvm_info("AUTO_FSM", "start_dataplane: background tasks forked", UVM_MEDIUM)
-    endtask
-
+    extern virtual task start_dataplane();
     // ------------------------------------------------------------------------
     // stop_dataplane -- FSM_RUNNING -> FSM_READY
     //
@@ -528,47 +439,16 @@ class virtio_auto_fsm extends uvm_report_object;
     // High-Level Data Operations
     // ========================================================================
 
-    // ------------------------------------------------------------------------
-    // send_packets -- Submit packets for transmission
-    //
-    // Builds a default virtio_net_hdr per packet and submits via tx_submit.
-    // queue_id is treated as a pair index if < active_num_pairs.
-    // ------------------------------------------------------------------------
-    virtual task send_packets(uvm_object pkts[$], int unsigned queue_id = 0);
-        int unsigned tx_qid;
-        int unsigned desc_id;
-
-        // Transmit queues are odd-numbered: pair_index*2+1
-        if (queue_id < active_num_pairs)
-            tx_qid = queue_id * 2 + 1;
-        else
-            tx_qid = queue_id;
-
-        `uvm_info("AUTO_FSM",
-            $sformatf("send_packets: count=%0d queue_id=%0d", pkts.size(), tx_qid), UVM_MEDIUM)
-
-        foreach (pkts[i]) begin
-            virtio_net_hdr_t hdr;
-
-            // Build default virtio_net_hdr
-            hdr.flags       = 8'h00;
-            hdr.gso_type    = VIRTIO_NET_HDR_GSO_NONE;
-            hdr.hdr_len     = 16'h0000;
-            hdr.gso_size    = 16'h0000;
-            hdr.csum_start  = 16'h0000;
-            hdr.csum_offset = 16'h0000;
-            hdr.num_buffers = 16'h0000;
-            hdr.hash_value  = 32'h00000000;
-            hdr.hash_report = 16'h0000;
-
-            // If CSUM offload is negotiated, set NEEDS_CSUM flag
-            if (ops.negotiated_features[VIRTIO_NET_F_CSUM]) begin
-                hdr.flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
-            end
-
-            ops.tx_submit(tx_qid, hdr, pkts[i], 0, desc_id);
-        end
-    endtask
+    // 发送同一事务绑定的报文和offload请求；pair下标映射到TX逻辑qid。
+    // 仅提交至ops，不改Function能力；timeout_ns逐包限制空间等待，失败即停止后续包。
+    extern virtual task send_packets(
+        uvm_object	pkts[$],
+        int unsigned	queue_id = 0,
+        virtio_tx_offload_t	tx_offload = '0,
+        int unsigned	timeout_ns = 0,
+        bit	notify = 1,
+        virtio_tx_seg_t	tx_seg = '0
+    );
 
     // ------------------------------------------------------------------------
     // wait_packets -- Wait for packets to arrive on receive queues
@@ -1179,44 +1059,7 @@ class virtio_auto_fsm extends uvm_report_object;
     // 时即 Q_RESET；未协商时标准设备无法单独停队），未确认时保留队列并进入 FSM_ERROR；
     // 重建成功后 RX 队列补 buffer，原先运行的数据面重新启动。
     // ------------------------------------------------------------------------
-    virtual task reset_single_queue(int unsigned queue_id);
-        bit setup_ok;
-        bit was_running;
-        `uvm_info("AUTO_FSM",
-            $sformatf("reset_single_queue: queue_id=%0d", queue_id), UVM_MEDIUM)
-
-        was_running = (state == FSM_RUNNING);
-        if (was_running)
-            stop_dataplane();
-
-        ops.teardown_queue(queue_id);
-        if (ops.vq_mgr.has_queue(queue_id)) begin
-            state = FSM_ERROR;
-            `uvm_error("AUTO_FSM", $sformatf(
-                "reset_single_queue: queue %0d was not stopped; retaining it", queue_id))
-            return;
-        end
-
-        ops.setup_queue(queue_id, drv_cfg.queue_size, queue_format(), setup_ok);
-        if (!setup_ok) begin
-            state = FSM_ERROR;
-            `uvm_error("AUTO_FSM", $sformatf(
-                "reset_single_queue: failed to setup queue %0d", queue_id))
-            return;
-        end
-
-        // If this is a receive queue (even-numbered), refill RX buffers
-        if (queue_id % 2 == 0 && queue_id < active_num_pairs * 2) begin
-            ops.rx_refill(queue_id, drv_cfg.queue_size);
-        end
-
-        if (was_running)
-            start_dataplane();
-
-        `uvm_info("AUTO_FSM",
-            $sformatf("reset_single_queue: queue_id=%0d complete", queue_id), UVM_MEDIUM)
-    endtask
-
+    extern virtual task reset_single_queue(int unsigned queue_id);
     // ========================================================================
     // Background Tasks
     //
@@ -1230,43 +1073,9 @@ class virtio_auto_fsm extends uvm_report_object;
     // ------------------------------------------------------------------------
     // rx_refill_loop -- Periodically refill RX buffers for a queue
     // ------------------------------------------------------------------------
-    protected virtual task rx_refill_loop(
+    extern protected virtual task rx_refill_loop(
         int unsigned queue_id, int unsigned worker_epoch
     );
-        int unsigned interval;
-        int unsigned threshold;
-
-        interval  = ops.wait_pol.default_poll_interval_ns;
-        threshold = drv_cfg.rx_refill_threshold;
-        if (threshold == 0)
-            threshold = drv_cfg.queue_size / 4;
-
-        `uvm_info("AUTO_FSM",
-            $sformatf("rx_refill_loop: queue_id=%0d started, threshold=%0d",
-                      queue_id, threshold), UVM_HIGH)
-
-        while (dataplane_worker_may_run(worker_epoch)) begin
-            virtqueue_base vq;
-
-            // Wait for event or poll interval (isolated wait)
-            wait_event_or_stop(used_ring_updated_event, interval);
-
-            if (!dataplane_worker_may_run(worker_epoch)) return;
-
-            // Check if refill is needed
-            vq = ops.vq_mgr.get_queue(queue_id);
-            if (vq != null) begin
-                int unsigned free_count = vq.get_free_count();
-                if (free_count >= threshold) begin
-                    ops.rx_refill(queue_id, free_count);
-                end
-            end
-        end
-
-        `uvm_info("AUTO_FSM",
-            $sformatf("rx_refill_loop: queue_id=%0d exiting", queue_id), UVM_HIGH)
-    endtask
-
     // ------------------------------------------------------------------------
     // tx_complete_loop -- Periodically poll for TX completions
     // ------------------------------------------------------------------------
@@ -1473,5 +1282,219 @@ class virtio_auto_fsm extends uvm_report_object;
     endtask
 
 endclass : virtio_auto_fsm
+
+// 在首次投递、后台补充和队列重建时统一换算，使用最终协商值而非 feature 请求掩码。
+function int unsigned virtio_auto_fsm::rx_buffer_size();
+    if (queue_format() == VQ_CUSTOM)
+        return 0;
+
+    if (drv_cfg.rx_packet_size != 0)
+        return drv_cfg.rx_packet_size +
+            virtio_net_hdr_util::get_hdr_size(ops.negotiated_features);
+
+    return 0;
+endfunction
+
+// header与发送字节都由目标ops根据同一包准备，禁止按全局feature自动开启checksum。
+task virtio_auto_fsm::send_packets(
+    uvm_object	pkts[$],
+    int unsigned	queue_id = 0,
+    virtio_tx_offload_t	tx_offload = '0,
+    int unsigned	timeout_ns = 0,
+    bit	notify = 1,
+    virtio_tx_seg_t	tx_seg = '0
+);
+    int unsigned	tx_qid;
+    int unsigned	desc_id;
+    virtio_net_hdr_t	hdr;
+
+    tx_qid = (queue_id < active_num_pairs) ? queue_id * 2 + 1 : queue_id;
+    hdr = '{default:0};
+
+    `uvm_info("AUTO_FSM", $sformatf("send_packets: count=%0d queue_id=%0d",
+        pkts.size(), tx_qid), UVM_HIGH)
+
+    foreach (pkts[i]) begin
+        ops.tx_submit(tx_qid, hdr, pkts[i], 0, desc_id, tx_offload, timeout_ns,
+                      notify, tx_seg);
+        if (desc_id == '1) return;
+    end
+endtask
+
+
+// READY 状态下按实际 RX 容量预投递并启动后台任务；旧 worker 未退出时拒绝启动。
+task virtio_auto_fsm::start_dataplane();
+    int unsigned	run_epoch;
+
+    if (state != FSM_READY) begin
+        `uvm_error("AUTO_FSM",
+            $sformatf("start_dataplane: invalid state %s (expected FSM_READY)", state.name()))
+        return;
+    end
+    if (!mq_pairs_committed) begin
+        `uvm_error("AUTO_FSM",
+            {"start_dataplane: MQ target has not been committed to the ",
+             "device; configure_mq must complete first"})
+        return;
+    end
+    if ((dataplane_workers_expected != 0) &&
+        (dataplane_workers_completed != dataplane_workers_expected)) begin
+        `uvm_error("AUTO_FSM",
+            "start_dataplane: previous dataplane workers have not stopped")
+        return;
+    end
+
+    `uvm_info("AUTO_FSM", "start_dataplane: starting data plane", UVM_MEDIUM)
+
+    dataplane_epoch++;
+    dataplane_stop_requested = 0;
+    dataplane_workers_expected = 5;
+    dataplane_workers_completed = 0;
+    dataplane_running = 1;
+    run_epoch = dataplane_epoch;
+    state = FSM_RUNNING;
+
+    // Pre-fill RX buffers for all receive queues (even-numbered queues)
+    for (int unsigned	i = 0; i < active_num_pairs; i++) begin
+        int unsigned	rx_qid = i * 2;
+        if (ops.external_direction_enabled(0))
+            ops.rx_refill(rx_qid, drv_cfg.queue_size, rx_buffer_size());
+    end
+
+    // Fork all background tasks in a named block
+    fork : dataplane_tasks
+        begin : rx_refill_loops
+            for (int unsigned	i = 0; i < active_num_pairs; i++) begin
+                automatic int unsigned	rx_qid = i * 2;
+                fork
+                    if (ops.external_direction_enabled(0))
+                        rx_refill_loop(rx_qid, run_epoch);
+                join_none
+            end
+            wait fork;
+            complete_dataplane_worker(run_epoch);
+        end
+
+        begin : tx_complete_loops
+            for (int unsigned	i = 0; i < active_num_pairs; i++) begin
+                automatic int unsigned	tx_qid = i * 2 + 1;
+                fork
+                    if (ops.external_direction_enabled(1))
+                        tx_complete_loop(tx_qid, run_epoch);
+                join_none
+            end
+            wait fork;
+            complete_dataplane_worker(run_epoch);
+        end
+
+        begin
+            if (!ops.uses_external_configuration())
+                interrupt_handler_loop(run_epoch);
+            complete_dataplane_worker(run_epoch);
+        end
+
+        begin : adaptive_irq_check
+            if (!ops.uses_external_configuration() && drv_cfg.irq_mode == IRQ_POLLING) begin
+                adaptive_irq_loop(run_epoch);
+            end
+            complete_dataplane_worker(run_epoch);
+        end
+
+        begin
+            if (!ops.uses_external_configuration())
+                config_change_handler(run_epoch);
+            complete_dataplane_worker(run_epoch);
+        end
+    join_none
+
+    // DEVICE_NEEDS_RESET may be detected by config_change_handler(), one
+    // of the workers above.  Keep recovery outside that worker set so it
+    // can wait for the complete acknowledgement without self-deadlock.
+    fork : dataplane_recovery_watch
+        dataplane_recovery_supervisor(run_epoch);
+    join_none
+
+    `uvm_info("AUTO_FSM", "start_dataplane: background tasks forked", UVM_MEDIUM)
+endtask
+
+
+// 确认队列停止后重建；RX 按当前容量重新投递，失败保留错误状态和未确认的资源。
+task virtio_auto_fsm::reset_single_queue(int unsigned	queue_id);
+    bit	setup_ok;
+    bit	was_running;
+    `uvm_info("AUTO_FSM",
+        $sformatf("reset_single_queue: queue_id=%0d", queue_id), UVM_MEDIUM)
+
+    was_running = (state == FSM_RUNNING);
+    if (was_running)
+        stop_dataplane();
+
+    ops.teardown_queue(queue_id);
+    if (ops.vq_mgr.has_queue(queue_id)) begin
+        state = FSM_ERROR;
+        `uvm_error("AUTO_FSM", $sformatf(
+            "reset_single_queue: queue %0d was not stopped; retaining it", queue_id))
+        return;
+    end
+
+    ops.setup_queue(queue_id, drv_cfg.queue_size, queue_format(), setup_ok);
+    if (!setup_ok) begin
+        state = FSM_ERROR;
+        `uvm_error("AUTO_FSM", $sformatf(
+            "reset_single_queue: failed to setup queue %0d", queue_id))
+        return;
+    end
+
+    // If this is a receive queue (even-numbered), refill RX buffers
+    if (queue_id % 2 == 0 && queue_id < active_num_pairs * 2) begin
+        ops.rx_refill(queue_id, drv_cfg.queue_size, rx_buffer_size());
+    end
+
+    if (was_running)
+        start_dataplane();
+
+    `uvm_info("AUTO_FSM",
+        $sformatf("reset_single_queue: queue_id=%0d complete", queue_id), UVM_MEDIUM)
+endtask
+
+
+// 本代 worker 周期检查空闲描述符；达到阈值后按配置容量补充，停止请求后退出。
+task virtio_auto_fsm::rx_refill_loop(
+    int unsigned	queue_id, int unsigned	worker_epoch
+);
+    int unsigned	interval;
+    int unsigned	threshold;
+
+    interval  = ops.wait_pol.default_poll_interval_ns;
+    threshold = drv_cfg.rx_refill_threshold;
+    if (threshold == 0)
+        threshold = drv_cfg.queue_size / 4;
+
+    `uvm_info("AUTO_FSM",
+        $sformatf("rx_refill_loop: queue_id=%0d started, threshold=%0d",
+                  queue_id, threshold), UVM_HIGH)
+
+    while (dataplane_worker_may_run(worker_epoch)) begin
+        virtqueue_base	vq;
+
+        // Wait for event or poll interval (isolated wait)
+        wait_event_or_stop(used_ring_updated_event, interval);
+
+        if (!dataplane_worker_may_run(worker_epoch)) return;
+
+        // Check if refill is needed
+        vq = ops.vq_mgr.get_queue(queue_id);
+        if (vq != null) begin
+            int unsigned	free_count = vq.get_free_count();
+            if (free_count >= threshold) begin
+                ops.rx_refill(queue_id, free_count, rx_buffer_size());
+            end
+        end
+    end
+
+    `uvm_info("AUTO_FSM",
+        $sformatf("rx_refill_loop: queue_id=%0d exiting", queue_id), UVM_HIGH)
+endtask
+
 
 `endif // VIRTIO_AUTO_FSM_SV

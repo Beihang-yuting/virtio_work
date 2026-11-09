@@ -13,6 +13,8 @@ package project_env_test_pkg;
     import virtio_net_pkg::*;
     import virtio_aip_pkg::*;
     import project_env_pkg::*;
+	import virtio_dpu_pkg::*;
+	import dpu_pcie_pkg::*;
     import intel_pcie_adapter_pkg::*;
     `include "uvm_macros.svh"
 
@@ -73,7 +75,7 @@ package project_env_test_pkg;
             expect_true(cfg.dpu_cfg.device_cfg.hosts[0] == first_host, "load_params recreated Host input");
             // 交换 Host 与 RC/EP slot，证明端点使用显式映射，而不是偶然相同的数组下标。
             if ($test$plusargs("PROJECT_SWAP_SLOTS")) begin
-                if (cfg.hosts != 2) `uvm_fatal("PROJECT_TEST", "swap case requires two Hosts")
+                if (cfg.dpu_cfg.hosts != 2) `uvm_fatal("PROJECT_TEST", "swap case requires two Hosts")
                 cfg.tl_slot_by_host[0] = 1;
                 cfg.tl_slot_by_host[1] = 0;
             end
@@ -120,7 +122,7 @@ package project_env_test_pkg;
             if (negative == "iommu_policy") injected_iommu[0].strict_permission_check = !cfg.vio_cfg.iommu_strict;
             if (negative == "missing_root") cfg.tl_slot_by_host.delete(0);
             if (negative == "duplicate_slot") cfg.tl_slot_by_host[1] = cfg.tl_slot_by_host[0];
-            if (negative == "invalid_slot") cfg.tl_slot_by_host[0] = cfg.hosts;
+            if (negative == "invalid_slot") cfg.tl_slot_by_host[0] = cfg.dpu_cfg.hosts;
             if (negative == "missing_intel_vif") cfg.intel_rc_vifs.delete(0);
             if (negative == "reused_intel_vif") cfg.intel_rc_vifs[1] = cfg.intel_rc_vifs[0];
             if (negative == "reused_intel_cfg") cfg.intel_cfg_by_slot[1] = cfg.intel_cfg_by_slot[0];
@@ -180,8 +182,7 @@ package project_env_test_pkg;
             active_functions = 0;
             expect_true(env.shared_pool == injected_pool, "project replaced platform pool");
             expect_true(cfg.dpu_cfg.host_mem_pool_ref == injected_pool, "DPU has a different pool");
-            expect_true(cfg.dpu_cfg.executor == null, "project installed a legacy executor");
-            expect_true(cfg.dpu_setup.belongs_to(env.dpu_env.get_snapshot(), cfg.bar_registry),
+            expect_true(cfg.dpu_cfg.device_snapshot == env.dpu_env.get_snapshot(),
                 "public setup differs from authoritative snapshot");
             expect_true(env.dpu_env.get_state() == DPU_DEVICE_RESOLVED,
                 "assembly unexpectedly executed device configuration");
@@ -201,7 +202,7 @@ package project_env_test_pkg;
             expect_true(cfg.pcie_cfg.ep_root_by_index.num() == 0,
                 "RC-only integration retained EP bindings");
             if ($value$plusargs("PROJECT_EXPECT_HOSTS=%d", expected))
-                expect_true(cfg.hosts == expected && env.vio_envs.num() == expected, "dpu.hosts not consumed");
+                expect_true(cfg.dpu_cfg.hosts == expected && env.vio_envs.num() == expected, "dpu.hosts not consumed");
             if ($value$plusargs("PROJECT_EXPECT_PH=%d", expected))
                 expect_true(env.pcie_env.fc_mgrs[0].posted_header.current == expected, "PCIe credit override not consumed");
 
@@ -278,7 +279,7 @@ package project_env_test_pkg;
             if (used.size() != 0) check_protocol_api(used[0]);
             #1ns;
             `uvm_info("PROJECT_CHECK", $sformatf("PASS checks=%0d hosts=%0d active_functions=%0d",
-                checks, cfg.hosts, active_functions), UVM_LOW)
+                checks, cfg.dpu_cfg.hosts, active_functions), UVM_LOW)
             phase.drop_objection(this);
         endtask
     endclass

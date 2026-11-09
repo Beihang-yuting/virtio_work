@@ -11,6 +11,8 @@ package project_external_contract_test_pkg;
 	import net_packet_pkg::*;
 	import intel_pcie_adapter_pkg::*;
 	import project_env_pkg::*;
+	import virtio_dpu_pkg::*;
+	import dpu_pcie_pkg::*;
 	import project_external_integration_test_pkg::*;
 	`include "uvm_macros.svh"
 
@@ -44,125 +46,163 @@ package project_external_contract_test_pkg;
 	// 模型hook与只读导出供独立断言；全部发送保留checked_write及生产资源校验。
 	class project_contract_seq extends project_external_model_seq;
 		`uvm_object_utils(project_contract_seq)
-		int unsigned	control_calls[project_table_kind_e];
+		int unsigned	control_calls[dpu_table_kind_e];
 
 		// 创建单项配置 hook 的模型实现，不拥有 env 或 DMA 资源。
 		extern function new(string	name = "project_contract_seq");
 
 		// 可选RDMA与W1C都必须由平台显式调用，不随队列初始化自动运行。
-		extern virtual task user_configure_rdma_notify_entry(input project_rdma_notify_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task write_rdma_notify(input dpu_rdma_notify_cfg_t	item, output bit	ok, output string	why);
 		// W1C仅执行显式mask，不能偷偷读状态或清除其他位。
-		extern virtual task user_clear_pfvf_drop_status(input project_pfvf_drop_clear_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task user_clear_pfvf_drop_status(input dpu_pfvf_drop_clear_cfg_t	item, output bit	ok, output string	why);
 		// 显式模型PROJECT_AF控制逐项走checked helper；调用数由完整遍历断言。
-		extern virtual task user_configure_af(input project_control_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task user_configure_af(input dpu_control_cfg_t	item, output bit	ok, output string	why);
 		// 显式模型PROJECT_MSIX_CONTROL控制逐项走checked helper；调用数由完整遍历断言。
-		extern virtual task user_configure_msix_control_entry(input project_control_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task user_configure_msix_control_entry(input dpu_control_cfg_t	item, output bit	ok, output string	why);
 		// 显式模型PROJECT_MSIX_FUNCTION控制逐项走checked helper；调用数由完整遍历断言。
-		extern virtual task user_configure_msix_function(input project_control_cfg_t	item, output bit	ok, output string	why);
-		// 显式模型PROJECT_SPWRR控制逐项走checked helper；调用数由完整遍历断言。
-		extern virtual task user_configure_qsch_spwrr(input project_control_cfg_t	item, output bit	ok, output string	why);
-		// 显式模型PROJECT_TC_WEIGHT控制逐项走checked helper；调用数由完整遍历断言。
-		extern virtual task user_configure_qsch_tc_weight(input project_control_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task user_configure_msix_function(input dpu_control_cfg_t	item, output bit	ok, output string	why);
 		// 显式模型PROJECT_QUEUE_AUX控制逐项走checked helper；调用数由完整遍历断言。
-		extern virtual task user_configure_queue_aux(input project_queue_control_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task write_queue_aux(input dpu_queue_control_cfg_t	item, output bit	ok, output string	why);
 		// 显式模型PROJECT_COMPLETION_BDF控制逐项走checked helper；调用数由完整遍历断言。
-		extern virtual task user_configure_completion_bdf_entry(input project_completion_bdf_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task write_completion_bdf(input dpu_completion_bdf_cfg_t	item, output bit	ok, output string	why);
 		// 显式模型PROJECT_PREFIX控制逐项走checked helper；调用数由完整遍历断言。
-		extern virtual task user_configure_tlp_prefix_entry(input project_tlp_prefix_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task write_tlp_prefix(input dpu_tlp_prefix_cfg_t	item, output bit	ok, output string	why);
 		// 显式模型PROJECT_RNET控制逐项走checked helper；调用数由完整遍历断言。
-		extern virtual task user_configure_qsch_rnet_entry(input project_qsch_rnet_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task write_qsch_rnet(input dpu_qsch_rnet_cfg_t	item, output bit	ok, output string	why);
+		extern virtual task write_control(input dpu_control_cfg_t	item, output bit	ok, output string	why);
 		// 导出实际配置记录，调用者只检查冻结值和真实发送结果。
-		extern function bit inspect_queues(input project_vio_selection_t	selected,
-			input project_table_kind_e	kinds[$], output project_config_record_t	rows[$], output string	why);
+		extern function bit inspect_queues(input dpu_cfg_scope	selected,
+			input dpu_table_kind_e	kinds[$], output dpu_table_item_t	rows[$], output string	why);
 		// 导出公共记录，不创建测试专属生产接口。
-		extern function bit inspect_public(input project_table_kind_e	kind,
-			input project_dpu_config_scope	scope, output project_config_record_t	rows[$], output string	why);
+		extern function bit inspect_public(input dpu_table_kind_e	kind,
+			input dpu_cfg_scope	scope, output dpu_table_item_t	rows[$], output string	why);
+		// 测试仅开放批次入口；写入、预检和后置使能仍执行生产实现。
+		extern task send_batch(
+			input dpu_table_item_t	rows[$],
+			output bit		ok,
+			output string		why
+		);
 	endclass
 
+	// 空批次和故障测试直接检查返回值，不调用默认 body 的其他配置阶段。
+	task project_contract_seq::send_batch(
+		input dpu_table_item_t	rows[$],
+		output bit		ok,
+		output string		why
+	);
+		write_records(rows, ok, why);
+	endtask
+
+	// 共享控制写入口按明确 kind 计数，沿用生产的冻结记录校验。
+	task project_contract_seq::write_control(input dpu_control_cfg_t	item, output bit	ok, output string	why);
+		if (item.ctx.kind inside {DPU_TABLE_SPWRR, DPU_TABLE_TC_WEIGHT}) control_calls[item.ctx.kind]++;
+		super.write_control(item, ok, why);
+	endtask
+
 	// 构造观察层，沿用原平台 hook。
+
 	function project_contract_seq::new(string	name = "project_contract_seq");
 		super.new(name);
 	endfunction
 
+
 	// 可选RDMA条目使用同一冻结检查和高低DWORD写序。
-	task project_contract_seq::user_configure_rdma_notify_entry(input project_rdma_notify_cfg_t	item, output bit	ok, output string	why);
-		write_rdma_notify(item, ok, why);
+
+	task project_contract_seq::write_rdma_notify(input dpu_rdma_notify_cfg_t	item, output bit	ok, output string	why);
+		super.write_rdma_notify(item, ok, why);
 	endtask
 
+
 	// 此模型平台声明W1C寄存器的写法；只发送用户mask，绝不读状态再回写。
-	task project_contract_seq::user_clear_pfvf_drop_status(input project_pfvf_drop_clear_cfg_t	item, output bit	ok, output string	why);
+
+	task project_contract_seq::user_clear_pfvf_drop_status(input dpu_pfvf_drop_clear_cfg_t	item, output bit	ok, output string	why);
 		pcie_bar_write(item.ctx.target.function_key, item.ctx.target.bar_lease.even_bar_id,
 			item.ctx.byte_offset, 4, 128'(item.entry.clear_mask), 0, ok, why);
 	endtask
 
+
 	// PROJECT_AF使用平台声明布局和原typed校验，不伪造配置成功。
-	task project_contract_seq::user_configure_af(input project_control_cfg_t	item, output bit	ok, output string	why);
-		control_calls[PROJECT_AF]++;
+
+	task project_contract_seq::user_configure_af(input dpu_control_cfg_t	item, output bit	ok, output string	why);
+		control_calls[DPU_TABLE_AF]++;
 		write_control(item, ok, why);
 	endtask
+
 
 	// PROJECT_MSIX_CONTROL使用平台声明布局和原typed校验，不伪造配置成功。
-	task project_contract_seq::user_configure_msix_control_entry(input project_control_cfg_t	item, output bit	ok, output string	why);
-		control_calls[PROJECT_MSIX_CONTROL]++;
+
+	task project_contract_seq::user_configure_msix_control_entry(input dpu_control_cfg_t	item, output bit	ok, output string	why);
+		control_calls[DPU_TABLE_MSIX_CONTROL]++;
 		write_control(item, ok, why);
 	endtask
+
 
 	// PROJECT_MSIX_FUNCTION使用平台声明布局和原typed校验，不伪造配置成功。
-	task project_contract_seq::user_configure_msix_function(input project_control_cfg_t	item, output bit	ok, output string	why);
-		control_calls[PROJECT_MSIX_FUNCTION]++;
+
+	task project_contract_seq::user_configure_msix_function(input dpu_control_cfg_t	item, output bit	ok, output string	why);
+		control_calls[DPU_TABLE_MSIX_FUNCTION]++;
 		write_control(item, ok, why);
 	endtask
+
 
 	// PROJECT_SPWRR使用平台声明布局和原typed校验，不伪造配置成功。
-	task project_contract_seq::user_configure_qsch_spwrr(input project_control_cfg_t	item, output bit	ok, output string	why);
-		control_calls[PROJECT_SPWRR]++;
-		write_control(item, ok, why);
-	endtask
+
+
 
 	// PROJECT_TC_WEIGHT使用平台声明布局和原typed校验，不伪造配置成功。
-	task project_contract_seq::user_configure_qsch_tc_weight(input project_control_cfg_t	item, output bit	ok, output string	why);
-		control_calls[PROJECT_TC_WEIGHT]++;
-		write_control(item, ok, why);
-	endtask
+
+
 
 	// PROJECT_QUEUE_AUX使用平台声明布局和原typed校验，不伪造配置成功。
-	task project_contract_seq::user_configure_queue_aux(input project_queue_control_cfg_t	item, output bit	ok, output string	why);
-		control_calls[PROJECT_QUEUE_AUX]++;
-		write_queue_aux(item, ok, why);
+
+	task project_contract_seq::write_queue_aux(input dpu_queue_control_cfg_t	item, output bit	ok, output string	why);
+		control_calls[DPU_TABLE_QUEUE_AUX]++;
+		super.write_queue_aux(item, ok, why);
 	endtask
+
 
 	// PROJECT_COMPLETION_BDF使用平台声明布局和原typed校验，不伪造配置成功。
-	task project_contract_seq::user_configure_completion_bdf_entry(input project_completion_bdf_cfg_t	item, output bit	ok, output string	why);
-		control_calls[PROJECT_COMPLETION_BDF]++;
-		write_completion_bdf(item, ok, why);
+
+	task project_contract_seq::write_completion_bdf(input dpu_completion_bdf_cfg_t	item, output bit	ok, output string	why);
+		control_calls[DPU_TABLE_COMPLETION_BDF]++;
+		super.write_completion_bdf(item, ok, why);
 	endtask
+
 
 	// PROJECT_PREFIX使用平台声明布局和原typed校验，不伪造配置成功。
-	task project_contract_seq::user_configure_tlp_prefix_entry(input project_tlp_prefix_cfg_t	item, output bit	ok, output string	why);
+
+	task project_contract_seq::write_tlp_prefix(input dpu_tlp_prefix_cfg_t	item, output bit	ok, output string	why);
 		if (!$test$plusargs("PROJECT_CONTROLS")) begin
-			super.user_configure_tlp_prefix_entry(item, ok, why);
+			super.write_tlp_prefix(item, ok, why);
 			return;
 		end
-		control_calls[PROJECT_PREFIX]++;
-		write_tlp_prefix(item, ok, why);
+		control_calls[DPU_TABLE_PREFIX]++;
+		super.write_tlp_prefix(item, ok, why);
 	endtask
+
 
 	// PROJECT_RNET使用平台声明布局和原typed校验，不伪造配置成功。
-	task project_contract_seq::user_configure_qsch_rnet_entry(input project_qsch_rnet_cfg_t	item, output bit	ok, output string	why);
-		control_calls[PROJECT_RNET]++;
-		write_qsch_rnet(item, ok, why);
+
+	task project_contract_seq::write_qsch_rnet(input dpu_qsch_rnet_cfg_t	item, output bit	ok, output string	why);
+		control_calls[DPU_TABLE_RNET]++;
+		super.write_qsch_rnet(item, ok, why);
 	endtask
 
+
 	// 复用真实导出，只读检查有完整失败说明。
-	function bit project_contract_seq::inspect_queues(input project_vio_selection_t	selected,
-		input project_table_kind_e	kinds[$], output project_config_record_t	rows[$], output string	why);
+
+	function bit project_contract_seq::inspect_queues(input dpu_cfg_scope	selected,
+		input dpu_table_kind_e	kinds[$], output dpu_table_item_t	rows[$], output string	why);
 		return cfg.queue_records(selected, kinds, rows, why);
 	endfunction
+
 	// 返回真实公共条目，缺布局仍由产品拒绝。
-	function bit project_contract_seq::inspect_public(input project_table_kind_e	kind,
-		input project_dpu_config_scope	scope, output project_config_record_t	rows[$], output string	why);
+
+	function bit project_contract_seq::inspect_public(input dpu_table_kind_e	kind,
+		input dpu_cfg_scope	scope, output dpu_table_item_t	rows[$], output string	why);
 		return cfg.public_records(kind, scope, rows, why);
 	endfunction
+
 
 	// 同一测试覆盖传输/顺序和实际 RX，plusarg 选择原 fixture 的协议与 Host 数。
 	class project_external_contract_test extends project_external_integration_test;
@@ -172,6 +212,7 @@ package project_external_contract_test_pkg;
 		extern function new(string	name, uvm_component	parent);
 		project_contract_seq	probe;
 		pcie_tl_mem_tlp	requests[int unsigned][$];
+		int unsigned	write_start[int unsigned];
 		bit	read_error;
 		string	policy_case;
 
@@ -180,9 +221,11 @@ package project_external_contract_test_pkg;
 		// 可选成功控制仅在PROJECT_CONTROLS显式声明，未知地址全部为模型示例。
 		extern function void declare_controls();
 		// 按公开类别执行额外控制，检查真实Memory写与预期逐项调用数。
-		extern task check_public_controls(input project_dpu_config_scope	scope);
+		extern task check_public_controls(input dpu_cfg_scope	scope);
 		// 平台正常停止 DMA 后释放实际 ring，并核对共享 cfg 的视图。
 		extern task check_release_generation();
+		// DPU 导出必须对应实际 ring；重复查询不更换 setup、内存管理器或创建队列。
+		extern function void check_queue_export();
 
 
 		// BAR 读可注入 UR Completion；仍经 Intel APP 引脚发送。
@@ -191,17 +234,21 @@ package project_external_contract_test_pkg;
 		extern task check_mmio();
 		// 表项 API 独立检查高到低的 DWORD 事务，以及非法整项在首笔前拒绝。
 		extern task check_table_mmio();
+		// 记录各目标Host的起点；共享MSI-X管理窗口可与表项owner不在同一Host。
+		extern function void capture_write_start();
 		// 与捕获的 Intel 写事务逐项比较，不通过 pack/unpack 自证顺序。
-		extern task check_writes(input project_config_record_t	rows[$], input int unsigned	first);
+		extern task check_writes(input dpu_table_item_t	rows[$]);
 		// 将完整 payload 分段为真实 Memory Write，DUT 不直接操作 Host GPA。
 		extern task dma_bytes(input int unsigned	host, input bit [15:0]	requester,
 			input bit [63:0]	address, input byte	data[]);
 		// 真实 512B RX 的 descriptor、buffer、CQ/used 均走非 identity Function IOMMU。
 		extern task check_rx();
 		// 可选RDMA顺序、PBA只读容量和显式W1C独立于初始化类别。
-		extern task check_optional_state(input project_dpu_config_scope	scope);
+		extern task check_optional_state(input dpu_cfg_scope	scope);
+		// 独立 RDMA 批次验证空选择、重复目标和发送失败；错误后不得提前使能。
+		extern task check_notify_batches(input dpu_cfg_scope	scope);
 
-		// 当前Custom CQ格式的N-1、初值及RX wrap组件合同，不混用旧legacy黄金值。
+	// 当前Custom CQ格式的N-1、初值及RX wrap组件合同，不混用旧legacy黄金值。
 		extern task check_current_custom_ring();
 		// 新租约registry和同域消息歧义使用真实冻结API，保持组件与Intel证据分层。
 		extern task check_registry_and_notifications();
@@ -218,7 +265,7 @@ package project_external_contract_test_pkg;
 
 	// 在既有参数入口前设置混合模式；不修改已解析快照或环描述符。
 	function void project_external_contract_test::build_phase(uvm_phase	phase);
-		project_bar_group_policy_t	group;
+		dpu_bar_group_policy_t	group;
 		bit	rdma_declared;
 		void'($value$plusargs("PROJECT_POLICY_CASE=%s", policy_case));
 		project_external_model_seq::type_id::set_type_override(project_contract_seq::get_type());
@@ -232,7 +279,7 @@ package project_external_contract_test_pkg;
 			aip_cmdline_override::set_val("vio.h0.pf1.vf0.i0.enabled", "1");
 		end
 		super.build_phase(phase);
-		if ($test$plusargs("PROJECT_LATE_BAR_PRINT")) cfg.print_bar_map = 0;
+		if ($test$plusargs("PROJECT_LATE_BAR_PRINT")) cfg.dpu_cfg.print_bar_map = 0;
 		if ($test$plusargs("PROJECT_UNEQUAL")) begin
 			for (int	f = cfg.dpu_cfg.device_cfg.functions.size()-1; f >= 0; f--) begin
 				dpu_function_key_t	key;
@@ -241,14 +288,14 @@ package project_external_contract_test_pkg;
 				if (key.pf_id == 1 && key.kind == DPU_FUNCTION_VF && key.vf_id == 1) begin
 					name = dpu_function_key_name(key);
 					cfg.dpu_cfg.device_cfg.functions.delete(f);
-					cfg.function_policies.delete(name);
-					cfg.msix_policies.delete(name);
-					cfg.message_templates.delete(name);
+					cfg.dpu_cfg.function_policies.delete(name);
+					cfg.dpu_cfg.msix_policies.delete(name);
+					cfg.dpu_cfg.message_templates.delete(name);
 				end
 			end
-			foreach (cfg.vio_policies[name])
-				if (cfg.vio_policies[name].service_key.function_key.pf_id == 1 &&
-					cfg.vio_policies[name].service_key.function_key.vf_id == 1) cfg.vio_policies.delete(name);
+			foreach (cfg.dpu_cfg.vio_policies[name])
+				if (cfg.dpu_cfg.vio_policies[name].service_key.function_key.pf_id == 1 &&
+					cfg.dpu_cfg.vio_policies[name].service_key.function_key.vf_id == 1) cfg.dpu_cfg.vio_policies.delete(name);
 		end
 		require_true($cast(probe, config_seq), "contract sequence factory override");
 		foreach (cfg.dpu_cfg.placement_cfg.vio_requests[r]) begin
@@ -262,7 +309,7 @@ package project_external_contract_test_pkg;
 			end
 		end
 		// 一个覆盖所有真实 BAR 成员的声明组，使部分 scope 必须明确失败。
-		cfg.bar_mapping_per_lease = 0;
+		cfg.dpu_cfg.bar_mapping_per_lease = 0;
 		group.name = "fixture_atomic_all_bars";
 		foreach (cfg.dpu_cfg.device_cfg.functions[f]) begin
 			for (int unsigned	b = 0; b < 3; b++) begin
@@ -270,124 +317,125 @@ package project_external_contract_test_pkg;
 				group.bar_ids.push_back(b*2);
 			end
 		end
-		cfg.bar_group_policies.push_back(group);
-		foreach (cfg.vio_policies[name]) begin
-			cfg.vio_policies[name].net_base = 128 + cfg.vio_policies[name].service_key.function_key.pf_id*64 + cfg.vio_policies[name].service_key.function_key.vf_id*16;
-			cfg.vio_policies[name].group_id = 64 + cfg.vio_policies[name].service_key.function_key.pf_id*4 + cfg.vio_policies[name].service_key.function_key.vf_id;
-			cfg.vio_policies[name].eth_ports = $test$plusargs("PROJECT_ETS") ? 4 : 2;
-			cfg.vio_policies[name].ets = $test$plusargs("PROJECT_ETS");
-			cfg.vio_policies[name].ets_priority = 3;
+		cfg.dpu_cfg.bar_group_policies.push_back(group);
+		foreach (cfg.dpu_cfg.vio_policies[name]) begin
+			cfg.dpu_cfg.vio_policies[name].net_base = 128 + cfg.dpu_cfg.vio_policies[name].service_key.function_key.pf_id*64 + cfg.dpu_cfg.vio_policies[name].service_key.function_key.vf_id*16;
+			cfg.dpu_cfg.vio_policies[name].group_id = 64 + cfg.dpu_cfg.vio_policies[name].service_key.function_key.pf_id*4 + cfg.dpu_cfg.vio_policies[name].service_key.function_key.vf_id;
+			cfg.dpu_cfg.vio_policies[name].eth_ports = $test$plusargs("PROJECT_ETS") ? 4 : 2;
+			cfg.dpu_cfg.vio_policies[name].ets = $test$plusargs("PROJECT_ETS");
+			cfg.dpu_cfg.vio_policies[name].ets_priority = 3;
 			// 双Host共享同一物理RAM时明确保留不重叠的descriptor槽区间。
-			cfg.vio_policies[name].prefetch_ram = "fixture_shared_ram";
-			cfg.vio_policies[name].prefetch_start += cfg.vio_policies[name].service_key.function_key.host_id*8192 + cfg.vio_policies[name].service_key.function_key.pf_id*1024;
+			cfg.dpu_cfg.vio_policies[name].prefetch_ram = "fixture_shared_ram";
+			cfg.dpu_cfg.vio_policies[name].prefetch_start += cfg.dpu_cfg.vio_policies[name].service_key.function_key.host_id*8192 + cfg.dpu_cfg.vio_policies[name].service_key.function_key.pf_id*1024;
 			case (policy_case)
-				"alignment": cfg.vio_policies[name].prefetch_start = 1;
-				"capacity": cfg.vio_policies[name].prefetch_start = 32768;
+				"alignment": cfg.dpu_cfg.vio_policies[name].prefetch_start = 1;
+				"capacity": cfg.dpu_cfg.vio_policies[name].prefetch_start = 32768;
 				"fpga_high": begin
-					cfg.vio_policies[name].fpga = 1;
-					cfg.vio_policies[name].prefetch_start = 16384;
+					cfg.dpu_cfg.vio_policies[name].fpga = 1;
+					cfg.dpu_cfg.vio_policies[name].prefetch_start = 16384;
 				end
 				"prefetch_depth": begin
-					cfg.vio_policies[name].vrx.dsc_pre_max_num = 0;
-					cfg.vio_policies[name].prefetch_slots = 256;
+					cfg.dpu_cfg.vio_policies[name].vrx.dsc_pre_max_num = 0;
+					cfg.dpu_cfg.vio_policies[name].prefetch_slots = 256;
 				end
-				"overlap": cfg.vio_policies[name].prefetch_start = 0;
-				"headsplit": cfg.vio_policies[name].vrx.head_dsc_len = 1;
-				"reserved": cfg.vio_policies[name].vtx.reserved_111_106 = 1;
-				"unknown": cfg.vio_policies[name].vrx.dsc_dma_num = 'x;
-				"qsch_overflow": cfg.vio_policies[name].net_base = 1024;
-				"qsch_conflict": cfg.vio_policies[name].net_base = 128;
+				"overlap": cfg.dpu_cfg.vio_policies[name].prefetch_start = 0;
+				"headsplit": cfg.dpu_cfg.vio_policies[name].vrx.head_dsc_len = 1;
+				"reserved": cfg.dpu_cfg.vio_policies[name].vtx.reserved_111_106 = 1;
+				"unknown": cfg.dpu_cfg.vio_policies[name].vrx.dsc_dma_num = 'x;
+				"qsch_overflow": cfg.dpu_cfg.vio_policies[name].net_base = 1024;
+				"qsch_conflict": cfg.dpu_cfg.vio_policies[name].net_base = 128;
 				default: ;
 			endcase
 		end
-		add_layout(PROJECT_RDMA_NOTIFY, 8, 256, 'h200000, 'hc000);
-		add_layout(PROJECT_PFVF_DROP, 4, 128, 'h200000, 'ha000);
-		add_layout(PROJECT_MSIX_PBA, 8, 2, 'h100000, 'h10000);
-		foreach (cfg.function_policies[name]) begin
-			project_control_cfg_t	control;
-			project_rdma_notify_entry_t	entry;
-			if ($test$plusargs("PROJECT_SELF_MASK")) cfg.msix_policies[name].self_mask = 1;
+		add_layout(DPU_TABLE_RDMA_NOTIFY, 8, 256, 'h200000, 'hc000);
+		add_layout(DPU_TABLE_PFVF_DROP, 4, 128, 'h200000, 'ha000);
+		add_layout(DPU_TABLE_MSIX_PBA, 8, 2, 'h100000, 'h10000);
+		foreach (cfg.dpu_cfg.function_policies[name]) begin
+			dpu_control_cfg_t	control;
+			dpu_rdma_notify_entry_t	entry;
+			if ($test$plusargs("PROJECT_SELF_MASK")) cfg.dpu_cfg.msix_policies[name].self_mask = 1;
 
-			if (cfg.function_policies[name].key.kind != DPU_FUNCTION_VF || rdma_declared) continue;
+			if (cfg.dpu_cfg.function_policies[name].key.kind != DPU_FUNCTION_VF) continue;
+			if (rdma_declared && !$test$plusargs("PROJECT_NOTIFY_BATCH")) continue;
 			entry = '0;
-			entry.host_id = cfg.function_policies[name].key.host_id;
-			entry.vf_id = cfg.function_policies[name].key.vf_id;
+			entry.host_id = cfg.dpu_cfg.function_policies[name].key.host_id;
+			entry.vf_id = cfg.dpu_cfg.function_policies[name].key.vf_id;
 			entry.base_addr_60_13 = 48'h12345678;
-			control.ctx.kind = PROJECT_RDMA_NOTIFY;
-			control.ctx.table_index = 0;
-			control.owner = cfg.function_policies[name].key;
+			control.ctx.kind = DPU_TABLE_RDMA_NOTIFY;
+			control.ctx.table_index = cfg.dpu_cfg.function_policies[name].key.vf_id;
+			control.owner = cfg.dpu_cfg.function_policies[name].key;
 			control.value = 128'(entry);
 			control.writable_mask = 128'h07ff_ffff_ffff_ffff;
-			cfg.platform_controls.push_back(control);
+			cfg.dpu_cfg.platform_controls.push_back(control);
 			rdma_declared = 1;
 		end
 
 		if ($test$plusargs("PROJECT_CONTROLS")) declare_controls();
 		if (policy_case inside {"control_scope_missing", "control_consumer_unknown"}) begin
-			foreach (cfg.platform_controls[c]) if (cfg.platform_controls[c].ctx.kind == PROJECT_AF) begin
-				if (policy_case == "control_scope_missing") cfg.platform_controls[c].consumers_complete = 0;
+			foreach (cfg.dpu_cfg.platform_controls[c]) if (cfg.dpu_cfg.platform_controls[c].ctx.kind == DPU_TABLE_AF) begin
+				if (policy_case == "control_scope_missing") cfg.dpu_cfg.platform_controls[c].consumers_complete = 0;
 				else begin
 					dpu_service_key_t	missing;
-					missing = '{function_key:cfg.platform_controls[c].owner, service_kind:DPU_SERVICE_VIO_NET, service_instance_id:99};
-					cfg.platform_controls[c].consumers.push_back(missing);
+					missing = '{function_key:cfg.dpu_cfg.platform_controls[c].owner, service_kind:DPU_SERVICE_VIO_NET, service_instance_id:99};
+					cfg.dpu_cfg.platform_controls[c].consumers.push_back(missing);
 				end
 			end
 		end
 
 		if (policy_case == "pba_overlap") begin
-			foreach (cfg.msix_policies[name]) if (cfg.function_policies[name].key.kind == DPU_FUNCTION_PF) begin
-				cfg.msix_policies[name].table_present = 1;
-				cfg.msix_policies[name].table_bar = 0;
-				cfg.msix_policies[name].table_offset = 'h120000;
-				cfg.msix_policies[name].table_size = 1024;
-				cfg.msix_policies[name].pba_present = 1;
-				cfg.msix_policies[name].pba_bar = 0;
-				cfg.msix_policies[name].pba_offset = 'h120000;
-				cfg.msix_policies[name].pba_words = 1;
+			foreach (cfg.dpu_cfg.msix_policies[name]) if (cfg.dpu_cfg.function_policies[name].key.kind == DPU_FUNCTION_PF) begin
+				cfg.dpu_cfg.msix_policies[name].table_present = 1;
+				cfg.dpu_cfg.msix_policies[name].table_bar = 0;
+				cfg.dpu_cfg.msix_policies[name].table_offset = 'h120000;
+				cfg.dpu_cfg.msix_policies[name].table_size = 1024;
+				cfg.dpu_cfg.msix_policies[name].pba_present = 1;
+				cfg.dpu_cfg.msix_policies[name].pba_bar = 0;
+				cfg.dpu_cfg.msix_policies[name].pba_offset = 'h120000;
+				cfg.dpu_cfg.msix_policies[name].pba_words = 1;
 			end
 		end
-		if (policy_case == "missing_layout") cfg.table_layouts.delete(PROJECT_VRX);
+		if (policy_case == "missing_layout") cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_VRX);
 		if (policy_case == "missing_hook") begin
-			add_layout(PROJECT_PREFIX, 8, 128, 'h100000, 'h18000);
-			foreach (cfg.function_policies[name]) cfg.function_policies[name].prefix_enabled = 1;
+			add_layout(DPU_TABLE_PREFIX, 8, 128, 'h100000, 'h18000);
+			foreach (cfg.dpu_cfg.function_policies[name]) cfg.dpu_cfg.function_policies[name].prefix_enabled = 1;
 		end
 	endfunction
 
 	// 可选控制使用明确的模型地址/值；SW Requester由固定BDF输入分配后再冻结。
 	function void project_external_contract_test::declare_controls();
-		project_table_kind_e	control_kinds[$] = '{PROJECT_AF, PROJECT_MSIX_CONTROL, PROJECT_MSIX_FUNCTION,
-			PROJECT_SPWRR, PROJECT_TC_WEIGHT, PROJECT_QUEUE_AUX, PROJECT_RNET};
+		dpu_table_kind_e	control_kinds[$] = '{DPU_TABLE_AF, DPU_TABLE_MSIX_CONTROL, DPU_TABLE_MSIX_FUNCTION,
+			DPU_TABLE_SPWRR, DPU_TABLE_TC_WEIGHT, DPU_TABLE_QUEUE_AUX, DPU_TABLE_RNET};
 		require_true(host_count == 1, "control fixture is one explicit Host platform");
 		foreach (control_kinds[k])
 			add_layout(control_kinds[k], 4, 2048, 'h700000+k*'h10000, 0);
 		// AF只配置真实PF0；不把该平台寄存器强制成每个VF的依赖。
-		cfg.table_layouts[PROJECT_AF].required = 0;
-		add_layout(PROJECT_COMPLETION_BDF, 4, 4096, 'h300000, 'h18000);
-		cfg.table_layouts[PROJECT_RNET].table_offset = 'h15000;
-		cfg.table_layouts[PROJECT_RNET].capacity = 256;
-		add_layout(PROJECT_PREFIX, 8, 256, 'h100000, 'h18000);
+		cfg.dpu_cfg.table_layouts[DPU_TABLE_AF].required = 0;
+		add_layout(DPU_TABLE_COMPLETION_BDF, 4, 4096, 'h300000, 'h18000);
+		cfg.dpu_cfg.table_layouts[DPU_TABLE_RNET].table_offset = 'h15000;
+		cfg.dpu_cfg.table_layouts[DPU_TABLE_RNET].capacity = 256;
+		add_layout(DPU_TABLE_PREFIX, 8, 256, 'h100000, 'h18000);
 		foreach (cfg.dpu_cfg.device_cfg.functions[f]) begin
 			dpu_function_key_t	key;
 			string	name;
-			project_control_cfg_t	control;
-			project_table_kind_e	public_kinds[$] = '{PROJECT_MSIX_CONTROL, PROJECT_MSIX_FUNCTION, PROJECT_RNET};
+			dpu_control_cfg_t	control;
+			dpu_table_kind_e	public_kinds[$] = '{DPU_TABLE_MSIX_CONTROL, DPU_TABLE_MSIX_FUNCTION, DPU_TABLE_RNET};
 			key = cfg.dpu_cfg.device_cfg.functions[f].key;
 			name = dpu_function_key_name(key);
 			cfg.dpu_cfg.device_cfg.functions[f].bdf_mode = DPU_ALLOC_PINNED;
 			cfg.dpu_cfg.device_cfg.functions[f].pinned_bdf = 16'h20+f;
-			cfg.function_policies[name].mode = PROJECT_HOST_SW;
-			cfg.function_policies[name].requester = 16'h20+f;
-			cfg.function_policies[name].prefix_enabled = 1;
-			cfg.function_policies[name].prefix = 32'h12340000+f;
-			cfg.msix_policies[name].table_only_enable = 0;
+			cfg.dpu_cfg.function_policies[name].mode = DPU_HOST_SW;
+			cfg.dpu_cfg.function_policies[name].requester = 16'h20+f;
+			cfg.dpu_cfg.function_policies[name].prefix_enabled = 1;
+			cfg.dpu_cfg.function_policies[name].prefix = 32'h12340000+f;
+			cfg.dpu_cfg.msix_policies[name].table_only_enable = 0;
 			control.owner = key;
 			control.consumers_complete = 1;
-			control.ctx.table_index = cfg.function_policies[name].vport;
+			control.ctx.table_index = cfg.dpu_cfg.function_policies[name].vport;
 			control.writable_mask = 32'hffff;
 			foreach (public_kinds[k]) begin
 				control.ctx.kind = public_kinds[k];
 				control.consumers.delete();
-				if ($test$plusargs("PROJECT_CONTROL_GUARD") && key.kind == DPU_FUNCTION_PF && key.pf_id == 0 && public_kinds[k] inside {PROJECT_MSIX_CONTROL, PROJECT_MSIX_FUNCTION}) begin
+				if ($test$plusargs("PROJECT_CONTROL_GUARD") && key.kind == DPU_FUNCTION_PF && key.pf_id == 0 && public_kinds[k] inside {DPU_TABLE_MSIX_CONTROL, DPU_TABLE_MSIX_FUNCTION}) begin
 					dpu_service_key_t	shared_service;
 					require_true(cfg.dpu_cfg.placement_cfg.vio_requests[0].fixed_devices.size() == 1, "shared control needs explicit service owner");
 					shared_service =
@@ -396,20 +444,20 @@ package project_external_contract_test_pkg;
 					control.consumers.push_back(shared_service);
 					control.consumers.push_back(shared_service); // canonical 输出必须去重。
 				end
-				control.value = public_kinds[k] == PROJECT_RNET ? (key.host_id << 1) | 1 : 32'h21+k;
-				cfg.platform_controls.push_back(control);
+				control.value = public_kinds[k] == DPU_TABLE_RNET ? (key.host_id << 1) | 1 : 32'h21+k;
+				cfg.dpu_cfg.platform_controls.push_back(control);
 			end
 			if (key.kind == DPU_FUNCTION_PF && key.pf_id == 0) begin
 				control.consumers.delete();
-				control.ctx.kind = PROJECT_AF;
+				control.ctx.kind = DPU_TABLE_AF;
 				control.value = 32'h15;
-				cfg.platform_controls.push_back(control);
+				cfg.dpu_cfg.platform_controls.push_back(control);
 			end
 		end
 		foreach (cfg.dpu_cfg.placement_cfg.vio_requests[r]) begin
-			project_control_cfg_t	control;
+			dpu_control_cfg_t	control;
 			dpu_service_key_t	service;
-			project_table_kind_e	shared_kinds[$] = '{PROJECT_SPWRR, PROJECT_TC_WEIGHT};
+			dpu_table_kind_e	shared_kinds[$] = '{DPU_TABLE_SPWRR, DPU_TABLE_TC_WEIGHT};
 			require_true(cfg.dpu_cfg.placement_cfg.vio_requests[r].fixed_devices.size() == 1,
 				"controls require the explicit one-owner placement request");
 			control.owner = cfg.dpu_cfg.placement_cfg.vio_requests[r].fixed_devices[0];
@@ -417,54 +465,54 @@ package project_external_contract_test_pkg;
 				service_instance_id:cfg.dpu_cfg.placement_cfg.vio_requests[r].service_instance_id};
 			control.consumers.push_back(service);
 			control.consumers_complete = 1;
-			control.ctx.table_index = cfg.function_policies[dpu_function_key_name(control.owner)].vport;
+			control.ctx.table_index = cfg.dpu_cfg.function_policies[dpu_function_key_name(control.owner)].vport;
 			control.writable_mask = 32'hff;
 			foreach (shared_kinds[k]) begin
 				control.ctx.kind = shared_kinds[k];
 				control.value = k == 0 ? 32'h31 : 32'h52;
-				cfg.platform_controls.push_back(control);
+				cfg.dpu_cfg.platform_controls.push_back(control);
 			end
 			for (int unsigned	q = 0; q < pairs; q++) begin
-				control.ctx.kind = PROJECT_QUEUE_AUX;
+				control.ctx.kind = DPU_TABLE_QUEUE_AUX;
 				control.ctx.table_index = 100+r*16+q*3;
 				control.value = 32'h73;
-				cfg.platform_controls.push_back(control);
+				cfg.dpu_cfg.platform_controls.push_back(control);
 			end
 		end
 	endfunction
 
 	// 公共额外类别逐项比对真实Intel发送，防止空catalog冒充成功。
-	task project_external_contract_test::check_public_controls(input project_dpu_config_scope	scope);
-		project_table_kind_e	kinds[$] = '{PROJECT_AF, PROJECT_COMPLETION_BDF, PROJECT_PREFIX, PROJECT_RNET, PROJECT_MSIX_FUNCTION};
-		project_config_record_t	rows[$];
+	task project_external_contract_test::check_public_controls(input dpu_cfg_scope	scope);
+		dpu_table_kind_e	kinds[$] = '{DPU_TABLE_AF, DPU_TABLE_COMPLETION_BDF, DPU_TABLE_PREFIX, DPU_TABLE_RNET, DPU_TABLE_MSIX_FUNCTION};
+		dpu_table_item_t	rows[$];
 		bit	ok;
 		string	why;
 		int unsigned	before_count;
 		foreach (kinds[k]) begin
 			require_true(probe.inspect_public(kinds[k], scope, rows, why) && rows.size() != 0, why);
-			if (kinds[k] == PROJECT_COMPLETION_BDF) foreach (rows[r]) begin
-				project_function_record_t	owner;
-				project_completion_bdf_entry_t	entry;
-				require_true(cfg.dpu_setup.get_function(rows[r].owner, owner), "Completion owner absent");
-				entry = project_completion_bdf_entry_t'(rows[r].entry);
+			if (kinds[k] == DPU_TABLE_COMPLETION_BDF) foreach (rows[r]) begin
+				dpu_function_record_t	owner;
+				dpu_completion_bdf_entry_t	entry;
+				require_true(cfg.dpu_cfg.get_function(rows[r].owner, owner), "Completion owner absent");
+				entry = dpu_completion_bdf_entry_t'(rows[r].entry);
 				require_true(entry.completion_id == owner.pcie_id.bdf && entry.valid,
 					"Completion BDF did not use actual frozen SW identity");
 			end
 			#20ns;
-			before_count = posted[0].size();
+			capture_write_start();
 			case (kinds[k])
-				PROJECT_AF: config_seq.configure_af(scope, ok, why);
-				PROJECT_COMPLETION_BDF: config_seq.configure_completion_bdf_table(scope, ok, why);
-				PROJECT_PREFIX: config_seq.configure_tlp_prefix(scope, ok, why);
-				PROJECT_RNET: config_seq.configure_qsch_rnet(scope, ok, why);
-				PROJECT_MSIX_FUNCTION: config_seq.enable_msix(scope, ok, why);
+				DPU_TABLE_AF: config_seq.configure_af(scope, ok, why);
+				DPU_TABLE_COMPLETION_BDF: config_seq.configure_completion_bdf_table(scope, ok, why);
+				DPU_TABLE_PREFIX: config_seq.configure_tlp_prefix(scope, ok, why);
+				DPU_TABLE_RNET: config_seq.configure_qsch_rnet(scope, ok, why);
+				DPU_TABLE_MSIX_FUNCTION: config_seq.enable_msix(scope, ok, why);
 				default: require_true(0, "unknown optional public test category");
 			endcase
 			require_true(ok && probe.control_calls[kinds[k]] == rows.size(), why);
-			check_writes(rows, before_count);
+			check_writes(rows);
 		end
-		require_true(probe.inspect_public(PROJECT_MSIX_CONTROL, scope, rows, why) &&
-			probe.control_calls[PROJECT_MSIX_CONTROL] == rows.size(), "MSI-X control traversal count");
+		require_true(probe.inspect_public(DPU_TABLE_MSIX_CONTROL, scope, rows, why) &&
+			probe.control_calls[DPU_TABLE_MSIX_CONTROL] == rows.size(), "MSI-X control traversal count");
 	endtask
 
 	// 测试模型完成业务且无在途 DMA，按正常收尾路径释放导出的资源。
@@ -472,12 +520,79 @@ package project_external_contract_test_pkg;
 		bit	ok;
 		string	why;
 
-		cfg.release_vio_resources(selection, 1, ok, why);
-		require_true(ok && cfg.vio_setups.num() == 0, why);
+		config_seq.release_vio_resources(selection, 1, ok, why);
+		require_true(ok && cfg.dpu_cfg.queues_by_host.num() == 0, why);
 	endtask
 
+	// 期望直接取 VIO 的实际 setup 和队列管理器，不使用 DPU 写表结果反推 ring。
+	// 同时确认 PCIe 与 VIO 使用同一 Host backing，重复导出仅复制配置值。
+	function void project_external_contract_test::check_queue_export();
+		foreach (env.vio_envs[h]) begin
+			vio_external_setup	setup;
+			vio_queue_setup_t	actual[$];
+			dpu_vio_queue_t		exported[$];
+			int unsigned		queue_count;
+			int unsigned		after_count;
+			string				why;
+
+			setup = env.vio_envs[h].get_external_setup();
+			require_true(setup != null, "prepared Host has no actual VIO setup");
+			setup.list_queues(actual);
+			require_true(
+				cfg.pcie_cfg.host_mem_by_root[cfg.tl_slot_by_host[h]] == env.vio_envs[h].host_mem &&
+				env.shared_pool.get_host(h) == env.vio_envs[h].host_mem,
+				"PCIe and VIO do not share the Host memory manager"
+			);
+
+			queue_count = 0;
+			foreach (env.vio_envs[h].function_instances[f])
+				queue_count += env.vio_envs[h].function_instances[f].vq_mgr.get_queue_count();
+
+			repeat (2) begin
+				require_true(env.vio_envs[h].export_dpu_queues(setup, null, exported, why), why);
+				require_true(
+					exported.size() == actual.size() &&
+					exported.size() == cfg.dpu_cfg.queues_by_host[h].size(),
+					"DPU export changed the number of actual queues"
+				);
+
+				foreach (actual[q]) begin
+					require_true(
+						exported[q] === cfg.dpu_cfg.queues_by_host[h][q] &&
+						exported[q].snapshot == cfg.dpu_cfg.device_snapshot &&
+						exported[q].generation == setup.get_generation() &&
+						exported[q].service_key == actual[q].service_key &&
+						exported[q].qpair == actual[q].qpair &&
+						exported[q].desc_iova == actual[q].desc_iova &&
+						exported[q].local_qid == actual[q].notification.local_qid &&
+						exported[q].queue_size == actual[q].queue_size &&
+						exported[q].virtio_mode == (actual[q].queue_type == VQ_PACKED) &&
+						exported[q].notify_address == actual[q].notify_address,
+						"DPU export differs from the allocated VIO descriptor/identity"
+					);
+				end
+			end
+
+			after_count = 0;
+			foreach (env.vio_envs[h].function_instances[f])
+				after_count += env.vio_envs[h].function_instances[f].vq_mgr.get_queue_count();
+			require_true(
+				env.vio_envs[h].get_external_setup() == setup && after_count == queue_count,
+				"export replaced the VIO generation or allocated extra queues"
+			);
+		end
+		`uvm_info("PROJECT_QUEUE_EXPORT_PASS",
+			"actual descriptors, repeated export and shared Host memory checked", UVM_LOW)
+	endfunction
+
 	// 捕获完整请求，并以实际 Completion 注入读失败；不拦截产品 receive 路径。
+	// 此按表合同测试从已就绪 AF 开始，0x1010 返回状态8；声明/故障时序由 bare_config 测试覆盖。
 	task project_external_contract_test::receive_contract(input int unsigned	host);
+		dpu_bar_target_t	af_target;
+		string			why;
+
+		require_true(cfg.dpu_cfg.bar_map.resolve_name("h0.pf0.bar0", af_target, why), why);
+
 		forever begin
 			pcie_tl_tlp	t;
 			pcie_tl_mem_tlp	m;
@@ -518,6 +633,10 @@ package project_external_contract_test_pkg;
 				c.lower_addr = m.addr[6:0] + pcie_tl_mem_first_valid_in_range(m, 0, pcie_tl_mem_dw_count(m)*4);
 				c.payload = new[read_error ? 0 : pcie_tl_mem_dw_count(m)*4];
 				foreach (c.payload[i]) c.payload[i] = mmio_bytes[host].exists(pcie_tl_mem_wire_addr(m)+i) ? mmio_bytes[host][pcie_tl_mem_wire_addr(m)+i] : 0;
+				if (!read_error && host == 0 && m.addr == af_target.bar_lease.base + 'h1010) begin
+					require_true(c.payload.size() == 4, "AF status read must be one DWORD");
+					c.payload = '{8'h8, 8'h0, 8'h0, 8'h0};
+				end
 				apps[host].send(c);
 			end
 		end
@@ -525,8 +644,8 @@ package project_external_contract_test_pkg;
 
 	// 全宽和边缘稀疏 byte enables 经过 codec，非法输入在捕获计数增加前拒绝。
 	task project_external_contract_test::check_mmio();
-		project_function_record_t	functions[$];
-		project_bar_target_t	target;
+		dpu_function_record_t	functions[$];
+		dpu_bar_target_t	target;
 		logic [127:0]	value;
 		logic [127:0]	actual;
 		logic [127:0]	expected;
@@ -535,12 +654,12 @@ package project_external_contract_test_pkg;
 		string	why;
 		int unsigned	before_count;
 		project_ur_expected_report	catcher;
-		cfg.dpu_setup.list_functions(functions);
+		cfg.dpu_cfg.list_functions(functions);
 		foreach (functions[f]) begin
 			int unsigned	h;
 			h = functions[f].key.host_id;
 			// BAR2 是真实偶数 BAR ID，不是角色或列表下标。
-			require_true(cfg.bar_registry.resolve_function(functions[f].key, 2, target, why), why);
+			require_true(cfg.dpu_cfg.bar_map.resolve_function(functions[f].key, 2, target, why), why);
 			for (int unsigned	length = 4; length <= 16; length += 4) begin
 				for (int	masked = 0; masked < 2; masked++) begin
 					value = 0;
@@ -563,9 +682,9 @@ package project_external_contract_test_pkg;
 							m = requests[h][n];
 							require_true(m.kind == TLP_MEM_WR, "posted write issued a read");
 							if (!masked) require_true(m.length*4 == length, "whole Memory TLP length");
-							require_true(m.cq_route.bar_id == 2 && m.cq_route.pf_index == target.route.pf_index &&
-								m.cq_route.is_vf == target.route.is_vf &&
-								(!target.route.is_vf || m.cq_route.vf_index == target.route.vf_index), "actual Intel VF/PF/BAR sideband");
+							require_true(m.cq_route.bar_id == 2 && m.cq_route.pf_index == cfg.dpu_cfg.frozen_functions[dpu_function_key_name(target.function_key)].intel_pf &&
+								m.cq_route.is_vf == (target.function_key.kind == DPU_FUNCTION_VF) &&
+								(!(target.function_key.kind == DPU_FUNCTION_VF) || m.cq_route.vf_index == cfg.dpu_cfg.frozen_functions[dpu_function_key_name(target.function_key)].intel_vf), "actual Intel VF/PF/BAR sideband");
 							foreach (m.payload[i]) if (pcie_tl_mem_lane_enabled(m, i)) begin
 								int unsigned	lane;
 								lane = pcie_tl_mem_wire_addr(m)+i-(target.bar_lease.base+'h300+length*32+masked*16);
@@ -606,8 +725,8 @@ package project_external_contract_test_pkg;
 	// 使用非对称字节验证字序与字节序；每个真实 PF/VF 的 BAR2 由 registry 解析。
 	// 无效跨度、宽度、X/Z 或超宽 payload 必须零发送，不能只检查每笔局部 DWORD。
 	task project_external_contract_test::check_table_mmio();
-		project_function_record_t	functions[$];
-		project_bar_target_t			target;
+		dpu_function_record_t	functions[$];
+		dpu_bar_target_t			target;
 		logic [127:0]				value;
 		logic [63:0]				offset;
 		int unsigned				length;
@@ -616,11 +735,11 @@ package project_external_contract_test_pkg;
 		bit							ok;
 		string						why;
 
-		cfg.dpu_setup.list_functions(functions);
+		cfg.dpu_cfg.list_functions(functions);
 
 		foreach (functions[f]) begin
 			h = functions[f].key.host_id;
-			require_true(cfg.bar_registry.resolve_function(functions[f].key, 2, target, why), why);
+			require_true(cfg.dpu_cfg.bar_map.resolve_function(functions[f].key, 2, target, why), why);
 
 			for (length = 4; length <= 16; length += 4) begin
 				value = '0;
@@ -647,9 +766,9 @@ package project_external_contract_test_pkg;
 						m.first_be == 4'hf && m.last_be == 0, "table API emitted non-DWORD write");
 					require_true(pcie_tl_mem_wire_addr(m) == target.bar_lease.base + offset + byte_index,
 						"table API address order must descend");
-					require_true(m.cq_route.bar_id == 2 && m.cq_route.pf_index == target.route.pf_index &&
-						m.cq_route.is_vf == target.route.is_vf &&
-						(!target.route.is_vf || m.cq_route.vf_index == target.route.vf_index), "table API route");
+					require_true(m.cq_route.bar_id == 2 && m.cq_route.pf_index == cfg.dpu_cfg.frozen_functions[dpu_function_key_name(target.function_key)].intel_pf &&
+						m.cq_route.is_vf == (target.function_key.kind == DPU_FUNCTION_VF) &&
+						(!(target.function_key.kind == DPU_FUNCTION_VF) || m.cq_route.vf_index == cfg.dpu_cfg.frozen_functions[dpu_function_key_name(target.function_key)].intel_vf), "table API route");
 
 					foreach (m.payload[i]) begin
 						require_true(m.payload[i] == byte'(8'h51 + byte_index + i), "table API byte order");
@@ -689,12 +808,18 @@ package project_external_contract_test_pkg;
 		`uvm_info("PROJECT_TABLE_DWORD_PASS", "4/8/12/16B high-to-low DWORDs, actual PF/VF BAR routing, whole-span preflight", UVM_LOW)
 	endtask
 
+	// 在配置入口前保存全部接收队列位置；按实际BAR目标域比对，不按owner重用其他Host的cursor。
+	function void project_external_contract_test::capture_write_start();
+		foreach (apps[h]) write_start[h] = posted[h].size();
+	endfunction
+
 	// 逐条重建规格要求的 DWORD 地址/值；间接项必须四笔数据后才出现 clear/trigger。
-	// 精确计数排除旧 bank/ready 和隐含状态写，不使用产品写 helper 生成期望序列。
-	task project_external_contract_test::check_writes(input project_config_record_t	rows[$], input int unsigned	first);
-		int unsigned	cursor;
+	// Notify 批次最后按实际管理 BAR 检查一次使能；期望值直接来自硬件规格。
+	task project_external_contract_test::check_writes(input dpu_table_item_t	rows[$]);
+		int unsigned	cursor[int unsigned];
 		bit	seen[string];
-		cursor = first;
+		dpu_bar_target_t	notify_targets[string];
+		cursor = write_start;
 		#20ns;
 		foreach (rows[r]) begin
 			int unsigned	h;
@@ -702,8 +827,11 @@ package project_external_contract_test_pkg;
 			int unsigned	data_count;
 			if (seen.exists(rows[r].ctx.record_key)) continue;
 			seen[rows[r].ctx.record_key] = 1;
+			if (rows[r].ctx.kind inside {DPU_TABLE_NOTIFY, DPU_TABLE_RDMA_NOTIFY}) begin
+				notify_targets[rows[r].ctx.target.canonical_name] = rows[r].ctx.target;
+			end
 			h = rows[r].ctx.target.function_key.host_id;
-			// 本检查逐 Host 调用，first 属于该 Host 的独立捕获队列。
+			// MSI-X线性表可能统一经Host0写入，各目标域独立推进接收位置。
 			data_count = rows[r].ctx.layout.entry_bytes / 4;
 			count = data_count + (rows[r].ctx.layout.indirect ? 2 : 0);
 			for (int unsigned	n = 0; n < count; n++) begin
@@ -711,8 +839,8 @@ package project_external_contract_test_pkg;
 				bit [63:0]	offset;
 				logic [127:0]	expected;
 				int unsigned	length;
-				require_true(cursor < posted[h].size(), "missing expected table transaction");
-				m = posted[h][cursor++];
+				require_true(cursor.exists(h) && cursor[h] < posted[h].size(), "missing expected table transaction");
+				m = posted[h][cursor[h]++];
 				length = 4;
 				if (n < data_count) begin
 					offset = rows[r].ctx.layout.indirect ?
@@ -734,7 +862,30 @@ package project_external_contract_test_pkg;
 				foreach (m.payload[i]) require_true(m.payload[i] == byte'(expected[i*8 +: 8]), "table payload differs");
 			end
 		end
-		if (rows.size() != 0) require_true(cursor == posted[rows[0].ctx.target.function_key.host_id].size(), "extra bank/state/control write");
+		foreach (notify_targets[name]) begin
+			dpu_bar_target_t	target;
+			pcie_tl_mem_tlp		m;
+			int unsigned		h;
+
+			target = notify_targets[name];
+			h      = target.function_key.host_id;
+			require_true(cursor.exists(h) && cursor[h] < posted[h].size(),
+				"missing Notify enable after table writes");
+			m = posted[h][cursor[h]++];
+			require_true(
+				pcie_tl_mem_wire_addr(m) == target.bar_lease.base + 64'h0008_0044 &&
+				m.length == 1 && m.payload.size() == 4 &&
+				m.first_be == 4'hf && m.last_be == 0,
+				"Notify enable address/width/byte enables differ"
+			);
+			require_true(
+				m.payload[0] == 8'h01 && m.payload[1] == 8'h00 &&
+				m.payload[2] == 8'h00 && m.payload[3] == 8'h00,
+				"Notify enable must write DWORD 1"
+			);
+		end
+		foreach (cursor[h])
+			require_true(cursor[h] == posted[h].size(), "extra bank/state/control write");
 	endtask
 
 	// 连续 buffer 按 4 DWORD 分段；每段保留原 Function wire requester。
@@ -763,9 +914,9 @@ package project_external_contract_test_pkg;
 
 	// RX发布真实buffer，经Intel写payload/完成结构后比较交付；self-mask场景由用户显式rearm后发第二次消息。
 	task project_external_contract_test::check_rx();
-		foreach (selection.setups[h]) begin
+		foreach (cfg.dpu_cfg.queues_by_host[h]) begin
 			vio_queue_setup_t	rows[$];
-			selection.setups[h].list_queues(rows);
+			env.vio_envs[h].get_external_setup().list_queues(rows);
 			foreach (rows[q]) begin
 				virtio_function_instance	instance;
 				packet_item	packet;
@@ -775,14 +926,14 @@ package project_external_contract_test_pkg;
 				byte unsigned	actual_bytes[$];
 				byte	bytes[];
 				bit [63:0]	iova;
-				project_function_policy_t	policy;
+				dpu_function_policy_t	policy;
 				bit	custom_mode;
 				if (rows[q].tx_mode || rows[q].qpair.virtio_pair_index != 0) continue;
 				foreach (env.vio_envs[h].function_instances[f])
 					if (dpu_service_key_name(env.vio_envs[h].function_instances[f].service_key) == dpu_service_key_name(rows[q].service_key))
 						instance = env.vio_envs[h].function_instances[f];
 				require_true(instance != null, "RX instance missing");
-				policy = cfg.function_policies[dpu_function_key_name(rows[q].service_key.function_key)];
+				policy = cfg.dpu_cfg.function_policies[dpu_function_key_name(rows[q].service_key.function_key)];
 				custom_mode = rows[q].queue_type == VQ_CUSTOM;
 				for (int unsigned	frame = 0; frame < ($test$plusargs("PROJECT_SELF_MASK") ? 2 : 1); frame++) begin
 					received.delete();
@@ -832,9 +983,9 @@ package project_external_contract_test_pkg;
 							require_true(requests[h].size() == before_count+1 && requests[h][$].kind == TLP_MEM_WR &&
 								requests[h][$].payload[0] == 1, "user self-mask rearm emitted RMW or failed");
 						end
-						foreach (cfg.messages[m])
-							if (dpu_same_function_key(cfg.messages[m].owner, policy.key) && cfg.messages[m].local_vector == rows[q].qpair.local_msix_vector_id)
-								send_memory(h, 1, 16'hffff, cfg.messages[m].address, cfg.messages[m].data);
+						foreach (cfg.dpu_cfg.messages[m])
+							if (dpu_same_function_key(cfg.dpu_cfg.messages[m].owner, policy.key) && cfg.dpu_cfg.messages[m].local_vector == rows[q].qpair.local_msix_vector_id)
+								send_memory(h, 1, 16'hffff, cfg.dpu_cfg.messages[m].address, cfg.dpu_cfg.messages[m].data);
 						#100ns;
 					end
 					instance.driver_agent.ops.rx_receive(rows[q].notification.local_qid, received, 8);
@@ -849,30 +1000,31 @@ package project_external_contract_test_pkg;
 
 	// 仅测试平台策略失败，不伪造坏环；失败后仍可凭quiescence完整释放。
 	task project_external_contract_test::check_policy_rejection();
-		project_dpu_config_scope	scope;
+		dpu_cfg_scope	scope;
 		dpu_function_key_t	keys[$];
 		int unsigned	bars[$];
 		bit	ok;
 		string	why;
-		scope = new("policy", cfg.dpu_setup, keys, bars);
-		cfg.prepare_vio_configuration(selection, ok, why);
+		scope = new("policy", cfg.dpu_cfg.device_snapshot, keys, bars);
+		config_seq.prepare_vio_configuration(selection, ok, why);
 		require_true(ok, why);
+		check_queue_export();
 		if (policy_case inside {"control_scope_missing", "control_consumer_unknown"}) config_seq.configure_af(scope, ok, why);
 		else if (policy_case == "missing_hook") config_seq.configure_tlp_prefix(scope, ok, why);
 		else if (policy_case == "pba_overlap") config_seq.configure_msix(scope, ok, why);
 		else if (policy_case inside {"qsch_overflow", "qsch_conflict"}) config_seq.configure_qsch(selection, ok, why);
 		else config_seq.configure_vio_queues(selection, ok, why);
 		require_true(!ok && why != "", {"bad platform policy accepted: ", policy_case});
-		if (policy_case == "control_scope_missing") require_true(why == "platform control requires complete explicit consumer scope" && probe.control_calls[PROJECT_AF] == 0, "missing scope reached hook/wrong diagnostic");
-		if (policy_case == "control_consumer_unknown") require_true(why == "control consumer absent from frozen topology" && probe.control_calls[PROJECT_AF] == 0, "unknown consumer reached hook/wrong diagnostic");
+		if (policy_case == "control_scope_missing") require_true(why == "platform control requires complete explicit consumer scope" && probe.control_calls[DPU_TABLE_AF] == 0, "missing scope reached hook/wrong diagnostic");
+		if (policy_case == "control_consumer_unknown") require_true(why == "control consumer absent from frozen topology" && probe.control_calls[DPU_TABLE_AF] == 0, "unknown consumer reached hook/wrong diagnostic");
 		#20ns;
 		foreach (apps[h]) begin
 			require_true(requests[h].size() == 0, "failed category emitted a partial TLP");
 			require_true(env.vio_envs[h].function_instances[0].vq_mgr.get_queue_count() != 0, "policy failure reclaimed exported DMA");
 		end
-		cfg.release_vio_resources(selection, 0, ok, why);
+		config_seq.release_vio_resources(selection, 0, ok, why);
 		require_true(!ok, "bad policy bypassed quiescence");
-		cfg.release_vio_resources(selection, 1, ok, why);
+		config_seq.release_vio_resources(selection, 1, ok, why);
 		require_true(ok, why);
 		foreach (env.vio_envs[h]) env.vio_envs[h].host_mem.leak_check();
 		`uvm_info("PROJECT_POLICY_REJECTION_PASS", policy_case, UVM_LOW)
@@ -880,17 +1032,18 @@ package project_external_contract_test_pkg;
 
 	// 独立完整流程；空闲/prepare/commit 均以真实请求计数证明无访问。
 	task project_external_contract_test::run_phase(uvm_phase	phase);
-		project_dpu_config_scope	public_scope;
-		project_dpu_config_scope	partial_scope;
+		dpu_cfg_scope	public_scope;
+		dpu_cfg_scope	partial_scope;
 		dpu_function_key_t	keys[$];
 		int unsigned	bars[$];
-		project_function_record_t	functions[$];
-		project_config_record_t	rows[$];
-		project_table_kind_e	kinds[$];
+		dpu_function_record_t	functions[$];
+		dpu_table_item_t	rows[$];
+		dpu_table_kind_e	kinds[$];
 		bit	ok;
 		string	why;
 		int unsigned	before_count;
 		phase.raise_objection(this);
+		config_seq.set_sequencer(env.pcie_env.rc_agents[cfg.tl_slot_by_host[0]].sequencer);
 		foreach (apps[h]) begin
 			automatic int unsigned	host = h;
 			fork
@@ -900,20 +1053,19 @@ package project_external_contract_test_pkg;
 		#100ns;
 		if ($test$plusargs("PROJECT_LATE_BAR_PRINT")) begin
 			uvm_report_server	reports;
-			project_bar_registry	saved_registry;
-			project_dpu_setup	saved_setup;
+			dpu_bar_map	saved_registry;
+			dpu_device_snapshot	saved_setup;
 			int unsigned	expected_reports;
 			reports = uvm_report_server::get_server();
-			saved_registry = cfg.bar_registry;
-			saved_setup = cfg.dpu_setup;
+			saved_registry = cfg.dpu_cfg.bar_map;
+			saved_setup = cfg.dpu_cfg.device_snapshot;
 			require_true(saved_registry != null && saved_setup != null && reports.get_id_count("DPU_BAR_MAP") == 0,
 				"connect must install routes while disabled automatic BAR printing stays silent");
-			saved_setup.list_functions(functions);
+			// 每份快照现在以一条分组消息输出；再次发布不得重复打印。
 			expected_reports = 1;
-			foreach (functions[f]) expected_reports += functions[f].bars.size();
-			cfg.print_bar_map = 1;
+			cfg.dpu_cfg.print_bar_map = 1;
 			env.publish_dpu_configuration(ok, why);
-			require_true(ok && cfg.bar_registry == saved_registry && cfg.dpu_setup == saved_setup &&
+			require_true(ok && cfg.dpu_cfg.bar_map == saved_registry && cfg.dpu_cfg.device_snapshot == saved_setup &&
 				reports.get_id_count("DPU_BAR_MAP") == expected_reports, "late first BAR map count/identity");
 			env.publish_dpu_configuration(ok, why);
 			require_true(ok && reports.get_id_count("DPU_BAR_MAP") == expected_reports,
@@ -932,10 +1084,10 @@ package project_external_contract_test_pkg;
 		check_table_mmio();
 		check_registry_and_notifications();
 		check_current_custom_ring();
-		public_scope = new("all", cfg.dpu_setup, keys, bars);
-		cfg.dpu_setup.list_functions(functions);
+		public_scope = new("all", cfg.dpu_cfg.device_snapshot, keys, bars);
+		cfg.dpu_cfg.list_functions(functions);
 		keys.push_back(functions[0].key);
-		partial_scope = new("split_atomic_group", cfg.dpu_setup, keys, bars);
+		partial_scope = new("split_atomic_group", cfg.dpu_cfg.device_snapshot, keys, bars);
 		config_seq.configure_bar_table(partial_scope, ok, why);
 		require_true(!ok && config_seq.bar_calls == 0, "partial BAR group reached hook");
 		config_seq.configure_bar_table(public_scope, ok, why);
@@ -945,22 +1097,22 @@ package project_external_contract_test_pkg;
 		config_seq.configure_pf_vf_map(public_scope, ok, why);
 		require_true(ok, why);
 		foreach (apps[h]) begin
-			project_dpu_config_scope	host_scope;
-			project_config_record_t	public_rows[$];
-			project_config_record_t	part[$];
-			project_table_kind_e	msix_kinds[$] = '{PROJECT_MSIX_LINEAR,PROJECT_MSIX_INFO,PROJECT_MSIX_INTERVAL,PROJECT_MSIX_CONTROL,PROJECT_MSIX_TABLE};
+			dpu_cfg_scope	host_scope;
+			dpu_table_item_t	public_rows[$];
+			dpu_table_item_t	part[$];
+			dpu_table_kind_e	msix_kinds[$] = '{DPU_TABLE_MSIX_LINEAR,DPU_TABLE_MSIX_INFO,DPU_TABLE_MSIX_INTERVAL,DPU_TABLE_MSIX_CONTROL,DPU_TABLE_MSIX_TABLE};
 			keys.delete();
 			foreach (functions[f]) if (functions[f].key.host_id == h) keys.push_back(functions[f].key);
-			host_scope = new("msix_host", cfg.dpu_setup, keys, bars);
+			host_scope = new("msix_host", cfg.dpu_cfg.device_snapshot, keys, bars);
 			foreach (msix_kinds[k]) begin
 				require_true(probe.inspect_public(msix_kinds[k], host_scope, part, why), why);
 				foreach (part[r]) public_rows.push_back(part[r]);
 			end
 			#20ns;
-			before_count = posted[h].size();
+			capture_write_start();
 			config_seq.configure_msix(host_scope, ok, why);
 			require_true(ok, why);
-			check_writes(public_rows, before_count);
+			check_writes(public_rows);
 		end
 		if ($test$plusargs("PROJECT_CONTROLS")) check_public_controls(public_scope);
 		check_optional_state(public_scope);
@@ -968,75 +1120,77 @@ package project_external_contract_test_pkg;
 		require_true(ok, why);
 		#20ns;
 		before_count = requests[0].size();
-		cfg.prepare_vio_configuration(selection, ok, why);
+		config_seq.prepare_vio_configuration(selection, ok, why);
 		require_true(ok, why);
+		check_queue_export();
 		#20ns;
 		require_true(requests[0].size() == before_count, "prepare emitted traffic");
 		// 每 Host 独立 scope 使捕获计数和 shared 项去重的检查可直接对应。
-		foreach (selection.setups[h]) begin
-			project_vio_selection_t	subset;
-			subset.setups[h] = selection.setups[h];
-			subset.scopes[h] = selection.scopes[h];
-			kinds = '{PROJECT_NOTIFY};
+		foreach (cfg.dpu_cfg.queues_by_host[h]) begin
+			dpu_cfg_scope	subset;
+			keys.delete();
+			foreach (functions[f]) if (functions[f].key.host_id == h) keys.push_back(functions[f].key);
+			subset = new("host_queues", cfg.dpu_cfg.device_snapshot, keys, bars);
+			kinds = '{DPU_TABLE_NOTIFY};
 			require_true(probe.inspect_queues(subset, kinds, rows, why), why);
 			foreach (rows[r]) begin
-				project_vio_notify_entry_t	entry;
-				entry = project_vio_notify_entry_t'(rows[r].entry);
+				dpu_vio_notify_entry_t	entry;
+				entry = dpu_vio_notify_entry_t'(rows[r].entry);
 				require_true(rows[r].binding.qpair.global_qpair_id >= 100 &&
-					rows[r].binding.qpair.global_qpair_id != rows[r].binding.notification.local_qid/2,
+					rows[r].binding.qpair.global_qpair_id != rows[r].binding.local_qid/2,
 					"noncontinuous global pair fixture lost");
 				require_true(entry.global_qid == rows[r].binding.qpair.global_qpair_id,
 					"notify used local pair as global ID");
 			end
-			before_count = posted[h].size();
+			capture_write_start();
 			config_seq.configure_vio_notify(subset, ok, why);
 			require_true(ok, why);
-			check_writes(rows, before_count);
-			kinds = '{PROJECT_Q2TC, PROJECT_N2G, PROJECT_G2P, PROJECT_SPWRR, PROJECT_TC_WEIGHT};
+			check_writes(rows);
+			kinds = '{DPU_TABLE_Q2TC, DPU_TABLE_N2G, DPU_TABLE_G2P, DPU_TABLE_SPWRR, DPU_TABLE_TC_WEIGHT};
 			require_true(probe.inspect_queues(subset, kinds, rows, why), why);
 			foreach (rows[r]) begin
 				case (rows[r].ctx.kind)
-					PROJECT_Q2TC: begin
-						project_qsch_q2tc_entry_t	entry;
-						entry = project_qsch_q2tc_entry_t'(rows[r].entry);
+					DPU_TABLE_Q2TC: begin
+						dpu_qsch_q2tc_entry_t	entry;
+						entry = dpu_qsch_q2tc_entry_t'(rows[r].entry);
 						require_true(entry.net_id == 128+rows[r].owner.pf_id*64+rows[r].owner.vf_id*16+rows[r].binding.qpair.virtio_pair_index &&
 							rows[r].ctx.byte_offset == ($test$plusargs("PROJECT_DRIVER_PORTS") ? 64'hb10000 : 64'h610000) +
 							rows[r].ctx.table_index*4, "wide QSCH net/relative offset");
 					end
-					PROJECT_N2G: begin
-						project_qsch_n2g_entry_t	entry;
-						entry = project_qsch_n2g_entry_t'(rows[r].entry);
+					DPU_TABLE_N2G: begin
+						dpu_qsch_n2g_entry_t	entry;
+						entry = dpu_qsch_n2g_entry_t'(rows[r].entry);
 						require_true(entry.group_id == 64+rows[r].owner.pf_id*4+rows[r].owner.vf_id, "wide QSCH group truncated");
 					end
-					PROJECT_G2P: begin
-						project_qsch_g2p_entry_t	entry;
-						entry = project_qsch_g2p_entry_t'(rows[r].entry);
+					DPU_TABLE_G2P: begin
+						dpu_qsch_g2p_entry_t	entry;
+						entry = dpu_qsch_g2p_entry_t'(rows[r].entry);
 						require_true(entry.dpt == ($test$plusargs("PROJECT_ETS") ? 4 : 2)+h &&
 							entry.lvl2_id == ($test$plusargs("PROJECT_ETS") ? 3 : h), "QSCH ETH/ETS destination");
 					end
-					PROJECT_SPWRR, PROJECT_TC_WEIGHT: require_true(rows[r].entry == (rows[r].ctx.kind == PROJECT_SPWRR ? 32'h31 : 32'h52), "scheduler control payload");
+					DPU_TABLE_SPWRR, DPU_TABLE_TC_WEIGHT: require_true(rows[r].entry == (rows[r].ctx.kind == DPU_TABLE_SPWRR ? 32'h31 : 32'h52), "scheduler control payload");
 					default: require_true(0, "unexpected scheduler category");
 				endcase
 			end
 			#20ns;
-			before_count = posted[h].size();
+			capture_write_start();
 			config_seq.configure_qsch(subset, ok, why);
 			require_true(ok, why);
-			check_writes(rows, before_count);
-			kinds = '{PROJECT_VTX, PROJECT_VRX, PROJECT_QUEUE_AUX};
+			check_writes(rows);
+			kinds = '{DPU_TABLE_VTX, DPU_TABLE_VRX, DPU_TABLE_QUEUE_AUX};
 			require_true(probe.inspect_queues(subset, kinds, rows, why), why);
 			foreach (rows[r]) begin
-				if (rows[r].ctx.kind == PROJECT_VTX) begin
-					project_vtx_entry_t	entry;
-					entry = project_vtx_entry_t'(rows[r].entry);
-					require_true(entry.virtio_mode == (rows[r].binding.queue_type == VQ_PACKED), "mixed service VTX mode crossed");
+				if (rows[r].ctx.kind == DPU_TABLE_VTX) begin
+					dpu_vtx_entry_t	entry;
+					entry = dpu_vtx_entry_t'(rows[r].entry);
+					require_true(entry.virtio_mode == rows[r].binding.virtio_mode, "mixed service VTX mode crossed");
 				end
 			end
 			#20ns;
-			before_count = posted[h].size();
+			capture_write_start();
 			config_seq.configure_vio_queues(subset, ok, why);
 			require_true(ok, why);
-			check_writes(rows, before_count);
+			check_writes(rows);
 		end
 		config_seq.enable_vio_queues(selection, ok, why);
 		require_true(ok, why);
@@ -1044,50 +1198,120 @@ package project_external_contract_test_pkg;
 		require_true(ok, why);
 		#20ns;
 		before_count = requests[0].size();
-		cfg.commit_vio_configuration(selection, ok, why);
+		config_seq.commit_vio_configuration(selection, ok, why);
 		require_true(ok, why);
 		#100ns;
 		require_true(requests[0].size() == before_count, "commit/idle emitted implicit config/status traffic");
 		check_rx();
 		if ($test$plusargs("PROJECT_CONTROLS")) begin
-			require_true(probe.control_calls[PROJECT_SPWRR] == cfg.dpu_cfg.placement_cfg.vio_requests.size() &&
-				probe.control_calls[PROJECT_TC_WEIGHT] == cfg.dpu_cfg.placement_cfg.vio_requests.size() &&
-				probe.control_calls[PROJECT_QUEUE_AUX] == cfg.dpu_cfg.placement_cfg.vio_requests.size()*pairs,
+			require_true(probe.control_calls[DPU_TABLE_SPWRR] == cfg.dpu_cfg.placement_cfg.vio_requests.size() &&
+				probe.control_calls[DPU_TABLE_TC_WEIGHT] == cfg.dpu_cfg.placement_cfg.vio_requests.size() &&
+				probe.control_calls[DPU_TABLE_QUEUE_AUX] == cfg.dpu_cfg.placement_cfg.vio_requests.size()*pairs,
 				"optional queue control traversal count");
 			`uvm_info("PROJECT_CONTROLS_PASS", "all declared public and queue control hooks emitted checked Memory writes", UVM_LOW)
 		end
+		if ($test$plusargs("PROJECT_NOTIFY_BATCH")) check_notify_batches(public_scope);
 		check_release_generation();
 		foreach (env.vio_envs[h]) env.vio_envs[h].host_mem.leak_check();
 		`uvm_info("PROJECT_EXTERNAL_CONTRACT_PASS", $sformatf("checks=%0d mixed=%0d hosts=%0d", checks, $test$plusargs("PROJECT_MIXED"), host_count), UVM_LOW)
 		phase.drop_objection(this);
 	endtask
+	// 每次使用新 probe，使 AF 计数从零开始；故障由真实 PCIe sequence 在指定请求处拒绝。
+	// 正例按原始表项检查字节和顺序，负例单独确认已发送数量以及没有任何使能写。
+	task project_external_contract_test::check_notify_batches(input dpu_cfg_scope	scope);
+		dpu_table_item_t	rows[$];
+		dpu_table_item_t	batch[$];
+		project_contract_seq	batch_seq;
+		int unsigned		fail_at;
+		int unsigned		sent;
+		int unsigned		table_writes;
+		bit			ok;
+		string			why;
+
+		require_true(probe.inspect_public(DPU_TABLE_RDMA_NOTIFY, scope, rows, why), why);
+		require_true(rows.size() != 0, "Notify batch fixture needs RDMA records");
+		table_writes = rows.size() * 2;
+		pcie_tl_reg_seq::type_id::set_type_override(project_config_fault_seq::get_type());
+
+		for (int unsigned scenario = 0; scenario < 5; scenario++) begin
+			batch_seq = new($sformatf("notify_batch_%0d", scenario));
+			batch_seq.cfg = cfg.dpu_cfg;
+			batch_seq.set_sequencer(probe.get_sequencer());
+			batch.delete();
+			fail_at = 0;
+
+			if (scenario != 0) begin
+				batch = rows;
+				// 重复同一记录不能多写表项或多使能同一个管理 BAR。
+				batch.push_back(rows[0]);
+			end
+			case (scenario)
+				2: fail_at = 1;
+				3: fail_at = 2;
+				4: fail_at = table_writes + 1;
+				default: ;
+			endcase
+			project_config_fault_seq::calls = 0;
+			project_config_fault_seq::fail_on_call = fail_at;
+			capture_write_start();
+			batch_seq.send_batch(batch, ok, why);
+			project_config_fault_seq::fail_on_call = 0;
+
+			if (fail_at == 0) begin
+				require_true(ok, why);
+				check_writes(batch);
+				continue;
+			end
+
+			require_true(!ok && why != "", "failed Notify send reported success");
+			#20ns;
+			sent = 0;
+			foreach (write_start[h]) begin
+				sent += posted[h].size() - write_start[h];
+				for (int unsigned i = write_start[h]; i < posted[h].size(); i++) begin
+					foreach (rows[r]) begin
+						require_true(
+							pcie_tl_mem_wire_addr(posted[h][i]) !=
+							rows[r].ctx.target.bar_lease.base + 64'h0008_0044,
+							"failed Notify batch enabled a management target"
+						);
+					end
+				end
+			end
+			require_true(sent == fail_at - 1,
+				"Notify failure sent unexpected requests or continued after rejection");
+		end
+		`uvm_info("PROJECT_NOTIFY_BATCH_PASS",
+			"empty/duplicate/multiple-target batches and table/enable send failures", UVM_LOW)
+	endtask
+
 	// 可选入口逐项调用；初始化之后没有隐含PBA/stat读写，W1C只发显式mask。
-	task project_external_contract_test::check_optional_state(input project_dpu_config_scope	scope);
-		project_config_record_t	rows[$];
-		project_function_record_t	functions[$];
-		project_state_query_t	query_item;
-		project_pfvf_drop_clear_cfg_t	clear_item;
-		project_msix_pba_word_t	pba;
+	task project_external_contract_test::check_optional_state(input dpu_cfg_scope	scope);
+		dpu_table_item_t	rows[$];
+		dpu_function_record_t	functions[$];
+		dpu_state_query_t	query_item;
+		dpu_pfvf_drop_clear_cfg_t	clear_item;
+		dpu_msix_pba_word_t	pba;
 		bit	ok;
 		string	why;
 		int unsigned	before_count;
-		require_true(probe.inspect_public(PROJECT_RDMA_NOTIFY, scope, rows, why), why);
+		require_true(probe.inspect_public(DPU_TABLE_RDMA_NOTIFY, scope, rows, why), why);
 		#20ns;
-		before_count = posted[0].size();
+		capture_write_start();
 		config_seq.configure_rdma_notify(scope, ok, why);
 		require_true(ok, why);
-		check_writes(rows, before_count);
-		cfg.dpu_setup.list_functions(functions);
+		check_writes(rows);
+		cfg.dpu_cfg.list_functions(functions);
 		foreach (functions[f]) begin
 			int unsigned	h;
 			h = functions[f].key.host_id;
-			require_true(cfg.get_state_context(PROJECT_MSIX_PBA, functions[f].key, 1, query_item, why), why);
+			require_true(cfg.dpu_cfg.get_state_context(DPU_TABLE_MSIX_PBA, functions[f].key, 1, query_item, why), why);
 			before_count = posted[h].size();
 			config_seq.read_msix_pba(query_item, pba, ok, why);
 			require_true(ok && pba.pending == 0 && posted[h].size() == before_count, "PBA read emitted initialization write");
-			require_true(!cfg.get_state_context(PROJECT_MSIX_PBA, functions[f].key, 2, query_item, why), "PBA capacity inferred or exceeded");
+			require_true(!cfg.dpu_cfg.get_state_context(DPU_TABLE_MSIX_PBA, functions[f].key, 2, query_item, why), "PBA capacity inferred or exceeded");
 		end
-		require_true(cfg.get_state_context(PROJECT_PFVF_DROP, functions[0].key, 0, query_item, why), why);
+		require_true(cfg.dpu_cfg.get_state_context(DPU_TABLE_PFVF_DROP, functions[0].key, 0, query_item, why), why);
 		clear_item.ctx = query_item.ctx;
 		clear_item.owner = query_item.owner;
 		clear_item.entry.clear_mask = 32'h00008005;
@@ -1159,8 +1383,8 @@ package project_external_contract_test_pkg;
 
 	// 独立冻结快照同路径跟随新租约；消息歧义使用新manager，绝不改活动Function状态。
 	task project_external_contract_test::check_registry_and_notifications();
-		project_bar_registry	registries[2];
-		project_bar_target_t	targets[2];
+		dpu_pcie_bar_map	registries[2];
+		dpu_bar_target_t	targets[2];
 		dpu_function_key_t	key;
 		virtio_notification_manager	notifications;
 		vio_external_queue_binding_t	binding;

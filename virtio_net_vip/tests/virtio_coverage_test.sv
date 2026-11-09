@@ -11,7 +11,7 @@ class virtio_coverage_test extends uvm_test;
 
     dpu_device_env             device_env;
     virtio_test_device_builder device_builder;
-    dpu_device_env_config      device_cfg;
+    dpu_env_cfg	device_cfg;
     virtio_net_env_config      cfg;
     virtio_net_env             env;
 
@@ -42,7 +42,7 @@ class virtio_coverage_test extends uvm_test;
             this,
             "device_env.env.pf_0_0.pf_function.driver_agent",
             "is_active", UVM_PASSIVE);
-        uvm_config_db#(dpu_device_env_config)::set(
+        uvm_config_db#(dpu_env_cfg)::set(
             this, "device_env", "cfg", device_cfg);
         device_env = dpu_device_env::type_id::create("device_env", this);
         uvm_config_db#(virtio_net_env_config)::set(

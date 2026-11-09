@@ -11,6 +11,7 @@
 //
 // The agent receives shared component references (ops, fsm, protocol) from the env
 // before build_phase and injects them into the driver during connect_phase.
+// src/agent：组件由 UVM 管理，ops/FSM 由 Function 持有并注入；结束时统一输出 ops 的 RX 统计。
 //
 // Usage:
 //   - Set is_active via uvm_config_db or agent config before build_phase
@@ -35,6 +36,9 @@ class virtio_driver_agent extends uvm_agent;
     virtio_atomic_ops   ops;
     virtio_auto_fsm     fsm;
     virtio_driver_protocol protocol;
+
+    // 仿真结束时输出本 Function 的 RX 汇总；未绑定 ops 的被动 agent 直接跳过。
+    extern virtual function void report_phase(uvm_phase	phase);
 
     // ========================================================================
     // Constructor
@@ -124,5 +128,12 @@ class virtio_driver_agent extends uvm_agent;
     endfunction
 
 endclass : virtio_driver_agent
+
+// 汇总不触碰队列和 DMA；复用共享 ops 的计数，避免遗漏直接 sequence/FSM 的收包入口。
+function void virtio_driver_agent::report_phase(uvm_phase	phase);
+    super.report_phase(phase);
+
+    if (ops != null) ops.print_rx_stats();
+endfunction
 
 `endif // VIRTIO_DRIVER_AGENT_SV

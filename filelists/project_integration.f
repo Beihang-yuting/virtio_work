@@ -5,5 +5,8 @@
 +incdir+$INTEL_PCIE_ROOT/src
 $INTEL_PCIE_ROOT/src/interface/intel_pcie_if.sv
 $INTEL_PCIE_ROOT/src/adapter/intel_pcie_adapter_pkg.sv
+-f $DPU_COMMON_ROOT/filelists/dpu_pcie.f
++incdir+integration/dpu
+integration/dpu/virtio_dpu_pkg.sv
 +incdir+integration/project
 integration/project/project_env_pkg.sv

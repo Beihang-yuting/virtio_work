@@ -241,7 +241,7 @@ class virtio_e2e_test extends uvm_test;
     // ===== Configs =====
     pcie_tl_env_config         pcie_cfg;
     virtio_test_device_builder device_builder;
-    dpu_device_env_config      device_cfg;
+    dpu_env_cfg	device_cfg;
     virtio_net_env_config      virtio_cfg;
 
     protected bit [63:0] e2e_host_allocations[$];
@@ -357,7 +357,7 @@ class virtio_e2e_test extends uvm_test;
         virtio_cfg.iommu_strict         = 1;
         virtio_cfg.scb_enable           = 1;
         virtio_cfg.cov_enable           = 0;
-        uvm_config_db#(dpu_device_env_config)::set(
+        uvm_config_db#(dpu_env_cfg)::set(
             this, "device_env", "cfg", device_cfg);
         device_env = dpu_device_env::type_id::create("device_env", this);
         uvm_config_db#(virtio_net_env_config)::set(

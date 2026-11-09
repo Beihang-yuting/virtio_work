@@ -164,21 +164,48 @@ class virtio_vq_test_kit extends uvm_object;
         mem.write_mem(vq.device_ring_addr + 2, idx_bytes);
     endfunction
 
-    // 设备侧 packed 完成：在描述符 head 的 flags 上置 USED 位（其余字段不变）。
-    static function void complete_packed(
-        host_mem_manager mem,
-        virtqueue_base vq,
-        int unsigned head
+    // 模拟标准设备：读取链尾 ID，只写一个 used 项，清 NEXT 并正确处理两种 wrap。
+    // 不读取 VIP 的 token/链记录，使测试能够发现错误的 ID 约定和回收长度。
+    extern static function void complete_packed(
+        host_mem_manager	mem,
+        virtqueue_base	vq,
+        int unsigned	head
     );
-        byte flags[];
-        bit [15:0] value;
-
-        mem.read_mem(vq.desc_table_addr + head * 16 + 14, 2, flags);
-        value = {flags[1], flags[0]} | VIRTQ_DESC_F_USED;
-        flags[0] = value[7:0];
-        flags[1] = value[15:8];
-        mem.write_mem(vq.desc_table_addr + head * 16 + 14, flags);
-    endfunction
 endclass : virtio_vq_test_kit
+
+// 完成项覆盖链头；链尾的 Buffer ID 与 used flags 是设备唯一需要交还的身份。
+function void virtio_vq_test_kit::complete_packed(
+    host_mem_manager	mem,
+    virtqueue_base	vq,
+    int unsigned	head
+);
+    byte		data[];
+    byte		completion[4];
+    bit [15:0]	flags;
+    bit [15:0]	buffer_id;
+    bit		wrap;
+    int unsigned	slot;
+    int unsigned	count;
+
+    mem.read_mem(vq.desc_table_addr + head * 16, 16, data);
+    wrap = (data[14] & 8'h80) != 0;
+    slot = head;
+    count = 0;
+    do begin
+        mem.read_mem(vq.desc_table_addr + slot * 16, 16, data);
+        buffer_id = {data[13], data[12]};
+        flags = {data[15], data[14]};
+        slot = (slot + 1) % vq.queue_size;
+        count++;
+        if (count > vq.queue_size) begin
+            `uvm_fatal("PACKED_DEVICE", "descriptor chain exceeds ring size")
+            return;
+        end
+    end while ((flags & VIRTQ_DESC_F_NEXT) != 0);
+
+    flags = wrap ? (VIRTQ_DESC_F_AVAIL | VIRTQ_DESC_F_USED) : 0;
+    completion = '{buffer_id[7:0], buffer_id[15:8], flags[7:0], flags[15:8]};
+    mem.write_mem(vq.desc_table_addr + head * 16 + 12, completion);
+endfunction
 
 `endif // VIRTIO_VQ_TEST_KIT_SV

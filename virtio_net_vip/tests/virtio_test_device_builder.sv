@@ -195,10 +195,10 @@ class virtio_test_device_builder extends uvm_object;
         device_cfg.af_request.requester = function_cfg.key;
     endfunction
 
-    function dpu_device_env_config make_env_config();
-        dpu_device_env_config env_cfg;
+    function dpu_env_cfg make_env_config();
+        dpu_env_cfg	env_cfg;
 
-        env_cfg = dpu_device_env_config::type_id::create(
+        env_cfg = dpu_env_cfg::type_id::create(
             {get_name(), "_env_cfg"});
         env_cfg.device_cfg.copy_from(device_cfg);
         env_cfg.placement_cfg.copy_from(placement_cfg);

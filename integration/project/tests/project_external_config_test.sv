@@ -3,6 +3,9 @@
 `include "uvm_macros.svh"
 import uvm_pkg::*;
 import project_env_pkg::*;
+	import virtio_dpu_pkg::*;
+	import dpu_pcie_pkg::*;
+	import dpu_resource_pkg::*;
 class project_external_config_test extends uvm_test;
 	`uvm_component_utils(project_external_config_test)
 	// 构造测试；类型缺失时 RED 应在编译阶段明确失败。
@@ -14,10 +17,10 @@ function project_external_config_test::new(string name, uvm_component parent);
 	super.new(name, parent);
 endfunction
 task project_external_config_test::run_phase(uvm_phase phase);
-	project_vtx_entry_t	vtx;
-	project_vrx_entry_t	vrx;
-	project_qsch_q2tc_entry_t	q2tc;
-	project_qsch_n2g_entry_t	n2g;
+	dpu_vtx_entry_t	vtx;
+	dpu_vrx_entry_t	vrx;
+	dpu_qsch_q2tc_entry_t	q2tc;
+	dpu_qsch_n2g_entry_t	n2g;
 	phase.raise_objection(this);
 	vtx = '0;
 	vtx.high_speed_mode = 1;
@@ -40,7 +43,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 	if (q2tc !== 32'h80001fff || n2g !== 32'h800003ff)
 		`uvm_fatal("PROJECT_EXTERNAL", "QSCH ten-bit golden mismatch")
 	begin
-		project_vtx_entry_t	e;
+		dpu_vtx_entry_t	e;
 		if ($bits(e) != 128) `uvm_fatal("PROJECT_EXTERNAL", "vtx_entry width")
 		e = '0; e.sport_id = '1;
 		if (e !== 128'h000003ff000000000000000000000000) `uvm_fatal("PROJECT_EXTERNAL", "vtx_entry.sport_id golden")
@@ -72,7 +75,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 128'h0000000000000000ffffffffffffffff) `uvm_fatal("PROJECT_EXTERNAL", "vtx_entry.desc_addr golden")
 	end
 	begin
-		project_vrx_entry_t	e;
+		dpu_vrx_entry_t	e;
 		if ($bits(e) != 128) `uvm_fatal("PROJECT_EXTERNAL", "vrx_entry width")
 		e = '0; e.dsc_pre_read_ram_addr = '1;
 		if (e !== 128'h7fff0000000000000000000000000000) `uvm_fatal("PROJECT_EXTERNAL", "vrx_entry.dsc_pre_read_ram_addr golden")
@@ -106,7 +109,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 128'h0000000000000000ffffffffffffffff) `uvm_fatal("PROJECT_EXTERNAL", "vrx_entry.dsc_addr golden")
 	end
 	begin
-		project_vio_notify_entry_t	e;
+		dpu_vio_notify_entry_t	e;
 		if ($bits(e) != 128) `uvm_fatal("PROJECT_EXTERNAL", "vio_notify_entry width")
 		e = '0; e.notify_type = '1;
 		if (e !== 128'h00000000000018000000000000000000) `uvm_fatal("PROJECT_EXTERNAL", "vio_notify_entry.notify_type golden")
@@ -120,7 +123,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 128'h0000000000000000000000000000007f) `uvm_fatal("PROJECT_EXTERNAL", "vio_notify_entry.local_qid_encoding golden")
 	end
 	begin
-		project_bdf_entry_t	e;
+		dpu_bdf_entry_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "bdf_entry width")
 		e = '0; e.vdpa_en = '1;
 		if (e !== 32'h00040000) `uvm_fatal("PROJECT_EXTERNAL", "bdf_entry.vdpa_en golden")
@@ -132,7 +135,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h0000ffff) `uvm_fatal("PROJECT_EXTERNAL", "bdf_entry.requester_id golden")
 	end
 	begin
-		project_ep_requester_id_t	e;
+		dpu_ep_requester_id_t	e;
 		if ($bits(e) != 16) `uvm_fatal("PROJECT_EXTERNAL", "ep_requester_id width")
 		e = '0; e.vf_valid = '1;
 		if (e !== 16'h8000) `uvm_fatal("PROJECT_EXTERNAL", "ep_requester_id.vf_valid golden")
@@ -142,7 +145,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 16'h000f) `uvm_fatal("PROJECT_EXTERNAL", "ep_requester_id.pf_num golden")
 	end
 	begin
-		project_completion_bdf_entry_t	e;
+		dpu_completion_bdf_entry_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "completion_bdf_entry width")
 		e = '0; e.ecrc_en = '1;
 		if (e !== 32'h00020000) `uvm_fatal("PROJECT_EXTERNAL", "completion_bdf_entry.ecrc_en golden")
@@ -152,7 +155,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h0000ffff) `uvm_fatal("PROJECT_EXTERNAL", "completion_bdf_entry.completion_id golden")
 	end
 	begin
-		project_pfvf_entry_t	e;
+		dpu_pfvf_entry_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "pfvf_entry width")
 		e = '0; e.first_vf_offset = '1;
 		if (e !== 32'h000007fe) `uvm_fatal("PROJECT_EXTERNAL", "pfvf_entry.first_vf_offset golden")
@@ -160,7 +163,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h00000001) `uvm_fatal("PROJECT_EXTERNAL", "pfvf_entry.valid golden")
 	end
 	begin
-		project_tlp_prefix_entry_t	e;
+		dpu_tlp_prefix_entry_t	e;
 		if ($bits(e) != 64) `uvm_fatal("PROJECT_EXTERNAL", "tlp_prefix_entry width")
 		e = '0; e.vdpa_en = '1;
 		if (e !== 64'h0000000200000000) `uvm_fatal("PROJECT_EXTERNAL", "tlp_prefix_entry.vdpa_en golden")
@@ -170,7 +173,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 64'h00000000ffffffff) `uvm_fatal("PROJECT_EXTERNAL", "tlp_prefix_entry.tlp_prefix golden")
 	end
 	begin
-		project_msix_linear_entry_t	e;
+		dpu_msix_linear_entry_t	e;
 		if ($bits(e) != 64) `uvm_fatal("PROJECT_EXTERNAL", "msix_linear_entry width")
 		e = '0; e.global_msix_idx = '1;
 		if (e !== 64'h00000007ffc00000) `uvm_fatal("PROJECT_EXTERNAL", "msix_linear_entry.global_msix_idx golden")
@@ -182,7 +185,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 64'h00000000000001ff) `uvm_fatal("PROJECT_EXTERNAL", "msix_linear_entry.local_msix_idx golden")
 	end
 	begin
-		project_msix_info_entry_t	e;
+		dpu_msix_info_entry_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "msix_info_entry width")
 		e = '0; e.valid = '1;
 		if (e !== 32'h00004000) `uvm_fatal("PROJECT_EXTERNAL", "msix_info_entry.valid golden")
@@ -194,7 +197,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h000003ff) `uvm_fatal("PROJECT_EXTERNAL", "msix_info_entry.function_id golden")
 	end
 	begin
-		project_msix_interval_entry_t	e;
+		dpu_msix_interval_entry_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "msix_interval_entry width")
 		e = '0; e.intrl_pnum = '1;
 		if (e !== 32'hffff0000) `uvm_fatal("PROJECT_EXTERNAL", "msix_interval_entry.intrl_pnum golden")
@@ -202,7 +205,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h0000ffff) `uvm_fatal("PROJECT_EXTERNAL", "msix_interval_entry.intrl_rate golden")
 	end
 	begin
-		project_msix_table_entry_t	e;
+		dpu_msix_table_entry_t	e;
 		if ($bits(e) != 128) `uvm_fatal("PROJECT_EXTERNAL", "msix_table_entry width")
 		e = '0; e.msix_mask = '1;
 		if (e !== 128'h00000001000000000000000000000000) `uvm_fatal("PROJECT_EXTERNAL", "msix_table_entry.msix_mask golden")
@@ -212,7 +215,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 128'h0000000000000000ffffffffffffffff) `uvm_fatal("PROJECT_EXTERNAL", "msix_table_entry.msix_addr golden")
 	end
 	begin
-		project_qsch_q2tc_entry_t	e;
+		dpu_qsch_q2tc_entry_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "qsch_q2tc_entry width")
 		e = '0; e.valid = '1;
 		if (e !== 32'h80000000) `uvm_fatal("PROJECT_EXTERNAL", "qsch_q2tc_entry.valid golden")
@@ -222,7 +225,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h00000007) `uvm_fatal("PROJECT_EXTERNAL", "qsch_q2tc_entry.cos golden")
 	end
 	begin
-		project_qsch_n2g_entry_t	e;
+		dpu_qsch_n2g_entry_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "qsch_n2g_entry width")
 		e = '0; e.valid = '1;
 		if (e !== 32'h80000000) `uvm_fatal("PROJECT_EXTERNAL", "qsch_n2g_entry.valid golden")
@@ -230,7 +233,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h000003ff) `uvm_fatal("PROJECT_EXTERNAL", "qsch_n2g_entry.group_id golden")
 	end
 	begin
-		project_qsch_g2p_entry_t	e;
+		dpu_qsch_g2p_entry_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "qsch_g2p_entry width")
 		e = '0; e.valid = '1;
 		if (e !== 32'h80000000) `uvm_fatal("PROJECT_EXTERNAL", "qsch_g2p_entry.valid golden")
@@ -240,7 +243,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h0000000f) `uvm_fatal("PROJECT_EXTERNAL", "qsch_g2p_entry.lvl2_id golden")
 	end
 	begin
-		project_qsch_rnet_entry_t	e;
+		dpu_qsch_rnet_entry_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "qsch_rnet_entry width")
 		e = '0; e.host_id = '1;
 		if (e !== 32'h0000000e) `uvm_fatal("PROJECT_EXTERNAL", "qsch_rnet_entry.host_id golden")
@@ -248,7 +251,7 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h00000001) `uvm_fatal("PROJECT_EXTERNAL", "qsch_rnet_entry.enable golden")
 	end
 	begin
-		project_rdma_notify_entry_t	e;
+		dpu_rdma_notify_entry_t	e;
 		if ($bits(e) != 64) `uvm_fatal("PROJECT_EXTERNAL", "rdma_notify_entry width")
 		e = '0; e.vf_id = '1;
 		if (e !== 64'h07f8000000000000) `uvm_fatal("PROJECT_EXTERNAL", "rdma_notify_entry.vf_id golden")
@@ -258,13 +261,13 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 64'h0000ffffffffffff) `uvm_fatal("PROJECT_EXTERNAL", "rdma_notify_entry.base_addr_60_13 golden")
 	end
 	begin
-		project_msix_pba_word_t	e;
+		dpu_msix_pba_word_t	e;
 		if ($bits(e) != 64) `uvm_fatal("PROJECT_EXTERNAL", "msix_pba_word width")
 		e = '0; e.pending = '1;
 		if (e !== 64'hffffffffffffffff) `uvm_fatal("PROJECT_EXTERNAL", "msix_pba_word.pending golden")
 	end
 	begin
-		project_msix_stat_t	e;
+		dpu_msix_stat_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "msix_stat width")
 		e = '0; e.intrl_pnum_stat = '1;
 		if (e !== 32'hffff0000) `uvm_fatal("PROJECT_EXTERNAL", "msix_stat.intrl_pnum_stat golden")
@@ -272,13 +275,13 @@ task project_external_config_test::run_phase(uvm_phase phase);
 		if (e !== 32'h0000ffff) `uvm_fatal("PROJECT_EXTERNAL", "msix_stat.intrl_rate_timer golden")
 	end
 	begin
-		project_pfvf_drop_status_t	e;
+		dpu_pfvf_drop_status_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "pfvf_drop_status width")
 		e = '0; e.status = '1;
 		if (e !== 32'hffffffff) `uvm_fatal("PROJECT_EXTERNAL", "pfvf_drop_status.status golden")
 	end
 	begin
-		project_pfvf_drop_clear_t	e;
+		dpu_pfvf_drop_clear_t	e;
 		if ($bits(e) != 32) `uvm_fatal("PROJECT_EXTERNAL", "pfvf_drop_clear width")
 		e = '0; e.clear_mask = '1;
 		if (e !== 32'hffffffff) `uvm_fatal("PROJECT_EXTERNAL", "pfvf_drop_clear.clear_mask golden")
