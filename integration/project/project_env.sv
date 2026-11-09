@@ -510,7 +510,7 @@ function void project_env::connect_phase(uvm_phase	phase);
 endfunction
 
 // 每个仿真调用一次：按完整 service 身份登记各 Host，再注册已有 Tcl 命令。
-// 空 Host 可跳过；全局没有 VIO service 或重复注册属于接入错误。
+// 空 Host 可跳过；全局未启用 VIO 时不注册业务命令，重复注册仍报接入错误。
 function void project_env::register_aip_commands();
 	int unsigned	active_hosts;
 	string			why;

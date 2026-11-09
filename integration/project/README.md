@@ -116,6 +116,27 @@ RDMA 仍通过独立 `configure_rdma_notify(scope, ok, why)` 使用，不自动�
 
 平台停止 DMA 后可调用同一 `vio_dpu_cfg_seq` 的
 `release_vio_resources(config_seq.selection, 1, ok, why)`；先确认停机，再释放。
+仅当 `config_seq.selection != null` 时需要释放 VIO 资源。
+
+## 不启用 VIO 或仅启用 VRX
+
+不使用 VIO 时设置 `+vio.enabled=0` 即可；external 集成也支持 `+vio.pairs=0`
+或同时 `+vio.tx_enable=0 +vio.rx_enable=0`。这些条件按每个 service 最终覆盖后的值判断：
+不分配 ring，不要求 VIO Notify/MSI-X 消息配置，不写 VTX、VRX、Notify 表及其使能寄存器、
+QSCH 表和模式寄存器。公共 AF/BDF 等仍按原流程执行。
+全局/Host 参数作为模板，精确 service 覆盖仍可单独启用某个 Function。
+
+仅启用 VRX 时，在下方 Packed 参数基础上设置：
+
+```text
++vio.enabled=1 +vio.pairs=1 +vio.tx_enable=0 +vio.rx_enable=1
++vio.vrx.dsc_pre_max_num=3
++vio.prefetch_ram=ram_h0 +vio.prefetch_start=0 +vio.prefetch_slots=32
+```
+
+保留实际平台的 Notify 和 completion 参数。这里预取区示例为32槽，需与 DUT RAM 分配一致。
+只配置 VRX 和 Notify，不需要提供 QSCH/VTX 布局或调度参数；多 Function 混合 TX/RX 时，
+仅有 TX 的队列生成 QSCH。以上是首次构建的使能选择，快照恢复仍不改变已冻结的队列数量和启用集合。
 
 ## 一对 Packed VTX 的启动参数
 

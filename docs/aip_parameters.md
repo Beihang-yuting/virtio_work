@@ -278,8 +278,8 @@ DPU 与 VIO 共用最终 service 采样值，不分别随机生成第二份队�
 | `dpu.<category>.reg_target` | `dpu_env_cfg::load_platform_params`；覆盖该类别访问窗口，类别见下表 |
 | `dpu.bar_map.reg_target` / `dpu.msix.reg_target` / `dpu.qsch.reg_target` | 同类；BAR/MSI-X/QSCH 家族默认，详细类别覆盖家族 |
 | `vio.vtx.reg_target` / `vio.vrx.reg_target` / `vio.notify_table.reg_target` | 同类；分别最后覆盖 `dpu.vtx/vrx/vio_notify.reg_target` |
-| `vio.enabled` / `tx_enable` / `rx_enable` | `virtio_net_env_config::load_external_requirement`；0/1，默认均1；禁用服务不删除公共 Function，启用服务至少开一个方向 |
-| `vio.pairs/queue_size/queue_type` | 核心同类；先求最终需求再 placement，不静默减小。项目使用 `VQ_PACKED` 或 `VQ_CUSTOM`；实际深度同时受VIP和图片约束 |
+| `vio.enabled` / `tx_enable` / `rx_enable` | `virtio_net_env_config::load_external_requirement`；0/1，默认均1。最终 enabled=0 或 TX/RX 均0时不分配 VIO 队列、不写 VIO/Notify/QSCH；公共 Function 保留。RX-only 跳过 VTX/QSCH |
+| `vio.pairs/queue_size/queue_type` | 核心同类；先求最终需求再 placement，不静默减小。external 的 pairs=0 表示不启用该 service；旧驱动模式仍要求非零。项目使用 `VQ_PACKED` 或 `VQ_CUSTOM`；实际深度同时受VIP和图片约束 |
 | `vio.features` | 核心同类；external Packed 默认 VERSION_1 与 RING_PACKED，二者必需；另允许 NOTIFICATION_DATA、IN_ORDER、RING_EVENT_IDX、ACCESS_PLATFORM、CSUM、HOST_TSO4/6、HOST_USO。TSO/USO依赖CSUM；声明能力不自动启用每包offload。Custom 强制0，显式非零拒绝，不执行设备协商 |
 | `vio.completion_mode` | 核心同类；`VIRTIO_COMPLETION_POLLING` 或 `VIRTIO_COMPLETION_MSIX`，MSI-X 无轮询兜底 |
 | `vio.notify_bar/notify_base/notify_stride/notify_encoding` | 核心同类；真实 doorbell 的偶数 BAR、BAR内offset/队列步长/`VIO_NOTIFY_QID16`、`VIO_NOTIFY_DATA32`、`VIO_NOTIFY_DPU32`。提供 notify_base 标记布局有效，不能拿 notify lookup 表偏移替代 |

@@ -938,3 +938,41 @@ Tcl bridge在53主机从该源码构建。最终输入2445个文件已逐项核�
 其余源码保持验证时的字节内容。`commit_format_audit.json` 记录两份文件前后SHA，
 并确认差异只有末尾换行；本节验证记录也在核对后补充。
 本轮是模型端点和软件集成的针对性验证，不代表整仓全量回归或真实RTL DUT验证。
+
+## 2026-11-09：按 VIO 使能跳过配置，RX-only 不配置 QSCH
+
+external service 在全局、Host 和精确 service 覆盖合并后判断是否启用：
+`enabled=0`、`pairs=0` 或 TX/RX 均关闭时不申请 VIO placement、不创建 ring，
+配置 seq 返回空 selection，跳过 VTX/VRX、Notify 表及其使能、QSCH 表与模式寄存器。
+公共 AF/BDF 等仍沿用原流程。RX-only 保留实际 VRX 和 Notify，只由 TX 队列产生 QSCH。
+Host/service 覆盖仍可重新启用自身；快照恢复的固定资源边界保持原约束。
+
+在 `ubuntu@10.11.10.53:/tmp/vio_enable_gating_20261109` 使用 VCS
+`W-2024.09-SP1` 完成 project、AIP 两组编译及以下定向验证。
+8个集成正例和1个参数正例全部通过严格日志检查，无 warning/error/fatal；
+另2个非法参数按预期拒绝，不计作普通正例。
+
+| 场景 | 实际配置写/读 | 验证重点 |
+| --- | --- | --- |
+| `enabled=0` / `pairs=0` / TX、RX均0，三次独立运行 | 各2写/1读 | 只有AF写/读和BDF写；无VIO ring/Notify/QSCH；未供MSI-X消息仍正常 |
+| Packed RX-only | 19写/1读 | 无VTX/QSCH；VRX初始化及使能12写、Notify行4写及使能1写 |
+| Custom RX-only，开启读回 | 19写/4读 | 相同方向过滤，读回只验证实际配置表 |
+| Packed TX-only | 25写/1读 | QSCH正常，512B TX生成真实Intel Notify |
+| Packed双向 | 37写/1读 | 两方向初始化及使能正常 |
+| 双Host，Host0双向、Host1 RX-only | 6398项检查 | QSCH只来自Host0，Host1的VRX仍正常配置 |
+| AIP分层参数 | 615项检查 | 关闭模板、零对、双方向关闭及精确Host/service重新启用 |
+
+关闭/RX-only用例主动移除未启用模块的表布局，确认不是依赖闲置布局才能跳过。
+AIP负例分别验证旧驱动模式仍拒绝零对，以及33对越界；均精确命中参数范围fatal，退出码3。
+
+首次关闭用例发现空Notify目录调用sort的仿真器警告，已改为多于一项才排序。
+混合方向测试原先把RX-only消息误当无消费者，注入了无pending报文的完成；
+测试修正为按任意RX/TX消费者判断后重跑通过，生产接口和完成校验未改。
+前述失败日志保留，不用于最终通过结论。
+
+证据目录为 `build/vio_enable_gating_20261109/`，结果与复现步骤分别见
+`VALIDATION_RESULT.md`、`FINAL_INPUTS.md`。最终2296文件manifest已核对本地与53一致，
+SHA-256为 `80fd63861027d15453e407dc58c5f609df1603af43543592622463323a393b46`。
+project v3仅改混合测试的消息注入函数；其他7个集成正例使用相同生产源码的v2产物，
+AIP也使用v2产物，不依赖该测试文件。本节为验证后追加的说明。
+这是Intel接口模型和软件集成定向验证，未运行真实RTL或整仓回归。

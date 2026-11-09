@@ -433,29 +433,13 @@ class virtio_net_env_config extends uvm_object;
         return 1;
     endfunction
 
-    // 校验 queue 数量、队列大小和带宽参数等本地行为约束；失败时通过 why
-    // 返回可读原因，不产生状态副作用。
-    protected function bit validate_driver_behavior(
-        input virtio_driver_config_t driver_cfg,
-        input string label,
-        output string why
+    // 校验本地几何/带宽约束；external 允许零对作为关闭模板，最终使能在 service 合并后确定。
+    // 旧驱动模式仍拒绝零对；失败只返回原因，不修改模板或覆盖后续 Host/service 参数。
+    extern protected function bit validate_driver_behavior(
+        input virtio_driver_config_t	driver_cfg,
+        input string			label,
+        output string			why
     );
-        if (driver_cfg.num_queue_pairs == 0) begin
-            why = {label, " has zero queue pairs"};
-            return 0;
-        end
-        if ((driver_cfg.queue_size != 0) &&
-            ((driver_cfg.queue_size & (driver_cfg.queue_size - 1)) != 0)) begin
-            why = {label, " queue size is not a power of two"};
-            return 0;
-        end
-        if (driver_cfg.bw_limit_enable && (driver_cfg.bw_limit_mbps == 0)) begin
-            why = {label, " enables a zero bandwidth limit"};
-            return 0;
-        end
-        why = "";
-        return 1;
-    endfunction
 
     // 为一个完整 service key 注册显式驱动行为；拒绝重复 service、同 Function
     // 多份配置和非法行为，成功后由本对象拥有该配置副本。
@@ -952,8 +936,33 @@ function void virtio_net_env_config::load_external_requirement(
 `endif
 endfunction
 
+// external 的零对模板可被 Host/service 覆盖；旧驱动模式保留非零队列约束。
+// 这里只检查本地行为，不分配资源；失败返回原因。
+function bit virtio_net_env_config::validate_driver_behavior(
+    input virtio_driver_config_t	driver_cfg,
+    input string			label,
+    output string			why
+);
+    if (driver_cfg.num_queue_pairs == 0 && !external_configuration) begin
+        why = {label, " has zero queue pairs"};
+        return 0;
+    end
+    if ((driver_cfg.queue_size != 0) &&
+        ((driver_cfg.queue_size & (driver_cfg.queue_size - 1)) != 0)) begin
+        why = {label, " queue size is not a power of two"};
+        return 0;
+    end
+    if (driver_cfg.bw_limit_enable && (driver_cfg.bw_limit_mbps == 0)) begin
+        why = {label, " enables a zero bandwidth limit"};
+        return 0;
+    end
+    why = "";
+    return 1;
+endfunction
+
 // placement/connect 共用最终缓存；已加载的全局/Host 层只继承值，精确 service 层首次采样。
 // 未显式 load 的独立配置仍支持按 service 延迟解析；运行期只在候选上重新采样。
+// 全部覆盖完成后，未使能、零对或双方向关闭都不创建 service 队列，也不要求 Notify/MSI-X 合同。
 function bit virtio_net_env_config::resolve_final_service_requirement(
     input dpu_service_key_t	key, output vio_service_requirement_t	requirement,
     output string	why);
@@ -991,19 +1000,23 @@ function bit virtio_net_env_config::resolve_final_service_requirement(
                 load_external_requirement(paths[i], requirement, features_present);
         end
     end
-    if ($isunknown({requirement.enabled, requirement.tx_enable, requirement.rx_enable,
-                    requirement.notify_layout_valid, requirement.notify_bar,
-                    requirement.notify_base, requirement.notify_stride,
-                    requirement.notify_encoding, requirement.completion_mode}) ||
-        !(requirement.completion_mode inside {VIRTIO_COMPLETION_POLLING, VIRTIO_COMPLETION_MSIX}) ||
-        !(requirement.notify_encoding inside {VIO_NOTIFY_QID16, VIO_NOTIFY_DATA32, VIO_NOTIFY_DPU32}) ||
-        (requirement.enabled && (!requirement.tx_enable && !requirement.rx_enable))) begin
-        why = "external requirement has unknown/invalid direction or completion/notify mode";
+    if ($isunknown({requirement.enabled, requirement.tx_enable, requirement.rx_enable})) begin
+        why = "external requirement has unknown enable/direction";
         return 0;
     end
+    requirement.enabled &= (requirement.tx_enable || requirement.rx_enable) &&
+                           requirement.behavior.num_queue_pairs != 0;
     if (!requirement.enabled) begin
         final_requirements[name_key] = requirement;
         return 1;
+    end
+    if ($isunknown({requirement.notify_layout_valid, requirement.notify_bar,
+                    requirement.notify_base, requirement.notify_stride,
+                    requirement.notify_encoding, requirement.completion_mode}) ||
+        !(requirement.completion_mode inside {VIRTIO_COMPLETION_POLLING, VIRTIO_COMPLETION_MSIX}) ||
+        !(requirement.notify_encoding inside {VIO_NOTIFY_QID16, VIO_NOTIFY_DATA32, VIO_NOTIFY_DPU32})) begin
+        why = "external requirement has unknown/invalid completion/notify mode";
+        return 0;
     end
     if (!validate_driver_behavior(requirement.behavior, name_key, why)) return 0;
     if (requirement.behavior.num_queue_pairs > DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE ||
@@ -1256,7 +1269,8 @@ function void virtio_net_env_config::load_params(string	path);
 endfunction
 
 
-// 合并驱动参数到值副本；RX 报文容量先检查非零和加头/对齐溢出，不在这里重复加头。
+// 合并驱动参数到值副本；external 的 pairs=0 表示无队列，待最终 service 覆盖后确定使能。
+// RX 报文容量先检查非零和加头/对齐溢出，不在这里重复加头。
 function void virtio_net_env_config::load_driver_params(string	path, ref virtio_driver_config_t	behavior);
 `ifdef AIP_CMDLINE_SV
     longint unsigned			pairs;
@@ -1281,7 +1295,7 @@ function void virtio_net_env_config::load_driver_params(string	path, ref virtio_
         `uvm_fatal("VIO_PARAM", {path, ".rx_buf_size: 报文容量必须在 1..4294967272 字节内（不含 Virtio 头）"})
         return;
     end
-    if ((pairs == 0) || (pairs > DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE) ||
+    if ((pairs == 0 && !external_configuration) || (pairs > DPU_VIO_NET_MAX_QPAIRS_PER_DEVICE) ||
         ((queue_size != 0) && ((queue_size < 2) || (queue_size > 32768) ||
           ((queue_size & (queue_size - 1)) != 0))) ||
         (napi_budget == 0) || (napi_budget > 64'hffff_ffff) ||

@@ -81,6 +81,7 @@ function bit vio_dpu_cfg_seq::get_env(
 endfunction
 
 // 本地准备不发送 TLP；由单个配置 sequence 在写 VIO 表之前调用。
+// 无活动 qpair 时返回成功和空 selection，不要求 VIO env、Notify 或调度策略。
 // 所有 Host 的绑定先解析，真实 ring 仅由核心 env 分配；每个成功 Host 在导出前保留释放入口。
 // 后续准备/导出失败不自动停 DUT 或释放资源，由调用方确认停机后使用返回的 selection 清理。
 task vio_dpu_cfg_seq::prepare_vio_configuration(
@@ -102,6 +103,12 @@ task vio_dpu_cfg_seq::prepare_vio_configuration(
 	selection = null;
 	why       = "DPU configuration must be published first";
 	if (cfg == null || !cfg.runtime_ready) return;
+	cfg.resource_snapshot.list_vio_bindings(pairs);
+	if (pairs.size() == 0) begin
+		ok = cfg.set_queues(all_queues, why);
+		return;
+	end
+
 	cfg.device_snapshot.list_hosts(hosts);
 	foreach (hosts[i]) begin
 		if (!get_env(hosts[i].host_id, envs[hosts[i].host_id], why)) return;
@@ -110,7 +117,6 @@ task vio_dpu_cfg_seq::prepare_vio_configuration(
 			return;
 		end
 	end
-	cfg.resource_snapshot.list_vio_bindings(pairs);
 	foreach (pairs[p]) begin
 		int unsigned	h;
 

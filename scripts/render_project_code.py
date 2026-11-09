@@ -47,6 +47,7 @@ def render():
 写 Notify/QSCH/VTX/VRX，最后确认 VIO。每批 VIO/RDMA Notify 表成功后，
 每个管理 BAR 写一次 `+0x80044 = 1`。空批次不写，失败停止；不增加 bank 切换或使能读回。
 原有每100次完整 DWORD 写后的 AF 状态读保持不变。
+未启用的 VIO service 不分配 ring 或写 VIO/Notify/QSCH；RX-only 只写 VRX/Notify，跳过 VTX/QSCH。
 
 Tcl 名称仍为 `dut_config`、`reg_acc`、`load_params`；其中 reg_acc 注册 `dpu_bar_reg_seq`，
 addr 为 Host0/PF0 BAR0 内偏移。load_params 用 AIP 命令宏注册一次，顶层统一刷新允许字段。

@@ -1,6 +1,7 @@
 // integration/project/tests：真实 Intel 引脚/monitor/bridge 的项目合同模型回归。
 // 应用侧 adapter 仅模拟 DUT 的 BAR MMIO、VTX/VRX 间接表和主动 DMA；Host 仍由项目 RC 唯一响应。
 // 裸 seq 回归不覆写生产 hook，核对 AF 首笔写和发送失败停止，再验证配置、读回及缺布局拒绝。
+// 关闭/零队列和 RX-only 场景删除未使用的布局，并从真实 Intel MMIO 验证不会配置未启用模块。
 // PROJECT_PREPARE_RETRY 复用双 Host 组件，验证后续 Host 准备失败仍能显式释放前序 Host 并重试。
 // 测试拥有 app adapter 和期望值；不向 observer 直接注入，不声称覆盖真实 RTL。
 package project_external_integration_test_pkg;
@@ -399,7 +400,7 @@ package project_external_integration_test_pkg;
 		cfg.dpu_cfg.table_layouts[kind] = l;
 	endfunction
 
-	// 配置基于真实 DPU 生成器，精确 enabled/pairs 在 placement 前解析。
+	// 配置基于真实 DPU 生成器，精确 enabled/pairs 在 placement 前解析；混合方向固定 Host0 双向、Host1 RX-only。
 	function void project_external_integration_test::build_phase(uvm_phase phase);
 		string	why;
 		project_external_model_cfg	model_cfg;
@@ -415,6 +416,12 @@ package project_external_integration_test_pkg;
 		pairs = vf_count == 2 ? 16 : 32;
 		if ($test$plusargs("PROJECT_SMALL")) pairs = 2;
 		if ($test$plusargs("PROJECT_ONE_PAIR")) pairs = 1;
+		if ($test$plusargs("PROJECT_MIXED_DIRECTIONS")) begin
+			host_count = 2;
+			vf_count   = 1;
+			pairs      = 1;
+			tx_only    = 0;
+		end
 		// 生命周期负例固定最小双 Host 拓扑，避免依赖额外场景参数才能覆盖部分成功。
 		if ($test$plusargs("PROJECT_PREPARE_RETRY")) begin
 			require_true(!no_vio, "prepare retry requires enabled VIO services");
@@ -455,6 +462,8 @@ package project_external_integration_test_pkg;
 			for (int unsigned v = 0; v < vf_count; v++)
 				aip_cmdline_override::set_val($sformatf("vio.h%0d.pf0.vf%0d.i0.enabled",h,v), no_vio ? "0" : "1");
 		end
+		if ($test$plusargs("PROJECT_MIXED_DIRECTIONS"))
+			aip_cmdline_override::set_val("vio.h1.pf0.vf0.i0.tx_enable", "0");
 		// 全局调度默认与精确 service 覆盖通过真实参数解析验证。
 		aip_cmdline_override::set_val("dpu.qsch.cos", "3");
 		aip_cmdline_override::set_val("vio.h0.pf0.vf0.i0.qsch.cos", "5");
@@ -666,6 +675,7 @@ package project_external_integration_test_pkg;
 	endtask
 
 	// 独立分配 DMA backing，测试不会破坏真实 ring；权限失败检查 backing 与 dirty tracking。
+	// 无消费者的消息才测试 RC sink；RX-only 向量仍有消费者，不能凭空注入未提交报文的完成。
 	task project_external_integration_test::check_receive_path();
 		dpu_function_record_t	functions[$];
 		project_dma_expected_error	catcher;
@@ -733,10 +743,10 @@ package project_external_integration_test_pkg;
 					int unsigned desc_id;
 					bit [31:0] word_value;
 					dpu_function_policy_t policy;
-					if (!rows[q].tx_mode || !dpu_same_function_key(rows[q].service_key.function_key, message.owner) ||
+					if (!dpu_same_function_key(rows[q].service_key.function_key, message.owner) ||
 						rows[q].qpair.local_msix_vector_id != message.local_vector) continue;
 					active = 1;
-					if (!msix_mode) continue;
+					if (!rows[q].tx_mode || !msix_mode) continue;
 					foreach (env.vio_envs[message.owner.host_id].function_instances[f])
 						if (dpu_service_key_name(env.vio_envs[message.owner.host_id].function_instances[f].service_key) == dpu_service_key_name(rows[q].service_key))
 							instance = env.vio_envs[message.owner.host_id].function_instances[f];
@@ -822,6 +832,7 @@ package project_external_integration_test_pkg;
 	// 正常使用方式：只启动一个配置 seq，自动 get 同一 cfg，成功后进入 READY。
 	// 故障行每次仿真只注入一个 DWORD，检查整个 body 停止且不进入发包状态。
 	// 准备重试分支仅执行本地生命周期检查，保留同一真实组件树但不启动 MMIO 模型。
+	// 混合方向检查 QSCH 记录只来自 Host0，防止用全局 TX 开关误配 Host1 的纯 RX 队列。
 	task project_external_integration_test::run_phase(uvm_phase	phase);
 		bit				ok;
 		string			why;
@@ -864,8 +875,20 @@ package project_external_integration_test_pkg;
 			require_true(config_seq.success, config_seq.error_msg);
 			if (!no_vio) begin
 				require_true(cfg.dpu_cfg.queues_by_host.num() == host_count, "missing prepared Host");
-				require_true(config_seq.vtx_calls == pairs*vf_count*host_count, "VTX hook count differs from actual queues");
+				require_true(config_seq.vtx_calls == pairs*vf_count*
+					($test$plusargs("PROJECT_MIXED_DIRECTIONS") ? 1 : host_count), "VTX hook count differs from actual queues");
 				require_true(config_seq.vrx_calls == (tx_only ? 0 : pairs*vf_count*host_count), "VRX hook count differs from actual queues");
+				if ($test$plusargs("PROJECT_MIXED_DIRECTIONS")) begin
+					int unsigned	q2tc_count;
+
+					foreach (cfg.dpu_cfg.records[name]) begin
+						if (cfg.dpu_cfg.records[name].ctx.kind inside
+							{DPU_TABLE_Q2TC, DPU_TABLE_N2G, DPU_TABLE_G2P, DPU_TABLE_SPWRR, DPU_TABLE_TC_WEIGHT})
+							require_true(cfg.dpu_cfg.records[name].owner.host_id == 0, "RX-only Host contributed QSCH table");
+						if (cfg.dpu_cfg.records[name].ctx.kind == DPU_TABLE_Q2TC) q2tc_count++;
+					end
+					require_true(q2tc_count == 1, "mixed direction lost TX scheduler entry");
+				end
 				foreach (env.vio_envs[h]) foreach (env.vio_envs[h].function_instances[f]) begin
 					require_true(env.vio_envs[h].function_instances[f].driver_agent.fsm.state == FSM_READY,
 						"successful configuration did not enable packet admission");
@@ -1078,6 +1101,9 @@ package project_external_integration_test_pkg;
 		bit			business_notify_enabled;
 		bit [63:0]		business_notify_offset;
 		pcie_tl_mem_tlp		business_notifications[$];
+		bit				tx_active;
+		bit				rx_active;
+		int unsigned		active_pairs;
 
 		// 构造测试组件，不提前创建或复制生产 cfg。
 		extern function new(string name, uvm_component parent);
@@ -1109,14 +1135,17 @@ package project_external_integration_test_pkg;
 	endfunction
 
 	// 使用真实 load_params 构造资源；不手填布局、BAR 分组、Function 身份或配置 hook。
-	// 参数扩展由 PROJECT_BARE_PAIRS / PROJECT_CUSTOM / PROJECT_BARE_RX 选择。
+	// PROJECT_BARE_RX 保留双向场景；RX_ONLY、NO_DIRECTIONS、NO_VIO 及 pairs=0 验证使能边界。
 	function void project_bare_config_test::build_phase(uvm_phase phase);
 		intel_pcie_vif_t		vif;
 		intel_pcie_adapter_config	app_cfg;
 
 		pairs = 1;
 		void'($value$plusargs("PROJECT_BARE_PAIRS=%d", pairs));
-		tx_only = !$test$plusargs("PROJECT_BARE_RX");
+		tx_only = !$test$plusargs("PROJECT_BARE_RX") && !$test$plusargs("PROJECT_BARE_RX_ONLY");
+		no_vio = $test$plusargs("PROJECT_NO_VIO");
+		tx_active = !$test$plusargs("PROJECT_BARE_RX_ONLY") && !$test$plusargs("PROJECT_NO_DIRECTIONS");
+		rx_active = !tx_only && !$test$plusargs("PROJECT_NO_DIRECTIONS");
 		host_count = 1;
 		vf_count = 0;
 		corrupt_bdf = $test$plusargs("PROJECT_BARE_CORRUPT_BDF");
@@ -1149,21 +1178,26 @@ package project_external_integration_test_pkg;
 		aip_cmdline_override::set_val("dpu.vfs_per_pf", "0");
 		aip_cmdline_override::set_val("dpu.reg_target", "h0.pf0.bar0");
 		aip_cmdline_override::set_val("dpu.print_bar_map", "1");
-		aip_cmdline_override::set_val("vio.enabled", "1");
+		aip_cmdline_override::set_val("vio.enabled", no_vio ? "0" : "1");
 		aip_cmdline_override::set_val("vio.pairs", $sformatf("%0d", pairs));
-		aip_cmdline_override::set_val("vio.tx_enable", "1");
-		aip_cmdline_override::set_val("vio.rx_enable", tx_only ? "0" : "1");
+		aip_cmdline_override::set_val("vio.tx_enable", tx_active ? "1" : "0");
+		aip_cmdline_override::set_val("vio.rx_enable", rx_active ? "1" : "0");
+		tx_active &= !no_vio && pairs != 0;
+		rx_active &= !no_vio && pairs != 0;
+		active_pairs = tx_active || rx_active ? pairs : 0;
 		aip_cmdline_override::set_val("vio.queue_type", $test$plusargs("PROJECT_CUSTOM") ? "VQ_CUSTOM" : "VQ_PACKED");
 		aip_cmdline_override::set_val("vio.queue_size", "256");
 		// RX 的预取 RAM 是平台输入；32 槽小于 256 深度，并按 pair 自动推进起始位置。
-		if (!tx_only) begin
+		if (rx_active) begin
 			aip_cmdline_override::set_val("vio.vrx.dsc_pre_max_num", "3");
 			aip_cmdline_override::set_val("vio.prefetch_ram", "ram_h0");
 			aip_cmdline_override::set_val("vio.prefetch_start", "0");
 			aip_cmdline_override::set_val("vio.prefetch_slots", "32");
 		end
 		aip_cmdline_override::set_val("vio.features", $test$plusargs("PROJECT_CUSTOM") ? "0" : "0x0000000500000000");
-		aip_cmdline_override::set_val("vio.completion_mode", msix_mode ? "VIRTIO_COMPLETION_MSIX" : "VIRTIO_COMPLETION_POLLING");
+		// 无 VIO 时故意保留 MSI-X 模式且不提供消息；关闭的 service 不得要求中断配置。
+		aip_cmdline_override::set_val("vio.completion_mode",
+			msix_mode || active_pairs == 0 ? "VIRTIO_COMPLETION_MSIX" : "VIRTIO_COMPLETION_POLLING");
 		if (msix_mode && !missing_message) begin
 			aip_cmdline_override::set_val("dpu.msix.msg_addr_base", "0x900000000000");
 			aip_cmdline_override::set_val("dpu.msix.msg_addr_stride", "4");
@@ -1187,6 +1221,17 @@ package project_external_integration_test_pkg;
 		cfg = project_env_cfg::type_id::create("cfg");
 		cfg.vio_cfg.scb_enable = 0;
 		cfg.load_params();
+		// 不提供未启用模块的布局，证明正常跳过而非仅写入零值；公共 BDF/AF 保持有效。
+		if (!tx_active) begin
+			cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_VTX);
+			cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_Q2TC);
+			cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_N2G);
+			cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_G2P);
+			cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_SPWRR);
+			cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_TC_WEIGHT);
+		end
+		if (!rx_active) cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_VRX);
+		if (active_pairs == 0) cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_NOTIFY);
 		if (missing_layout) cfg.dpu_cfg.table_layouts.delete(DPU_TABLE_NOTIFY);
 		require_true(!cfg.dpu_cfg.configure_public, "bare default unexpectedly enables public tables");
 		require_true(cfg.dpu_cfg.function_policies.exists(dpu_function_key_name(
@@ -1252,6 +1297,15 @@ package project_external_integration_test_pkg;
 		end
 		write_offsets.push_back(offset);
 		write_values.push_back(value);
+		if (active_pairs == 0)
+			require_true(offset inside {'h1010, 'h108000}, "disabled VIO emitted dependent MMIO");
+		if (!tx_active) begin
+			require_true(!(offset >= 'h880130 && offset <= 'h880140), "disabled VTX emitted MMIO");
+			require_true(offset != 'hb001c0 && !(offset >= 'hb10000 && offset < 'hb19000),
+				"RX-only/disabled VIO emitted QSCH MMIO");
+		end
+		if (!rx_active)
+			require_true(!(offset >= 'h900200 && offset <= 'h900210), "disabled VRX emitted MMIO");
 		if (write_offsets.size() > 1) begin
 			require_true(completed_af_reads == 1 + (write_offsets.size()-2)/100,
 				"configuration write crossed AF initial/100-DWORD status-read boundary");
@@ -1405,12 +1459,13 @@ package project_external_integration_test_pkg;
 		end
 	endtask
 
-	// 以冻结的唯一表项计算发送笔数：AF 一笔、Notify 实际 pair、QSCH mode、普通 DWORD 表，
+	// 以冻结的唯一表项计算发送笔数：AF 一笔、活动 Notify pair、仅 TX 的 QSCH mode、普通 DWORD 表，
 	// VTX/VRX 各有初始化和使能两组六笔写。按接收完成数等待，不用任意固定延迟假设。
 	task project_bare_config_test::await_configuration_writes();
 		int unsigned	expected_writes;
 
-		expected_writes = 2 + pairs*4 + (msix_mode ? 2048*2 : 0) + (cfg.dpu_cfg.qsch_configure_controls ? 1 : 0);
+		expected_writes = 1 + (active_pairs != 0 ? 1 : 0) + active_pairs*4 +
+			(msix_mode ? 2048*2 : 0) + (tx_active && cfg.dpu_cfg.qsch_configure_controls ? 1 : 0);
 		foreach (cfg.dpu_cfg.records[name]) begin
 			case (cfg.dpu_cfg.records[name].ctx.kind)
 				DPU_TABLE_NOTIFY, DPU_TABLE_MSIX_LINEAR: ;
@@ -1422,12 +1477,12 @@ package project_external_integration_test_pkg;
 		require_true(write_offsets.size() == expected_writes,
 			$sformatf("configuration posted writes incomplete/extra: received=%0d expected=%0d",
 				write_offsets.size(), expected_writes));
-		require_true(indirect_transactions[0] == pairs*2 &&
-			indirect_transactions[1] == (tx_only ? 0 : pairs*2),
+		require_true(indirect_transactions[0] == (tx_active ? pairs*2 : 0) &&
+			indirect_transactions[1] == (rx_active ? pairs*2 : 0),
 			"posted drain did not receive all queue enable triggers");
 	endtask
 
-	// 逐项检查最终 enabled 内容；Notify 额外核对所属 Function BAR 与四笔连续写序。
+	// 逐项检查活动队列的 enabled 内容和关闭模块无写入；Notify 核对 Function BAR 与连续写序。
 	function void project_bare_config_test::check_configuration();
 		int unsigned	counts[dpu_table_kind_e];
 		int unsigned	notify_writes;
@@ -1443,15 +1498,16 @@ package project_external_integration_test_pkg;
 		require_true(write_offsets.size() != 0 && write_offsets[0] == 'h1010 &&
 			write_values[0] == 32'h5555_aaaa && table_value('h1010, 4) == 128'h5555_aaaa,
 			"default configuration did not declare AF before table writes");
-		require_true(indirect_transactions[0] == pairs*2, "VTX needs initial write and enabled rewrite per pair");
-		require_true(indirect_transactions[1] == (tx_only ? 0 : pairs*2), "VRX enabled rewrite count");
+		require_true(indirect_transactions[0] == (tx_active ? pairs*2 : 0), "VTX initial/enabled write count");
+		require_true(indirect_transactions[1] == (rx_active ? pairs*2 : 0), "VRX initial/enabled write count");
 		require_true(af_reads == 1 + (write_offsets.size()-1)/100 && completed_af_reads == af_reads,
 			"AF initial/periodic read count differs from completed DWORD writes");
 		if (cfg.dpu_cfg.verify_readback)
 			require_true(read_requests > af_reads, "enabled table readback performed no extra MemRead");
 		else
 			require_true(read_requests == af_reads, "default configuration read beyond required AF status reads");
-		require_true(table_value('hb001c0, 4) == 0, "QSCH mode is not VNET");
+		if (tx_active) require_true(table_value('hb001c0, 4) == 0, "QSCH mode is not VNET");
+		else require_true(!mmio_bytes[0].exists(management.bar_lease.base+'hb001c0), "inactive QSCH mode was written");
 
 		foreach (cfg.dpu_cfg.records[name]) begin
 			dpu_table_item_t	r;
@@ -1486,10 +1542,17 @@ package project_external_integration_test_pkg;
 				require_true(entry.virtio_mode == ($test$plusargs("PROJECT_CUSTOM") ? 0 : 1), "VTX Packed/Custom mode differs");
 			end
 		end
-		require_true(counts[DPU_TABLE_NOTIFY] == pairs && counts[DPU_TABLE_VTX] == pairs &&
-			counts[DPU_TABLE_Q2TC] == pairs, "queue-derived table count differs");
-		require_true(counts[DPU_TABLE_N2G] != 0 && counts[DPU_TABLE_G2P] != 0 &&
-			counts[DPU_TABLE_SPWRR] != 0 && counts[DPU_TABLE_TC_WEIGHT] != 0, "scheduler tables incomplete");
+		require_true(counts[DPU_TABLE_NOTIFY] == active_pairs &&
+			counts[DPU_TABLE_VTX] == (tx_active ? pairs : 0) &&
+			counts[DPU_TABLE_VRX] == (rx_active ? pairs : 0) &&
+			counts[DPU_TABLE_Q2TC] == (tx_active ? pairs : 0), "queue-derived table count differs");
+		if (tx_active) begin
+			require_true(counts[DPU_TABLE_N2G] != 0 && counts[DPU_TABLE_G2P] != 0 &&
+				counts[DPU_TABLE_SPWRR] != 0 && counts[DPU_TABLE_TC_WEIGHT] != 0, "scheduler tables incomplete");
+		end else begin
+			require_true(counts[DPU_TABLE_N2G]+counts[DPU_TABLE_G2P]+counts[DPU_TABLE_SPWRR]+
+				counts[DPU_TABLE_TC_WEIGHT] == 0, "disabled TX generated scheduler records");
+		end
 
 		require_true(counts[DPU_TABLE_BDF] == 1, "default configuration must contain PF0 BDF exactly once");
 		first_queue_trigger = '1;
@@ -1498,7 +1561,8 @@ package project_external_integration_test_pkg;
 				bdf_writes++;
 				bdf_position = i;
 			end
-			if (write_offsets[i] == 'h880130 && (write_values[i] & 'h2000) != 0 && first_queue_trigger == '1)
+			if (((write_offsets[i] == 'h880130 && (write_values[i] & 'h2000) != 0) ||
+				(write_offsets[i] == 'h900200 && (write_values[i] & 'h10000) != 0)) && first_queue_trigger == '1)
 				first_queue_trigger = i;
 		end
 		require_true(bdf_writes == 1 && bdf_position < first_queue_trigger,
@@ -1518,7 +1582,7 @@ package project_external_integration_test_pkg;
 		foreach (write_offsets[i]) begin
 			if (write_offsets[i] == 'h80044) begin
 				notify_enables++;
-				require_true(notify_writes == pairs*4 && i > last_notify &&
+				require_true(notify_writes == active_pairs*4 && i > last_notify &&
 					write_values[i] == 1 && first_qsch == '1,
 					"Notify enable must follow all rows and precede scheduler configuration");
 			end
@@ -1530,11 +1594,12 @@ package project_external_integration_test_pkg;
 			notify_writes++;
 			last_notify = i;
 		end
-		require_true(notify_enables == 1, "Notify management target must be enabled exactly once");
-		require_true(notify_writes == pairs*4, "Notify must contain exactly one written row per queue pair");
+		require_true(notify_enables == (active_pairs != 0 ? 1 : 0), "Notify enable count differs from active queues");
+		require_true(notify_writes == active_pairs*4, "Notify must contain exactly one written row per active queue pair");
 		if (cfg.dpu_cfg.verify_readback && !msix_mode) begin
 			// 每个唯一表项读一次，加 QSCH mode 一次；不存在未用 Notify 行的额外读回。
-			require_true(read_requests == af_reads + cfg.dpu_cfg.records.num() + (cfg.dpu_cfg.qsch_configure_controls ? 1 : 0),
+			require_true(read_requests == af_reads + cfg.dpu_cfg.records.num() +
+				(tx_active && cfg.dpu_cfg.qsch_configure_controls ? 1 : 0),
 				"configuration read count includes missing/extra table reads");
 		end
 	endfunction
@@ -1732,9 +1797,16 @@ package project_external_integration_test_pkg;
 				require_true(env.vio_envs[h].function_instances[f].driver_agent.fsm.state == FSM_READY,
 					"verified bare configuration did not enter READY");
 			end
-			check_tx_notify();
-			`uvm_info("PROJECT_BARE_CONFIG_PASS", $sformatf("pairs=%0d rx=%0b writes=%0d reads=%0d elapsed=%0t checks=%0d",
-				pairs, !tx_only, write_offsets.size(), read_requests, $time-started, checks), UVM_LOW)
+			if (active_pairs == 0) begin
+				require_true(selection == null && cfg.dpu_cfg.queues_by_host.num() == 0 &&
+					cfg.dpu_cfg.notify_records.size() == 0, "disabled VIO allocated/exported queues");
+				foreach (env.vio_envs[h])
+					require_true(env.vio_envs[h].function_instances.size() == 0 &&
+						env.vio_envs[h].get_external_setup() == null, "disabled VIO created live service/setup");
+			end
+			if (tx_active) check_tx_notify();
+			`uvm_info("PROJECT_BARE_CONFIG_PASS", $sformatf("pairs=%0d active_pairs=%0d tx=%0b rx=%0b writes=%0d reads=%0d elapsed=%0t checks=%0d",
+				pairs, active_pairs, tx_active, rx_active, write_offsets.size(), read_requests, $time-started, checks), UVM_LOW)
 		end
 
 		#100ns;

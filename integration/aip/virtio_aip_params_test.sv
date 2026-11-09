@@ -5,6 +5,7 @@
  * 生命周期：所有配置在 run_phase 同步构造和读取；service 缓存通过真实 get_service_config 检查。
  * 负例：+PARAM_NEGATIVE=<mode> 每项单独运行，必须在对应解析点 fatal；不可并入正常汇总。
  * 正例只验证 authoring、值复制和服务消费，不代替真实 PCIe/DMA 或寄存器执行验证。
+ * external 的关闭/零队列模板必须允许精确 Host/service 再启用，不能在加载全局值时丢失覆盖能力。
  */
 `ifndef VIRTIO_AIP_PARAMS_TEST_SV
 `define VIRTIO_AIP_PARAMS_TEST_SV
@@ -346,6 +347,7 @@ class virtio_aip_params_test extends uvm_test;
 			"queue_wrap_negative": begin put("params.bad.queue_size", "-18446744073709551614"); vio_cfg.load_params("params.bad"); end
 			"wait_wrap_negative": begin put("params.bad.wait.timeout_ns", "-18446744073709551615"); vio_cfg.load_params("params.bad"); end
 			"pairs_range": begin put("params.bad.pairs", "33"); vio_cfg.load_params("params.bad"); end
+			"pairs_zero": begin put("params.bad.pairs", "0"); vio_cfg.load_params("params.bad"); end
 			"private_width": begin put("params.bad.dport_info", "4096"); private_cfg.load_params("params.bad"); end
 			"private_geometry": begin put("params.bad.queue_size", "8192"); private_cfg.load_params("params.bad"); end
 			"private_qid": begin put("params.bad.local_qid_base", "3"); private_cfg.load_params("params.bad"); end
@@ -369,23 +371,84 @@ class virtio_aip_params_test extends uvm_test;
 	// 缺失的新参数保留当前队列值；不创建 ring 或访问 DUT。
 	extern function void test_private_sampling();
 
+	// 关闭、零对和双方向关闭在最终 service 才生效；Host/service 覆盖可独立重新启用。
+	extern function void test_external_enables();
+
 	// 正例顺序执行后恢复参数并报告计数；负例进程在对应入口 fatal，不伪造正常 PASS。
-	virtual task run_phase(uvm_phase	phase);
-		string	negative_mode;
-		phase.raise_objection(this);
-		if ($value$plusargs("PARAM_NEGATIVE=%s", negative_mode)) run_negative(negative_mode);
-		test_defaults();
-		test_vio_layers_and_service();
-		test_external_sampling();
-		test_private_sampling();
-		test_private();
-		test_dpu_hosts();
-		test_dpu_policies();
-		restore_overrides();
-		`uvm_info("AIP_PARAMS_TEST", $sformatf("completed %0d parameter contract checks", checks), UVM_NONE)
-		phase.drop_objection(this);
-	endtask
+	extern virtual task run_phase(uvm_phase	phase);
 endclass
+
+// 运行参数合同检查；外部使能只在最终需求归一化，旧驱动的非法零对仍单独作为负例执行。
+task virtio_aip_params_test::run_phase(uvm_phase	phase);
+	string	negative_mode;
+
+	phase.raise_objection(this);
+	if ($value$plusargs("PARAM_NEGATIVE=%s", negative_mode)) run_negative(negative_mode);
+	test_defaults();
+	test_vio_layers_and_service();
+	test_external_sampling();
+	test_private_sampling();
+	test_external_enables();
+	test_private();
+	test_dpu_hosts();
+	test_dpu_policies();
+	restore_overrides();
+	`uvm_info("AIP_PARAMS_TEST", $sformatf("completed %0d parameter contract checks", checks), UVM_NONE)
+	phase.drop_objection(this);
+endtask
+
+// 使用真实分层参数加载验证 Packed/Custom 的关闭语义，覆盖只改变目标 Host/Function。
+// 不创建 ring；随后集成测试从实际 MMIO 验证这些最终需求控制了哪些表。
+function void virtio_aip_params_test::test_external_enables();
+	for (int unsigned	custom = 0; custom < 2; custom++) begin
+		for (int unsigned	mode = 0; mode < 3; mode++) begin
+			virtio_net_env_config	root_cfg;
+			string					why;
+
+			put("params.gates.enabled", mode == 0 ? "0" : "1");
+			put("params.gates.pairs", mode == 1 ? "0" : "2");
+			put("params.gates.tx_enable", mode == 2 ? "0" : "1");
+			put("params.gates.rx_enable", mode == 2 ? "0" : "1");
+			put("params.gates.queue_type", custom ? "VQ_CUSTOM" : "VQ_PACKED");
+			put("params.gates.queue_size", "256");
+			put("params.gates.completion_mode", "VIRTIO_COMPLETION_POLLING");
+			put("params.gates.notify_base", "0");
+			put("params.gates.notify_encoding", "VIO_NOTIFY_DPU32");
+			put("params.gates.h0.pf1.i0.enabled", "1");
+			put("params.gates.h0.pf1.i0.pairs", "1");
+			put("params.gates.h0.pf1.i0.tx_enable", "1");
+			put("params.gates.h1.enabled", "1");
+			put("params.gates.h1.pairs", "1");
+			put("params.gates.h1.rx_enable", "1");
+			root_cfg = new("gate_template");
+			root_cfg.external_configuration = 1;
+			root_cfg.load_params("params.gates");
+			check_param(root_cfg.enabled == (mode != 0), "全局加载不得提前改变 enabled 模板");
+
+			for (int unsigned	h = 0; h < 2; h++) begin
+				virtio_net_env_config		host_cfg;
+				vio_service_requirement_t	requirement;
+				dpu_service_key_t			key;
+
+				host_cfg = new("gate_host");
+				host_cfg.copy_defaults_from(root_cfg);
+				host_cfg.load_params($sformatf("params.gates.h%0d", h));
+				host_cfg.enable_service_params("params.gates");
+				key = '{function_key:'{host_id:h, pf_id:0, kind:DPU_FUNCTION_PF, vf_id:0},
+					service_kind:DPU_SERVICE_VIO_NET, service_instance_id:0};
+				for (int unsigned	pf = 0; pf < 2; pf++) begin
+					key.function_key.pf_id = pf;
+					check_param(host_cfg.resolve_final_service_requirement(key, requirement, why), why);
+					check_param(requirement.enabled == (h != 0 || pf != 0),
+						"关闭模板或 Host/service 独立启用结果错误");
+					if (requirement.enabled)
+						check_param(requirement.behavior.num_queue_pairs == 1,
+							"重新启用必须使用更精确层的队列数");
+				end
+			end
+		end
+	end
+endfunction
 
 // 每轮使用真实 AIP 列表/范围，比较不同 service 和候选的消费值，避免仅验证解析器。
 function void virtio_aip_params_test::test_external_sampling();

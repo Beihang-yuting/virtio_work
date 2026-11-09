@@ -22,6 +22,7 @@
 写 Notify/QSCH/VTX/VRX，最后确认 VIO。每批 VIO/RDMA Notify 表成功后，
 每个管理 BAR 写一次 `+0x80044 = 1`。空批次不写，失败停止；不增加 bank 切换或使能读回。
 原有每100次完整 DWORD 写后的 AF 状态读保持不变。
+未启用的 VIO service 不分配 ring 或写 VIO/Notify/QSCH；RX-only 只写 VRX/Notify，跳过 VTX/QSCH。
 
 Tcl 名称仍为 `dut_config`、`reg_acc`、`load_params`；其中 reg_acc 注册 `dpu_bar_reg_seq`，
 addr 为 Host0/PF0 BAR0 内偏移。load_params 用 AIP 命令宏注册一次，顶层统一刷新允许字段。
@@ -356,7 +357,7 @@ endfunction
 
 ## `integration/project/project_env.sv`
 
-SHA-256: `0e72c358c179e8302e31a1b685ba4d9eca8745143b15d9e124183ca53078645b`
+SHA-256: `111d9087d7e14d310aeb05aeea680255d2824af7b1a0413b065d1f214270c9bf`
 
 ```systemverilog
 // integration/project：项目组件组装；仅继承 uvm_env，不承担寄存器写表。
@@ -871,7 +872,7 @@ function void project_env::connect_phase(uvm_phase	phase);
 endfunction
 
 // 每个仿真调用一次：按完整 service 身份登记各 Host，再注册已有 Tcl 命令。
-// 空 Host 可跳过；全局没有 VIO service 或重复注册属于接入错误。
+// 空 Host 可跳过；全局未启用 VIO 时不注册业务命令，重复注册仍报接入错误。
 function void project_env::register_aip_commands();
 	int unsigned	active_hosts;
 	string			why;
