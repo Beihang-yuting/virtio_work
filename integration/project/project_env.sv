@@ -3,9 +3,10 @@
 // env 拥有子组件；dpu_cfg 保存公共资源/表值，各 Host VIO env 拥有实际 ring。
 // connect 将同一个 dpu_cfg 和各 Host VIO env 发布到 PCIe sequencer，seq 不依赖项目 cfg 类型。
 // 每 Host 一个 Intel RC，PF/VF 共用；VIO 挂在 DPU 子树保证快照先发布。
+// AIP 的 load_params/vio_release 借用同一个 env；实际队列的准备和回收仍由 VIO 所有者执行。
 typedef class project_env;
 
-// 单个命令借用项目 env；由 AIP 宏生成适配，无独立命令类。
+// 运行期命令共用项目 env；由 AIP 宏生成适配，无独立命令类。
 project_env	project_runtime_env;
 
 class project_env extends uvm_env;
@@ -42,6 +43,13 @@ class project_env extends uvm_env;
 
 	// 运行期入口：重读当前AIP参数，只在首次prepare前或已release后更新同一个cfg。
 	extern task load_params(
+		output bit		ok,
+		output string	why
+	);
+
+	// 统一停止并回收全部 Host 的 VIO；调用时机由用户安排，没有队列时成功返回。
+	// 先等待所有 worker 退出，再预检和回收实际资源并清除 cfg 的队列导出值。
+	extern task release_vio_resources(
 		output bit		ok,
 		output string	why
 	);
@@ -611,9 +619,57 @@ function void project_env::end_of_elaboration_phase(uvm_phase	phase);
 	publish_dpu_configuration(ok, why);
 	if (!ok) `uvm_fatal("PROJECT_PUBLICATION", why)
 	if (project_runtime_env != null && project_runtime_env != this)
-		`uvm_fatal("PROJECT_PARAM", "load_params command already registered")
+		`uvm_fatal("PROJECT_PARAM", "runtime commands already bound to another project environment")
 	project_runtime_env = this;
 endfunction
+
+// Tcl 释放整个项目的 VIO 资源，无须保留配置 sequence；不影响其他业务的 Host 内存。
+// 用户安排 DUT 业务收尾时序；本 task 只自动停止 VIP worker，不轮询或复位 DUT。
+// 已停止的 worker 不重复 stop；全部退出后先预检各 Host，随后无时间推进地统一回收。
+task project_env::release_vio_resources(
+	output bit		ok,
+	output string	why
+);
+	vio_external_setup	setup;
+	virtio_auto_fsm		fsm;
+
+	ok  = 0;
+	why = "";
+
+	foreach (vio_envs[h]) begin
+		if (vio_envs[h].get_external_setup() == null) continue;
+
+		foreach (vio_envs[h].function_instances[f]) begin
+			fsm = vio_envs[h].function_instances[f].driver_agent.fsm;
+			if (!fsm.external_workers_stopped())
+				fsm.stop_dataplane();
+		end
+	end
+
+	foreach (vio_envs[h]) begin
+		setup = vio_envs[h].get_external_setup();
+		if (setup == null) continue;
+
+		if (!vio_envs[h].preflight_external_configuration(setup, null, why)) begin
+			why = $sformatf("Host%0d: %s", h, why);
+			return;
+		end
+	end
+
+	foreach (vio_envs[h]) begin
+		setup = vio_envs[h].get_external_setup();
+		if (setup == null) continue;
+
+		if (!vio_envs[h].release_external_resources(setup, 1'b1, why)) begin
+			why = $sformatf("Host%0d: %s", h, why);
+			return;
+		end
+		cfg.dpu_cfg.clear_host_queues(h);
+	end
+
+	ok  = 1;
+	why = "";
+endtask
 
 // 全部候选和RC消息先校验，成功后不推进时间地提交；不自动停DUT或释放现有ring。
 // 资源和协议规模固定，字段更改由下一次配置seq写入DUT，命令自身不发送PCIe请求。
@@ -703,3 +759,29 @@ task project_load_params();
 endtask
 
 `aip_cmd_task(load_params, project_load_params)
+
+// 无参 Tcl 命令统一停止并释放 VIO；沿用宏的 status/result_out 通道返回结果。
+// 用户负责选择调用时机，不再读取参数表或要求单独的停机确认参数。
+task project_vio_release();
+	aip_cmd	command;
+	bit		ok;
+	string	why;
+
+	command = aip_cmd::get_handle("vio_release");
+	if (command.args_in != "") begin
+		command.status     = 1;
+		command.result_out = "ERROR: vio_release takes no arguments";
+		return;
+	end
+	if (project_runtime_env == null) begin
+		command.status     = 1;
+		command.result_out = "ERROR: vio_release environment is not ready";
+		return;
+	end
+
+	project_runtime_env.release_vio_resources(ok, why);
+	command.status     = ok ? 0 : 1;
+	command.result_out = ok ? "OK: VIO resources released" : {"ERROR: vio_release: ", why};
+endtask
+
+`aip_cmd_task(vio_release, project_vio_release)

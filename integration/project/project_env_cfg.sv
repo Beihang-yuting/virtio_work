@@ -1,6 +1,7 @@
 // integration/project：用户 env_cfg 的组合参考，不要求用户继承本类。
 // DPU 拥有资源与公共表，VIO 拥有行为/ring，PCIe 拥有传输参数；只在这里组装三个 cfg。
 // 平台 VIF/pool 均借用，创建和连接组件由 project_env 完成。
+// 项目默认不分配 VIO 队列；只有显式给出 pairs 的服务才进入外部队列几何和通知配置检查。
 class project_env_cfg extends uvm_object;
 	`uvm_object_utils(project_env_cfg)
 	// 三类子配置由本对象创建；每个 Host 的 VIO 配置在加载参数后独立生成。
@@ -60,6 +61,7 @@ function project_env_cfg::new(string	name);
 
 	vio_cfg.execution_mode         = VIRTIO_EXEC_REAL_DUT;
 	vio_cfg.external_configuration = 1;
+	vio_cfg.default_num_pairs      = 0;
 endfunction
 
 // 验证 Host→TL slot 是完整的一一映射；不补缺项，避免错配后静默使用 Root0。

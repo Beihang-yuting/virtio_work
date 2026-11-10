@@ -114,14 +114,20 @@ AF 读关闭 SCB 的历史 RAM 写值比较，但仍检查 Completion 和返回�
 空批次不写；表写失败不使能；使能失败返回失败。这个偏移不再叠加模块地址，也没有 bank 位。
 RDMA 仍通过独立 `configure_rdma_notify(scope, ok, why)` 使用，不自动加入 VIO 默认流程。
 
-平台停止 DMA 后可调用同一 `vio_dpu_cfg_seq` 的
-`release_vio_resources(config_seq.selection, 1, ok, why)`；先确认停机，再释放。
-仅当 `config_seq.selection != null` 时需要释放 VIO 资源。
+收尾时调用无参 Tcl 命令 `vio_release`，环境自动停止各 Host 的 VIO worker，再回收当前队列资源。
+调用时机和 DUT 业务收尾由用户安排，不需要 test 保存配置 seq。SV 用户也可在运行阶段调用
+`env.release_vio_resources(ok, why)`。
 
 ## 不启用 VIO 或仅启用 VRX
 
-不使用 VIO 时设置 `+vio.enabled=0` 即可；external 集成也支持 `+vio.pairs=0`
-或同时 `+vio.tx_enable=0 +vio.rx_enable=0`。这些条件按每个 service 最终覆盖后的值判断：
+参考 `project_env_cfg` 默认 `vio.pairs=0`，不传 VIO 参数即可运行纯 PCIe/其他业务用例，
+不会检查未使用的 Packed/Custom 几何或要求 Notify/MSI-X 配置。合入自己的 cfg 时保留
+构造中的 `vio_cfg.default_num_pairs = 0;`；需要 VIO 时显式设置 `vio.pairs` 和队列格式。
+已启用的队列仍在资源分配前做完整校验，避免生成无效的队列资源。
+参考 `project_base_test` 的 Tcl 入口不依赖 VIO 队列数量，纯 PCIe 用例同样可以执行命令。
+
+也可以设置 `+vio.enabled=0`、`+vio.pairs=0` 或同时 `+vio.tx_enable=0 +vio.rx_enable=0`。
+这些条件按每个 service 最终覆盖后的值判断：
 不分配 ring，不要求 VIO Notify/MSI-X 消息配置，不写 VTX、VRX、Notify 表及其使能寄存器、
 QSCH 表和模式寄存器。公共 AF/BDF 等仍按原流程执行。
 全局/Host 参数作为模板，精确 service 覆盖仍可单独启用某个 Function。
@@ -315,6 +321,63 @@ pcie_bar_write_by_name("h0.pf0.vf3.bar2", 'h40, 4, 128'h1234, 0, ok, why);
 环境按该 Function 的真实 BAR 和 Intel sideband 路由。多 Host 手动访问必须写完整 `hH`。
 `dpu.print_bar_map=1` 分组打印真实地址；无需把打印值重新抄回用例。
 
+## VTX 描述符 DMA 的数据检查
+
+Packed ring 复用时 AVAIL 随 wrap 翻转，描述符不能一直与上一轮 DUT 回写值比较。
+PCIe RC 的 `host_read_ap` 在实际取数后发布快照，公共 `pcie_tl_env` 自动接到对应
+Root 的 SCB；VIO 的 IOVA proxy 仍负责按 Host/Requester 翻译到同一份 Host memory。
+保持 `pcie_cfg.data_integrity_enable=1` 即可，不需要在 project env 添加同步代码或参数。
+快照在 Completion 前保存，因此发送等待期间 Host memory 再被修改也不会污染本次期望。
+
+## PCIe 活动与 Tcl 结束等待
+
+已接入 AIP 时，PCIe driver 每发送完一个 TLP、monitor 每收到一个 TLP 都调用
+`aip_activity::tick()`。DUT 的 DMA 请求、Host 自动返回的 Completion、寄存器访问和
+MSI-X 写均计入活动；接口时钟、空轮询和等待 credit 不产生 tick，无需用户额外注册。
+
+```tcl
+# 按用例完成业务等待后，再等待总线连续空闲。
+end_test idle=1us timeout=100us
+```
+
+等待中有新的 PCIe 活动，AIP 会继续检查下一个完整空闲窗口；`timeout` 是整个命令的等待上限。
+`end_test` 无参数仍立即退出，`drain=N` 仍是固定等待 N ns；同时给出时先 drain 再检查 idle。
+idle 检查表示一段时间没有活动，包数或业务完成条件仍使用用例自己的等待方式。
+
+## Tcl 停止和资源释放
+
+`vio_stop` 只停止 `vio.target` 对应服务的 VIP 后台 worker，保留 ring、RX buffer 和 IOMMU
+映射；它不复位 DUT。`vio_wait_rx` 仅等待包数，`end_test drain` 仅等待指定时间，均不释放资源。
+
+参考 `project_env.sv` 沿用 `load_params` 的全局 env 句柄和 EOE 绑定，增加一个宏命令：
+
+```systemverilog
+`aip_cmd_task(vio_release, project_vio_release)
+```
+
+合入自己的 env 时一并保留类内 `release_vio_resources` task、顶层 `project_vio_release`
+及该宏，只编译一个注册入口；不需要改变 env_cfg、base_test 或生产核心 filelist/package。
+
+```tcl
+# DUT 已配置、vio_start 已启动，网络侧按用例发送 1000 个包。
+set_param path=vio.target value=h0.pf0.i0
+set_param path=vio.rx.expected value=1000
+vio_wait_rx
+
+# 用例完成后统一停止 VIP worker 并回收资源。
+vio_release
+end_test
+```
+
+`vio_release` 不需要参数，也不需要提前执行 `vio_stop`。它停止整个项目的所有
+Host/PF/VF VIO worker，等待退出后回收队列，与 `vio.target` 无关；成功后清除对应 cfg
+队列记录，未使用的预投递 RX buffer 也会回收。没有 VIO 或已经释放时成功返回，
+Host memory/IOMMU 的现有 report 检查保持开启。命令不执行 DUT 停机或额外固定延时，
+调用时机由用户的 Tcl 流程安排。
+
+只暂停当前服务时仍使用 `vio_stop`，随后 `vio_start` 沿用原队列继续运行。
+`vio_release` 回收后需要重新执行 `dut_config`、`vio_start` 才能重新开展业务。
+
 ## 快照恢复后重新加载配置
 
 参考 env 用一个顶层 task 注册一次命令：
@@ -341,8 +404,8 @@ dut_config
 Host/PF/VF、BAR/BDF、pairs、queue_type、features 保持快照值；支持重载 queue_size、
 TX/RX 方向、完成模式、Notify、MSI-X、QSCH/队列表策略和等待参数。当前不重载 PCIe 拓扑/传输配置。
 失败返回非零 status 和简洁原因，原 cfg 保持不变；活动 ring 不隐含暂停或释放。
-多 Host 准备中途失败时，配置 seq 保留已成功 Host 的 `selection`；平台确认 DUT
-静止后可调用 `release_vio_resources(selection, 1, ok, why)`，再重载或重试。
+多 Host 准备中途失败时，成功 Host 的资源仍由对应 VIO env 持有；用户完成平台收尾后
+调用 `vio_release`，再重载或重试。
 
 保存未配置快照时，自己的 base_test 在平台就绪后进入 Tcl，由 Tcl 启动 `dut_config`；
 参考 base_test 默认先自动配置再进入业务 Tcl，两种流程任选其一，不能重复配置同一代。

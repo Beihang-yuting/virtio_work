@@ -1,6 +1,8 @@
 // integration/project/tests：补齐外部配置的可执行软件合同与真实 Intel 报文路径。
 // 复用已有显式模型平台；地址/身份公式仅为 fixture，不能作为用户 RTL 默认值。
 // 测试拥有 APP 侧 BAR 字节存储和捕获队列；Host DMA 仍仅由产品 RC 响应。
+// PROJECT_RELEASE 通过真实 AIP 命令暂停/恢复 worker，再以无参释放入口停止全部服务并回收资源。
+// PROJECT_HOST_READ_SYNC 让实际 Packed TX 环绕回，DUT 模型经 Intel DMA 取描述符并回写完成。
 package project_external_contract_test_pkg;
 	import uvm_pkg::*;
 	import aip_core_pkg::*;
@@ -8,6 +10,7 @@ package project_external_contract_test_pkg;
 	import dpu_resource_pkg::*;
 	import pcie_tl_pkg::*;
 	import virtio_net_pkg::*;
+	import virtio_aip_pkg::*;
 	import net_packet_pkg::*;
 	import intel_pcie_adapter_pkg::*;
 	import project_env_pkg::*;
@@ -222,7 +225,7 @@ package project_external_contract_test_pkg;
 		extern function void declare_controls();
 		// 按公开类别执行额外控制，检查真实Memory写与预期逐项调用数。
 		extern task check_public_controls(input dpu_cfg_scope	scope);
-		// 平台正常停止 DMA 后释放实际 ring，并核对共享 cfg 的视图。
+		// 经 AIP 释放实际资源；PROJECT_RELEASE 检查暂停/恢复、自动停止和未使用 RX buffer 回收。
 		extern task check_release_generation();
 		// DPU 导出必须对应实际 ring；重复查询不更换 setup、内存管理器或创建队列。
 		extern function void check_queue_export();
@@ -243,6 +246,8 @@ package project_external_contract_test_pkg;
 			input bit [63:0]	address, input byte	data[]);
 		// 真实 512B RX 的 descriptor、buffer、CQ/used 均走非 identity Function IOMMU。
 		extern task check_rx();
+		// 复用实际 Packed 环跨越 wrap，检查 CPU 重投递后 Intel DMA 返回新 AVAIL，SCB 不拿旧回写比较。
+		extern task check_host_read_sync();
 		// 可选RDMA顺序、PBA只读容量和显式W1C独立于初始化类别。
 		extern task check_optional_state(input dpu_cfg_scope	scope);
 		// 独立 RDMA 批次验证空选择、重复目标和发送失败；错误后不得提前使能。
@@ -515,13 +520,68 @@ package project_external_contract_test_pkg;
 			probe.control_calls[DPU_TABLE_MSIX_CONTROL] == rows.size(), "MSI-X control traversal count");
 	endtask
 
-	// 测试模型完成业务且无在途 DMA，按正常收尾路径释放导出的资源。
+	// 模型已完成主动 DMA；可选启动全部 Host 的真实 worker，独立 stop/start 保留原队列。
+	// 无参 vio_release 必须自行等待全部 worker 退出并回收资源，空代重复调用仍成功。
 	task project_external_contract_test::check_release_generation();
-		bit	ok;
-		string	why;
+		vio_external_setup		setups[int unsigned];
+		virtio_function_instance	running_instance;
+		int						status;
+		string					result;
 
-		config_seq.release_vio_resources(selection, 1, ok, why);
-		require_true(ok && cfg.dpu_cfg.queues_by_host.num() == 0, why);
+		foreach (env.vio_envs[h]) begin
+			setups[h] = env.vio_envs[h].get_external_setup();
+			foreach (env.vio_envs[h].function_instances[f])
+				running_instance = env.vio_envs[h].function_instances[f];
+		end
+
+		if ($test$plusargs("PROJECT_RELEASE")) begin
+			require_true(running_instance != null, "release worker test needs an active service");
+			env.register_aip_commands();
+			foreach (env.vio_envs[h]) begin
+				foreach (env.vio_envs[h].function_instances[f]) begin
+					running_instance = env.vio_envs[h].function_instances[f];
+					aip_cmdline_override::set_val("vio.target",
+						virtio_aip_registry::target_name(running_instance.service_key));
+					aip_cmd::exec_result("vio_start", SRC_INTERNAL, status, result);
+					require_true(status == 0 && running_instance.driver_agent.fsm.state == FSM_RUNNING, result);
+				end
+			end
+
+			aip_cmd::exec_result("vio_stop", SRC_INTERNAL, status, result);
+			require_true(status == 0 && running_instance.driver_agent.fsm.external_workers_stopped(), result);
+			foreach (setups[h])
+				require_true(env.vio_envs[h].get_external_setup() == setups[h] &&
+					env.vio_envs[h].iommu.total_maps > env.vio_envs[h].iommu.total_unmaps,
+					"vio_stop unexpectedly released the queue generation or DMA mappings");
+			aip_cmd::exec_result("vio_start", SRC_INTERNAL, status, result);
+			require_true(status == 0 && running_instance.driver_agent.fsm.state == FSM_RUNNING, result);
+			foreach (setups[h])
+				require_true(env.vio_envs[h].get_external_setup() == setups[h],
+					"vio_start replaced the paused queue generation");
+			// 此模型已无主动 DMA，待最后一笔 refill Notify 经过 Intel 接口后再回收。
+			#20ns;
+		end
+
+		aip_cmd::exec_result("vio_release", SRC_INTERNAL, status, result);
+		require_true(status == 0 && cfg.dpu_cfg.queues_by_host.num() == 0, result);
+		foreach (env.vio_envs[h]) begin
+			require_true(env.vio_envs[h].get_external_setup() == null &&
+				env.vio_envs[h].iommu.total_maps == env.vio_envs[h].iommu.total_unmaps,
+				"release retained a live setup or DMA mapping");
+			foreach (env.vio_envs[h].function_instances[f]) begin
+				require_true(env.vio_envs[h].function_instances[f].driver_agent.fsm.external_workers_stopped(),
+					"release returned before workers stopped");
+				require_true(env.vio_envs[h].function_instances[f].vq_mgr.get_queue_count() == 0,
+					"release retained a virtqueue");
+			end
+		end
+		if ($test$plusargs("PROJECT_RELEASE")) begin
+			aip_cmd::exec_result("vio_release", SRC_INTERNAL, status, result);
+			require_true(status == 0, "empty VIO generation failed release");
+			`uvm_info("PROJECT_VIO_RELEASE_PASS",
+				"VIO stop/start retains queues; no-argument release stops all workers and reclaims all Host resources",
+				UVM_LOW)
+		end
 	endtask
 
 	// 期望直接取 VIO 的实际 setup 和队列管理器，不使用 DPU 写表结果反推 ring。
@@ -1203,6 +1263,7 @@ package project_external_contract_test_pkg;
 		#100ns;
 		require_true(requests[0].size() == before_count, "commit/idle emitted implicit config/status traffic");
 		check_rx();
+		if ($test$plusargs("PROJECT_HOST_READ_SYNC")) check_host_read_sync();
 		if ($test$plusargs("PROJECT_CONTROLS")) begin
 			require_true(probe.control_calls[DPU_TABLE_SPWRR] == cfg.dpu_cfg.placement_cfg.vio_requests.size() &&
 				probe.control_calls[DPU_TABLE_TC_WEIGHT] == cfg.dpu_cfg.placement_cfg.vio_requests.size() &&
@@ -1326,6 +1387,100 @@ package project_external_contract_test_pkg;
 		config_seq.clear_pfvf_drop_status(clear_item, ok, why);
 		require_true(!ok, "unknown W1C mask accepted");
 		`uvm_info("PROJECT_OPTIONAL_STATE_PASS", "RDMA high/low, explicit PBA words and independent W1C", UVM_LOW)
+	endtask
+
+	// 真实 Packed 队列每包消耗两个槽，完成后立即回收；跨整环后 CPU 重新发布 AVAIL=0。
+	// 设备模型通过 Intel 引脚读出32B描述符并写完成，Host 只使用原有 VQ 接口，不修改 SCB。
+	// 这里只验证描述符 DMA/回绕；报文发送、协议头和网络侧结果仍由业务测试覆盖。
+	task project_external_contract_test::check_host_read_sync();
+		int unsigned	wrapped_reads;
+
+		wrapped_reads = 0;
+		foreach (env.vio_envs[h]) begin
+			vio_queue_setup_t	rows[$];
+
+			env.vio_envs[h].get_external_setup().list_queues(rows);
+			foreach (rows[q]) begin
+				virtio_function_instance	instance;
+				packed_virtqueue			queue;
+				virtio_sg_list			sgs[];
+				virtio_sg_entry			entry;
+				dpu_function_policy_t	policy;
+				bit [63:0]				gpa;
+				bit [63:0]				iova;
+
+				if (!rows[q].tx_mode || rows[q].qpair.virtio_pair_index != 0) continue;
+				foreach (env.vio_envs[h].function_instances[f])
+					if (dpu_service_key_name(env.vio_envs[h].function_instances[f].service_key) ==
+						dpu_service_key_name(rows[q].service_key))
+						instance = env.vio_envs[h].function_instances[f];
+				require_true(instance != null && $cast(queue,
+					instance.vq_mgr.get_queue(rows[q].notification.local_qid)), "Host read wrap test requires Packed TX");
+				policy = cfg.dpu_cfg.function_policies[dpu_function_key_name(rows[q].service_key.function_key)];
+				gpa = env.vio_envs[h].host_mem.alloc(64, 64);
+				iova = env.vio_envs[h].iommu.map_for_host(h, instance.bdf, gpa, 64, DMA_TO_DEVICE);
+				require_true(iova != 0 && rows[q].desc_iova != rows[q].desc_gpa, "test needs real nonidentity IOVA");
+				sgs = new[1];
+				entry.addr = iova;
+				entry.len = 32;
+				entry.is_indirect = 0;
+				sgs[0].entries.push_back(entry);
+				entry.addr = iova + 32;
+				sgs[0].entries.push_back(entry);
+
+				for (int unsigned	packet = 0; packet < rows[q].queue_size / 2 + 8; packet++) begin
+					packet_item			token;
+					uvm_object			returned;
+					pcie_tl_mem_tlp	request;
+					pcie_tl_cpl_tlp	completion;
+					byte				golden[];
+					byte				used[];
+					int unsigned	head;
+					int unsigned	length;
+
+					token = new("packed_tx_token");
+					head = queue.add_buf(sgs, 1, 0, token, 0);
+					require_true(head == (packet * 2) % rows[q].queue_size, "unexpected Packed producer slot");
+					env.vio_envs[h].host_mem.read_mem(rows[q].desc_gpa + head * 16, 32, golden);
+					require_true(golden[14] == (packet < rows[q].queue_size / 2 ? 8'h81 : 8'h01),
+						"Packed AVAIL did not flip at ring wrap");
+					request = new("packed_descriptor_read");
+					request.kind = TLP_MEM_RD;
+					request.type_f = TLP_TYPE_MEM_RD;
+					request.fmt = FMT_4DW_NO_DATA;
+					request.is_64bit = 1;
+					request.addr = rows[q].desc_iova + head * 16;
+					request.requester_id = policy.requester;
+					request.tag = 10'h56;
+					request.length = 8;
+					request.first_be = 4'hf;
+					request.last_be = 4'hf;
+					apps[h].send(request);
+					wait (completions[h].size() != 0);
+					completion = completions[h].pop_front();
+					require_true(completion.requester_id == policy.requester && completion.tag == request.tag &&
+						completion.cpl_status == CPL_STATUS_SC && completion.payload.size() == 32,
+						"Packed descriptor Completion identity/length/status mismatch");
+					foreach (golden[i]) require_true(completion.payload[i] == golden[i], "Intel descriptor data differs from Host");
+					if (packet >= rows[q].queue_size / 2) wrapped_reads++;
+
+					used = new[16];
+					foreach (used[i]) used[i] = golden[i];
+					// 设备只完成首槽；USED 跟随 AVAIL，本地链记录负责回收两个槽。
+					used[15][7] = used[14][7];
+					dma_bytes(h, policy.requester, request.addr, used);
+					#20ns;
+					require_true(queue.poll_used(returned, length) && returned == token, "Packed completion failed to reclaim chain");
+				end
+				env.vio_envs[h].iommu.unmap_for_host(h, instance.bdf, iova);
+				env.vio_envs[h].host_mem.free(gpa);
+				require_true(queue.get_free_count() == rows[q].queue_size, "Packed descriptors leaked after wrap");
+			end
+			require_true(env.pcie_env.scbs[cfg.tl_slot_by_host[h]].mismatched == 0,
+				"Host memory update was compared against stale PCIe write data");
+		end
+		require_true(wrapped_reads != 0, "Host read test did not cross a Packed wrap");
+		`uvm_info("PROJECT_HOST_READ_SYNC_PASS", $sformatf("wrapped_reads=%0d hosts=%0d", wrapped_reads, host_count), UVM_LOW)
 	endtask
 
 	// 小环加速当前CQ的回绕证明；token/SG是假定组件输入，不作为Intel报文证据。

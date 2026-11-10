@@ -5,5 +5,6 @@ integration/project/tests/project_bar_registry_test.sv
 integration/project/tests/project_external_config_test.sv
 integration/project/tests/project_external_integration_test.sv
 integration/project/tests/project_pcie_reg_test.sv
+integration/project/tests/project_pcie_idle_test.sv
 integration/project/tests/project_external_contract_test.sv
 integration/project/tests/project_env_tb.sv

@@ -5,7 +5,9 @@
 构造函数、复制和普通 `get` 不会重新读取全局参数。
 
 本页同时保留普通标准驱动和项目外部配置入口。普通入口可执行 init/reset/MQ/RSS；
-[项目外部配置](#项目外部配置参数)只注册 start/tx/wait_rx/stop，设备配置由 typed hook 承担。
+[项目外部配置](#项目外部配置参数)的业务命令为 start/tx/wait_rx/stop，设备配置由 typed hook 承担。
+参考 `project_env` 另注册 `load_params` 与无参 `vio_release`；后者自动停止 VIO worker 并回收
+全部 Host 的 VIO 队列资源，调用时机由用户安排，见[收尾示例](../integration/project/README.md#tcl-停止和资源释放)。
 
 ## 编译与文件定位
 
@@ -75,7 +77,7 @@ rg -n 'net_packet_pkg\.sv|core/packet\.sv' compile.log
 
 | 路径 | 缺省值/语义 |
 | --- | --- |
-| `vio.pairs` | 初始活动队列对数，默认 1；不增加 DPU 分配的资源 |
+| `vio.pairs` | 初始活动队列对数；独立 VIP 默认 1，参考 `project_env_cfg` 默认 0（未使用 VIO）；不增加 DPU 已分配的资源 |
 | `vio.queue_size` | 默认 256；0 表示设备最大值，其余要求 2..32768 的 2 的幂；实际还受设备/私有协议限制 |
 | `vio.queue_type` | `VQ_SPLIT`，亦可选择实际支持的队列格式 |
 | `vio.features` | 64 位 driver feature 掩码；默认全 1，最终仍需设备协商 |
@@ -282,7 +284,7 @@ DPU 与 VIO 共用最终 service 采样值，不分别随机生成第二份队�
 | `dpu.bar_map.reg_target` / `dpu.msix.reg_target` / `dpu.qsch.reg_target` | 同类；BAR/MSI-X/QSCH 家族默认，详细类别覆盖家族 |
 | `vio.vtx.reg_target` / `vio.vrx.reg_target` / `vio.notify_table.reg_target` | 同类；分别最后覆盖 `dpu.vtx/vrx/vio_notify.reg_target` |
 | `vio.enabled` / `tx_enable` / `rx_enable` | `virtio_net_env_config::load_external_requirement`；0/1，默认均1。最终 enabled=0 或 TX/RX 均0时不分配 VIO 队列、不写 VIO/Notify/QSCH；公共 Function 保留。RX-only 跳过 VTX/QSCH |
-| `vio.pairs/queue_size/queue_type` | 核心同类；先求最终需求再 placement，不静默减小。external 的 pairs=0 表示不启用该 service；旧驱动模式仍要求非零。项目使用 `VQ_PACKED` 或 `VQ_CUSTOM`；实际深度同时受VIP和图片约束 |
+| `vio.pairs/queue_size/queue_type` | 核心同类；先求最终需求再 placement，不静默减小。项目默认 pairs=0，不传 VIO 参数不启用 service；旧驱动模式仍要求非零。显式开队列时使用 `VQ_PACKED` 或 `VQ_CUSTOM`，实际深度同时受VIP和图片约束 |
 | `vio.features` | 核心同类；external Packed 默认 VERSION_1 与 RING_PACKED，二者必需；另允许 NOTIFICATION_DATA、IN_ORDER、RING_EVENT_IDX、ACCESS_PLATFORM、CSUM、HOST_TSO4/6、HOST_USO。TSO/USO依赖CSUM；声明能力不自动启用每包offload。Custom 强制0，显式非零拒绝，不执行设备协商 |
 | `vio.completion_mode` | 核心同类；`VIRTIO_COMPLETION_POLLING` 或 `VIRTIO_COMPLETION_MSIX`，MSI-X 无轮询兜底 |
 | `vio.notify_bar/notify_base/notify_stride/notify_encoding` | 核心同类；真实 doorbell 的偶数 BAR、BAR内offset/队列步长/`VIO_NOTIFY_QID16`、`VIO_NOTIFY_DATA32`、`VIO_NOTIFY_DPU32`。提供 notify_base 标记布局有效，不能拿 notify lookup 表偏移替代 |

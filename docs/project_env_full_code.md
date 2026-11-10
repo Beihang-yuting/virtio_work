@@ -23,9 +23,12 @@
 每个管理 BAR 写一次 `+0x80044 = 1`。空批次不写，失败停止；不增加 bank 切换或使能读回。
 原有每100次完整 DWORD 写后的 AF 状态读保持不变。
 未启用的 VIO service 不分配 ring 或写 VIO/Notify/QSCH；RX-only 只写 VRX/Notify，跳过 VTX/QSCH。
+参考 cfg 默认 `vio.pairs=0`；未使用 VIO 的用例无需传 VIO 参数，显式开队列后才检查队列几何。
 
 Tcl 名称仍为 `dut_config`、`reg_acc`、`load_params`；其中 reg_acc 注册 `dpu_bar_reg_seq`，
 addr 为 Host0/PF0 BAR0 内偏移。load_params 用 AIP 命令宏注册一次，顶层统一刷新允许字段。
+env 同时注册无参 `vio_release`，自动停止 worker 并回收全部 Host 的 VIO 资源；
+调用时机由用户安排，不需要 base_test 保存配置 seq。`vio_stop` 保留原队列，供后续恢复。
 完整快照恢复说明和边界见 README，源码变更后需重新编译并保存快照。
 
 ## `filelists/project_integration.f`
@@ -81,12 +84,13 @@ endpackage
 
 ## `integration/project/project_env_cfg.sv`
 
-SHA-256: `1fa558fe238ff871ec3d9638d9d219ba31e9bc9fcee67459bab2568f72660556`
+SHA-256: `e9710732c9e5a3f500b3b23d61477e546c0e26aabe3c99943fde5b2341db9eee`
 
 ```systemverilog
 // integration/project：用户 env_cfg 的组合参考，不要求用户继承本类。
 // DPU 拥有资源与公共表，VIO 拥有行为/ring，PCIe 拥有传输参数；只在这里组装三个 cfg。
 // 平台 VIF/pool 均借用，创建和连接组件由 project_env 完成。
+// 项目默认不分配 VIO 队列；只有显式给出 pairs 的服务才进入外部队列几何和通知配置检查。
 class project_env_cfg extends uvm_object;
 	`uvm_object_utils(project_env_cfg)
 	// 三类子配置由本对象创建；每个 Host 的 VIO 配置在加载参数后独立生成。
@@ -146,6 +150,7 @@ function project_env_cfg::new(string	name);
 
 	vio_cfg.execution_mode         = VIRTIO_EXEC_REAL_DUT;
 	vio_cfg.external_configuration = 1;
+	vio_cfg.default_num_pairs      = 0;
 endfunction
 
 // 验证 Host→TL slot 是完整的一一映射；不补缺项，避免错配后静默使用 Root0。
@@ -357,7 +362,7 @@ endfunction
 
 ## `integration/project/project_env.sv`
 
-SHA-256: `111d9087d7e14d310aeb05aeea680255d2824af7b1a0413b065d1f214270c9bf`
+SHA-256: `122143924438eb2f4ea7dd098590c20c140f282490e7cd39378fd41432689aae`
 
 ```systemverilog
 // integration/project：项目组件组装；仅继承 uvm_env，不承担寄存器写表。
@@ -365,9 +370,10 @@ SHA-256: `111d9087d7e14d310aeb05aeea680255d2824af7b1a0413b065d1f214270c9bf`
 // env 拥有子组件；dpu_cfg 保存公共资源/表值，各 Host VIO env 拥有实际 ring。
 // connect 将同一个 dpu_cfg 和各 Host VIO env 发布到 PCIe sequencer，seq 不依赖项目 cfg 类型。
 // 每 Host 一个 Intel RC，PF/VF 共用；VIO 挂在 DPU 子树保证快照先发布。
+// AIP 的 load_params/vio_release 借用同一个 env；实际队列的准备和回收仍由 VIO 所有者执行。
 typedef class project_env;
 
-// 单个命令借用项目 env；由 AIP 宏生成适配，无独立命令类。
+// 运行期命令共用项目 env；由 AIP 宏生成适配，无独立命令类。
 project_env	project_runtime_env;
 
 class project_env extends uvm_env;
@@ -404,6 +410,13 @@ class project_env extends uvm_env;
 
 	// 运行期入口：重读当前AIP参数，只在首次prepare前或已release后更新同一个cfg。
 	extern task load_params(
+		output bit		ok,
+		output string	why
+	);
+
+	// 统一停止并回收全部 Host 的 VIO；调用时机由用户安排，没有队列时成功返回。
+	// 先等待所有 worker 退出，再预检和回收实际资源并清除 cfg 的队列导出值。
+	extern task release_vio_resources(
 		output bit		ok,
 		output string	why
 	);
@@ -973,9 +986,57 @@ function void project_env::end_of_elaboration_phase(uvm_phase	phase);
 	publish_dpu_configuration(ok, why);
 	if (!ok) `uvm_fatal("PROJECT_PUBLICATION", why)
 	if (project_runtime_env != null && project_runtime_env != this)
-		`uvm_fatal("PROJECT_PARAM", "load_params command already registered")
+		`uvm_fatal("PROJECT_PARAM", "runtime commands already bound to another project environment")
 	project_runtime_env = this;
 endfunction
+
+// Tcl 释放整个项目的 VIO 资源，无须保留配置 sequence；不影响其他业务的 Host 内存。
+// 用户安排 DUT 业务收尾时序；本 task 只自动停止 VIP worker，不轮询或复位 DUT。
+// 已停止的 worker 不重复 stop；全部退出后先预检各 Host，随后无时间推进地统一回收。
+task project_env::release_vio_resources(
+	output bit		ok,
+	output string	why
+);
+	vio_external_setup	setup;
+	virtio_auto_fsm		fsm;
+
+	ok  = 0;
+	why = "";
+
+	foreach (vio_envs[h]) begin
+		if (vio_envs[h].get_external_setup() == null) continue;
+
+		foreach (vio_envs[h].function_instances[f]) begin
+			fsm = vio_envs[h].function_instances[f].driver_agent.fsm;
+			if (!fsm.external_workers_stopped())
+				fsm.stop_dataplane();
+		end
+	end
+
+	foreach (vio_envs[h]) begin
+		setup = vio_envs[h].get_external_setup();
+		if (setup == null) continue;
+
+		if (!vio_envs[h].preflight_external_configuration(setup, null, why)) begin
+			why = $sformatf("Host%0d: %s", h, why);
+			return;
+		end
+	end
+
+	foreach (vio_envs[h]) begin
+		setup = vio_envs[h].get_external_setup();
+		if (setup == null) continue;
+
+		if (!vio_envs[h].release_external_resources(setup, 1'b1, why)) begin
+			why = $sformatf("Host%0d: %s", h, why);
+			return;
+		end
+		cfg.dpu_cfg.clear_host_queues(h);
+	end
+
+	ok  = 1;
+	why = "";
+endtask
 
 // 全部候选和RC消息先校验，成功后不推进时间地提交；不自动停DUT或释放现有ring。
 // 资源和协议规模固定，字段更改由下一次配置seq写入DUT，命令自身不发送PCIe请求。
@@ -1065,11 +1126,37 @@ task project_load_params();
 endtask
 
 `aip_cmd_task(load_params, project_load_params)
+
+// 无参 Tcl 命令统一停止并释放 VIO；沿用宏的 status/result_out 通道返回结果。
+// 用户负责选择调用时机，不再读取参数表或要求单独的停机确认参数。
+task project_vio_release();
+	aip_cmd	command;
+	bit		ok;
+	string	why;
+
+	command = aip_cmd::get_handle("vio_release");
+	if (command.args_in != "") begin
+		command.status     = 1;
+		command.result_out = "ERROR: vio_release takes no arguments";
+		return;
+	end
+	if (project_runtime_env == null) begin
+		command.status     = 1;
+		command.result_out = "ERROR: vio_release environment is not ready";
+		return;
+	end
+
+	project_runtime_env.release_vio_resources(ok, why);
+	command.status     = ok ? 0 : 1;
+	command.result_out = ok ? "OK: VIO resources released" : {"ERROR: vio_release: ", why};
+endtask
+
+`aip_cmd_task(vio_release, project_vio_release)
 ```
 
 ## `integration/project/project_base_test.sv`
 
-SHA-256: `04ea43e97f302122313a8d6abfe04a1a73f7e729d07a140420345ab9999cdbd4`
+SHA-256: `8b8f1cecd2d148b65e22a6c1a067952a2c261cffe4fb08797b4dbb1c5f9299af`
 
 ```systemverilog
 // integration/project：可继承的 AIP base_test，由 project_env_pkg 最后包含。
@@ -1142,6 +1229,7 @@ endfunction
 
 // 平台就绪后启动一个配置 sequence；失败不进入业务，成功才注册发包命令。
 // 参考 VIO/QSCH 布局可直接使用基类；平台特殊访问才需 factory override 单项 hook。
+// Tcl 是项目公共入口；没有 VIO 队列时仍允许 PCIe/RDMA 命令及 end_test 的活动等待。
 task project_base_test::run_phase(uvm_phase	phase);
 	vio_dpu_cfg_seq	config_seq;
 	int unsigned	host;
@@ -1156,10 +1244,8 @@ task project_base_test::run_phase(uvm_phase	phase);
 	config_seq.start(env.pcie_env.rc_agents[cfg.tl_slot_by_host[host]].sequencer);
 	require_success(config_seq.success, config_seq.error_msg);
 
-	if (cfg.dpu_cfg.queues_by_host.num() != 0) begin
-		env.register_aip_commands();
-		aip_tcl_bridge::run_loop();
-	end
+	env.register_aip_commands();
+	aip_tcl_bridge::run_loop();
 	finish_platform();
 	phase.drop_objection(this);
 endtask

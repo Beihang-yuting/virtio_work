@@ -631,7 +631,8 @@ runtime state；已发布的 service、local/global qpair identity 和 snapshot 
 VTX/VRX 使用实际 descriptor IOVA，先高到低四次 DWORD 数据写，再操作间接触发端口。
 QSCH 策略从 `dpu_cfg` 生成，不再挂旧的 plan extension。
 
-实际队列释放前由平台确认 DUT 已停机，再调用 `release_vio_resources`；
+参考 env 的无参 Tcl 命令 `vio_release` 自动停止全部 VIO worker 并回收队列资源，
+调用时机由用户安排；独立 `vio_stop` 保留资源，供后续 `vio_start` 继续运行。
 不会自动切换 bank、清 PBA 或猜测硬件 teardown 时序。
 AF extra queue 仍保留为 function-owned 资源，不自动成为 VIO service 的 ring/Notify；
 单 AF PF0 需要32对普通 VIO 时显式设置 `dpu.caps.af_extra_queue_count=0`。

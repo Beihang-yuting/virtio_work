@@ -68,6 +68,7 @@ endfunction
 
 // 平台就绪后启动一个配置 sequence；失败不进入业务，成功才注册发包命令。
 // 参考 VIO/QSCH 布局可直接使用基类；平台特殊访问才需 factory override 单项 hook。
+// Tcl 是项目公共入口；没有 VIO 队列时仍允许 PCIe/RDMA 命令及 end_test 的活动等待。
 task project_base_test::run_phase(uvm_phase	phase);
 	vio_dpu_cfg_seq	config_seq;
 	int unsigned	host;
@@ -82,10 +83,8 @@ task project_base_test::run_phase(uvm_phase	phase);
 	config_seq.start(env.pcie_env.rc_agents[cfg.tl_slot_by_host[host]].sequencer);
 	require_success(config_seq.success, config_seq.error_msg);
 
-	if (cfg.dpu_cfg.queues_by_host.num() != 0) begin
-		env.register_aip_commands();
-		aip_tcl_bridge::run_loop();
-	end
+	env.register_aip_commands();
+	aip_tcl_bridge::run_loop();
 	finish_platform();
 	phase.drop_objection(this);
 endtask
