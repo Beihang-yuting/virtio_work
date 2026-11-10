@@ -61,7 +61,6 @@ rg -n 'net_packet_pkg\.sv|core/packet\.sv' compile.log
 | 外部 `dpu_common/src/dpu_device_cfg.sv` | Host/domain/MMIO/function/BAR/AF 等原类加载；不根据数量创建拓扑 |
 | 外部 `dpu_common/src/dpu_placement_cfg.sv` | 资源池、候选过滤与 placement request 加载 |
 | 外部 `dpu_common/src/dpu_env_cfg.sv` | 默认拓扑、公共布局/MSI-X、VIO/QSCH 硬件策略；接收核心 VIO 已缓存的 service 需求 |
-| 外部 `dpu_common/src/dpu_vio_qsch_topology.sv` | 独立 QSCH topology generator 加载；不自动执行 DUT 配置 |
 | 外部 `dpu_common/src/dpu_dut_caps.sv` | 可选能力上限加载 |
 | 外部 `pcie_work/pcie_tl_vip/src/env/pcie_tl_env_config.sv` | 原配置类 `load_params("pcie_cfg")` 加载实际 TL 组件消费的行为策略，字段名保持不变 |
 | `examples/virtio_system_env/virtio_system_env_example_test.sv` | `author_param_config` 创建拓扑，`virtio_system_env_config.load_params` 设置内存创建策略 |
@@ -221,7 +220,6 @@ pcie_cfg.load_params("pcie_cfg"); // 此后再创建消费它的 PCIe env
 | `dpu.candidate_kind/device_policy/ordering/placement_seed` | 选择 PF/VF、固定/自动放置、排序和候选 shuffle seed |
 | `dpu.host_ids/vf_ids/parent_pfs/functions/fixed_devices` | 候选过滤/固定设备集合，按完整 Function 身份声明 |
 | `dpu.lan_msix` | 每 Function LAN 向量数，0 表示按分配到的 qpair 数量 |
-| `dpu.qsch.mode/max_groups/max_ports/max_tc/shared_group/include_af` | **legacy** QSCH generator 约束，需显式调用 generator.load_params 后再生成拓扑 |
 | `dpu.caps.*` | DUT 能力边界；不能把声明上限当成实际已创建数量 |
 
 Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来的 GPA/MMIO
@@ -231,7 +229,7 @@ Host 模板加载 `dpu` 一次，复制后加载 `dpu.hN`。示例沿用原来�
 是该 request 的总量。完整 DPU 字段/集合映射见外部 `dpu_common/README.md`。
 
 修改 MSI-X/QSCH 输入不会自动重写硬件。当前项目使用下节 `dpu_env_cfg` 和
-`vio_dpu_cfg_seq`，加载配置后显式执行 sequence；独立 topology generator 仍只是数据构造工具。
+`vio_dpu_cfg_seq`，加载配置后显式执行 sequence；QSCH 记录由 `dpu_env_cfg` 唯一生成。
 
 ### 私有队列
 
@@ -273,6 +271,11 @@ DPU 与 VIO 共用最终 service 采样值，不分别随机生成第二份队�
 | `dpu.hH.pfP[.vfV].requester/intel_pf/intel_vf/vport` | 软件路由；每 Host 的 PF0/no-VF 默认0/0/-1/0，其余Function显式提供四项或完整 policy；不下发硬件表 |
 | `dpu.hH.pfP[.vfV].bdf_index` | BDF表硬件索引0..127；新生成policy默认取vport，已有显式policy保持其索引；配置seq使用同一身份写表 |
 | `dpu.qsch.configure_controls` | 默认1；配置模式并自动生成缺少的SP/WRR和TC weight项，显式catalog优先 |
+| `dpu.qsch.topology` | 默认 `DPU_QSCH_AUTO`；每个 TX Function 一个 net、同源 Host+dpt 一个 group。显式固定/随机参数无需切换此项；`DPU_QSCH_RANDOM` 仅将未指定 net/group 默认设为 rand，`DPU_QSCH_MANUAL` 使用原显式策略。AUTO/RANDOM 要求 VNET |
+| `dpu.qsch.net_id/group_id` | 固定值、`rand/random` 或 AIP 有限表达式（如 `[100:400]`）；0..1023，固定优先、随机唯一。未给值时分别用 global_function_id / host_id*16+dpt。多个 TX Function 不能强制共用 net，多个源/目的 route 不能强制共用 group；替代旧 net_min/net_max |
+| `dpu.qsch.dpt` | AUTO/RANDOM 的目的节点，默认0=ETH0；固定值、rand/random 或有限表达式。ETHn=n，HOSTh=eth_ports+h；仅允许当前有效节点，13..15保留。lvl2取源host_id |
+| `dpu.qsch.eth_ports` | 默认8，按实际DUT指定1..8；决定Host目的编码起点。AUTO/RANDOM中为全局物理规格 |
+| `dpu.qsch.print` | 默认0；1时打印 Function→net→group 和 pair/global_qid，默认明细为 UVM_HIGH；查询/重复导出不重新随机 |
 | `dpu.qsch.mode/mode_offset` | 默认0/0xb001c0；mode为0=VNET、1=ETS，须与service的ets一致；offset为管理BAR内字节偏移 |
 | `dpu.qsch.spwrr/tc_weight` | 默认0xff/0x11111111；分别8位SP/WRR选择、32位TC权重，每个实际net_id生成一项 |
 | `dpu.<category>.reg_target` | `dpu_env_cfg::load_platform_params`；覆盖该类别访问窗口，类别见下表 |
@@ -320,7 +323,10 @@ DPU 与 VIO 共用最终 service 采样值，不分别随机生成第二份队�
 | `vtx.dma_info` | 4位显式平台策略 |
 | `vtx.tail_buf_id_dis/redraw_en/high_speed_mode/seg_en/interl_seg_en` | 各0/1，硬件/深度约束另行检查 |
 | `vrx.dsc_pre_max_num/dsc_pre_read_threshold/dsc_dma_num/dsc_mode/payload_dsc_len/head_dsc_len` | 图片位宽分别3/2/2/2/3/2；目前非零dsc_mode/payload/head split 不支持并拒绝 |
-| `qsch.net_base/net_stride/group_id/cos/eth_ports/ets/distinguish_business/ets_priority` | 生成实际Q2TC/N2G/G2P；net/group10位、cos3位、ETH加Host须容纳4位、ETS priority3位；不等同legacy generator参数 |
+| `qsch.cos` | 所有拓扑模式均使用该 service 的 COS，范围0..7 |
+| `qsch.net_id/group_id/dpt` | AUTO/RANDOM 的 Function 级覆盖；沿上述路径查原始表达式，由 cfg 在实际队列导出时统一生成。group约束属于源Host+dpt，共享route须一致；全局group默认仅在无route覆盖时使用 |
+| `qsch.net_base/net_stride/eth_ports/ets/ets_priority` | MANUAL 旧策略；group_id也作为MANUAL显式编号。net/group10位、ETH数1..8、Host0..4、ETS priority3位 |
+| `qsch.distinguish_business` | 旧策略字段，当前不参与硬件表编码 |
 | `fpga` | 0/1，限制global qpair/VRX RAM高位容量 |
 | `prefetch_ram/prefetch_start/prefetch_slots` | RAM名字表示真实共享域，起点/容量单位是descriptor槽；同名RAM跨Host也检查重叠 |
 | `notify_net_pair5` | 0/1，明确采用单bank net pair5编码 |
@@ -334,7 +340,7 @@ Notify 保持512行单bank容量，但seq只写实际队列对的有效项；同
 首次配置前DUT须已按 `05.png` 复位，未用项type=3、lookup key/global_qid全1、reserved=0。
 Notify目录使用统一管理BAR；参考布局短目标默认Host0，可用`vio.notify_table.reg_target`改为完整目标。
 旧 `dpu.notify.bank/auto_bank/full_bank` 和旧 MSI-X plan policy 已随生产 builder 删除；
-独立 QSCH generator 仍保留。每批 VIO/RDMA Notify 成功后，每个管理 BAR 写一次
+独立 QSCH generator 已删除，自动/随机关联由 `dpu_env_cfg` 生成并保存。每批 VIO/RDMA Notify 成功后，每个管理 BAR 写一次
 `+0x80044=1`，无 bank 参数；空批次或表写失败不发使能。
 
 运行期 `load_params` 用 `aip_cmd_task(load_params, project_load_params)` 在顶层注册一次，

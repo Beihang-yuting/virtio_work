@@ -33,8 +33,6 @@ package virtio_net_pkg;
   export host_mem_pkg::*;
 
   `include "shared/host_mem_bar_reservation_importer.sv"
-  `include "pcie/pcie_tl_dpu_reg_backend.sv"
-
   // ---------------------------------------------------------------------------
   // 第 1 层 – 类型与共享基础（types/、shared/）
   // ---------------------------------------------------------------------------

@@ -151,8 +151,8 @@ QSCH 表和模式寄存器。公共 AF/BDF 等仍按原流程执行。
 +vio.notify_bar=0 +vio.notify_base=0 +vio.notify_stride=0
 +vio.notify_encoding=VIO_NOTIFY_DPU32
 +vio.notify_net_pair5=1
-+dpu.qsch.net_base=0 +dpu.qsch.net_stride=1 +dpu.qsch.group_id=0
-+dpu.qsch.cos=0 +dpu.qsch.eth_ports=8 +dpu.qsch.ets=0
++dpu.qsch.topology=DPU_QSCH_AUTO +dpu.qsch.mode=0
++dpu.qsch.cos=0 +dpu.qsch.dpt=0 +dpu.qsch.print=1
 ```
 
 该配置共 **25 笔 32-bit 配置写和 1 笔 AF 读**，包含新增 Notify 使能，不包含后续业务 DB。
@@ -161,6 +161,92 @@ QSCH 表和模式寄存器。公共 AF/BDF 等仍按原流程执行。
 
 改 Custom 使用 `+vio.queue_type=VQ_CUSTOM +vio.features=0`，其他关联仍来自同一资源。
 Packed 使用标准12B `virtio_net_hdr`，512B 报文长度另计；Custom 使用私有 descriptor/CQ。
+
+多个 PF/VF 可分别指定队列数。以下片段只展示业务选择；真实平台的 Function 路由、
+接口绑定及公共参数沿用自己的配置：
+
+```text
++dpu.hosts=1 +dpu.pfs_per_host=2 +dpu.vfs_per_pf=1
++vio.enabled=0 +vio.tx_enable=1 +vio.rx_enable=0
++vio.h0.pf0.i0.enabled=1 +vio.h0.pf0.i0.pairs=2
++vio.h0.pf1.i0.enabled=1 +vio.h0.pf1.i0.pairs=3
++vio.h0.pf0.vf0.i0.enabled=1 +vio.h0.pf0.vf0.i0.pairs=4
++dpu.qsch.net_id=[100:400] +dpu.qsch.group_id=random
++dpu.qsch.dpt=0 +dpu.qsch.print=1
+```
+
+这会为三个启用 TX 的 Function 生成三个唯一随机 net_id；PF0 的两对队列共用
+一个 net，PF1 的三对共用另一个，VF0 的四对共用第三个。这里 `pairs` 是队列对数，
+TX 的 Q2TC 表使用实际 `global_qpair_id`，不能把本地 virtqueue_id 或 PF 编号当索引。
+同源 Host、同目的 dpt 共享一个 group；Q2TC、N2G、G2P、SPWRR 和 TC_WEIGHT 自动保持关联。
+net/group 随机值只生成一次，查询和写表不重复采样，使用仿真器种子复现。
+
+固定值直接生效，不需要随机开关。一个 PF 的示例：
+
+```text
++dpu.qsch.net_id=100 +dpu.qsch.group_id=20
++dpu.qsch.eth_ports=8 +dpu.qsch.dpt=8 +dpu.qsch.cos=3
++dpu.qsch.spwrr=0x55 +dpu.qsch.tc_weight=0x87654321
++dpu.qsch.print=1
+```
+
+此处 `dpt=8` 是 HOST0；默认 `dpt=0` 是 ETH0。按图片定义，ETHn=n，
+HOSTh=`eth_ports+h`；ETH数要与真实 DUT 一致，目的 Host 必须已创建，13..15保留。
+两个 ETH 时 HOST0/1 编码为2/3。`dpt` 也支持 rand/random 或有限范围，选择当前有效节点。
+
+多个 Function 可用精确路径分别覆盖，例如：
+
+```text
++vio.h0.pf0.i0.qsch.net_id=100 +vio.h0.pf0.i0.qsch.group_id=20
++vio.h0.pf0.i0.qsch.dpt=0
++vio.h0.pf1.i0.qsch.net_id=200 +vio.h0.pf1.i0.qsch.group_id=30
++vio.h0.pf1.i0.qsch.dpt=8
+```
+
+先用 `vio.h0.pfP[.vfV].i0.pairs` 指定该 Function 队列对数；每组队列都进入对应 net。
+同源 Host+dpt 的 Function 共享 group，其显式 group 参数需一致；不同 route 需不同 group。
+固定值优先保留，随机候选不足或冲突会报出具体 Function/route，seq 不继续写 QSCH。
+
+`env`/`env_cfg` 和 base_test 沿用原接线。`dut_config` 对应 `vio_dpu_cfg_seq`，启动后：
+
+```text
+VIO 准备实际队列 → dpu_cfg.set_queues() 生成唯一映射
+    → dpu_cfg_seq.configure_qsch() → pcie_tl_reg_seq → DUT
+```
+
+以一个 PF0、一对队列（global_qpair_id=0）和上面的 net100/group20/HOST0 固定参数为例，
+默认驱动参考布局写出下表。所有地址都会加环境分配的管理 BAR base，无需用户手算 BAR。
+
+| 表 | BAR 内偏移 | 32-bit 写入值 |
+| --- | --- | --- |
+| QSCH mode | `0xb001c0` | `0x00000000` |
+| Q2TC[0] | `0xb10000` | `0x80000323`（net100、COS3） |
+| N2G[100] | `0xb12190` | `0x80000014`（group20） |
+| G2P[20] | `0xb14050` | `0x80080000`（HOST0，源Host0） |
+| SPWRR[100] | `0xb16190` | `0x00000055` |
+| TC_WEIGHT[100] | `0xb18190` | `0x87654321` |
+
+这是完整配置流程中的 QSCH 部分；AF、BDF、Notify、VTX/VRX 仍按实际使能执行。
+net_id 变化会同时改变 Q2TC 内容及三张 net 表的地址；group_id 变化会同时改变 N2G
+内容和 G2P 地址。seq 直接消费 cfg 保存的结果，不再随机，也无需另传一份参数。
+管理窗口可用 `dpu.qsch.reg_target=h0.pf0.bar0` 覆盖，不改变队列自身的 PF/VF 归属。
+
+原 `net_base/net_stride/group_id/eth_ports/ets` 策略使用 `DPU_QSCH_MANUAL`。
+自动生成当前覆盖 VNET (`dpu.qsch.mode=0`)；不提供业务运行中的动态改配。
+参数重载后，需重新启动配置 seq 才写 DUT；已运行的 VIO 队列需先停机并释放。
+
+若从未配置的快照进入 Tcl，可先覆盖参数，再沿已有入口加载并配置：
+
+```tcl
+set_param path=dpu.qsch.net_id value=100
+set_param path=dpu.qsch.group_id value=20
+set_param path=dpu.qsch.dpt value=8
+load_params
+dut_config
+```
+
+随机范围用 Tcl 花括号保留方括号，例如
+`set_param path=dpu.qsch.net_id {value=[100:400]}`。
 
 Notify 表的查找基址默认取实际 doorbell 地址的 `[60:7]`，无需再重复指定
 `vio.notify_table_bar/notify_table_offset`。显式提供任一项时，另一项沿用当前值

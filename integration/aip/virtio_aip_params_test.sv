@@ -253,13 +253,12 @@ class virtio_aip_params_test extends uvm_test;
 		      "BDF 区间、保留集合和 BAR policy 必须继承模板");
 	endfunction
 
-	// placement、notify、QSCH 和 AF/caps 均使用原类入口，集合值由真实 AIP schema 解析。
+	// placement、notify 和 AF/caps 均使用原类入口，集合值由真实 AIP schema 解析。
 	function void test_dpu_policies();
 		dpu_resource_placement_cfg	placement_cfg;
 		dpu_resource_pool_config_t	profile;
 		dpu_vio_placement_request	request_cfg;
 		dpu_env_cfg	policy;
-		dpu_qsch_topology_generator	qsch;
 		dpu_device_cfg	device_cfg;
 		string	why;
 		bit	ok;
@@ -304,18 +303,6 @@ class virtio_aip_params_test extends uvm_test;
 		policy.load_params();
 		check_param(policy.msix_policies[dpu_function_key_name('{0, 0, DPU_FUNCTION_PF, 0})].interval_entry == 32'h8000ffff,
 		      "公共 MSI-X interval 必须使用图片定义的两个16位域");
-		aip_cmdline_override::clear_all();
-		qsch = new("qsch_generator");
-		put("params.qsch.mode", "DPU_QSCH_TOPOLOGY_RANDOM_STRESS");
-		put("params.qsch.max_groups", "3");
-		put("params.qsch.max_ports", "2");
-		put("params.qsch.max_tc", "4");
-		put("params.qsch.shared_group", "1");
-		put("params.qsch.include_af", "0");
-		qsch.load_params("params.qsch");
-		check_param(qsch.mode == DPU_QSCH_TOPOLOGY_RANDOM_STRESS && qsch.max_group_nodes == 3 &&
-		      qsch.max_port_nodes == 2 && qsch.max_tc_id == 4 && qsch.require_shared_group && !qsch.include_af_extra_queues,
-		      "QSCH 参数应只修改 generator 约束");
 		device_cfg = new("device_cfg");
 		device_cfg.af_request.requester = '{host_id:0, pf_id:0, kind:DPU_FUNCTION_PF, vf_id:0};
 		put("params.device.af_host", "1");

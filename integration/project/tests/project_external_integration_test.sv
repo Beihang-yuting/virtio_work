@@ -288,6 +288,8 @@ package project_external_integration_test_pkg;
 
 	function project_external_model_cfg::new(string name="project_external_model_cfg");
 		super.new(name);
+		// 本 fixture 专门验证原有逐 service 的显式布局；自动拓扑由独立测试覆盖。
+		qsch_topology = DPU_QSCH_MANUAL;
 	endfunction
 
 
@@ -1211,12 +1213,7 @@ package project_external_integration_test_pkg;
 		aip_cmdline_override::set_val("vio.notify_table_bar", "0");
 		aip_cmdline_override::set_val("vio.notify_table_offset", "0");
 		aip_cmdline_override::set_val("vio.notify_net_pair5", "1");
-		aip_cmdline_override::set_val("dpu.qsch.net_base", "0");
-		aip_cmdline_override::set_val("dpu.qsch.net_stride", "1");
-		aip_cmdline_override::set_val("dpu.qsch.group_id", "0");
-		aip_cmdline_override::set_val("dpu.qsch.cos", "0");
-		aip_cmdline_override::set_val("dpu.qsch.eth_ports", "8");
-		aip_cmdline_override::set_val("dpu.qsch.ets", "0");
+		// QSCH 使用生产默认值或本次 CLI 参数；fixture 不覆盖 net/group/COS，便于验证真实下发链。
 
 		cfg = project_env_cfg::type_id::create("cfg");
 		cfg.vio_cfg.scb_enable = 0;
@@ -1532,8 +1529,10 @@ package project_external_integration_test_pkg;
 				require_true(entry.local_qid_encoding == (r.binding.qpair.virtio_pair_index << 1 | 1), "Notify local pair encoding");
 				require_true(r.binding.notify_address == management.bar_lease.base, "runtime doorbell differs from assigned BAR");
 			end
-			if (r.ctx.kind == DPU_TABLE_SPWRR) require_true(actual == 'hff, "SPWRR default differs");
-			if (r.ctx.kind == DPU_TABLE_TC_WEIGHT) require_true(actual == 'h11111111, "TC weight default differs");
+			if (r.ctx.kind == DPU_TABLE_SPWRR)
+				require_true(actual == cfg.dpu_cfg.qsch_spwrr, "SPWRR parameter did not reach DUT");
+			if (r.ctx.kind == DPU_TABLE_TC_WEIGHT)
+				require_true(actual == cfg.dpu_cfg.qsch_tc_weight, "TC weight parameter did not reach DUT");
 			if (r.ctx.kind == DPU_TABLE_VTX) begin
 				dpu_vtx_entry_t	entry;
 
@@ -1541,6 +1540,28 @@ package project_external_integration_test_pkg;
 				require_true(entry.q_depth == 8, "VTX depth does not match 256 descriptors");
 				require_true(entry.virtio_mode == ($test$plusargs("PROJECT_CUSTOM") ? 0 : 1), "VTX Packed/Custom mode differs");
 			end
+		end
+		// 独立核对 CLI→cfg→配置 seq→Intel 接口收到的地址/数值，不仅与 records 自己比较。
+		// 固定例指定 net100/group20/HOST0；随机例限制 net100..103/group20..23/ETH0..1。
+		if (tx_active && ($test$plusargs("PROJECT_QSCH_FIXED") || $test$plusargs("PROJECT_QSCH_RANDOM"))) begin
+			dpu_qsch_q2tc_entry_t	q2tc;
+			dpu_qsch_n2g_entry_t		n2g;
+			dpu_qsch_g2p_entry_t		g2p;
+			bit						fixed_ids;
+
+			fixed_ids = $test$plusargs("PROJECT_QSCH_FIXED");
+			q2tc = dpu_qsch_q2tc_entry_t'(table_value('hb10000, 4));
+			n2g  = dpu_qsch_n2g_entry_t'(table_value('hb12000 + 4*q2tc.net_id, 4));
+			g2p  = dpu_qsch_g2p_entry_t'(table_value('hb14000 + 4*n2g.group_id, 4));
+			require_true(q2tc.valid && q2tc.cos == 3 && q2tc.net_id >= 100 &&
+				q2tc.net_id <= (fixed_ids ? 100 : 103), "CLI net/COS absent from actual Q2TC write");
+			require_true(n2g.valid && n2g.group_id >= 20 && n2g.group_id <= (fixed_ids ? 20 : 23),
+				"CLI group absent from actual N2G write");
+			require_true(g2p.valid && g2p.lvl2_id == 0 && (fixed_ids ? g2p.dpt == 8 : g2p.dpt <= 1),
+				"CLI node absent from actual G2P write");
+			require_true(table_value('hb16000 + 4*q2tc.net_id, 4) == 'h55 &&
+				table_value('hb18000 + 4*q2tc.net_id, 4) == 'h87654321,
+				"CLI scheduler controls were written at a different net index");
 		end
 		require_true(counts[DPU_TABLE_NOTIFY] == active_pairs &&
 			counts[DPU_TABLE_VTX] == (tx_active ? pairs : 0) &&

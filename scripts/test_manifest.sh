@@ -21,8 +21,6 @@ fi
 
 VIRTIO_MAINTAINED_TESTS=(
   dpu_resource_manager_test
-  dpu_reg_plan_test
-  dpu_pcie_reg_executor_test
   dpu_device_resolver_test
   dpu_placement_test
   dpu_resource_resolver_test
@@ -56,7 +54,6 @@ VIRTIO_MAINTAINED_TESTS=(
   virtio_real_driver_rx_test
   host_mem_random_test
   virtio_pcie_host_mem_test
-  dpu_pcie_tl_executor_integration_test
   dpu_priv_driver_flow_test
   dpu_priv_ring_contract_test
 )
@@ -172,18 +169,6 @@ _validate_global_dpu_static_contracts() {
      ! grep -q 'task dpu_cfg_seq::enable_notify' "$builder" ||
      ! grep -q "64'h0008_0044, 4, 128'h1" "$builder"; then
     echo "DPU configuration sequence must enable the completed Notify batch" >&2
-    return 1
-  fi
-
-  executor_input_count="$(grep -c \
-    '^function void configure_executor(input dpu_reg_executor injected_executor);$' \
-    "$manifest_root/README.md" || true)"
-  executor_assignment_count="$(grep -c \
-    '^[[:space:]]*injected_executor.bind_topology(device_env.get_snapshot());$' \
-    "$manifest_root/README.md" || true)"
-  if [[ "$executor_input_count" -ne 1 ||
-        "$executor_assignment_count" -ne 1 ]]; then
-    echo "README executor example requires one explicit input and one snapshot binding" >&2
     return 1
   fi
 

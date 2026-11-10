@@ -1409,8 +1409,8 @@ frozen snapshot pair 和 pair-seeded manager；`virtio_resource_client` 按 serv
 导入不可变 qpair mapping，`virtio_vf_resource_pool` 提供同一 mapping 的 service-keyed
 local/global queue lookup。DPU config 与 VIO config 分别通过 `uvm_config_db` 传入资源 env 和 VIO child。
 当前资源 cfg 为 `dpu_env_cfg`；`dpu_device_env` 只解析/发布快照。
-通用计划由调用方显式 `executor.bind_topology(device_env.get_snapshot())` 后交给
-orchestrator 执行，保留 PCIe config/MMIO、domain 路由、Completion 及读比较能力。
+当前 DUT 表由 `dpu_cfg_seq` 直接通过 PCIe TL 写入；资源 env 只发布冻结快照，
+不再保留独立的通用寄存器计划执行链。
 当前图片版外部 DUT 配置使用 `vio_dpu_cfg_seq`，详见
 [集成参考](../integration/project/README.md)，不再使用旧 env executor 字段。
 
@@ -1739,9 +1739,9 @@ AF extra queue 仍是独立的 function-owned frozen binding，不属于 VIO ser
 资源解析保留默认11项及其占用保护。当前 VIO 配置不会为没有实际 ring 的 extra queue
 生成 Notify；单 AF PF0 配32对业务需显式设置 `dpu.caps.af_extra_queue_count=0`。
 
-独立 `dpu_qsch_topology_generator` 继续保留逻辑拓扑和合法随机化能力，
-但不再导入旧 driver extension。当前表策略用 `dpu_env_cfg.vio_policies/platform_controls`
-声明，访问 `configure_qsch` / `write_qsch_*` 使用同一实际资源。
+QSCH 拓扑由 `dpu_env_cfg.vio_policies/platform_controls` 结合冻结资源和实际队列
+统一生成，`configure_qsch` / `write_qsch_*` 直接使用这些记录，不再保留独立
+拓扑 generator。
 
 冻结 snapshot 中的 VIO qpair capabilities 是硬件上限，并在以下边界执行：
 
@@ -1788,7 +1788,7 @@ make regression
 
 `scripts/test_manifest.sh` 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的
 单一事实源。该入口按清单顺序运行 `dpu_resource_manager_test`、
-`dpu_reg_plan_test`、`dpu_pcie_reg_executor_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
+`dpu_device_resolver_test`、`dpu_placement_test`、
 `dpu_resource_resolver_test`、`virtio_dut_caps_test`、
 `virtio_execution_mode_test`、`virtio_real_dut_iova_dma_test`、
 `virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_vdev_unit_test`、
@@ -1803,9 +1803,9 @@ make regression
 `virtio_net_packet_multi_queue_test`、`virtio_real_driver_flow_test`、
 `virtio_real_driver_multiqueue_test`、`virtio_real_driver_rx_test`、
 `host_mem_random_test`、
-`virtio_pcie_host_mem_test`、`dpu_pcie_tl_executor_integration_test`、
-`dpu_priv_driver_flow_test` 和 `dpu_priv_ring_contract_test`，
-共 39 项。该入口
+`virtio_pcie_host_mem_test`、`dpu_priv_driver_flow_test` 和
+`dpu_priv_ring_contract_test`，
+共 36 项。该入口
 要求 `make check-deps` 先通过；无 VCS 环境时它应在编译前报告 VCS 依赖错误。
 
 其中 `virtio_host_mem_reclaim_test`、`virtio_queue_semantics_test`、

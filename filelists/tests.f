@@ -12,8 +12,6 @@ virtio_net_vip/tests/virtio_vq_test_kit.sv
 // 设备模型测试件：无 PCIe 回环端口、事件记录器、预期报告捕获器。
 virtio_net_vip/tests/vdev_loopback_port.sv
 $DPU_COMMON_ROOT/tests/dpu_resource_manager_test.sv
-$DPU_COMMON_ROOT/tests/dpu_reg_plan_test.sv
-$DPU_COMMON_ROOT/tests/dpu_pcie_reg_executor_test.sv
 // scripts/test_manifest.sh guards these focused test sources at exact-once.
 $DPU_COMMON_ROOT/tests/dpu_device_resolver_test.sv
 $DPU_COMMON_ROOT/tests/dpu_placement_test.sv
@@ -50,7 +48,6 @@ virtio_net_vip/tests/virtio_net_packet_multi_queue_test.sv
 virtio_net_vip/tests/virtio_real_driver_flow_test.sv
 virtio_net_vip/tests/virtio_real_driver_multiqueue_test.sv
 virtio_net_vip/tests/virtio_real_driver_rx_test.sv
-virtio_net_vip/tests/dpu_pcie_tl_executor_integration_test.sv
 // 私有环流程测试继承多 Host 示例环境，示例文件须先于两个私有环测试编译；
 // 示例测试类本身不在维护清单中，仍由 examples/virtio_system_env/run_vcs.sh 运行。
 examples/virtio_system_env/virtio_system_env_example_test.sv

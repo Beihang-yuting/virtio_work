@@ -407,8 +407,7 @@ make test TEST=virtio_unit_test
 
 `make compile` 仅编译；`make test` 编译后运行指定测试。`scripts/test_manifest.sh`
 中的 `VIRTIO_MAINTAINED_TESTS` 是回归清单和顺序的单一事实源；`make regression`
-按该顺序运行 `dpu_resource_manager_test`、`dpu_reg_plan_test`、
-`dpu_pcie_reg_executor_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
+按该顺序运行 `dpu_resource_manager_test`、`dpu_device_resolver_test`、`dpu_placement_test`、
 `dpu_resource_resolver_test`、`virtio_dut_caps_test`、
 `virtio_execution_mode_test`、`virtio_real_dut_iova_dma_test`、
 `virtio_fabric_resource_test`、`virtio_unit_test`、`virtio_vdev_unit_test`、
@@ -423,8 +422,7 @@ make test TEST=virtio_unit_test
 `virtio_real_driver_flow_test`、`virtio_real_driver_multiqueue_test`、
 `virtio_real_driver_rx_test`、
 `host_mem_random_test`、`virtio_pcie_host_mem_test`、
-`dpu_pcie_tl_executor_integration_test`、`dpu_priv_driver_flow_test` 和
-`dpu_priv_ring_contract_test`，共 39 项。
+`dpu_priv_driver_flow_test` 和 `dpu_priv_ring_contract_test`，共 36 项。
 `make check-deps` 会验证 `host_mem` 外部 checkout 固定 SHA、VCS 环境以及
 `dpu_common` 的固定版本；同时要求 `net_packet` 处于 `main`/`origin/main`、
 `pcie_work` 处于 `main`/`origin/main`，并且二者都来自指定远程。
@@ -565,15 +563,6 @@ uvm_config_db#(virtio_net_env_config)::set(
 endfunction
 ```
 
-通用寄存器计划仍可使用独立 executor。在 connect 阶段显式绑定已解析的快照，
-随后由调用方的 orchestrator 执行；资源 env 本身不发送配置：
-
-```systemverilog
-function void configure_executor(input dpu_reg_executor injected_executor);
-    injected_executor.bind_topology(device_env.get_snapshot());
-endfunction
-```
-
 After `dpu_device_env` completes `build_phase`, its `get_resource_snapshot()`
 query returns the exact frozen resource authority declared above; VIO children
 receive that same object through `uvm_config_db`.
@@ -634,7 +623,7 @@ runtime state；已发布的 service、local/global qpair identity 和 snapshot 
 [单 env/env_cfg 参考](integration/project/README.md)。
 旧 bootstrap/VIO 双 bank builder、policy 和 dataplane extension 已移除，
 不能继续调用旧 `build_vio_register_plan` / `apply_vio_register_plan` 入口。
-通用寄存器 plan/executor/orchestrator 和独立 `dpu_qsch_topology_generator` 保留。
+通用寄存器 plan/executor/orchestrator 和独立 QSCH generator 已删除。
 
 表格式采用当前图片定义。Notify 为512行单 bank，仅写实际 qpair 的有效项；
 按 Host、BAR 匹配基址和连续 pair 编号排序，global qid 只写入内容。
@@ -647,9 +636,9 @@ QSCH 策略从 `dpu_cfg` 生成，不再挂旧的 plan extension。
 AF extra queue 仍保留为 function-owned 资源，不自动成为 VIO service 的 ring/Notify；
 单 AF PF0 需要32对普通 VIO 时显式设置 `dpu.caps.af_extra_queue_count=0`。
 
-独立 QSCH topology generator 仍提供逻辑 port/group/net/qpair 图及合法随机化；
-当前图片版表策略由 `dpu_env_cfg.vio_policies/platform_controls` 显式声明。
-逻辑图不会自动经已经删除的 driver extension 写入 DUT。
+QSCH 拓扑由 `dpu_env_cfg.vio_policies/platform_controls` 结合冻结资源和实际队列
+统一生成，直接转换为 Q2TC/N2G/G2P/SPWRR/TC weight 表项；不会再产生第二套
+独立拓扑或寄存器写入入口。
 
 ---
 
