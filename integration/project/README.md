@@ -17,6 +17,10 @@ PCIe 使用同一份 BAR 和内存结果。设备配置只走 Memory Read/Write�
 `integration/project/project_vio_packet_checker.sv`。它创建两个 keyed common SCB，
 通过 `virtio_packet_seq` 从每个 Function 的 packet hub 取完整样本；hub 只复制已经完成
 所有 descriptor ownership 处理的报文，不驱动 PCIe，也不拥有 ring 或 Host memory。
+VTX hub 样本是环境发往 DUT 的基准报文，自动进入 `vtx_scb` 的 expected；用户的 DUT
+输出 monitor 需要调用 `push_actual(VIO_PACKET_VTX, dut_tx)`。VRX hub 样本是 DUT
+写回并被环境收到的实际报文，自动进入 `vrx_scb` 的 actual；环境送入 DUT 的参考包
+需要调用 `push_expected(VIO_PACKET_VRX, env_rx)`。
 该文件不在 `project_integration.f` 中，生产环境只需在需要报文比对的 test filelist
 显式加入它，并同时加入已经生成的 `common_lib_pkg.f`。
 
@@ -39,22 +43,26 @@ function void my_env::connect_phase(uvm_phase phase);
 endfunction
 ```
 
-`bind_function()` 要在 `run_phase` 前调用。VTX 或 VRX 的参考样本由用户的 RM 在提交
-或收到业务报文后调用 `push_expected(direction, sample)`；带稳定 `sample.packet_key`
-时会走 keyed API，同一 key 的重复报文按 FIFO 保留，actual 可以先到。没有 key 的样本
-仍按 Host/BDF/PF/VF/local-qid/global-qid 的 flow stream 走兼容 FIFO。样本包含完整
+`bind_function()` 要在 `run_phase` 前调用。用户 RM 对 DUT 的 VTX 输出调用
+`push_actual(VIO_PACKET_VTX, dut_tx)`，对环境送入 DUT 的 VRX 输入调用
+`push_expected(VIO_PACKET_VRX, env_rx)`；带稳定 `sample.packet_key` 时会走 keyed
+API，同一 key 的重复报文按 FIFO 保留，actual 可以先到。没有 key 的样本仍按
+Host/BDF/PF/VF/local-qid/global-qid 的 flow stream 走兼容 FIFO。样本包含完整
 `virtio_net_hdr`、Custom offload、payload、descriptor、Function 身份和 reset epoch，
 用户可以在 RM 中直接 clone 后修改 expected 字段。
 
 ```systemverilog
-virtio_packet_sample expected;
+virtio_packet_sample expected_rx;
 
-expected = virtio_packet_sample::type_id::create("vtx_expected");
-expected.copy_from(generated_packet);
-expected.direction = VIO_PACKET_VTX;
-expected.key_valid = 1;
-expected.packet_key = $sformatf("h%0d-q%0d-%0d", host, qid, seq);
-packet_checker.push_expected(VIO_PACKET_VTX, expected);
+expected_rx = virtio_packet_sample::type_id::create("vrx_expected");
+expected_rx.copy_from(environment_input_packet);
+expected_rx.direction = VIO_PACKET_VRX;
+expected_rx.key_valid = 1;
+expected_rx.packet_key = $sformatf("h%0d-q%0d-%0d", host, qid, seq);
+packet_checker.push_expected(VIO_PACKET_VRX, expected_rx);
+
+// DUT VTX 输出 monitor 得到完整报文后送入 actual。
+packet_checker.push_actual(VIO_PACKET_VTX, dut_tx_sample);
 ```
 
 调用 `packet_checker.shutdown()` 时只停止新业务并排空已经发布的 mailbox；需要解除

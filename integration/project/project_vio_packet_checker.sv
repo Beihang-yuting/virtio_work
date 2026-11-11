@@ -2,8 +2,11 @@
 // project_vio_packet_checker.sv
 // 目录层次：integration/project；VIO 完整报文的可选业务 sidecar 参考实现。
 // 文件职责：在 project_env 外部创建采样 sequence、RM 入口和 keyed common SCB；
-// project_env 不持有此对象，也不因未启用 VIO 而创建任何报文线程。用户可继承
-// 本类覆盖 RM 逻辑，或直接调用 push_expected() 把参考模型结果送入对应 SCB。
+// project_env 不持有此对象，也不因未启用 VIO 而创建任何报文线程。VTX hub 样本
+// 代表环境发往 DUT 的基准报文，自动进入 vtx_scb 的 expected；VRX hub 样本代表
+// DUT 写回并被环境收到的实际报文，自动进入 vrx_scb 的 actual。用户通过
+// push_actual(VIO_PACKET_VTX, dut_tx) 提供 DUT 的 VTX 输出，通过
+// push_expected(VIO_PACKET_VRX, env_rx) 提供 VRX 参考报文。
 // 主要依赖：virtio_net_pkg、simflow/uvm_gen 生成的 common_lib_pkg；AIP 构建时
 // 可选依赖 aip_core_pkg。该文件不加入原始 project_integration.f，只有需要完整
 // 报文检查的 test 才显式加入自己的 filelist。
@@ -71,10 +74,10 @@ class project_vio_packet_checker extends uvm_component;
         virtio_packet_sample sample
     );
 
-    // 功能：把采样到的 actual 样本送入对应方向 SCB。
+    // 功能：把 DUT 侧 actual 样本送入对应方向 SCB。
     // 输入/输出：输入方向和完整样本；无返回值。
-    // 边界/副作用：keyed 样本按 Function/queue stream 独立乱序匹配；空 key 保持
-    // 兼容 stream FIFO，用户若要求跨方向严格配对应在 RM/解析器中补 key。
+    // 边界/副作用：VTX 由用户 DUT 输出 monitor 调用，VRX 通常由内部 worker 自动调用；
+    // keyed 样本按 Function/queue stream 独立乱序匹配，空 key 保持 stream FIFO。
     extern function void push_actual(
         vio_packet_dir_e direction,
         virtio_packet_sample sample
@@ -114,7 +117,8 @@ class project_vio_packet_checker extends uvm_component;
 
     // 功能：在 run_phase 中为每个绑定 Function 启动持久采样 worker。
     // 输入/输出：输入 UVM phase；无输出。
-    // 边界/副作用：无绑定 Function 时不创建线程；线程只取 hub 样本并调用 actual 接口。
+    // 边界/副作用：无绑定 Function 时不创建线程；VTX hub 样本进入 expected，
+    // VRX hub 样本进入 actual。
     extern virtual task run_phase(uvm_phase phase);
 
     // 功能：轮询一个 Function 的 VTX/RX mailbox。
@@ -277,7 +281,9 @@ task project_vio_packet_checker::run_worker(int unsigned index);
             m_sequences[index].mon_xaction(
                 packet, VIO_PACKET_VTX, m_consumer_ids[index], 0);
             if (packet != null) begin
-                push_actual(VIO_PACKET_VTX, packet);
+                // VTX 是环境发往 DUT 的基准报文；DUT 的对应输出由用户
+                // monitor 通过 push_actual(VIO_PACKET_VTX, ...) 提供。
+                push_expected(VIO_PACKET_VTX, packet);
                 got_packet = 1;
             end
         end
@@ -295,7 +301,7 @@ task project_vio_packet_checker::run_worker(int unsigned index);
         m_sequences[index].mon_xaction(
             packet, VIO_PACKET_VTX, m_consumer_ids[index], 1ns);
         if (packet != null) begin
-            push_actual(VIO_PACKET_VTX, packet);
+            push_expected(VIO_PACKET_VTX, packet);
             continue;
         end
         m_sequences[index].mon_xaction(
