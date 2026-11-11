@@ -51,8 +51,7 @@ class virtio_transaction extends uvm_sequence_item;
     rand int unsigned        queue_id;
     uvm_object               packets[$];       // packet_item list (TX input)
     uvm_object               received_pkts[$]; // packet_item list (RX output)
-    int unsigned             expected_count;
-    int unsigned		timeout_ns;       // RX等待或本包TX空间等待预算
+    int unsigned		timeout_ns;       // 本包 TX 空间等待预算
 
     // ===== Control plane fields =====
     rand virtio_ctrl_class_e ctrl_class;
@@ -131,7 +130,7 @@ class virtio_transaction extends uvm_sequence_item;
         printer.print_int("queue_id", queue_id, 32);
         case (txn_type)
             VIO_TXN_SEND_PKTS:  printer.print_int("num_packets", packets.size(), 32);
-            VIO_TXN_WAIT_PKTS:  printer.print_int("expected", expected_count, 32);
+            VIO_TXN_RX_REFILL:  printer.print_int("num_bufs", num_bufs, 32);
             VIO_TXN_CTRL_CMD:   begin
                 printer.print_string("ctrl_class", ctrl_class.name());
                 printer.print_int("ctrl_cmd", ctrl_cmd, 8);
@@ -165,7 +164,6 @@ function virtio_transaction::new(string	name = "virtio_transaction");
     irq_mode = IRQ_MSIX_PER_QUEUE;
     num_vfs = 0;
     queue_id = 0;
-    expected_count = 0;
     timeout_ns = 50000;  // 50us default
     queue_size = 256;
     vq_type = VQ_SPLIT;
@@ -204,7 +202,6 @@ function void virtio_transaction::do_copy(uvm_object	rhs);
         queue_id       = rhs_t.queue_id;
         packets        = rhs_t.packets;
         received_pkts  = rhs_t.received_pkts;
-        expected_count = rhs_t.expected_count;
         timeout_ns     = rhs_t.timeout_ns;
         ctrl_class     = rhs_t.ctrl_class;
         ctrl_cmd       = rhs_t.ctrl_cmd;

@@ -116,7 +116,7 @@ task virtio_driver::process_transaction(virtio_transaction	req);
         VIO_TXN_SEND_PKTS:  fsm.send_packets(req.packets, req.queue_id,
                                            req.tx_offload, req.timeout_ns, req.tx_notify,
                                            req.tx_seg);
-        VIO_TXN_WAIT_PKTS:  fsm.wait_packets(req.expected_count, req.received_pkts, req.timeout_ns);
+        VIO_TXN_RX_REFILL:  ops.rx_refill(req.queue_id, req.num_bufs);
         VIO_TXN_START_DP:   fsm.start_dataplane();
         VIO_TXN_STOP_DP:    fsm.stop_dataplane();
 

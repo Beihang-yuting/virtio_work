@@ -32,7 +32,7 @@ package virtio_aip_pkg;
 		static bit			owner_is_tx[string];
 
 		// 事务级仲裁不能保护MQ/复位与多包流之间的生命周期，因此在命令入口按
-		// service设置租约。仅TX/TX共享；RX会阻塞同一driver，必须避免同时启动。
+		// service设置租约。仅TX/TX共享；补充描述符及生命周期命令按序执行。
 		// 租约只约束本注册表命令；用户直接启动的sequence须由用户串行化生命周期。
 		// 被取消owner遗留租约被回收，但目标标记需reset，绝不假设DMA已撤销。
 		static function bit	acquire(string	command, string	target, bit	is_tx,
@@ -157,14 +157,15 @@ package virtio_aip_pkg;
 		string				result_text;
 		bit				ok;
 		int unsigned			count;
+		int unsigned			queue_id;
 		int unsigned			pair;
 		int unsigned			pkt_len;
 		int unsigned			len_min;
 		int unsigned			len_max;
 		int unsigned			gap_ns;
 		int unsigned			notify_batch;
-		int unsigned			expected;
 		int unsigned			timeout_ns;
+		int unsigned			num_bufs;
 		int unsigned			pairs;
 		packet_template_e		kind;
 		virtio_rss_config_t		rss;
@@ -224,13 +225,9 @@ package virtio_aip_pkg;
 				VIO_TXN_SEND_PKTS: begin
 					pair = scalar("pair", 0);
 				end
-				VIO_TXN_WAIT_PKTS: begin
-					expected = scalar("expected", 1);
-					timeout_ns = scalar("timeout_ns", 50000);
-					if (expected == 0 || timeout_ns == 0) begin
-						result_text = "RX expected and timeout_ns must be positive";
-						return 0;
-					end
+				VIO_TXN_RX_REFILL: begin
+					queue_id = scalar("qid", 0);
+					num_bufs = scalar("count", 0);
 				end
 				VIO_TXN_SET_MQ: pairs = scalar("pairs", 1);
 				VIO_TXN_SET_RSS: begin
@@ -283,7 +280,7 @@ package virtio_aip_pkg;
 			return 1;
 		endfunction
 
-		// 单事务保持标准UVM语义；有限heartbeat覆盖正常TX流控/RX等待，预算后不再tick。
+		// 单事务保持标准 UVM 语义；有限 heartbeat 覆盖 TX 流控等待，预算后不再 tick。
 		// 取消仍由AIP kill处理，不撤回driver已经接受的工作。
 		extern protected task submit(virtio_transaction	item, int unsigned	heartbeat_ns = 0);
 
@@ -315,7 +312,7 @@ package virtio_aip_pkg;
 			end
 		endtask
 
-		// 主体先检查状态，再发事务并核对FSM/ACK/收到数量。全局UVM错误计数采用
+		// 主体先检查状态，再发事务并核对FSM/ACK/补充结果。全局UVM错误计数采用
 		// 保守语义：并发命令产生错误也会使本命令失败，绝不将UVM_ERROR包装成OK。
 		virtual task body();
 			virtio_auto_fsm		fsm;
@@ -333,7 +330,8 @@ package virtio_aip_pkg;
 				result_text = "sequence started on a sequencer belonging to another target"; return;
 			end
 			if (target.driver_agent.ops.uses_external_configuration()) begin
-				if (!(operation inside {VIO_TXN_START_DP, VIO_TXN_SEND_PKTS, VIO_TXN_WAIT_PKTS, VIO_TXN_STOP_DP})) begin
+				if (!(operation inside {VIO_TXN_START_DP, VIO_TXN_SEND_PKTS,
+					VIO_TXN_RX_REFILL, VIO_TXN_STOP_DP})) begin
 					result_text = "external mode accepts business/stop only; platform owns device configuration"; return;
 				end
 				if (!virtio_aip_registry::external_reuse_ready(target_path) && operation != VIO_TXN_STOP_DP) begin
@@ -367,8 +365,11 @@ package virtio_aip_pkg;
 				VIO_TXN_START_DP: if (fsm.state != FSM_READY || !fsm.mq_pair_count_is_committed()) begin
 					result_text = "start requires READY and committed MQ"; return;
 				end
-				VIO_TXN_SEND_PKTS, VIO_TXN_WAIT_PKTS: if (fsm.state != FSM_RUNNING) begin
-					result_text = "TX/RX requires RUNNING"; return;
+				VIO_TXN_SEND_PKTS, VIO_TXN_RX_REFILL: begin
+					if (fsm.state != FSM_RUNNING) begin
+						result_text = "TX/RX requires RUNNING";
+						return;
+					end
 				end
 				VIO_TXN_STOP_DP: if (fsm.state != FSM_RUNNING) begin
 					result_text = "stop requires RUNNING"; return;
@@ -436,21 +437,54 @@ package virtio_aip_pkg;
 				end
 				ok = (fsm.state == FSM_RUNNING);
 				result_text = $sformatf("submitted %0d packets (DUT completion/scoreboard not checked)", count);
-			end else if (operation == VIO_TXN_WAIT_PKTS) begin
-				// 一个真实WAIT事务保持driver原有总超时语义；有限heartbeat只在用户
-				// 等待预算内活动。预算耗尽后停止tick，卡住的driver仍可被AIP watchdog发现。
-				// 这里不注入报文，也不通过重复短wait制造多次中间超时warning。
-				item = virtio_transaction::type_id::create("wait_rx");
-				item.txn_type = VIO_TXN_WAIT_PKTS;
-				item.expected_count = expected;
-				item.timeout_ns = timeout_ns;
-				submit(item, timeout_ns);
-				ok = item.received_pkts.size() >= expected;
-				result_text = $sformatf("RX %s: received=%0d expected=%0d", ok ? "complete" : "timeout/stopped", item.received_pkts.size(), expected);
+			end else if (operation == VIO_TXN_RX_REFILL) begin
+				virtqueue_base	vq;
+				int unsigned	free_before;
+				int unsigned	pending_before;
+				int unsigned	free_after;
+				int unsigned	pending_after;
+
+				if (num_bufs == 0) begin
+					result_text = "RX refill count must be positive";
+					return;
+				end
+				if ((queue_id[0] != 0) ||
+					!target.driver_agent.ops.external_direction_enabled(0)) begin
+					result_text = $sformatf("qid=%0d is not an active RX queue", queue_id);
+					return;
+				end
+				if (target.driver_agent.ops.vq_mgr == null) begin
+					result_text = "RX refill requires a bound virtqueue manager";
+					return;
+				end
+				vq = target.driver_agent.ops.vq_mgr.get_queue(queue_id);
+				if (vq == null) begin
+					result_text = $sformatf("RX queue qid=%0d is not configured", queue_id);
+					return;
+				end
+				free_before = vq.get_free_count();
+				pending_before = vq.get_pending_count();
+				item = virtio_transaction::type_id::create("rx_refill");
+				item.txn_type = VIO_TXN_RX_REFILL;
+				item.queue_id = queue_id;
+				item.num_bufs = num_bufs;
+				submit(item);
+				free_after = vq.get_free_count();
+				pending_after = vq.get_pending_count();
+				ok = (reports.get_severity_count(UVM_ERROR) +
+					reports.get_severity_count(UVM_FATAL) == errors_before);
+				if ((free_before == 0) || (pending_after == pending_before))
+					`uvm_warning("VIO_RX", $sformatf(
+						"RX refill qid=%0d requested=%0d added=0 free=%0d pending=%0d",
+						queue_id, num_bufs, free_after, pending_after))
+				result_text = $sformatf(
+					"RX refill qid=%0d requested=%0d added=%0d free=%0d pending=%0d",
+					queue_id, num_bufs,
+					(pending_after >= pending_before) ? pending_after - pending_before : 0,
+					free_after, pending_after);
 			end else begin
 				item = virtio_transaction::type_id::create("operation");
 				item.txn_type = operation;
-				item.expected_count = expected;
 				item.timeout_ns = timeout_ns;
 				item.num_pairs = pairs;
 				item.rss_cfg = rss;
@@ -496,8 +530,8 @@ package virtio_aip_pkg;
 					end
 					default: ok = 0;
 				endcase
-				result_text = $sformatf("%s %s; state=%s received=%0d", operation.name(),
-					ok ? "completed" : "failed", fsm.state.name(), item.received_pkts.size());
+				result_text = $sformatf("%s %s; state=%s", operation.name(),
+					ok ? "completed" : "failed", fsm.state.name());
 			end
 			if (errors_before != reports.get_severity_count(UVM_ERROR) + reports.get_severity_count(UVM_FATAL)) begin
 				ok = 0;
@@ -604,15 +638,20 @@ package virtio_aip_pkg;
 			background_allowed = 1;
 			group = "virtio";
 			description = "Virtio sequence command; TX success means submission only";
-			param_info = (op == VIO_TXN_SEND_PKTS) ? "count=<positive integer> [wait=0]" : "[wait=0]";
+			param_info = (op == VIO_TXN_SEND_PKTS) ? "count=<positive integer> [wait=0]" :
+				(op == VIO_TXN_RX_REFILL) ? "qid=<even RX qid> count=<positive integer>" :
+				"[wait=0]";
 		endfunction
 
 		// 启动前登记使AIP能按调用取消；正常退出注销。取消不能回滚driver在途事务。
 		virtual task cmd_exec();
 			virtio_aip_sequence	seq;
 			string			count_text;
+			string			qid_text;
 			longint unsigned	parsed_count;
+			longint unsigned	parsed_qid;
 			int			width;
+			int			qid_width;
 
 			seq = virtio_aip_sequence::type_id::create(cmd_name);
 			seq.operation = operation;
@@ -622,8 +661,13 @@ package virtio_aip_pkg;
 			if (aip_cmd::get_arg(args_in, "time") != "") begin
 				result_out = "time is unsupported; vio_tx supports finite count only"; return;
 			end
-			if (operation != VIO_TXN_SEND_PKTS && aip_cmd::get_arg(args_in, "count") != "") begin
-				result_out = "count is supported only by TX commands"; return;
+			if (!(operation inside {VIO_TXN_SEND_PKTS, VIO_TXN_RX_REFILL}) &&
+				aip_cmd::get_arg(args_in, "count") != "") begin
+				result_out = "count is supported only by TX/refill commands"; return;
+			end
+			if (!seq.load_params(parameter_path) || !seq.ready_binding()) begin
+				result_out = seq.result_text;
+				return;
 			end
 			if (operation == VIO_TXN_SEND_PKTS) begin
 				count_text = aip_cmd::get_arg(args_in, "count");
@@ -640,9 +684,30 @@ package virtio_aip_pkg;
 					seq.count = int'(parsed_count);
 				end
 			end
-			if (!seq.load_params(parameter_path) || !seq.ready_binding()) begin
-				result_out = seq.result_text;
-				return;
+			if (operation == VIO_TXN_RX_REFILL) begin
+				count_text = aip_cmd::get_arg(args_in, "count");
+				if (count_text != "") begin
+					if (aip_str::str_find(count_text, "-") >= 0) begin
+						result_out = "count must be a positive integer literal, not a negative value"; return;
+					end
+					parsed_count = aip_str::str_to_num(count_text, width);
+					if (width == 0 || parsed_count == 0 || parsed_count > 32'h7fffffff) begin
+						result_out = "count must be a positive 31-bit integer literal"; return;
+					end
+					seq.num_bufs = int'(parsed_count);
+				end
+				qid_text = aip_cmd::get_arg(args_in, "qid");
+				if (qid_text == "") begin
+					result_out = "vio_rx_refill requires qid=<even RX queue id>"; return;
+				end
+				if (aip_str::str_find(qid_text, "-") >= 0) begin
+					result_out = "qid must be an unsigned integer literal"; return;
+				end
+				parsed_qid = aip_str::str_to_num(qid_text, qid_width);
+				if (qid_width == 0 || parsed_qid > 32'hffff_ffff) begin
+					result_out = "qid must be an unsigned 32-bit integer literal"; return;
+				end
+				seq.queue_id = int'(parsed_qid);
 			end
 			if (!virtio_aip_registry::acquire(cmd_name, seq.target_path,
 				operation == VIO_TXN_SEND_PKTS, result_out)) return;
@@ -657,9 +722,17 @@ package virtio_aip_pkg;
 
 	// 整组预检名称，避免碰撞后只注册一半；允许先bind或先register，执行时统一预检。
 	function bit	virtio_aip_registry::register_commands(output string	why);
-		string			names[$] = '{"vio_init", "vio_start", "vio_tx", "vio_wait_rx", "vio_set_mq", "vio_set_rss", "vio_stop", "vio_reset"};
-		string			paths[$] = '{"vio", "vio", "vio.tx", "vio.rx", "vio.mq", "vio.rss", "vio", "vio"};
-		virtio_txn_type_e	ops[$] = '{VIO_TXN_INIT, VIO_TXN_START_DP, VIO_TXN_SEND_PKTS, VIO_TXN_WAIT_PKTS, VIO_TXN_SET_MQ, VIO_TXN_SET_RSS, VIO_TXN_STOP_DP, VIO_TXN_RESET};
+		string			names[$] = '{
+			"vio_init", "vio_start", "vio_tx", "vio_rx_refill",
+			"vio_set_mq", "vio_set_rss", "vio_stop", "vio_reset"
+		};
+		string			paths[$] = '{
+			"vio", "vio", "vio.tx", "vio.rx", "vio.mq", "vio.rss", "vio", "vio"
+		};
+		virtio_txn_type_e	ops[$] = '{
+			VIO_TXN_INIT, VIO_TXN_START_DP, VIO_TXN_SEND_PKTS, VIO_TXN_RX_REFILL,
+			VIO_TXN_SET_MQ, VIO_TXN_SET_RSS, VIO_TXN_STOP_DP, VIO_TXN_RESET
+		};
 		virtio_aip_command	command;
 
 		why = "";
@@ -692,9 +765,11 @@ package virtio_aip_pkg;
 
 	// 名称整组预检，外部项目不重新注册已移除的设备 reset/init/MQ/RSS 链。
 	function bit virtio_aip_registry::register_business_commands(output string why);
-		string	names[$] = '{"vio_start", "vio_tx", "vio_wait_rx", "vio_stop"};
-		string	paths[$] = '{"vio", "vio.tx", "vio.rx", "vio"};
-		virtio_txn_type_e	ops[$] = '{VIO_TXN_START_DP, VIO_TXN_SEND_PKTS, VIO_TXN_WAIT_PKTS, VIO_TXN_STOP_DP};
+		string			names[$] = '{"vio_start", "vio_tx", "vio_rx_refill", "vio_stop"};
+		string			paths[$] = '{"vio", "vio.tx", "vio.rx", "vio"};
+		virtio_txn_type_e	ops[$] = '{
+			VIO_TXN_START_DP, VIO_TXN_SEND_PKTS, VIO_TXN_RX_REFILL, VIO_TXN_STOP_DP
+		};
 		virtio_aip_command	command;
 		why = "";
 		foreach (names[i]) begin

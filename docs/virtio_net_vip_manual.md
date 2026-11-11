@@ -595,7 +595,7 @@ static function void unpack_hdr(byte unsigned data[$], bit [63:0] features,
 | | `VIO_TXN_RESET` | 设备重置 |
 | | `VIO_TXN_SHUTDOWN` | 关闭数据面 |
 | 数据面 | `VIO_TXN_SEND_PKTS` | 发送报文 |
-| | `VIO_TXN_WAIT_PKTS` | 等待接收报文 |
+| | `VIO_TXN_RX_REFILL` | 按指定 RX qid 补充描述符并按需通知设备 |
 | | `VIO_TXN_START_DP` | 启动数据面 |
 | | `VIO_TXN_STOP_DP` | 停止数据面 |
 | 控制面 | `VIO_TXN_CTRL_CMD` | 控制 VQ 命令 |
@@ -607,6 +607,9 @@ static function void unpack_hdr(byte unsigned data[$], bit [63:0] features,
 | 队列管理 | `VIO_TXN_RESET_QUEUE` | 单队列重置 |
 | | `VIO_TXN_SETUP_QUEUE` | 队列配置 |
 | 错误注入 | `VIO_TXN_INJECT_ERROR` | 注入错误 |
+
+启动数据面后，后台 worker 持续收包，`rx_auto_refill` 控制是否自动补充 RX 描述符。
+结束时 agent 自动打印累计 RX 统计；手工原子收包仍可使用 `ATOMIC_RX_RECEIVE`。
 
 ### 4.2 等待策略框架 (shared/virtio_wait_policy)
 

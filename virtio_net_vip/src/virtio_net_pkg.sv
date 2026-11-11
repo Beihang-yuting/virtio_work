@@ -38,6 +38,7 @@ package virtio_net_pkg;
   // ---------------------------------------------------------------------------
   `include "types/virtio_net_types.sv"
   `include "types/virtio_net_hdr.sv"
+  `include "types/virtio_packet_sample.sv"
   `include "shared/virtio_wait_policy.sv"
   `include "shared/virtio_memory_barrier_model.sv"
 
@@ -84,6 +85,7 @@ package virtio_net_pkg;
   // 第 5 层 – 事务与驱动 agent（types/、agent/）
   // ---------------------------------------------------------------------------
   `include "types/virtio_transaction.sv"
+  `include "agent/virtio_packet_hub.sv"
   // The RX responder accepts external net_packet objects, so the byte-stream
   // adapter must be visible before the agent/responder classes are compiled.
   `include "dataplane/virtio_net_packet_adapter.sv"
@@ -131,6 +133,7 @@ package virtio_net_pkg;
   `include "sriov/virtio_vf_instance.sv"
   `include "sriov/virtio_pf_manager.sv"
   `include "sriov/virtio_pf_instance.sv"
+  `include "agent/virtio_packet_seq.sv"
 
   // ---------------------------------------------------------------------------
   // 第 8 层 – 顶层环境（env/）

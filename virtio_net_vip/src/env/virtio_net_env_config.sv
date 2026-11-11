@@ -131,7 +131,9 @@ class virtio_net_env_config extends uvm_object;
     int unsigned		default_rx_buf_size = 1526;
     bit [31:0]			default_rx_packet_size = 0;
 
-    int unsigned         default_rx_refill_threshold = 16;
+    // 自动补充默认开启；关闭时初次与后续投递都由指定 qid 的 RX refill 命令完成。
+    int unsigned		default_rx_refill_threshold = 16;
+    bit				default_rx_auto_refill      = 1;
     int unsigned         default_mtu = 1500;
     int unsigned         default_mss = 1460;
     driver_mode_e        default_driver_mode = DRV_MODE_AUTO;
@@ -791,6 +793,7 @@ function void virtio_net_env_config::set_requirement_defaults(input vio_service_
     default_napi_budget         = requirement.behavior.napi_budget;
     default_rx_packet_size      = requirement.behavior.rx_packet_size;
     default_rx_refill_threshold = requirement.behavior.rx_refill_threshold;
+    default_rx_auto_refill      = requirement.behavior.rx_auto_refill;
 endfunction
 
 
@@ -819,6 +822,8 @@ function void virtio_net_env_config::inherit_requirement(
     if (present) requirement.behavior.rx_packet_size = default_rx_packet_size;
     `DPU_AIP_PRESENT(path, "rx_refill", present)
     if (present) requirement.behavior.rx_refill_threshold = default_rx_refill_threshold;
+    `DPU_AIP_PRESENT(path, "rx_auto_refill", present)
+    if (present) requirement.behavior.rx_auto_refill = default_rx_auto_refill;
     `DPU_AIP_PRESENT(path, "enabled", present)
     if (present) requirement.enabled = enabled;
     `DPU_AIP_PRESENT(path, "tx_enable", present)
@@ -1277,6 +1282,7 @@ function void virtio_net_env_config::load_driver_params(string	path, ref virtio_
     longint unsigned			queue_size;
     longint unsigned			napi_budget;
     longint unsigned			rx_refill;
+    longint unsigned			rx_auto_refill;
     longint unsigned			rx_buf_size;
     bit					rx_size_present;
     virtqueue_type_e			queue_type;
@@ -1286,6 +1292,7 @@ function void virtio_net_env_config::load_driver_params(string	path, ref virtio_
     `DPU_AIP_UINT(path, longint unsigned, queue_size, behavior.queue_size);
     `DPU_AIP_UINT(path, longint unsigned, napi_budget, behavior.napi_budget);
     `DPU_AIP_UINT(path, longint unsigned, rx_refill, behavior.rx_refill_threshold);
+    `DPU_AIP_UINT(path, longint unsigned, rx_auto_refill, behavior.rx_auto_refill);
     `DPU_AIP_PRESENT(path, "rx_buf_size", rx_size_present)
     `DPU_AIP_UINT(path, longint unsigned, rx_buf_size, behavior.rx_packet_size);
     `aip_enum(path, virtqueue_type_e, queue_type, behavior.vq_type);
@@ -1299,14 +1306,16 @@ function void virtio_net_env_config::load_driver_params(string	path, ref virtio_
         ((queue_size != 0) && ((queue_size < 2) || (queue_size > 32768) ||
           ((queue_size & (queue_size - 1)) != 0))) ||
         (napi_budget == 0) || (napi_budget > 64'hffff_ffff) ||
-        (rx_refill == 0) || (rx_refill > 64'hffff_ffff)) begin
-        `uvm_fatal("VIO_PARAM", {path, ": pairs/queue_size/napi_budget/rx_refill 超出有效范围"})
+        (rx_refill == 0) || (rx_refill > 64'hffff_ffff) ||
+        (rx_auto_refill > 1)) begin
+        `uvm_fatal("VIO_PARAM", {path, ": pairs/queue_size/napi_budget/rx_refill/rx_auto_refill 超出有效范围"})
         return;
     end
     behavior.num_queue_pairs         = int'(pairs);
     behavior.queue_size              = int'(queue_size);
     behavior.napi_budget             = int'(napi_budget);
     behavior.rx_refill_threshold     = int'(rx_refill);
+    behavior.rx_auto_refill          = bit'(rx_auto_refill);
     behavior.rx_packet_size          = int'(rx_buf_size);
     behavior.vq_type                 = queue_type;
     behavior.driver_features         = features;
@@ -1344,6 +1353,7 @@ function void virtio_net_env_config::copy_defaults_from(virtio_net_env_config	rh
     default_rx_buf_size              = rhs.default_rx_buf_size;
     default_rx_packet_size           = rhs.default_rx_packet_size;
     default_rx_refill_threshold      = rhs.default_rx_refill_threshold;
+    default_rx_auto_refill           = rhs.default_rx_auto_refill;
     default_mtu                      = rhs.default_mtu;
     default_mss                      = rhs.default_mss;
     default_driver_mode              = rhs.default_driver_mode;
@@ -1380,6 +1390,7 @@ function virtio_driver_config_t virtio_net_env_config::make_default_driver_confi
     cfg.rx_buf_size                  = default_rx_buf_size;
     cfg.rx_packet_size               = default_rx_packet_size;
     cfg.rx_refill_threshold          = default_rx_refill_threshold;
+    cfg.rx_auto_refill               = default_rx_auto_refill;
     cfg.irq_mode                     = (completion_mode == VIRTIO_COMPLETION_POLLING) ?
                               IRQ_POLLING : default_irq_mode;
     cfg.napi_budget                  = default_napi_budget;

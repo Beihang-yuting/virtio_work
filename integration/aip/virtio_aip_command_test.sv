@@ -24,7 +24,7 @@ class virtio_aip_recording_driver extends virtio_driver;
 		super.new(name, parent);
 	endfunction
 
-	// TX只记录；生命周期只推进测试FSM，RX保持空以检验超时失败。
+	// 记录实际提交的事务；生命周期只推进测试 FSM，不启动真实收包或 DMA。
 	protected virtual task process_transaction(virtio_transaction	req);
 		seen.push_back(req);
 		seen_times.push_back($realtime);
@@ -152,7 +152,7 @@ class virtio_aip_command_test extends uvm_test;
 	// 固定32包的尾批、随机批大小和逐包默认值；检查实际送到driver的通知标志。
 	extern task check_notify_batches(virtio_aip_recording_driver	driver);
 
-	// 顺序覆盖空registry、双host路由、TX报文、活动pair范围及非注入RX超时。
+	// 顺序覆盖空 registry、双 Host 路由、TX 报文、活动 pair 范围及 RX 补充预检。
 	virtual task run_phase(uvm_phase	phase);
 		string				why;
 		string				negative_mode;
@@ -165,6 +165,8 @@ class virtio_aip_command_test extends uvm_test;
 
 		phase.raise_objection(this);
 		if (!virtio_aip_registry::register_commands(why)) `uvm_fatal("AIP_TEST", why)
+		if (aip_cmd::get_handle("vio_wait_rx") != null)
+			`uvm_error("AIP_TEST", "obsolete RX wait command is still registered")
 		command("vio_init", 0);
 		if (!virtio_aip_registry::bind_env(env, why)) `uvm_fatal("AIP_TEST", why)
 		if (!$cast(driver0, env.function_instances[0].driver_agent.driver) ||
@@ -260,8 +262,10 @@ class virtio_aip_command_test extends uvm_test;
 		command("vio_start", 0);
 		command("vio_init", 1);
 		command("vio_start", 1);
-		aip_cmdline_override::set_val("vio.rx.timeout_ns", "3");
-		command("vio_wait_rx", 0);
+		command("vio_rx_refill count=1", 0);
+		command("vio_rx_refill qid=1 count=1", 0);
+		command("vio_rx_refill qid=0 count=1", 0);
+		command("vio_stop", 1);
 		if (driver1.seen.size() < 3) `uvm_error("AIP_TEST", "second host did not receive operations")
 		phase.drop_objection(this);
 	endtask

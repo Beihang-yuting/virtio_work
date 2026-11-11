@@ -221,12 +221,13 @@ typedef enum {
 
 typedef enum {
     VIO_TXN_INIT, VIO_TXN_RESET, VIO_TXN_SHUTDOWN,
-    VIO_TXN_SEND_PKTS, VIO_TXN_WAIT_PKTS, VIO_TXN_START_DP, VIO_TXN_STOP_DP,
+    // 删除同步 RX 等待后保留后续事务编码；收包由后台 worker 或原子接口执行。
+    VIO_TXN_SEND_PKTS, VIO_TXN_START_DP = 5, VIO_TXN_STOP_DP,
     VIO_TXN_CTRL_CMD, VIO_TXN_SET_MQ, VIO_TXN_SET_RSS,
     VIO_TXN_ATOMIC_OP,
     VIO_TXN_FREEZE, VIO_TXN_RESTORE,
     VIO_TXN_RESET_QUEUE, VIO_TXN_SETUP_QUEUE,
-    VIO_TXN_INJECT_ERROR
+    VIO_TXN_INJECT_ERROR, VIO_TXN_RX_REFILL
 } virtio_txn_type_e;
 
 typedef enum {
@@ -407,6 +408,8 @@ typedef struct {
     int unsigned		rx_buf_size;
     bit [31:0]			rx_packet_size;
     int unsigned		rx_refill_threshold;
+    // 仅控制预填和自动补充，不改变队列的 polling/MSI-X completion 模式。
+    bit				rx_auto_refill;
     interrupt_mode_e		irq_mode;
     int unsigned		napi_budget;
     int unsigned		coal_max_packets;

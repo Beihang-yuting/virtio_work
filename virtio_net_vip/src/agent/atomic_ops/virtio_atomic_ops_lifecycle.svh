@@ -91,6 +91,7 @@
         ctrl_recovery_pending = 0;
         negotiated_features = '0;
         queue_recovery_pending = 0;
+        packet_reset_epoch++;
 
         `uvm_info("ATOMIC_OPS", "device_reset: complete", UVM_MEDIUM)
     endtask

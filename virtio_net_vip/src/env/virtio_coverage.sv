@@ -4,6 +4,9 @@
 // ============================================================================
 // virtio_coverage
 //
+// src/env：被动采样 monitor/事务；组件与 covergroup 由 env 创建并随仿真结束。
+// 借用事务数据，不拥有队列或 DMA；RX 按实际收到的报文采样，无需独立等待事务。
+//
 // 8-covergroup functional coverage collector for virtio-net transactions.
 // Receives transactions via uvm_analysis_imp, extracts sampling state, and
 // samples enabled covergroups.
@@ -145,7 +148,6 @@ class virtio_coverage extends uvm_component;
         }
         cp_txn_type: coverpoint sampled_txn_type {
             bins send    = {VIO_TXN_SEND_PKTS};
-            bins wait_rx = {VIO_TXN_WAIT_PKTS};
             bins ctrl    = {VIO_TXN_CTRL_CMD};
             bins atomic  = {VIO_TXN_ATOMIC_OP};
         }
@@ -296,76 +298,11 @@ class virtio_coverage extends uvm_component;
     endfunction
 
     // ========================================================================
-    // write -- Analysis port callback
-    //
-    // Extract sampling state from each transaction and sample enabled
-    // covergroups.
+    // 提取事务结果并采样已启用的覆盖组；RX 以实际返回报文数为准，空结果不采样数据面。
+    // 不主动取包或影响 worker，关闭总开关时直接返回。
     // ========================================================================
 
-    virtual function void write(virtio_transaction txn);
-        if (!cov_enable) return;
-
-        // Extract common sampling state
-        sampled_txn_type = txn.txn_type;
-        sampled_queue_id = txn.queue_id;
-        sampled_vq_type  = txn.vq_type;
-        sampled_features = txn.features;
-        sampled_irq_mode = txn.irq_mode;
-        sampled_vf_count = txn.num_vfs;
-        sampled_pkt_size = txn.monitor_length;
-
-        // Extract transaction-specific state
-        case (txn.txn_type)
-            VIO_TXN_SEND_PKTS: begin
-                sampled_burst_len  = txn.packets.size();
-                sampled_hdr_flags  = txn.net_hdr.flags;
-                sampled_gso_type   = txn.net_hdr.gso_type;
-                sampled_gso_size   = txn.net_hdr.gso_size;
-            end
-            VIO_TXN_WAIT_PKTS: begin
-                sampled_burst_len = txn.received_pkts.size();
-            end
-            VIO_TXN_INIT: begin
-                sampled_dev_status = device_status_e'(txn.status_val);
-                sampled_queue_size = txn.queue_size;
-            end
-            VIO_TXN_INJECT_ERROR: begin
-                sampled_err_type = txn.vq_error_type;
-            end
-            VIO_TXN_SETUP_QUEUE: begin
-                sampled_queue_size = txn.queue_size;
-            end
-            default: ;
-        endcase
-
-        // Sample enabled covergroups
-        if (cov_feature_enable && sampled_features != '0)
-            cg_features.sample();
-
-        if (cov_queue_enable)
-            cg_queue_ops.sample();
-
-        if (cov_dataplane_enable &&
-            (txn.txn_type == VIO_TXN_SEND_PKTS || txn.txn_type == VIO_TXN_WAIT_PKTS))
-            cg_dataplane.sample();
-
-        if (cov_offload_enable && txn.txn_type == VIO_TXN_SEND_PKTS)
-            cg_offload.sample();
-
-        if (cov_notification_enable)
-            cg_notification.sample();
-
-        if (cov_error_enable && txn.txn_type == VIO_TXN_INJECT_ERROR)
-            cg_errors.sample();
-
-        if (cov_lifecycle_enable &&
-            (txn.txn_type inside {VIO_TXN_INIT, VIO_TXN_RESET, VIO_TXN_SHUTDOWN,
-                                   VIO_TXN_FREEZE, VIO_TXN_RESTORE}))
-            cg_lifecycle.sample();
-
-        if (cov_sriov_enable)
-            cg_sriov.sample();
-    endfunction
+    extern virtual function void write(virtio_transaction	txn);
 
     // ========================================================================
     // report_phase -- Report coverage percentages
@@ -403,5 +340,71 @@ class virtio_coverage extends uvm_component;
     endfunction
 
 endclass : virtio_coverage
+
+// 根据实际事务和收到的报文采样；空 RX 不增加数据面覆盖，关闭开关时无副作用。
+function void virtio_coverage::write(virtio_transaction	txn);
+    if (!cov_enable) return;
+
+    // Extract common sampling state
+    sampled_txn_type = txn.txn_type;
+    sampled_queue_id = txn.queue_id;
+    sampled_vq_type  = txn.vq_type;
+    sampled_features = txn.features;
+    sampled_irq_mode = txn.irq_mode;
+    sampled_vf_count = txn.num_vfs;
+    sampled_pkt_size = txn.monitor_length;
+
+    // Extract transaction-specific state
+    case (txn.txn_type)
+        VIO_TXN_SEND_PKTS: begin
+            sampled_burst_len  = txn.packets.size();
+            sampled_hdr_flags  = txn.net_hdr.flags;
+            sampled_gso_type   = txn.net_hdr.gso_type;
+            sampled_gso_size   = txn.net_hdr.gso_size;
+        end
+        VIO_TXN_INIT: begin
+            sampled_dev_status = device_status_e'(txn.status_val);
+            sampled_queue_size = txn.queue_size;
+        end
+        VIO_TXN_INJECT_ERROR: begin
+            sampled_err_type = txn.vq_error_type;
+        end
+        VIO_TXN_SETUP_QUEUE: begin
+            sampled_queue_size = txn.queue_size;
+        end
+        default: ;
+    endcase
+
+    if (txn.received_pkts.size() != 0)
+        sampled_burst_len = txn.received_pkts.size();
+
+    // Sample enabled covergroups
+    if (cov_feature_enable && sampled_features != '0)
+        cg_features.sample();
+
+    if (cov_queue_enable)
+        cg_queue_ops.sample();
+
+    if (cov_dataplane_enable &&
+        (txn.txn_type == VIO_TXN_SEND_PKTS || txn.received_pkts.size() != 0))
+        cg_dataplane.sample();
+
+    if (cov_offload_enable && txn.txn_type == VIO_TXN_SEND_PKTS)
+        cg_offload.sample();
+
+    if (cov_notification_enable)
+        cg_notification.sample();
+
+    if (cov_error_enable && txn.txn_type == VIO_TXN_INJECT_ERROR)
+        cg_errors.sample();
+
+    if (cov_lifecycle_enable &&
+        (txn.txn_type inside {VIO_TXN_INIT, VIO_TXN_RESET, VIO_TXN_SHUTDOWN,
+                               VIO_TXN_FREEZE, VIO_TXN_RESTORE}))
+        cg_lifecycle.sample();
+
+    if (cov_sriov_enable)
+        cg_sriov.sample();
+endfunction
 
 `endif // VIRTIO_COVERAGE_SV

@@ -450,75 +450,6 @@ class virtio_auto_fsm extends uvm_report_object;
         virtio_tx_seg_t	tx_seg = '0
     );
 
-    // ------------------------------------------------------------------------
-    // wait_packets -- Wait for packets to arrive on receive queues
-    //
-    // Uses mixed event + polling approach (no bare #delay).
-    // Loop until count >= expected or timeout, using isolated wait blocks.
-    // ------------------------------------------------------------------------
-    virtual task wait_packets(
-        int unsigned expected_count,
-        ref uvm_object received[$],
-        int unsigned timeout_ns
-    );
-        int unsigned   count = 0;
-        realtime       start_time;
-        int unsigned   interval;
-        int unsigned   budget;
-        int unsigned   eff_timeout;
-
-        interval    = ops.wait_pol.default_poll_interval_ns;
-        budget      = drv_cfg.napi_budget;
-        if (budget == 0) budget = 64;
-        eff_timeout = ops.wait_pol.effective_timeout(timeout_ns);
-        start_time  = $realtime;
-
-        `uvm_info("AUTO_FSM",
-            $sformatf("wait_packets: expecting %0d, timeout=%0dns", expected_count, eff_timeout),
-            UVM_MEDIUM)
-
-        while (count < expected_count) begin
-            realtime elapsed_ns;
-            elapsed_ns = ($realtime - start_time) / 1ns;
-
-            if (elapsed_ns >= eff_timeout) begin
-                `uvm_warning("AUTO_FSM",
-                    $sformatf("wait_packets: timeout after %0dns, received %0d/%0d",
-                              eff_timeout, count, expected_count))
-                return;
-            end
-
-            if (!dataplane_running) begin
-                `uvm_info("AUTO_FSM",
-                    "wait_packets: dataplane stopped, exiting wait", UVM_MEDIUM)
-                return;
-            end
-
-            // Wait for used ring event or poll interval (isolated wait)
-            wait_event_or_stop(used_ring_updated_event, interval);
-
-            if (!dataplane_running)
-                return;
-
-            // Poll all receive queues for new packets
-            for (int unsigned i = 0; i < active_num_pairs; i++) begin
-                int unsigned rx_qid = i * 2;
-                uvm_object   rx_pkts[$];
-
-                ops.rx_receive(rx_qid, rx_pkts, budget);
-
-                foreach (rx_pkts[j]) begin
-                    received.push_back(rx_pkts[j]);
-                    count++;
-                    packet_completed_event.trigger();
-                end
-            end
-        end
-
-        `uvm_info("AUTO_FSM",
-            $sformatf("wait_packets: received %0d/%0d", count, expected_count), UVM_MEDIUM)
-    endtask
-
     // ========================================================================
     // Reconfiguration
     // ========================================================================
@@ -1071,7 +1002,7 @@ class virtio_auto_fsm extends uvm_report_object;
     // ========================================================================
 
     // ------------------------------------------------------------------------
-    // rx_refill_loop -- Periodically refill RX buffers for a queue
+    // rx_refill_loop -- Poll RX completions and optionally refill a queue
     // ------------------------------------------------------------------------
     extern protected virtual task rx_refill_loop(
         int unsigned queue_id, int unsigned worker_epoch
@@ -1354,10 +1285,11 @@ task virtio_auto_fsm::start_dataplane();
     run_epoch = dataplane_epoch;
     state = FSM_RUNNING;
 
-    // Pre-fill RX buffers for all receive queues (even-numbered queues)
+    // Pre-fill RX buffers only when automatic refill is enabled.  Manual mode
+    // starts the poller with an empty queue and waits for vio_rx_refill.
     for (int unsigned	i = 0; i < active_num_pairs; i++) begin
         int unsigned	rx_qid = i * 2;
-        if (ops.external_direction_enabled(0))
+        if (ops.external_direction_enabled(0) && drv_cfg.rx_auto_refill)
             ops.rx_refill(rx_qid, drv_cfg.queue_size, rx_buffer_size());
     end
 
@@ -1458,42 +1390,73 @@ task virtio_auto_fsm::reset_single_queue(int unsigned	queue_id);
 endtask
 
 
-// 本代 worker 周期检查空闲描述符；达到阈值后按配置容量补充，停止请求后退出。
+// 本代 worker 持续轮询 RX completion；自动补充模式在空闲槽达到阈值后补充，
+// 手动模式只告警并等待用户通过 vio_rx_refill 指定队列和数量。
 task virtio_auto_fsm::rx_refill_loop(
     int unsigned	queue_id, int unsigned	worker_epoch
 );
     int unsigned	interval;
     int unsigned	threshold;
+    int unsigned	budget;
+    bit			starved_reported;
 
     interval  = ops.wait_pol.default_poll_interval_ns;
+    budget    = drv_cfg.napi_budget;
+    if (budget == 0)
+        budget = 64;
     threshold = drv_cfg.rx_refill_threshold;
     if (threshold == 0)
         threshold = drv_cfg.queue_size / 4;
+    starved_reported = 0;
 
     `uvm_info("AUTO_FSM",
-        $sformatf("rx_refill_loop: queue_id=%0d started, threshold=%0d",
-                  queue_id, threshold), UVM_HIGH)
+        $sformatf("rx_poll_loop: queue_id=%0d started, auto_refill=%0b threshold=%0d",
+                  queue_id, drv_cfg.rx_auto_refill, threshold), UVM_HIGH)
 
     while (dataplane_worker_may_run(worker_epoch)) begin
         virtqueue_base	vq;
+        uvm_object	received[$];
 
         // Wait for event or poll interval (isolated wait)
         wait_event_or_stop(used_ring_updated_event, interval);
 
         if (!dataplane_worker_may_run(worker_epoch)) return;
 
-        // Check if refill is needed
         vq = ops.vq_mgr.get_queue(queue_id);
+
+        // Poll the ring before consuming an MSI-X completion permit.  This
+        // keeps a notification pending when the posted write has not reached
+        // the ring yet.  An empty posted set is normal in manual mode.
+        if ((vq != null) && vq.vq_poll(0))
+            ops.rx_receive(queue_id, received, budget);
+        if (received.size() != 0)
+            packet_completed_event.trigger();
+
+        // Check if refill is needed
         if (vq != null) begin
             int unsigned	free_count = vq.get_free_count();
-            if (free_count >= threshold) begin
+            int unsigned	pending_count = vq.get_pending_count();
+
+            if (drv_cfg.rx_auto_refill && free_count >= threshold)
                 ops.rx_refill(queue_id, free_count, rx_buffer_size());
+
+            pending_count = vq.get_pending_count();
+            if ((pending_count == 0) && (vq.get_free_count() != 0)) begin
+                if (!starved_reported) begin
+                    `uvm_warning("VIO_RX", $sformatf(
+                        "RX descriptors exhausted: queue_id=%0d free=%0d pending=%0d auto_refill=%0b; waiting for refill",
+                        queue_id, vq.get_free_count(), pending_count,
+                        drv_cfg.rx_auto_refill))
+                    starved_reported = 1;
+                end
+            end else if (pending_count != 0) begin
+                starved_reported = 0;
             end
         end
     end
 
     `uvm_info("AUTO_FSM",
-        $sformatf("rx_refill_loop: queue_id=%0d exiting", queue_id), UVM_HIGH)
+        $sformatf("rx_poll_loop: queue_id=%0d exiting", queue_id), UVM_HIGH)
 endtask
 
 

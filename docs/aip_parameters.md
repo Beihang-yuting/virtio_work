@@ -5,7 +5,7 @@
 构造函数、复制和普通 `get` 不会重新读取全局参数。
 
 本页同时保留普通标准驱动和项目外部配置入口。普通入口可执行 init/reset/MQ/RSS；
-[项目外部配置](#项目外部配置参数)的业务命令为 start/tx/wait_rx/stop，设备配置由 typed hook 承担。
+[项目外部配置](#项目外部配置参数)的业务命令为 start/tx/rx_refill/stop，设备配置由 typed hook 承担。
 参考 `project_env` 另注册 `load_params` 与无参 `vio_release`；后者自动停止 VIO worker 并回收
 全部 Host 的 VIO 队列资源，调用时机由用户安排，见[收尾示例](../integration/project/README.md#tcl-停止和资源释放)。
 
@@ -82,6 +82,7 @@ rg -n 'net_packet_pkg\.sv|core/packet\.sv' compile.log
 | `vio.queue_type` | `VQ_SPLIT`，亦可选择实际支持的队列格式 |
 | `vio.features` | 64 位 driver feature 掩码；默认全 1，最终仍需设备协商 |
 | `vio.napi_budget` / `vio.rx_refill` | 默认 64 / 16，正整数 |
+| `vio.rx_auto_refill` | 默认 1；启动时预填 RX 描述符，运行中自动补充。设为 0 时首次及后续投递均由 `vio_rx_refill qid=N count=M` 完成；在配置队列前通过 `load_params` 加载 |
 | `vio.rx_buf_size` | 标准 RX 单个 buffer 的报文容量，**不含 `virtio_net_hdr`**；环境按最终特性加头。未设置时保留原有总容量，当前 external Packed 默认 1526B |
 | `vio.exec_mode` | `VIRTIO_EXEC_MODEL` 或 `VIRTIO_EXEC_REAL_DUT` |
 | `vio.completion_mode` | `VIRTIO_COMPLETION_MSIX` 或 `VIRTIO_COMPLETION_POLLING` |
@@ -374,12 +375,14 @@ endfunction
 
 run_phase 持有 objection，完成注册后调用 `aip_tcl_bridge::run_loop()`；
 Tcl `end_test` 使其返回，再释放 objection。参考 `virtio_aip_driver_test.sv`。
-普通 legacy 注册的默认命令是 `vio_init/vio_start/vio_tx/vio_wait_rx/vio_set_mq/vio_set_rss/vio_stop/vio_reset`。
+普通 legacy 注册的默认命令是 `vio_init/vio_start/vio_tx/vio_rx_refill/vio_set_mq/vio_set_rss/vio_stop/vio_reset`。
+`vio_start` 自动启动后台收包，结束时由 agent 的 `report_phase` 输出累计 `RX_STATS`，
+无需设置预期包数或执行额外收包命令。
 
 | 运行参数 | 语义 |
 | --- | --- |
 | `vio.target` | 完整服务身份，如 `h0.pf0.vf1.i0`；只有一个目标时可省略 |
-| `vio.tx.target` / `vio.rx.target` | 本次 TX/RX 目标，缺省继承 `vio.target` |
+| `vio.tx.target` / `vio.rx.target` | 本次 TX/手动 RX 补充的目标，缺省继承 `vio.target` |
 | `vio.tx.pair` | 活动队列对下标，默认 0，禁止当 raw queue ID 使用 |
 | `vio.tx.kind` | `packet_template_e` 名称或逗号候选列表，默认 `ETH_IPV4_TCP`；每包通过 `aip_enum` 重新读取并抽样 |
 | `vio.tx.len` / `len_min` / `len_max` | 每包重新取值，默认64字节（含协议头）；支持候选/范围表达式，保留min/max用法，必须容纳完整头和尾 |
@@ -390,7 +393,7 @@ Tcl `end_test` 使其返回，再释放 objection。参考 `virtio_aip_driver_te
 | `vio.tx.seg_mode` | `VIO_SEG_EQUAL`（默认）或 `VIO_SEG_RANDOM`，每包通过 `aip_enum` 取值；只切分报文数据，保持 header/扩展项完整 |
 | `vio.tx.csum` / `gso` / `mss` | 每包通过 `aip_int` 重新读取，默认0/0/1460；GSO隐含checksum，payload超过MSS才产生分段请求。报文与请求按同一transaction提交，实际队列决定标准/Custom编码 |
 | `vio.tx.hdr.*` | 复用packet.load_params，逐包读取协议头和payload；例如`eth.dst_mac/ipv4.src_addr/udp.dst_port/payload_mode/payload_fixed_val/payload_pattern` |
-| `vio.rx.expected/timeout_ns` | 默认 1 / 50000 ns；只等待，不产生网络侧激励 |
+| `vio.rx.qid/count` | 手动 API 的 RX 队列号和补充数量；Tcl 使用 `vio_rx_refill qid=N count=M`，qid 必须是已启用的偶数 RX qid |
 | `vio.mq.target/pairs` | 动态 MQ 命令，必须服从当前已分配资源上限 |
 | `vio.rss.target/hash_types/hash_key_size/hash_key[i]/table_size/indirection_table[i]` | RSS 控制输入；设备须已协商对应功能 |
 

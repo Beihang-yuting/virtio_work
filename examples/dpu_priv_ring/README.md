@@ -82,7 +82,7 @@ if (function_instance.driver_agent.fsm.state != FSM_READY)
 // 已创建全部 RX/TX 队列，启动时自动补充 RX buffer。
 function_instance.driver_agent.fsm.start_dataplane();
 function_instance.driver_agent.fsm.send_packets(packets, 0); // queue pair 0
-// 通过 wait_packets() 等待并取得 RX 原始帧。
+// RX worker 已在后台收包；用例自行完成业务检查后再停机，结束时自动打印累计 RX 统计。
 function_instance.shutdown(); // 停 worker，再确认停 DMA，成功后回收所有队列。
 if (function_instance.get_state() != VF_DISABLED)
     `uvm_fatal("PRIVATE_STOP", "私有停机失败，资源已保留")

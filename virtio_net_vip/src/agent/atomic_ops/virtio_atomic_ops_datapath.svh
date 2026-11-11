@@ -24,7 +24,8 @@
         input virtio_tx_offload_t	tx_offload = '0,
         input int unsigned		timeout_ns = 0,
         input bit			notify = 1,
-        input virtio_tx_seg_t	tx_seg = '0
+        input virtio_tx_seg_t	tx_seg = '0,
+        input string			packet_key = ""
     );
 
     // 只计算本包分段，不分配资源；非法参数返回原因，由 tx_submit 在发布前 fatal。
@@ -204,6 +205,7 @@
                 byte buf_data[];
                 byte unsigned first_bytes[$];
                 virtio_rx_frame_t frame;
+                bit frame_complete;
 
                 if (!rx_dma_map.exists(queue_id) ||
                     (rx_dma_map[queue_id].size() == 0)) begin
@@ -235,6 +237,7 @@
                                      !negotiated_features[VIRTIO_NET_F_MRG_RXBUF]) ? 1 :
                                     frame.net_hdr.num_buffers;
                 frame.token = token;
+                frame_complete = 1;
                 retire_normal_dma_record(record);
 
                 // Merge continuation buffers.  Every consumed descriptor
@@ -251,6 +254,7 @@
                         `uvm_error("ATOMIC_OPS", $sformatf(
                             "rx_receive: missing merged buffer queue=%0d expected=%0d got=%0d",
                             queue_id, frame.num_buffers, merge))
+                        frame_complete = 0;
                         break;
                     end
                     merge_record = rx_dma_map[queue_id].pop_front();
@@ -259,10 +263,15 @@
                     retire_normal_dma_record(merge_record);
                 end
 
-                frames.push_back(frame);
-                rx_packets++;
-                rx_bytes += frame.payload.size();
-                count++;
+                if (frame_complete) begin
+                    frames.push_back(frame);
+                    // frame 已完成 header 分离与 MRG_RXBUF 合并；在所有 buffer
+                    // ownership 退休后发布，sidecar 不会观察到半帧或悬空 DMA。
+                    publish_rx_frame(queue_id, frame);
+                    rx_packets++;
+                    rx_bytes += frame.payload.size();
+                    count++;
+                end
             end else begin
                 break;
             end

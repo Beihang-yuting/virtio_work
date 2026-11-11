@@ -11,6 +11,58 @@ PF/VF 共用端口。DPU 分配 Function/BDF/BAR/qpair/vector，VIO 分配实际
 PCIe 使用同一份 BAR 和内存结果。设备配置只走 Memory Read/Write，不执行 PCI capability
 发现、feature 协商或 Virtio reset/init。
 
+## 可选的完整报文 SCB
+
+需要比较完整 VTX/VRX 报文时，保持 `project_env` 不变，在用户 test 的 sidecar 中加入
+`integration/project/project_vio_packet_checker.sv`。它创建两个 keyed common SCB，
+通过 `virtio_packet_seq` 从每个 Function 的 packet hub 取完整样本；hub 只复制已经完成
+所有 descriptor ownership 处理的报文，不驱动 PCIe，也不拥有 ring 或 Host memory。
+该文件不在 `project_integration.f` 中，生产环境只需在需要报文比对的 test filelist
+显式加入它，并同时加入已经生成的 `common_lib_pkg.f`。
+
+```systemverilog
+project_vio_packet_checker packet_checker;
+
+function void my_env::build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    packet_checker = project_vio_packet_checker::type_id::create(
+        "packet_checker", this
+    );
+endfunction
+
+function void my_env::connect_phase(uvm_phase phase);
+    super.connect_phase(phase);
+    packet_checker.bind_function(env.vio_envs[0].function_instances[0]);
+`ifdef AIP_CMDLINE_SV
+    packet_checker.register_end_checker("vio_packet_scb");
+`endif
+endfunction
+```
+
+`bind_function()` 要在 `run_phase` 前调用。VTX 或 VRX 的参考样本由用户的 RM 在提交
+或收到业务报文后调用 `push_expected(direction, sample)`；带稳定 `sample.packet_key`
+时会走 keyed API，同一 key 的重复报文按 FIFO 保留，actual 可以先到。没有 key 的样本
+仍按 Host/BDF/PF/VF/local-qid/global-qid 的 flow stream 走兼容 FIFO。样本包含完整
+`virtio_net_hdr`、Custom offload、payload、descriptor、Function 身份和 reset epoch，
+用户可以在 RM 中直接 clone 后修改 expected 字段。
+
+```systemverilog
+virtio_packet_sample expected;
+
+expected = virtio_packet_sample::type_id::create("vtx_expected");
+expected.copy_from(generated_packet);
+expected.direction = VIO_PACKET_VTX;
+expected.key_valid = 1;
+expected.packet_key = $sformatf("h%0d-q%0d-%0d", host, qid, seq);
+packet_checker.push_expected(VIO_PACKET_VTX, expected);
+```
+
+调用 `packet_checker.shutdown()` 时只停止新业务并排空已经发布的 mailbox；需要解除
+订阅时再启动 `packet_checker.release_subscriptions()`。若使用 AIP end checker，先 shutdown 后执行
+`end_test wait_done=1`（或项目现有的 checker 等待语法），它会等待 worker
+退出、pending 为空且两个 SCB clean；`release_subscriptions()` 可以放在随后收尾阶段。没有创建
+sidecar 时，VIO/PCIe 环境原有行为和 filelist 不变。
+
 ## 文件职责与编译顺序
 
 | 实现位置 | 职责 |
@@ -347,7 +399,26 @@ idle 检查表示一段时间没有活动，包数或业务完成条件仍使用
 ## Tcl 停止和资源释放
 
 `vio_stop` 只停止 `vio.target` 对应服务的 VIP 后台 worker，保留 ring、RX buffer 和 IOMMU
-映射；它不复位 DUT。`vio_wait_rx` 仅等待包数，`end_test drain` 仅等待指定时间，均不释放资源。
+映射；它不复位 DUT。`vio_start` 自动启动后台收包，不设置预期包数；仿真结束时
+agent 的 `report_phase` 自动打印累计 `RX_STATS`。`end_test drain` 仅等待指定时间，
+不释放资源。
+
+`vio.rx_auto_refill` 是配置参数，默认 1；通过 `+vio.rx_auto_refill=0` 或下列 Tcl
+在配置队列前关闭自动补充。手动补充必须明确指定实际 RX virtqueue 的 `qid`：
+
+```tcl
+set_param path=vio.rx_auto_refill value=0
+load_params
+dut_config
+vio_start
+vio_rx_refill qid=0 count=8
+# 已配置第二对队列时，向其 RX 队列补充。
+vio_rx_refill qid=2 count=16
+```
+
+`vio_start` 会为每个已启用的 RX qid 启动后台轮询；描述符耗尽只产生 warning，补充
+后继续收包。`vio_rx_refill` 通过同一个 `ops.rx_refill()` 路径把指定队列的 buffer
+下到 DUT。
 
 参考 `project_env.sv` 沿用 `load_params` 的全局 env 句柄和 EOE 绑定，增加一个宏命令：
 
@@ -359,15 +430,13 @@ idle 检查表示一段时间没有活动，包数或业务完成条件仍使用
 及该宏，只编译一个注册入口；不需要改变 env_cfg、base_test 或生产核心 filelist/package。
 
 ```tcl
-# DUT 已配置、vio_start 已启动，网络侧按用例发送 1000 个包。
-set_param path=vio.target value=h0.pf0.i0
-set_param path=vio.rx.expected value=1000
-vio_wait_rx
-
-# 用例完成后统一停止 VIP worker 并回收资源。
-vio_release
-end_test
+# DUT 已配置、vio_start 已启动；网络侧完成激励后等待 PCIe 连续空闲。
+# end_test 在退出前同步执行 vio_release，report_phase 自动打印 RX 统计。
+end_test idle=10us timeout=0 cmd=vio_release
 ```
+
+上述收尾使用 AIP `end_test` 的 `cmd=` 能力；也可以在用例已确认业务完成后，
+分别执行 `vio_release`、`end_test`。总线空闲条件不代替报文内容的业务检查。
 
 `vio_release` 不需要参数，也不需要提前执行 `vio_stop`。它停止整个项目的所有
 Host/PF/VF VIO worker，等待退出后回收队列，与 `vio.target` 无关；成功后清除对应 cfg

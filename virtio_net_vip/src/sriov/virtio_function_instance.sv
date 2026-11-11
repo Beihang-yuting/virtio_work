@@ -429,6 +429,9 @@ class virtio_function_instance extends uvm_component;
         ops.mem = hmem;
         ops.iommu = iommu_mdl;
         ops.wait_pol = wpol;
+        ops.function_key = function_key;
+        ops.service_key = service_key;
+        ops.function_identity_valid = 1;
 
         // Keep the function-owned dataplane in the same host-qualified DMA
         // domain as the queue/atomic path.

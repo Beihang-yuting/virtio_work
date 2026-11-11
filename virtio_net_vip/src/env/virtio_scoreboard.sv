@@ -4,6 +4,10 @@
 // ============================================================================
 // virtio_scoreboard
 //
+// src/env：汇总 monitor 事件和事务结果；由 env 创建，借用报文句柄直到比较完成。
+// RX 比较直接使用原子收包返回的 received_pkts，不再依赖同步等待事务。
+// 本组件不启动收包、补充描述符或持有 DMA，队列生命周期仍归 ops/FSM。
+//
 // 7-category verification scoreboard for virtio-net transactions.
 // Receives transactions via uvm_analysis_imp and dispatches to
 // per-category check methods based on transaction type.
@@ -70,94 +74,11 @@ class virtio_scoreboard extends uvm_component;
     endfunction
 
     // ========================================================================
-    // write -- Analysis port callback
-    //
-    // Dispatches each incoming transaction to the appropriate checker(s)
-    // based on txn_type. Multiple checks may fire for a single transaction.
+    // 按 monitor 事件或事务结果分派检查；实际 RX 返回逐包比较，空结果不改变统计。
+    // 只消费观察到的报文句柄，不读取 ring 或与后台 worker 争用 completion。
     // ========================================================================
 
-    virtual function void write(virtio_transaction txn);
-        if (txn.is_monitor_event) begin
-            monitor_event_count++;
-            case (txn.monitor_event)
-                VIRTIO_MON_DMA: begin
-                    if (chk_dma_compliance && !txn.monitor_error)
-                        check_dma_access(txn.monitor_addr, txn.monitor_length,
-                            txn.monitor_is_write ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
-                end
-                VIRTIO_MON_INTERRUPT: begin
-                    if (chk_notification)
-                        check_notification(txn.queue_id, 0, 1);
-                end
-                default: ;
-            endcase
-            return;
-        end
-
-        case (txn.txn_type)
-            VIO_TXN_SEND_PKTS: begin
-                // Record expected TX packets for later matching
-                if (chk_data_integrity) begin
-                    foreach (txn.packets[i]) begin
-                        tx_expected.push_back(txn.packets[i]);
-                        stats.tx_sent++;
-                    end
-                end
-                // Check offload on each packet
-                if (chk_offload_correct) begin
-                    foreach (txn.packets[i]) begin
-                        check_offload(txn.net_hdr, get_pkt_data(txn.packets[i]));
-                    end
-                end
-                // Check feature compliance
-                if (chk_feature_compliance)
-                    check_feature_compliance(txn, negotiated_features);
-            end
-
-            VIO_TXN_WAIT_PKTS: begin
-                // Match received packets against expected
-                if (chk_data_integrity) begin
-                    foreach (txn.received_pkts[i]) begin
-                        stats.rx_received++;
-                        if (tx_expected.size() > 0) begin
-                            uvm_object expected_pkt = tx_expected.pop_front();
-                            check_data_integrity(expected_pkt, txn.received_pkts[i]);
-                        end else begin
-                            stats.unexpected_rx++;
-                            `uvm_error("SCB",
-                                $sformatf("Unexpected RX packet (no pending TX): queue=%0d",
-                                          txn.queue_id))
-                        end
-                    end
-                end
-            end
-
-            VIO_TXN_CTRL_CMD: begin
-                if (chk_feature_compliance)
-                    check_feature_compliance(txn, negotiated_features);
-            end
-
-            VIO_TXN_INIT: begin
-                // Track negotiated features from init transaction
-                if (txn.features != '0)
-                    negotiated_features = txn.features;
-            end
-
-            VIO_TXN_ATOMIC_OP: begin
-                if (chk_queue_protocol) begin
-                    case (txn.atomic_op)
-                        ATOMIC_KICK:      check_notification(txn.queue_id, 1, 0);
-                        ATOMIC_POLL_USED: check_notification(txn.queue_id, 0, 1);
-                        default: ;
-                    endcase
-                end
-                if (chk_ordering)
-                    check_ordering(txn.queue_id, txn.desc_id);
-            end
-
-            default: ;
-        endcase
-    endfunction
+    extern virtual function void write(virtio_transaction	txn);
 
     // ========================================================================
     // check_data_integrity
@@ -421,5 +342,89 @@ class virtio_scoreboard extends uvm_component;
     endfunction
 
 endclass : virtio_scoreboard
+
+// 只分派观察到的事务和 RX 输出；不读取或推进队列，缺少期望报文时沿用原有错误报告。
+function void virtio_scoreboard::write(virtio_transaction	txn);
+    if (txn.is_monitor_event) begin
+        monitor_event_count++;
+        case (txn.monitor_event)
+            VIRTIO_MON_DMA: begin
+                if (chk_dma_compliance && !txn.monitor_error)
+                    check_dma_access(txn.monitor_addr, txn.monitor_length,
+                        txn.monitor_is_write ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+            end
+            VIRTIO_MON_INTERRUPT: begin
+                if (chk_notification)
+                    check_notification(txn.queue_id, 0, 1);
+            end
+            default: ;
+        endcase
+        return;
+    end
+
+    case (txn.txn_type)
+        VIO_TXN_SEND_PKTS: begin
+            // Record expected TX packets for later matching
+            if (chk_data_integrity) begin
+                foreach (txn.packets[i]) begin
+                    tx_expected.push_back(txn.packets[i]);
+                    stats.tx_sent++;
+                end
+            end
+            // Check offload on each packet
+            if (chk_offload_correct) begin
+                foreach (txn.packets[i]) begin
+                    check_offload(txn.net_hdr, get_pkt_data(txn.packets[i]));
+                end
+            end
+            // Check feature compliance
+            if (chk_feature_compliance)
+                check_feature_compliance(txn, negotiated_features);
+        end
+
+        VIO_TXN_CTRL_CMD: begin
+            if (chk_feature_compliance)
+                check_feature_compliance(txn, negotiated_features);
+        end
+
+        VIO_TXN_INIT: begin
+            // Track negotiated features from init transaction
+            if (txn.features != '0)
+                negotiated_features = txn.features;
+        end
+
+        VIO_TXN_ATOMIC_OP: begin
+            if (chk_queue_protocol) begin
+                case (txn.atomic_op)
+                    ATOMIC_KICK:      check_notification(txn.queue_id, 1, 0);
+                    ATOMIC_POLL_USED: check_notification(txn.queue_id, 0, 1);
+                    default: ;
+                endcase
+            end
+            if (chk_ordering)
+                check_ordering(txn.queue_id, txn.desc_id);
+        end
+
+        default: ;
+    endcase
+
+    // ATOMIC_RX_RECEIVE 和私有 ATOMIC_POLL_USED 共用 RX 输出字段。
+    // 比较只依赖实际返回值，保留手工收包的检查能力。
+    if (chk_data_integrity) begin
+        foreach (txn.received_pkts[i]) begin
+            stats.rx_received++;
+            if (tx_expected.size() > 0) begin
+                uvm_object	expected_pkt;
+
+                expected_pkt = tx_expected.pop_front();
+                check_data_integrity(expected_pkt, txn.received_pkts[i]);
+            end else begin
+                stats.unexpected_rx++;
+                `uvm_error("SCB", $sformatf(
+                    "Unexpected RX packet (no pending TX): queue=%0d", txn.queue_id))
+            end
+        end
+    end
+endfunction
 
 `endif // VIRTIO_SCOREBOARD_SV
