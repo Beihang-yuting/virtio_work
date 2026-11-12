@@ -24,8 +24,7 @@
         input virtio_tx_offload_t	tx_offload = '0,
         input int unsigned		timeout_ns = 0,
         input bit			notify = 1,
-        input virtio_tx_seg_t	tx_seg = '0,
-        input string			packet_key = ""
+        input virtio_tx_seg_t	tx_seg = '0
     );
 
     // 只计算本包分段，不分配资源；非法参数返回原因，由 tx_submit 在发布前 fatal。

@@ -13,63 +13,116 @@ PCIe 使用同一份 BAR 和内存结果。设备配置只走 Memory Read/Write�
 
 ## 可选的完整报文 SCB
 
-需要比较完整 VTX/VRX 报文时，保持 `project_env` 不变，在用户 test 的 sidecar 中加入
-`integration/project/project_vio_packet_checker.sv`。它创建两个 keyed common SCB，
-通过 `virtio_packet_seq` 从每个 Function 的 packet hub 取完整样本；hub 只复制已经完成
-所有 descriptor ownership 处理的报文，不驱动 PCIe，也不拥有 ring 或 Host memory。
-VTX hub 样本是环境发往 DUT 的基准报文，自动进入 `vtx_scb` 的 expected；用户的 DUT
-输出 monitor 需要调用 `push_actual(VIO_PACKET_VTX, dut_tx)`。VRX hub 样本是 DUT
-写回并被环境收到的实际报文，自动进入 `vrx_scb` 的 actual；环境送入 DUT 的参考包
-需要调用 `push_expected(VIO_PACKET_VRX, env_rx)`。
-该文件不在 `project_integration.f` 中，生产环境只需在需要报文比对的 test filelist
-显式加入它，并同时加入已经生成的 `common_lib_pkg.f`。
+需要比较完整 VTX/VRX 报文时，在 test 或业务 sidecar 中创建
+[project_vio_packet_checker](project_vio_packet_checker.sv)。参考 `project_env`、
+`project_env_cfg` 无需增加成员。编译顺序是 `virtio_net_pkg`、simflow/uvm_gen
+生成的 `common_lib_pkg.f`、该 checker 文件、用户 test；checker 仍不加入
+`project_integration.f` 或生产 package。
+
+| 方向 | expected 来源 | actual 来源 |
+| --- | --- | --- |
+| VTX | ops 成功提交的实际 DMA 帧，由 packet hub 自动送入 | ETH 输出 monitor 调用 `push_actual_bytes()` |
+| VRX | ETH 注入前调用 `prepare_rx()`，在 payload 尾部写入标记并登记期望 | DUT 写回、VIO 合并完成的帧，由 packet hub 自动送入 |
+
+在自己的 test 中声明成员，并把以下代码合入已有 phase；`env` 为已经创建的环境。
+绑定发生在 `run_phase` 前，可用同一循环覆盖所有 Host/PF/VF。
 
 ```systemverilog
-project_vio_packet_checker packet_checker;
+project_vio_packet_checker	packet_checker;
 
-function void my_env::build_phase(uvm_phase phase);
+// 创建 checker；两个方向分别最多打印 10 条错误详情。
+function void my_test::build_phase(uvm_phase	phase);
+    common_uvm_scb_cfg	scb_cfg;
+
     super.build_phase(phase);
+    scb_cfg = new();
+    scb_cfg.m_err_limit = 10;
+    uvm_config_db#(common_uvm_scb_cfg)::set(
+        this, "packet_checker", "scb_cfg", scb_cfg
+    );
     packet_checker = project_vio_packet_checker::type_id::create(
         "packet_checker", this
     );
 endfunction
 
-function void my_env::connect_phase(uvm_phase phase);
+// 借用已装配的 Function/ops，不分配新的队列或 Host memory。
+function void my_test::connect_phase(uvm_phase	phase);
     super.connect_phase(phase);
-    packet_checker.bind_function(env.vio_envs[0].function_instances[0]);
+    foreach (env.vio_envs[h]) begin
+        foreach (env.vio_envs[h].function_instances[f]) begin
+            packet_checker.bind_function(
+                env.vio_envs[h].function_instances[f]
+            );
+        end
+    end
 `ifdef AIP_CMDLINE_SV
     packet_checker.register_end_checker("vio_packet_scb");
 `endif
 endfunction
 ```
 
-`bind_function()` 要在 `run_phase` 前调用。用户 RM 对 DUT 的 VTX 输出调用
-`push_actual(VIO_PACKET_VTX, dut_tx)`，对环境送入 DUT 的 VRX 输入调用
-`push_expected(VIO_PACKET_VRX, env_rx)`；带稳定 `sample.packet_key` 时会走 keyed
-API，同一 key 的重复报文按 FIFO 保留，actual 可以先到。没有 key 的样本仍按
-Host/BDF/PF/VF/local-qid/global-qid 的 flow stream 走兼容 FIFO。样本包含完整
-`virtio_net_hdr`、Custom offload、payload、descriptor、Function 身份和 reset epoch，
-用户可以在 RM 中直接 clone 后修改 expected 字段。
+VTX 保持原来的发包入口。绑定 checker 后，ops 在写 DMA 前把 20B
+尾标记写入原帧 payload 尾部，再重新组装协议头；expected 和实际 DMA 使用同一份
+字节，最终帧长度保持 `vtx.pkt.len` 不变。ETH monitor 只传完整帧字节：
 
 ```systemverilog
-virtio_packet_sample expected_rx;
-
-expected_rx = virtio_packet_sample::type_id::create("vrx_expected");
-expected_rx.copy_from(environment_input_packet);
-expected_rx.direction = VIO_PACKET_VRX;
-expected_rx.key_valid = 1;
-expected_rx.packet_key = $sformatf("h%0d-q%0d-%0d", host, qid, seq);
-packet_checker.push_expected(VIO_PACKET_VRX, expected_rx);
-
-// DUT VTX 输出 monitor 得到完整报文后送入 actual。
-packet_checker.push_actual(VIO_PACKET_VTX, dut_tx_sample);
+// bytes 为 ETH monitor 得到的帧，不含 preamble/FCS，末尾 20B 是 payload trace。
+packet_checker.push_actual_bytes(VIO_PACKET_VTX, bytes);
 ```
 
-调用 `packet_checker.shutdown()` 时只停止新业务并排空已经发布的 mailbox；需要解除
-订阅时再启动 `packet_checker.release_subscriptions()`。若使用 AIP end checker，先 shutdown 后执行
-`end_test wait_done=1`（或项目现有的 checker 等待语法），它会等待 worker
-退出、pending 为空且两个 SCB clean；`release_subscriptions()` 可以放在随后收尾阶段。没有创建
-sidecar 时，VIO/PCIe 环境原有行为和 filelist 不变。
+VRX 在把报文交给 ETH driver 之前调用一次 `prepare_rx()`：
+
+```systemverilog
+// rx_bytes 已包含待发送的完整 Ethernet 帧。
+// queue_id 是 Function 内的 RX virtqueue ID；标准队列对 0 的 RX ID 为 0。
+if (packet_checker.prepare_rx(
+        env.vio_envs[0].function_instances[0], 0, rx_bytes)) begin
+    // 将修改后的 rx_bytes 交给项目已有的 ETH 发包接口。
+    // 此时 rx_bytes 长度不变但 payload 已写入 trace，expected 也已登记，不再另调 push_expected。
+end
+```
+
+输入和输出都使用不含 preamble/FCS 的 Ethernet 帧；ETH monitor 仅向这个 checker
+提交参加 VIO 比对的业务流。trace 会占用 payload 尾部 20B，因此原始帧至少需要
+预留 20B payload 空间；RX 描述符容量无需额外增加。原帧 512B，加入标记后仍为
+512B（仍不包含独立的 `virtio_net_hdr`）。
+当前自动比对适用于帧字节保持不变的收发；checksum offload、TSO、封装等会改变
+线上帧的业务，需要在项目 RM 中生成相应的输出期望。
+
+20B 标记位于原帧 payload 的最后 20B；所有多字节数值使用小端编码：
+
+| 相对尾标记起点的字节偏移 | 长度 | 内容 |
+| --- | --- | --- |
+| 0 | 4B | magic：`56 49 4f 31`（`VIO1`） |
+| 4 | 1B | version：1 |
+| 5 | 1B | flags：VTX=0、VRX=1，其余位为 0 |
+| 6 | 2B | stream_id：1～65535 |
+| 8 | 8B | packet_sequence：每个流从 0 递增 |
+| 16 | 2B | 最终 Ethernet 帧长度，包含这 20B |
+| 18 | 2B | 前 18B 的 CRC-16/CCITT-FALSE |
+
+`stream_id` 由仿真内唯一 registry 分配，首次注册打印 `[VIO_STREAM]` 的
+Host/BDF/PF/VF/local_qid/global_qid 映射。方向、队列或 reset epoch 不同，流号
+也不同；不使用截断 hash，不回收旧流号，耗尽时报错。ETH 侧无需传递这些内部字段，
+checker 自动验证尾标记并恢复身份，再按 `stream_id + packet_sequence` 匹配，
+支持乱序以及 actual 先到。VRX 还会核对实际收包 Function/队列，防止投错队列后
+仅凭尾标记通过。原来的无 key FIFO 比对入口已取消。
+
+比对逐字节覆盖完整帧及尾标记，不比较 `net_hdr`、descriptor 等内部元数据。
+失败详情包含身份、两侧长度、首个错误字节、总差异字节数、最多 17B 的字节窗口，
+再补充最多 8 项 `net_packet` 字段差异。坏 magic、CRC、未知流号、错误队列也会
+报错，不用损坏的 key 猜测匹配对象。
+
+AIP 构建下，SCB 错误经 `aip_uerror` 显示红色，保留原有 UVM 错误计数，不重复
+输出一份 UVM 详情。默认 VTX/VRX 各展开前 10 条，超额继续计数，最终汇总
+`matched/mismatches/pending/suppressed` 和 FAIL；`m_err_limit=0` 只关闭详情，
+不会把失败变成通过。未启用 AIP 时使用普通 UVM 日志。
+
+业务发包和 DUT 回写停止后，再调用 `packet_checker.shutdown()`：它只让采样 worker
+排空 mailbox 并退出，不停止 VIO、ETH driver 或 DUT。若注册了 AIP end checker，
+随后用 `end_test wait_done=1` 等待 worker 退出、pending 清空且 SCB clean；需要解除
+订阅时调用 task `packet_checker.release_subscriptions()`。未绑定 checker 的 Function
+保留原始报文字节。
 
 ## 文件职责与编译顺序
 

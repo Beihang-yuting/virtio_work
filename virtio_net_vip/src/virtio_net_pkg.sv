@@ -39,6 +39,7 @@ package virtio_net_pkg;
   `include "types/virtio_net_types.sv"
   `include "types/virtio_net_hdr.sv"
   `include "types/virtio_packet_sample.sv"
+  `include "types/virtio_packet_trace.sv"
   `include "shared/virtio_wait_policy.sv"
   `include "shared/virtio_memory_barrier_model.sv"
 

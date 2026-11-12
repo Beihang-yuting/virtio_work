@@ -9,6 +9,8 @@ typedef class virtio_driver_protocol;
 //
 // 所属src/agent：统一生命周期与TX/RX操作；借用transport/队列管理器，持有
 // 每包DMA直到完成或已确认的复位。TX空间等待不分配DMA，也不改变待发报文。
+// 可选 wire checker 绑定后，ops 在分配 DMA 前把 trace 写入 payload；发布样本与实际
+// DMA 使用相同字节。未绑定 checker 时保留原始帧，packet hub 仍只负责值复制。
 // Low-level atomic operations library for the virtio-net driver VIP.
 // One method per real Linux virtio-net driver operation.
 //
@@ -46,12 +48,15 @@ class virtio_atomic_ops extends uvm_object;
     // 完整报文采样器由 Function ops 持有；sidecar 只借用 packet_hub，不能
     // 通过它改变 DMA、ring 或通知状态。Function identity 是冻结 DPU 快照的值副本，
     // 用于把同号 local_qid 隔离到不同 Host/PF/VF。
-    virtio_packet_hub          packet_hub;
-    dpu_function_key_t         function_key;
-    dpu_service_key_t          service_key;
-    bit                         function_identity_valid;
-    longint unsigned           packet_sequence;
-    longint unsigned           packet_reset_epoch;
+    virtio_packet_hub		packet_hub;
+    dpu_function_key_t		function_key;
+    dpu_service_key_t		service_key;
+    bit				function_identity_valid;
+    // 只有接入 wire checker 的 Function 才写入 trace；序号分别按 TX/RX 采样。
+    bit				packet_trace_enabled;
+    longint unsigned		tx_packet_sequence;
+    longint unsigned		rx_packet_sequence;
+    longint unsigned		packet_reset_epoch;
 
     // ===== Negotiated state =====
     bit [63:0]                 negotiated_features;
@@ -94,19 +99,25 @@ class virtio_atomic_ops extends uvm_object;
     // 绑定或替换本 Function 的报文 hub；只允许装配阶段调用，不改变队列资源。
     extern function void bind_packet_hub(virtio_packet_hub hub);
 
-    // 发布 TX/RX 完整样本；输入来自实际 DMA 字节/合并后的 RX frame，失败时
-    // 只跳过可选观察，不影响数据路径的 descriptor、notify 或 DMA 所有权。
-    extern protected function void publish_tx_packet(
-        int unsigned queue_id,
-        byte unsigned frame_bytes[],
-        virtio_net_hdr_t net_hdr,
-        vio_private_tx_offload_t private_offload,
-        int unsigned descriptor_id,
-        string packet_key
+    // 创建本 Function/本地 virtqueue 的身份样本；全局 qpair 取自已有 resource client。
+    // 不分配队列或访问 DUT；未绑定身份/映射时 identity_valid=0，trace 注册将拒绝。
+    extern function virtio_packet_sample packet_identity(
+        int unsigned		queue_id,
+        vio_packet_dir_e		direction
     );
+
+    // 成功提交描述符后发布同一份 DMA 字节；仅复制样本，不改变资源所有权。
+    extern protected function void publish_tx_packet(
+        virtio_packet_sample	sample,
+        virtio_net_hdr_t		net_hdr,
+        vio_private_tx_offload_t	private_offload,
+        int unsigned		descriptor_id
+    );
+
+    // RX 由已完成合并的 frame 采样；wire checker 再解析线上序号，不按收包顺序匹配。
     extern protected function void publish_rx_frame(
-        int unsigned queue_id,
-        virtio_rx_frame_t frame
+        int unsigned		queue_id,
+        virtio_rx_frame_t	frame
     );
 
     // 只登记尚未检查通知的TX发布；批末、等待空位前清除，队列释放时一并清除。
@@ -309,7 +320,9 @@ class virtio_atomic_ops extends uvm_object;
         negotiated_features = '0;
         packet_hub = virtio_packet_hub::type_id::create({name, "_packet_hub"});
         function_identity_valid = 0;
-        packet_sequence = 0;
+        packet_trace_enabled = 0;
+        tx_packet_sequence = 0;
+        rx_packet_sequence = 0;
         packet_reset_epoch = 0;
         ctrl_queue_id_valid = 0;
         ctrl_queue_id_value = 0;
@@ -595,82 +608,64 @@ function void virtio_atomic_ops::bind_packet_hub(virtio_packet_hub hub);
         packet_hub = hub;
 endfunction
 
-// 功能：发布 TX 的完整 Ethernet payload 和 Virtio/Custom 元数据。
-// 输入/输出：输入队列、实际 DMA payload、header、Custom offload、descriptor 和
-// 可选用户 packet key；无返回值。
-// 边界/副作用：未绑定 hub 时静默跳过；样本只复制值，不延长 DMA 资源生命周期。
-function void virtio_atomic_ops::publish_tx_packet(
-    int unsigned queue_id,
-    byte unsigned frame_bytes[],
-    virtio_net_hdr_t net_hdr,
-    vio_private_tx_offload_t private_offload,
-    int unsigned descriptor_id,
-    string packet_key
+// 从唯一的 Function placement 查询 global qpair；不能把 virtqueue ID 当成全局 ID。
+function virtio_packet_sample virtio_atomic_ops::packet_identity(
+    int unsigned	queue_id,
+    vio_packet_dir_e	direction
 );
-    virtio_packet_sample sample;
-    virtio_queue_program_t qprog;
+    virtio_packet_sample	sample;
 
+    sample = new("packet_sample");
+    sample.direction      = direction;
+    sample.local_qid      = queue_id;
+    sample.global_qid     = queue_id;
+    sample.reset_epoch    = packet_reset_epoch;
+    sample.identity_valid = function_identity_valid && transport != null;
+    sample.function_key   = function_key;
+    sample.service_key    = service_key;
+    if (transport != null) begin
+        sample.host_id = get_iommu_host_id(transport);
+        sample.bdf     = transport.bdf;
+        sample.is_vf   = transport.is_vf;
+        sample.vf_id   = transport.vf_index;
+        if (transport.fabric_resource_client != null &&
+            !transport.fabric_resource_client.local_qid_to_global_qid(
+                queue_id, sample.global_qid))
+            sample.identity_valid = 0;
+    end
+    return sample;
+endfunction
+
+// TX 所有权交给 VQ 后才发布，失败提交不产生 expected；sample 在 DMA 前已包含 tail。
+function void virtio_atomic_ops::publish_tx_packet(
+    virtio_packet_sample	sample,
+    virtio_net_hdr_t		net_hdr,
+    vio_private_tx_offload_t	private_offload,
+    int unsigned		descriptor_id
+);
     if (packet_hub == null) return;
-    sample = virtio_packet_sample::type_id::create("vtx_packet");
-    sample.direction       = VIO_PACKET_VTX;
-    sample.host_id         = get_iommu_host_id(transport);
-    sample.bdf             = transport.bdf;
-    sample.is_vf           = transport.is_vf;
-    sample.vf_id           = transport.vf_index;
-    sample.local_qid       = queue_id;
-    sample.global_qid      = queue_id;
     sample.descriptor_id   = descriptor_id;
     sample.buffer_count    = 1;
     sample.net_hdr         = net_hdr;
     sample.private_offload = private_offload;
-    sample.packet_sequence = packet_sequence++;
-    sample.reset_epoch     = packet_reset_epoch;
-    sample.key_valid       = packet_key.len() != 0;
-    sample.packet_key      = packet_key;
-    if (function_identity_valid) begin
-        sample.identity_valid = 1;
-        sample.function_key   = function_key;
-        sample.service_key    = service_key;
-    end
-    foreach (frame_bytes[i]) sample.frame_bytes.push_back(frame_bytes[i]);
-    if (get_queue_program(queue_id, qprog))
-        sample.global_qid = qprog.queue_id;
+    if (!packet_trace_enabled)
+        sample.packet_sequence = tx_packet_sequence++;
     void'(packet_hub.publish(sample));
 endfunction
 
-// 功能：发布 RX used entry 合并后的完整 payload。
-// 输入/输出：输入队列和已完成的 RX frame；无返回值。
-// 边界/副作用：header 已由 rx_receive_frames 分离；样本不重新读取或释放 DMA。
+// RX 完整包已脱离 ring/DMA 生命周期；保留实际接收身份，供 checker 检查错队列投递。
 function void virtio_atomic_ops::publish_rx_frame(
-    int unsigned queue_id,
-    virtio_rx_frame_t frame
+    int unsigned	queue_id,
+    virtio_rx_frame_t	frame
 );
-    virtio_packet_sample sample;
-    virtio_queue_program_t qprog;
+    virtio_packet_sample	sample;
 
     if (packet_hub == null) return;
-    sample = virtio_packet_sample::type_id::create("vrx_packet");
-    sample.direction       = VIO_PACKET_VRX;
-    sample.host_id         = get_iommu_host_id(transport);
-    sample.bdf             = transport.bdf;
-    sample.is_vf           = transport.is_vf;
-    sample.vf_id           = transport.vf_index;
-    sample.local_qid       = queue_id;
-    sample.global_qid      = queue_id;
+    sample = packet_identity(queue_id, VIO_PACKET_VRX);
     sample.buffer_count    = frame.num_buffers;
     sample.net_hdr         = frame.net_hdr;
-    sample.packet_sequence = packet_sequence++;
-    sample.reset_epoch     = packet_reset_epoch;
-    sample.key_valid       = 0;
-    sample.packet_key      = "";
-    if (function_identity_valid) begin
-        sample.identity_valid = 1;
-        sample.function_key   = function_key;
-        sample.service_key    = service_key;
-    end
-    foreach (frame.payload[i]) sample.frame_bytes.push_back(frame.payload[i]);
-    if (get_queue_program(queue_id, qprog))
-        sample.global_qid = qprog.queue_id;
+    sample.packet_sequence = rx_packet_sequence++;
+    sample.frame_bytes     = frame.payload;
     void'(packet_hub.publish(sample));
 endfunction
 
@@ -684,8 +679,7 @@ task virtio_atomic_ops::tx_submit(
     input virtio_tx_offload_t	tx_offload = '0,
     input int unsigned		timeout_ns = 0,
     input bit			notify = 1,
-    input virtio_tx_seg_t	tx_seg = '0,
-    input string			packet_key = ""
+    input virtio_tx_seg_t	tx_seg = '0
 );
     virtqueue_base		vq;
     custom_virtqueue		private_vq;
@@ -712,6 +706,7 @@ task virtio_atomic_ops::tx_submit(
     bit			space_ready;
     int unsigned		segment_lengths[$];
     int unsigned		packet_offset;
+    virtio_packet_sample	sample;
 
     desc_id = '1;
     if (!external_queue_ready(queue_id)) return;
@@ -761,6 +756,27 @@ task virtio_atomic_ops::tx_submit(
         pkt.do_pack(packer);
         packer.get_bytes(pkt_bytes);
     end
+    pkt_size = pkt_bytes.size();
+    // If packet has no data from do_pack, use minimum Ethernet frame size
+    if (pkt_size == 0) begin
+        pkt_bytes = new[64];
+        pkt_size  = pkt_bytes.size();
+    end
+
+    // Trace edits payload before checksum/GSO preparation.  This keeps the
+    // offload fields consistent with the bytes that will actually reach DMA.
+    sample = packet_identity(queue_id, VIO_PACKET_VTX);
+    wire_bytes = {};
+    foreach (pkt_bytes[i]) wire_bytes.push_back(pkt_bytes[i]);
+    if (packet_trace_enabled) begin
+        if (!virtio_packet_trace::stamp(sample, wire_bytes, why)) begin
+            `uvm_error("VIO_TRACE_TAIL", why)
+            return;
+        end
+        pkt_bytes = new[wire_bytes.size()];
+        foreach (wire_bytes[i]) pkt_bytes[i] = wire_bytes[i];
+    end
+
     if (tx_offload.valid) begin
         wire_bytes.delete();
         foreach (pkt_bytes[i]) wire_bytes.push_back(pkt_bytes[i]);
@@ -776,12 +792,8 @@ task virtio_atomic_ops::tx_submit(
         hdr_size = hdr_bytes.size();
     end
     pkt_size = pkt_bytes.size();
+    sample.frame_bytes = wire_bytes;
 
-    // If packet has no data from do_pack, use minimum Ethernet frame size
-    if (pkt_size == 0) begin
-        pkt_bytes = new[64];
-        pkt_size  = pkt_bytes.size();
-    end
     // Keep the backing allocation DWORD padded after the minimum-size
     // fallback as well; otherwise an empty packet would request a
     // zero-byte host_mem allocation even though the descriptor carries
@@ -876,12 +888,10 @@ task virtio_atomic_ops::tx_submit(
     // 真实 descriptor 已成功接管 DMA 所有权；从此处采样能保证 hub 看到的
     // payload 与最终下到 Host memory 的字节一致，失败时不会发布伪报文。
     publish_tx_packet(
-        queue_id,
-        pkt_bytes,
+        sample,
         net_hdr,
         private_control,
-        desc_id,
-        packet_key
+        desc_id
     );
 
     // 8. 批末发布当前真实游标；pending标志只属于本队列，不重复通知空批次。
