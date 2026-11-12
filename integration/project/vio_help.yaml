@@ -1,0 +1,425 @@
+# VIO / DPU / PCIe 参数参考
+#
+# 本文件是参数说明和示例，不会被 project_integration.f 编译或自动读取。
+# 启动参数写法：+vio.pairs=1
+# Tcl 写法：set_param path=vio.pairs value=1
+#
+# 参数覆盖顺序：全局路径 → Host 路径 → PF/VF service 路径。
+# 例如：vio → vio.h0 → vio.h0.pf0.i0；VF 使用 vio.h0.pf0.vf0.i0。
+# 范围表达式、random 和逗号候选值由 AIP 原生解析；需要保留原文时请用引号。
+
+# -----------------------------------------------------------------------------
+# DPU 拓扑、Host memory、BAR 和公共配置
+# -----------------------------------------------------------------------------
+dpu.hosts: 1                                      # Host 数量
+dpu.pfs_per_host: 1                               # 每个 Host 的 PF 数量
+dpu.vfs_per_pf: 0                                 # 每个 PF 的 VF 数量
+dpu.af_host: 0                                    # AF 所属 Host
+dpu.af_pf: 0                                      # AF 所属 PF
+dpu.af_kind: DPU_FUNCTION_PF                      # AF 类型
+dpu.reg_target: h0.pf0.bar0                       # 默认寄存器访问窗口
+dpu.print_bar_map: 1                              # 打印实际分配的 BAR 地址
+dpu.configure_public: 0                           # 是否配置公共 BAR/PF/VF 等表
+dpu.configure_bdf: 1                              # 是否配置 BDF requester 表
+dpu.driver_layouts: 1                             # 使用驱动参考表布局
+dpu.verify_readback: 0                            # 是否读回验证普通表项
+
+dpu.mem_base: 0x0000100000000000                 # Host GPA 起始地址
+dpu.mem_size: 0x10000000                          # Host GPA 空间大小
+dpu.mmio_base: 0x0000200000000000                # PCIe MMIO 起始地址
+dpu.mmio_size: 0x100000000                        # PCIe MMIO 空间大小
+dpu.address_width: 64                             # Host 地址宽度
+dpu.use_gpa: 1                                    # 是否启用 GPA aperture
+dpu.mem_mode: MODE_BUDDY                          # MODE_BUDDY 或 MODE_LINEAR
+dpu.mem_granule: 16                               # Host memory 最小粒度
+dpu.mem_policy: HOST_MEM_RANDOM                   # HOST_MEM_RANDOM 或 HOST_MEM_FIRST_FIT
+
+dpu.bdf_first: 0x0010                             # BDF 范围起始值
+dpu.bdf_last: 0x0fff                              # BDF 范围结束值
+dpu.reserved_bdfs: "0x0101,0x0102"               # 预留 BDF 列表
+dpu.bar_policy: DPU_BAR_PLACEMENT_RANDOM         # DPU_BAR_PLACEMENT_FIRST_FIT 或 RANDOM
+dpu.roles: DPU_BAR_DEVICE_MEMORY                  # 允许的 BAR role 列表
+
+# 单个 Host/domain 的显式覆盖；domain0 是 Host 的第一个 PCIe domain。
+dpu.h0.address_width: 64                          # Host0 地址宽度
+dpu.h0.mem_base: 0x0000100000000000              # Host0 GPA 起始地址
+dpu.h0.mem_size: 0x10000000                       # Host0 GPA 空间大小
+dpu.h0.use_gpa: 1                                 # Host0 是否启用 GPA aperture
+dpu.h0.mmio_base: 0x0000200000000000             # Host0 MMIO 起始地址
+dpu.h0.mmio_size: 0x100000000                     # Host0 MMIO 空间大小
+dpu.h0.bdf_first: 0x0010                          # Host0 BDF 起始值
+dpu.h0.bdf_last: 0x0fff                           # Host0 BDF 结束值
+dpu.h0.reserved_bdfs: "0x0101,0x0102"            # Host0 预留 BDF
+dpu.h0.bar_policy: DPU_BAR_PLACEMENT_RANDOM      # Host0 BAR 放置策略
+dpu.h0.domain0.mmio_base: 0x0000200000000000     # 多 domain 时使用 domain0 路径
+dpu.h0.domain0.mmio_size: 0x100000000            # domain0 MMIO 窗口大小
+
+# Function 的 BDF/BAR/service authoring 覆盖。
+dpu.h0.pf0.bdf_mode: DPU_ALLOC_AUTO               # DPU_ALLOC_AUTO 或 DPU_ALLOC_PINNED
+dpu.h0.pf0.bdf: 0x0100                            # 固定 BDF，PINNED 模式使用
+dpu.h0.pf0.segment: 0                              # PCIe segment
+dpu.h0.pf0.services: DPU_SERVICE_VIO_NET           # Function 支持的 service
+dpu.h0.pf0.requester: 0                            # PCIe requester 身份
+dpu.h0.pf0.intel_pf: 0                              # Intel PF 编号
+dpu.h0.pf0.intel_vf: -1                            # PF 使用 -1
+dpu.h0.pf0.vport: 0                                # DPU vport 编号
+dpu.h0.pf0.bdf_index: 0                            # BDF requester 表索引
+dpu.h0.pf0.bar0.role: DPU_BAR_DEVICE_MEMORY        # BAR0 role
+dpu.h0.pf0.bar0.size: 0x100000                    # BAR0 大小
+dpu.h0.pf0.bar0.alignment: 0x100000               # BAR0 对齐
+dpu.h0.pf0.bar0.placement: DPU_ALLOC_AUTO         # BAR0 自动或固定放置
+dpu.h0.pf0.bar0.base: 0                            # PINNED BAR 基地址
+
+# VF 模板覆盖；实际 VF 路径为 dpu.vf_pool.vfN 或 Function 的 .vfN 路径。
+dpu.vf_pool.vf0.bdf_mode: DPU_ALLOC_AUTO          # VF BDF 分配模式
+dpu.vf_pool.vf0.bdf: 0x0110                        # VF 固定 BDF
+dpu.vf_pool.vf0.segment: 0                         # VF PCIe segment
+dpu.vf_pool.vf0.services: DPU_SERVICE_VIO_NET      # VF 支持的 service
+dpu.vf_pool.vf0.bar0.size: 0x100000                # VF BAR0 大小
+dpu.vf_pool.vf0.bar0.alignment: 0x100000           # VF BAR0 对齐
+
+# 真实 Function 的 VF 路由覆盖。
+dpu.h0.pf0.vf0.requester: 0                        # VF requester 身份
+dpu.h0.pf0.vf0.intel_pf: 0                          # VF 所属 Intel PF
+dpu.h0.pf0.vf0.intel_vf: 0                          # Intel VF 编号
+dpu.h0.pf0.vf0.vport: 1                            # VF vport 编号
+dpu.h0.pf0.vf0.bdf_index: 1                        # VF BDF requester 表索引
+
+# -----------------------------------------------------------------------------
+# DUT 能力上限
+# -----------------------------------------------------------------------------
+dpu.caps.max_hosts: 2                              # 最大 Host 数
+dpu.caps.max_pfs_per_host: 4                       # 每 Host 最大 PF 数
+dpu.caps.max_vfs_per_pf: 64                        # 每 PF 最大 VF 数
+dpu.caps.max_functions: 128                        # 最大 Function 数
+dpu.caps.global_msix_vector_count: 2048            # 全局 MSI-X vector 数
+dpu.caps.mailbox_msix_vectors: 1                   # Mailbox MSI-X vector 数
+dpu.caps.af_extra_msix_vectors: 1                  # AF 额外 MSI-X vector 数
+dpu.caps.af_extra_queue_count: 0                   # AF 额外队列数量
+dpu.caps.vio_global_qpair_count: 128               # VIO 全局队列对容量
+dpu.caps.max_vio_net_qpairs_per_device: 32         # 单 Function 最大队列对
+dpu.caps.vio_notify_entries_per_bank: 512          # Notify 单 bank 表项数
+
+# -----------------------------------------------------------------------------
+# VIO qpair placement
+# -----------------------------------------------------------------------------
+dpu.qpairs: 4                                      # 单 request 的总队列对数
+dpu.qpair_capacity: 128                            # virtio.qpair 资源池容量
+dpu.qpair_per_func: 32                             # 单 Function 最大队列对
+dpu.reserved_qpairs: "1,3"                         # 预留 global qpair ID
+dpu.lan_msix: 0                                    # 0 表示按默认队列数量分配
+dpu.placement_seed: 123                            # placement 随机种子
+dpu.candidate_kind: DPU_VIO_CANDIDATE_PF_ONLY      # PF/VF 候选类型
+dpu.device_policy: DPU_VIO_DEVICE_AUTO_MINIMUM     # AUTO_MINIMUM/FIXED/ALL_ELIGIBLE
+dpu.ordering: DPU_PLACEMENT_CANONICAL              # CANONICAL/SEEDED_RANDOM
+dpu.host_ids: "0,1"                                # 候选 Host ID
+dpu.vf_ids: "0,1"                                  # 候选 VF ID
+dpu.parent_pfs.size: 1                             # parent PF 集合大小
+dpu.parent_pfs[0].host_id: 0                       # parent PF Host
+dpu.parent_pfs[0].pf_id: 0                         # parent PF 编号
+dpu.fixed_devices.size: 1                           # 固定 Function 集合大小
+dpu.fixed_devices[0].host_id: 0                    # 固定 Function Host
+dpu.fixed_devices[0].pf_id: 0                      # 固定 Function PF
+dpu.fixed_devices[0].kind: DPU_FUNCTION_PF         # 固定 Function 类型
+dpu.fixed_devices[0].vf_id: 0                      # PF 时填 0
+
+# 多个 placement request 使用 dpu.requestN；单 request 可使用上面的短路径。
+dpu.request0.qpairs: 1                             # request0 队列对数量
+dpu.request0.lan_msix: 0                           # request0 MSI-X 数量
+dpu.request0.placement_seed: 123                   # request0 随机种子
+dpu.request0.candidate_kind: DPU_VIO_CANDIDATE_PF_ONLY # request0 候选类型
+dpu.request0.device_policy: DPU_VIO_DEVICE_FIXED  # request0 设备选择策略
+dpu.request0.ordering: DPU_PLACEMENT_CANONICAL    # request0 排序策略
+dpu.request0.fixed_devices.size: 1                 # request0 固定设备数
+
+# 逐 Function 约束和逐 qpair 覆盖；只有对象已由 authoring 创建时才会读取。
+dpu.request0.device0.host: 0                       # device0 Host
+dpu.request0.device0.pf: 0                         # device0 PF
+dpu.request0.device0.kind: DPU_FUNCTION_PF         # device0 类型
+dpu.request0.device0.vf: 0                         # device0 VF
+dpu.request0.device0.mode: DPU_COUNT_EXACT         # 队列数量约束模式
+dpu.request0.device0.qpairs: 1                     # device0 队列对数量
+dpu.request0.pair0.index: 0                        # qpair override 对应的 request pair
+dpu.request0.pair0.owner_mode: DPU_ASSIGN_AUTO     # qpair owner 分配模式
+dpu.request0.pair0.owner_host: 0                   # qpair owner Host
+dpu.request0.pair0.owner_pf: 0                     # qpair owner PF
+dpu.request0.pair0.owner_kind: DPU_FUNCTION_PF     # qpair owner 类型
+dpu.request0.pair0.owner_vf: 0                     # qpair owner VF
+dpu.request0.pair0.local_mode: DPU_ASSIGN_AUTO     # local qpair 分配模式
+dpu.request0.pair0.local_id: 0                     # 固定 local qpair ID
+dpu.request0.pair0.global_mode: DPU_ASSIGN_AUTO    # global qpair 分配模式
+dpu.request0.pair0.global_id: 0                    # 固定 global qpair ID
+
+# -----------------------------------------------------------------------------
+# QSCH 全局策略
+# -----------------------------------------------------------------------------
+dpu.qsch.configure_controls: 1                     # 是否写 QSCH 控制表
+dpu.qsch.mode: 0                                   # 0=VNET，1=ETS
+dpu.qsch.mode_offset: 0xb001c0                    # QSCH mode 寄存器偏移
+dpu.qsch.spwrr: 0xff                              # SP/WRR 默认值
+dpu.qsch.tc_weight: 0x11111111                    # TC weight 默认值
+dpu.qsch.topology: DPU_QSCH_AUTO                  # AUTO/RANDOM/MANUAL
+dpu.qsch.net_id: random                            # Net ID，支持固定值、random、范围
+dpu.qsch.group_id: random                          # Group ID，支持固定值、random、范围
+dpu.qsch.dpt: 0                                   # 目的节点，ETHn=n
+dpu.qsch.eth_ports: 8                             # ETH 端口数量，范围 1..8
+dpu.qsch.print: 1                                 # 打印 Function/net/group 关联
+
+# -----------------------------------------------------------------------------
+# MSI-X 参数
+# -----------------------------------------------------------------------------
+dpu.msix.table_bar: 0                             # MSI-X table BAR
+dpu.msix.table_offset: 0x54000                    # MSI-X table 偏移
+dpu.msix.table_size: 64                            # MSI-X table 表项数
+dpu.msix.pba_bar: 0                                # PBA BAR
+dpu.msix.pba_offset: 0x56000                      # PBA 偏移
+dpu.msix.pba_words: 8                              # PBA word 数量
+dpu.msix.msg_addr_base: 0x900000000000            # Message Address 模板
+dpu.msix.msg_addr_stride: 4                        # Message Address 步长
+dpu.msix.msg_data_base: 0x13572468                # Message Data 模板
+dpu.msix.msg_data_stride: 0x100                   # Message Data 步长
+dpu.msix.interval_rate: 0                          # MSI-X interval rate
+dpu.msix.interval_packets: 0                       # MSI-X interval packet threshold
+dpu.msix.self_mask: 0                              # MSI-X self mask
+dpu.msix.table_only_enable: 1                      # 仅使用 MSI-X table mask
+dpu.msix.v0.msg_addr: 0x900000000000              # vector0 message address
+dpu.msix.v0.msg_data: 0x13572468                  # vector0 message data
+dpu.msix.v0.masked: 0                              # vector0 mask
+
+# -----------------------------------------------------------------------------
+# DPU 表访问窗口
+# -----------------------------------------------------------------------------
+dpu.bar_map.reg_target: h0.pf0.bar0                # BAR mapping 表访问窗口
+dpu.bar.reg_target: h0.pf0.bar0                    # BAR 表访问窗口
+dpu.af.reg_target: h0.pf0.bar0                     # AF 表访问窗口
+dpu.pfvf.reg_target: h0.pf0.bar0                   # PF/VF 表访问窗口
+dpu.bdf.reg_target: h0.pf0.bar0                    # BDF 表访问窗口
+dpu.completion_bdf.reg_target: h0.pf0.bar0         # Completion BDF 表
+dpu.tlp_prefix.reg_target: h0.pf0.bar0             # TLP prefix 表
+dpu.msix_linear.reg_target: h0.pf0.bar0            # MSI-X linear 表
+dpu.msix_info.reg_target: h0.pf0.bar0              # MSI-X info 表
+dpu.msix_interval.reg_target: h0.pf0.bar0          # MSI-X interval 表
+dpu.msix_control.reg_target: h0.pf0.bar0           # MSI-X control 表
+dpu.msix_table.reg_target: h0.pf0.bar0             # MSI-X table 表
+dpu.msix_function.reg_target: h0.pf0.bar0          # MSI-X function 表
+dpu.vio_notify.reg_target: h0.pf0.bar0             # VIO Notify 表
+dpu.qsch_q2tc.reg_target: h0.pf0.bar0              # QSCH Q2TC 表
+dpu.qsch_n2g.reg_target: h0.pf0.bar0              # QSCH N2G 表
+dpu.qsch_g2p.reg_target: h0.pf0.bar0              # QSCH G2P 表
+dpu.qsch_spwrr.reg_target: h0.pf0.bar0            # QSCH SPWRR 表
+dpu.qsch_tc_weight.reg_target: h0.pf0.bar0        # QSCH TC weight 表
+dpu.qsch_rnet.reg_target: h0.pf0.bar0              # QSCH RNET 表
+dpu.vtx.reg_target: h0.pf0.bar0                    # VTX 表
+dpu.vrx.reg_target: h0.pf0.bar0                    # VRX 表
+dpu.queue_aux.reg_target: h0.pf0.bar0              # Queue AUX 表
+dpu.rdma_notify.reg_target: h0.pf0.bar0            # RDMA Notify 表
+vio.vtx.reg_target: h0.pf0.bar0                    # VIO VTX 表
+vio.vrx.reg_target: h0.pf0.bar0                    # VIO VRX 表
+vio.notify_table.reg_target: h0.pf0.bar0           # Notify lookup 表
+
+# -----------------------------------------------------------------------------
+# VIO service 配置：可在 vio、vio.h0 或 vio.h0.pf0[.vf0].i0 层覆盖
+# -----------------------------------------------------------------------------
+vio.enabled: 1                                     # 是否创建 VIO service
+vio.tx_enable: 1                                   # 是否启用 TX
+vio.rx_enable: 1                                   # 是否启用 RX
+vio.pairs: 1                                       # 队列对数量
+vio.queue_size: 256                                # 队列深度，2..32768 的 2 的幂
+vio.queue_type: VQ_PACKED                          # VQ_PACKED 或 VQ_CUSTOM
+vio.features: 0x0000000500000000                   # Virtio driver feature mask
+vio.napi_budget: 64                                # NAPI budget
+vio.rx_refill: 16                                  # RX refill 阈值
+vio.rx_auto_refill: 1                              # 是否自动补充 RX 描述符
+vio.rx_buf_size: 2048                              # RX 报文容量，不含 Virtio header
+vio.exec_mode: VIRTIO_EXEC_REAL_DUT                # REAL_DUT 或 MODEL
+vio.completion_mode: VIRTIO_COMPLETION_POLLING     # POLLING 或 MSIX
+vio.iova_base: 0x0000001000000000                 # IOVA 起始地址
+vio.iova_size: 0x00100000                          # IOVA 空间大小
+vio.iova_policy: IOMMU_IOVA_RANDOM                 # RANDOM 或 FIRST_FIT
+vio.iommu_strict: 1                                # IOMMU 严格检查
+vio.scb: 1                                         # VIO scoreboard 开关
+vio.coverage: 0                                    # VIO coverage 开关
+vio.notify_bar: 0                                  # Notify doorbell BAR
+vio.notify_base: 0                                 # Notify doorbell 基地址
+vio.notify_stride: 0                               # Notify 队列步长
+vio.notify_encoding: VIO_NOTIFY_DPU32              # QID16、DATA32 或 DPU32
+vio.notify_table_bar: 0                            # Notify lookup table BAR
+vio.notify_table_offset: 0                         # Notify lookup table 偏移
+vio.notify_net_pair5: 1                            # 使用单 bank pair5 编码
+
+# Host/PF/VF service 覆盖示例。
+vio.h0.pf0.i0.enabled: 1                           # PF0 service 开关
+vio.h0.pf0.i0.tx_enable: 1                         # PF0 TX 开关
+vio.h0.pf0.i0.rx_enable: 1                         # PF0 RX 开关
+vio.h0.pf0.i0.pairs: 1                             # PF0 队列对数量
+vio.h0.pf0.i0.qsch.net_id: 100                     # PF0 service 固定 Net ID
+vio.h0.pf0.i0.qsch.group_id: 20                    # PF0 service 固定 Group ID
+vio.h0.pf0.i0.qsch.dpt: 0                          # PF0 service 目的节点
+vio.h0.pf0.vf0.i0.enabled: 1                       # VF0 service 开关
+vio.h0.pf0.vf0.i0.pairs: 2                         # VF0 队列对数量
+
+# -----------------------------------------------------------------------------
+# VIO 等待策略，单位为 ns
+# -----------------------------------------------------------------------------
+vio.wait.poll_ns: 10                               # 轮询间隔
+vio.wait.timeout_ns: 10000                         # 默认等待超时
+vio.wait.reset_ns: 5000                            # reset 等待时间
+vio.wait.queue_reset_ns: 5000                      # queue reset 等待时间
+vio.wait.vf_ready_ns: 10000                        # VF ready 等待时间
+vio.wait.flr_ns: 10000                             # FLR 等待时间
+vio.wait.multiplier: 1                             # 所有超时倍率
+vio.wait.max_polls: 10000                          # 最大轮询次数
+
+# -----------------------------------------------------------------------------
+# VTX/VRX/QSCH service 表策略
+# -----------------------------------------------------------------------------
+vio.vtx.dma_info: 0                                # VTX DMA 信息
+vio.vtx.tail_buf_id_dis: 0                         # 禁止 tail buffer ID
+vio.vtx.redraw_en: 0                               # redraw 开关
+vio.vtx.high_speed_mode: 0                         # 高速模式
+vio.vtx.seg_en: 0                                  # 分段开关
+vio.vtx.interl_seg_en: 0                           # 交错分段开关
+vio.vrx.dsc_pre_max_num: 0                         # VRX 最大预取描述符数
+vio.vrx.dsc_pre_read_threshold: 0                  # VRX 预读阈值
+vio.vrx.dsc_dma_num: 0                             # VRX DMA 数量
+vio.vrx.dsc_mode: 0                                # VRX 描述符模式
+vio.vrx.payload_dsc_len: 0                         # Payload descriptor 长度
+vio.vrx.head_dsc_len: 0                            # Header descriptor 长度
+vio.qsch.cos: 0                                    # service COS
+vio.qsch.net_id: random                            # service Net ID，支持固定值/范围/random
+vio.qsch.net_base: 0                               # MANUAL net 起始值
+vio.qsch.net_stride: 1                             # MANUAL net 步长
+vio.qsch.group_id: 0                               # MANUAL group ID
+vio.qsch.dpt: 0                                    # service 目的节点，支持固定值/范围/random
+vio.qsch.eth_ports: 8                              # service ETH 端口数量
+vio.qsch.ets: 0                                    # service ETS 开关
+vio.qsch.distinguish_business: 0                   # 业务区分开关
+vio.qsch.ets_priority: 0                           # ETS 优先级
+vio.fpga: 0                                        # FPGA 模式
+vio.prefetch_ram: ram_h0                           # 预取 RAM 名称
+vio.prefetch_start: 0                              # 预取起始槽
+vio.prefetch_slots: 32                             # 预取槽数量
+
+# -----------------------------------------------------------------------------
+# Custom 私有队列参数
+# -----------------------------------------------------------------------------
+vio.private.queue_size: 512                        # Custom 队列深度
+vio.private.rx_buf_size: 2048                      # Custom RX buffer 大小
+vio.private.local_qid_base: 0                      # 本地 QID 起始值
+vio.private.notify_bar: 0                          # 私有 Notify BAR
+vio.private.notify_offset: 0                       # 私有 Notify 偏移
+vio.private.dport_info: 0                          # 目的端口信息
+vio.private.dport_id: 0                            # 目的端口 ID
+vio.private.dport_type: 0                          # 目的端口类型
+vio.private.cpu_tx_cos: 0                          # CPU TX COS
+vio.private.rss_lag: 0                             # RSS LAG
+vio.private.l3_cs: 0                               # 外层 L3 checksum
+vio.private.l4_cs: 0                               # 外层 L4 checksum
+vio.private.i_l3_cs: 0                             # 内层 L3 checksum
+vio.private.i_l4_cs: 0                             # 内层 L4 checksum
+vio.private.fwd: 1                                 # Forward mode
+vio.private.q0.local_qid: 0                        # queue0 本地 QID
+vio.private.q0.notify_bar: 0                       # queue0 Notify BAR
+vio.private.q0.notify_offset: 0                    # queue0 Notify 偏移
+vio.private.q0.dport_id: 0                         # queue0 目的端口
+vio.private.q0.fwd: 1                              # queue0 Forward mode
+
+# -----------------------------------------------------------------------------
+# 运行期 TX 参数：每个数据包生成前重新读取
+# -----------------------------------------------------------------------------
+vio.target: h0.pf0.i0                             # 默认目标 Function
+vio.tx.target: h0.pf0.i0                          # TX 目标 Function
+vio.tx.pair: 0                                    # 队列对下标，不是 raw qid
+vio.tx.kind: ETH_IPV4_TCP                         # 报文模板
+vio.tx.len: 512                                   # 报文长度，包含协议报文
+vio.tx.len_min: 512                               # 随机长度下限
+vio.tx.len_max: 1514                              # 随机长度上限
+vio.tx.gap_ns: 0                                  # 包间隔
+vio.tx.timeout_ns: 10000                          # ring 空间等待超时
+vio.tx.notify_batch: 1                            # 每次 Notify 前累计的包数
+vio.tx.desc_count: 0                              # 描述符数，0 表示按格式自动计算
+vio.tx.seg_mode: VIO_SEG_EQUAL                    # VIO_SEG_EQUAL 或 VIO_SEG_RANDOM
+vio.tx.csum: 0                                    # checksum offload
+vio.tx.gso: 0                                     # GSO/TSO offload
+vio.tx.mss: 1460                                  # GSO MSS
+
+# net_packet 负责解析 hdr.*；这里只列出常用字段示例。
+vio.tx.hdr.eth.dst_mac: 0x001122334455            # 目的 MAC
+vio.tx.hdr.eth.src_mac: 0x000102030405            # 源 MAC
+vio.tx.hdr.ipv4.src_addr: 0x0a000001              # IPv4 源地址
+vio.tx.hdr.ipv4.dst_addr: 0x0a000002              # IPv4 目的地址
+vio.tx.hdr.tcp.src_port: 1000                     # TCP 源端口
+vio.tx.hdr.tcp.dst_port: 2000                    # TCP 目的端口
+vio.tx.hdr.payload_mode: PAYLOAD_FIXED            # Payload 生成模式
+vio.tx.hdr.payload_fixed_val: 0xaa               # 固定 Payload 字节
+vio.tx.hdr.payload_pattern: 0x5a                  # Payload pattern
+
+# -----------------------------------------------------------------------------
+# 运行期 RX/MQ/RSS 参数
+# -----------------------------------------------------------------------------
+vio.rx.target: h0.pf0.i0                          # RX 目标 Function
+vio.rx.qid: 0                                     # RX qid，vio_rx_refill 命令参数
+vio.rx.count: 64                                  # RX 补充数量，vio_rx_refill 命令参数
+vio.mq.target: h0.pf0.i0                          # MQ 目标 Function
+vio.mq.pairs: 1                                   # MQ 队列对数量
+vio.rss.target: h0.pf0.i0                         # RSS 目标 Function
+vio.rss.hash_types: 0                             # RSS hash 类型
+vio.rss.hash_key_size: 40                         # RSS key 字节数
+vio.rss.hash_key[0]: 0                            # RSS key 第 0 字节
+vio.rss.table_size: 1                             # RSS indirection table 大小
+vio.rss.indirection_table[0]: 0                   # RSS 映射的 queue pair
+
+# 运行期命令参数不是 load_params 字段，但可按下面方式使用：
+vio_tx.count: 100                                 # Tcl：vio_tx count=100
+vio_rx_refill.qid: 0                              # Tcl：vio_rx_refill qid=0 count=64
+vio_rx_refill.count: 64                           # Tcl：vio_rx_refill qid=0 count=64
+
+# -----------------------------------------------------------------------------
+# PCIe TL 行为参数
+# -----------------------------------------------------------------------------
+pcie_cfg.fc_enable: 1                             # Flow Control 开关
+pcie_cfg.infinite_credit: 1                       # 无限 credit
+pcie_cfg.init_ph_credit: 32                       # Posted Header credit
+pcie_cfg.init_pd_credit: 256                      # Posted Data credit
+pcie_cfg.init_nph_credit: 32                      # Non-Posted Header credit
+pcie_cfg.init_npd_credit: 256                     # Non-Posted Data credit
+pcie_cfg.init_cplh_credit: 32                     # Completion Header credit
+pcie_cfg.init_cpld_credit: 256                    # Completion Data credit
+pcie_cfg.shaper_enable: 0                         # 带宽整形
+pcie_cfg.avg_rate: 1.0                            # 平均速率，bytes/ns
+pcie_cfg.burst_size: 512                          # burst 大小
+pcie_cfg.extended_tag_enable: 1                   # Extended Tag
+pcie_cfg.phantom_func_enable: 0                   # Phantom Function
+pcie_cfg.max_outstanding: 32                      # 最大 outstanding 数
+pcie_cfg.max_payload_size: MPS_128                # 最大 Payload Size
+pcie_cfg.max_read_request_size: MRRS_256          # 最大 Read Request Size
+pcie_cfg.read_completion_boundary: RCB_128        # Read Completion Boundary
+pcie_cfg.relaxed_ordering_enable: 0               # Relaxed Ordering
+pcie_cfg.id_based_ordering_enable: 0              # ID Based Ordering
+pcie_cfg.bypass_ordering: 0                       # 绕过 ordering 检查
+pcie_cfg.cov_enable: 0                             # PCIe coverage 总开关
+pcie_cfg.tlp_basic_cov: 0                          # TLP coverage
+pcie_cfg.fc_state_cov: 0                           # FC state coverage
+pcie_cfg.tag_usage_cov: 0                          # Tag usage coverage
+pcie_cfg.ordering_cov: 0                           # Ordering coverage
+pcie_cfg.error_inject_cov: 0                       # Error injection coverage
+pcie_cfg.scb_enable: 1                             # PCIe scoreboard
+pcie_cfg.ordering_check_enable: 1                  # Ordering 检查
+pcie_cfg.completion_check_enable: 1                # Completion 检查
+pcie_cfg.data_integrity_enable: 1                  # 数据完整性检查
+pcie_cfg.scb_strict_check: 1                       # 严格 scoreboard 检查
+pcie_cfg.ep_auto_response: 0                       # EP 自动应答
+pcie_cfg.cpl_timeout_ns: 100000                    # Completion 超时
+pcie_cfg.link_delay_enable: 0                      # 链路延迟
+pcie_cfg.rc2ep_latency_min_ns: 0                   # RC→EP 最小延迟
+pcie_cfg.rc2ep_latency_max_ns: 0                   # RC→EP 最大延迟
+pcie_cfg.ep2rc_latency_min_ns: 0                   # EP→RC 最小延迟
+pcie_cfg.ep2rc_latency_max_ns: 0                   # EP→RC 最大延迟
+pcie_cfg.link_delay_update_interval: 1             # 延迟更新时间间隔
+
+# -----------------------------------------------------------------------------
+# 常用命令顺序
+# -----------------------------------------------------------------------------
+# vio_dpu_cfg_seq / project_single_queue_config_seq 负责配置 DUT 表。
+# 配置完成后由用户启动：vio_start → vio_tx/vio_rx_refill → vio_stop。
+# 配置恢复后可先执行 load_params，再重新执行 dut_config sequence。
