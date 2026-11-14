@@ -98,7 +98,7 @@ package virtio_net_pkg;
   `include "agent/virtio_driver.sv"
   `include "agent/virtio_monitor.sv"
   `include "pcie/virtio_pcie_model_dma_adapter.sv"
-  `include "pcie/virtio_pcie_iova_host_mem_proxy.sv"
+  `include "pcie/virtio_host_mem_view.sv"
   // 独立设备模型（devmodel/）：只依据 PCIe 请求维护状态，不引用驱动侧对象。
   `include "devmodel/vdev_port.sv"
   `include "devmodel/vdev_base.sv"
@@ -107,7 +107,7 @@ package virtio_net_pkg;
   `include "devmodel/vdev_dpu_priv.sv"
   // REAL_DUT 可选的 RC 侧 Host-memory DMA responder；不生成 virtio
   // 设备行为，只把 EP-originated MemRd/MemWr 交给 RC driver/backend。
-  `include "pcie/virtio_pcie_real_dut_host_mem_responder.sv"
+  `include "pcie/virtio_pcie_dma_responder.sv"
   `include "transport/virtio_pcie_observer_adapter.sv"
   `include "agent/virtio_sequencer.sv"
   `include "agent/virtio_driver_agent.sv"
