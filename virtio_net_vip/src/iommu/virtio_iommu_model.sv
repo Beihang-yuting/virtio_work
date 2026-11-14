@@ -444,6 +444,11 @@ class virtio_iommu_model extends uvm_object;
                                   gpa, fault);
     endfunction
 
+    // 功能：查询 Host/BDF 域内设备地址是否存在存活映射，不检查权限或注入故障。
+    // 输入输出及副作用：host_id/bdf/iova 指定域和单字节地址；返回所有权，不更新统计。
+    // 失败边界：无映射或已解除映射返回 0；只用于 DMA 视图选择，不能授权读写。
+    extern function bit claims_address_for_host(int unsigned host_id, bit [15:0] bdf, bit [63:0] iova);
+
     // Validate a device-to-Host access without mutating Host memory.  The
     // normal translate_for_host() API intentionally rejects FROM_DEVICE so
     // callers cannot bypass write_from_device_for_host() dirty tracking.  PCIe-TL
@@ -1263,5 +1268,13 @@ class virtio_iommu_model extends uvm_object;
     endfunction
 
 endclass : virtio_iommu_model
+
+
+// 功能：分离 IOVA 所有权与访问权限，阻止权限失败时被另一个业务视图接管。
+// 输入输出及副作用：host_id/bdf/iova 查询存活映射；不翻译、不写内存、不更新计数。
+// 失败边界：find_mapping_for_iova 无结果返回 0；返回 1 仍需单独权限检查。
+function bit virtio_iommu_model::claims_address_for_host(int unsigned host_id, bit [15:0] bdf, bit [63:0] iova);
+    return find_mapping_for_iova(host_id, bdf, iova) != '1;
+endfunction
 
 `endif // VIRTIO_IOMMU_MODEL_SV

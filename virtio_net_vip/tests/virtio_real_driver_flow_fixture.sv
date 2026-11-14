@@ -32,8 +32,8 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     vdev_virtio_pci            devices[];
     // Optional REAL_DUT RC service.  This is not a device model: it only
     // services EP-originated MemRd/MemWr against shared Host memory.
-    virtio_pcie_real_dut_host_mem_responder host_mem_responder;
-    bit                         real_dut_host_mem_responder_enable;
+    virtio_pcie_dma_responder host_mem_responder;
+    bit                         dma_responder_enable;
     // 中文说明：snapshot 中声明的 host0 VIO PF 数量（默认 1，即 AF 本身）。
     // 需要多个 Function 共享同一 PCIe EP 模型的测试，在 create 之后、本组件
     // build_phase 之前设置；PF 0 始终是 AF。
@@ -98,7 +98,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         m_poll_timeout_ns = 1000;
         m_selected_function = null;
         m_profile = null;
-        real_dut_host_mem_responder_enable = 0;
+        dma_responder_enable = 0;
         vio_pf_count = 1;
         initial_num_pairs = 2;
         pcie_cpl_timeout_ns = 100000;
@@ -182,11 +182,11 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         // The RC-side Host-memory service is opt-in.  A platform with a
         // complete PCIe RC/FULL-VIP backend must keep it disabled to avoid
         // duplicate Completions; a plain two-link pcie_tl_if integration can
-        // enable it with +VIRTIO_REAL_DUT_HOST_MEM_RESPONDER=1.
+        // enable it with +VIRTIO_PCIE_DMA_RESPONDER=1.
         responder_enable_arg = 0;
-        if ($value$plusargs("VIRTIO_REAL_DUT_HOST_MEM_RESPONDER=%d",
+        if ($value$plusargs("VIRTIO_PCIE_DMA_RESPONDER=%d",
                            responder_enable_arg))
-            real_dut_host_mem_responder_enable = (responder_enable_arg != 0);
+            dma_responder_enable = (responder_enable_arg != 0);
         void'($value$plusargs("VIRTIO_FLOW_TIMEOUT_NS=%d", m_poll_timeout_ns));
         if (m_poll_timeout_ns == 0)
             m_poll_timeout_ns = 1;
@@ -240,8 +240,8 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             tlm_adapter = null;
             if (m_profile.supports_host_mem_responder())
                 host_mem_responder =
-                    virtio_pcie_real_dut_host_mem_responder::type_id::create(
-                        "host_mem_responder", this);
+                    virtio_pcie_dma_responder::type_id::create(
+                        "dma_responder", this);
         end
         pcie_cfg = pcie_tl_env_config::type_id::create("pcie_cfg");
         pcie_cfg.if_mode = m_profile.pcie_if_mode();
@@ -398,7 +398,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         // by the driver when it authored descriptors, so PCIe IOVA accesses
         // resolve to the shared Host GPA backing without a second allocator.
         if (m_profile.supports_host_mem_responder() &&
-            real_dut_host_mem_responder_enable &&
+            dma_responder_enable &&
             (host_mem_responder != null)) begin
             string host_responder_why;
             bit [15:0] responder_bdf;
@@ -469,13 +469,13 @@ class virtio_real_driver_flow_fixture extends uvm_component;
             if (!m_host_mem_responder_bound &&
                 ((m_pcie_env == null) || !m_pcie_env.bridge_required)) begin
                 why = {"REAL_DUT has no EP->RC Host-memory responder; enable ",
-                       "+VIRTIO_REAL_DUT_HOST_MEM_RESPONDER=1 or provide a ",
+                       "+VIRTIO_PCIE_DMA_RESPONDER=1 or provide a ",
                        "pcie_work backend bridge"};
                 return 0;
             end
         end
         if (m_profile.supports_host_mem_responder() &&
-            real_dut_host_mem_responder_enable &&
+            dma_responder_enable &&
             !m_host_mem_responder_bound) begin
             why = "REAL_DUT Host-memory responder was enabled but not bound";
             return 0;
@@ -546,7 +546,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         return null;
     endfunction
 
-    function virtio_pcie_real_dut_host_mem_responder host_mem_dma_responder();
+    function virtio_pcie_dma_responder dma_responder();
         return host_mem_responder;
     endfunction
 
@@ -621,7 +621,7 @@ class virtio_real_driver_flow_fixture extends uvm_component;
     // Explicit opt-in hook for wrappers that cannot pass the plusarg before
     // build_phase.  Binding is idempotent for the same monitor/driver/memory
     // tuple and never creates a virtio device responder.
-    function bit enable_real_dut_host_mem_responder(output string why);
+    function bit enable_dma_responder(output string why);
         why = "";
         if ((m_profile == null) || !m_profile.supports_host_mem_responder()) begin
             why = "Host-memory responder can only be enabled in REAL_DUT mode";
@@ -668,12 +668,12 @@ class virtio_real_driver_flow_fixture extends uvm_component;
         if (snapshot_is_frozen())
             host_mem_responder.set_requester_filter(1'b1, m_pcie_id.bdf);
         host_mem_responder.enable();
-        real_dut_host_mem_responder_enable = 1;
+        dma_responder_enable = 1;
         return 1;
     endfunction
 
-    task disable_real_dut_host_mem_responder();
-        real_dut_host_mem_responder_enable = 0;
+    task disable_dma_responder();
+        dma_responder_enable = 0;
         if (host_mem_responder != null)
             host_mem_responder.shutdown();
     endtask

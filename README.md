@@ -116,8 +116,8 @@ if (!pcie_cfg.bind_host_memory(0, 0, host0_mem, why))
 `root_index` 选择 PCIe RC/Root，`host_id` 选择 Host 地址域；多 Root 模式要求每个
 Root 都有一条绑定。MODEL 设备端口（vdev_uvm_ep_port）通过 IOMMU 模型把设备可见 IOVA 翻译为 Host
 GPA，再访问这个 manager；REAL_DUT 启用本地
-`virtio_pcie_real_dut_host_mem_responder` 时安装同一条
-`virtio_pcie_iova_host_mem_proxy`，对 Endpoint→RC 的 Memory Read/Write TLP 执行
+`virtio_pcie_dma_responder` 时安装同一条
+`virtio_host_mem_view`，对 Endpoint→RC 的 Memory Read/Write TLP 执行
 IOVA→GPA 翻译、权限检查和 dirty-page 记录。它与 VIO 的 ring/buffer 分配看到
 完全相同的 backing storage，不会创建第二个 allocator。只有明确配置 legacy
 direct-GPA 集成时才跳过 IOMMU；不能把普通 REAL_DUT 的 IOVA 误当成 GPA。不同 Host
@@ -285,8 +285,8 @@ virtio_net_vip/
 │   ├── pcie/                               ← PCIe 适配层
 │   │   ├── pcie_tl_dpu_reg_backend.sv      ← dpu_common 寄存器计划 → PCIe TLP
 │   │   ├── virtio_pcie_model_dma_adapter.sv ← MODEL 设备 DMA → EP MemRd/MemWr
-│   │   ├── virtio_pcie_iova_host_mem_proxy.sv ← REAL_DUT IOVA → Host memory 适配
-│   │   └── virtio_pcie_real_dut_host_mem_responder.sv ← REAL_DUT EP→RC Memory TLP 应答
+│   │   ├── virtio_host_mem_view.sv ← REAL_DUT IOVA → Host memory 适配
+│   │   └── virtio_pcie_dma_responder.sv ← REAL_DUT EP→RC Memory TLP 应答
 │   ├── sriov/                              ← SR-IOV 支持
 │   │   ├── vio_snapshot_ctx.sv             ← 一次校验、此后只读的 VIO snapshot 上下文
 │   │   ├── virtio_resource_client.sv       ← 单 service qpair 绑定的只读视图 + device-ready
@@ -750,8 +750,8 @@ driver/queue/Host-memory API，但设备侧责任不同：
 - REAL_DUT 不创建设备模型；PCIe EP agent 被动观察真实 RTL 的 TLP，RC 侧必须
   同时提供 `pcie_tl_rc_vif`（RC→EP）和 `pcie_tl_ep_vif`（EP→RC）。如果使用
   plain `pcie_work` 链路，还必须显式加
-  `+VIRTIO_REAL_DUT_HOST_MEM_RESPONDER=1`，由
-  `virtio_pcie_real_dut_host_mem_responder` 响应 EP-originated Host-memory DMA；
+  `+VIRTIO_PCIE_DMA_RESPONDER=1`，由
+  `virtio_pcie_dma_responder` 响应 EP-originated Host-memory DMA；
   已经提供完整 backend bridge 时不能再打开这个 plusarg，否则会产生重复
   Completion/写入。
 - REAL_DUT 的 Host-memory responder 只负责 EP→RC DMA，不是 virtio 设备模型，

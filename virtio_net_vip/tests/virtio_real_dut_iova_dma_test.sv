@@ -65,7 +65,7 @@ class virtio_real_dut_iova_dma_test extends uvm_test;
     pcie_tl_base_monitor                    rc_monitor;
     pcie_tl_if_adapter                      rc_adapter;
     virtio_iova_probe_rc_driver            rc_driver;
-    virtio_pcie_real_dut_host_mem_responder real_responder;
+    virtio_pcie_dma_responder real_responder;
 
     function new(string name = "virtio_real_dut_iova_dma_test",
                  uvm_component parent = null);
@@ -78,7 +78,7 @@ class virtio_real_dut_iova_dma_test extends uvm_test;
         rc_adapter = pcie_tl_if_adapter::type_id::create("rc_adapter", this);
         rc_driver = virtio_iova_probe_rc_driver::type_id::create(
             "rc_driver", this);
-        real_responder = virtio_pcie_real_dut_host_mem_responder::type_id::create(
+        real_responder = virtio_pcie_dma_responder::type_id::create(
             "real_responder", this);
         // 监视器即使没有真实 TLP 也会启动轮询；显式绑定空闲的 TLM
         // adapter，使测试只等待 FIFO 而不会触发空句柄访问。
@@ -88,7 +88,7 @@ class virtio_real_dut_iova_dma_test extends uvm_test;
     virtual task run_phase(uvm_phase phase);
         host_mem_manager mem;
         virtio_iommu_model iommu;
-        virtio_pcie_iova_host_mem_proxy proxy;
+        virtio_host_mem_view proxy;
         bit [63:0] gpa_read;
         bit [63:0] gpa_write;
         bit [63:0] iova_read;
@@ -96,7 +96,7 @@ class virtio_real_dut_iova_dma_test extends uvm_test;
         bit [63:0] original_request_addr;
         bit [7:0]  original_request_byte;
         pcie_tl_mem_tlp request_orig;
-        virtio_pcie_iova_host_mem_proxy proxy_before;
+        virtio_host_mem_view proxy_before;
         byte read_data[];
         byte write_data[];
         byte backing_data[];
@@ -263,7 +263,7 @@ class virtio_real_dut_iova_dma_test extends uvm_test;
             (iova_read == gpa_read) || (iova_write == gpa_write))
             `uvm_fatal("IOVA_PROXY", "test did not obtain distinct IOVA mappings")
 
-        proxy = virtio_pcie_iova_host_mem_proxy::type_id::create("iova_proxy");
+        proxy = virtio_host_mem_view::type_id::create("iova_proxy");
         if (!proxy.configure(mem, iommu, 0, 16'h0100, why))
             `uvm_fatal("IOVA_PROXY", {"proxy setup failed: ", why})
 

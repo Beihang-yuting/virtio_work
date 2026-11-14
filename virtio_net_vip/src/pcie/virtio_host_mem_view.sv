@@ -1,5 +1,5 @@
-`ifndef VIRTIO_PCIE_IOVA_HOST_MEM_PROXY_SV
-`define VIRTIO_PCIE_IOVA_HOST_MEM_PROXY_SV
+`ifndef VIRTIO_HOST_MEM_VIEW_SV
+`define VIRTIO_HOST_MEM_VIEW_SV
 
 // 中文说明：REAL_DUT 的 PCIe Memory TLP 地址是设备可见的 IOVA，而
 // host_mem_manager 保存的是 Host GPA backing。这个适配器是两者之间唯一
@@ -10,8 +10,8 @@
 // 所有权：只借用调用方传入的 manager 和 IOMMU，不拥有、不释放，也不负责 map/unmap。
 // 生命周期：new 后先 configure 一次；随后可作为 host_mem_api 使用，teardown 时仅
 //           由调用方回收底层 manager 的分配。
-class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
-    `uvm_object_utils(virtio_pcie_iova_host_mem_proxy)
+class virtio_host_mem_view extends host_mem_view;
+    `uvm_object_utils(virtio_host_mem_view)
 
     protected host_mem_manager   m_mem;
     protected virtio_iommu_model m_iommu;
@@ -22,8 +22,18 @@ class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
     protected int unsigned       m_write_count;
     protected int unsigned       m_translation_fault_count;
 
+    // 功能：查询本 Host/BDF 的 IOVA 所有权，不依赖读写方向。
+    // 输入输出及副作用：addr 为设备地址；只读取映射，不更新 dirty/故障计数。
+    // 失败边界：未配置或无存活映射返回 0，权限失败不撤销所有权。
+    extern virtual function bit claims_dma_address(bit [63:0] addr);
+    // 功能：预检此视图的 DMA 权限，写仍由 write_mem 维护 dirty 状态。
+    // 输入输出及副作用：addr/size/write_access 为区间和方向，why 返回 IOMMU 错误。
+    // 失败边界：未配置、映射缺失、越界、方向错误或注入故障返回 0。
+    extern virtual function bit validate_dma_access(bit [63:0] addr, int unsigned size,
+                                                   bit write_access, output string why);
+
     // 接口契约：创建未配置的轻量代理，所有句柄为空、计数器清零；不分配内存。
-    function new(string name = "virtio_pcie_iova_host_mem_proxy");
+    function new(string name = "virtio_host_mem_view");
         super.new(name);
         m_mem = null;
         m_iommu = null;
@@ -61,6 +71,8 @@ class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
             why = "IOVA proxy is already configured for a different domain";
             return 0;
         end
+        if (!bind_backing(mem, why))
+            return 0;
         m_mem = mem;
         m_iommu = iommu;
         m_host_id = host_id;
@@ -180,6 +192,31 @@ class virtio_pcie_iova_host_mem_proxy extends host_mem_api;
     virtual function void leak_check(string file = "", int line = 0);
         if (m_mem != null) m_mem.leak_check(file, line);
     endfunction
-endclass : virtio_pcie_iova_host_mem_proxy
+endclass : virtio_host_mem_view
+
+// 功能：按映射查询此 VIO 视图对 DMA 地址的声明。
+// 输入输出及副作用：addr 查询本 Host/BDF；无统计或 backing 副作用。
+// 失败边界：未配置、空 IOMMU 或无存活映射返回 0。
+function bit virtio_host_mem_view::claims_dma_address(bit [63:0] addr);
+    return m_configured && m_iommu != null && m_iommu.claims_address_for_host(m_host_id, m_bdf, addr);
+endfunction
+
+// 功能：按设备访问方向预检 IOVA 映射和权限。
+// 输入输出及副作用：addr/size/write_access 交给 IOMMU，why 输出具体 fault；不读写 backing。
+// 失败边界：未配置或 IOMMU 拒绝时返回 0；保留 IOMMU 故障统计。
+function bit virtio_host_mem_view::validate_dma_access(bit [63:0] addr, int unsigned size,
+                                                      bit write_access, output string why);
+    bit [63:0] gpa;
+    iommu_fault_e fault;
+    why = "VIO DMA view is not configured";
+    if (!m_configured || m_iommu == null) return 0;
+    if (!m_iommu.validate_for_host(m_host_id, m_bdf, addr, size,
+            write_access ? DMA_FROM_DEVICE : DMA_TO_DEVICE, gpa, fault)) begin
+        why = {"DMA permission/range failure: ", fault.name()};
+        return 0;
+    end
+    why = "";
+    return 1;
+endfunction
 
 `endif

@@ -1,12 +1,12 @@
-`ifndef VIRTIO_PCIE_REAL_DUT_HOST_MEM_RESPONDER_SV
-`define VIRTIO_PCIE_REAL_DUT_HOST_MEM_RESPONDER_SV
+`ifndef VIRTIO_PCIE_DMA_RESPONDER_SV
+`define VIRTIO_PCIE_DMA_RESPONDER_SV
 
 // 所属层次：virtio_work PCIe/REAL_DUT 适配层。
 // 文件职责：把被动 RC monitor 观察到的真实 Endpoint→Root Complex Memory
 //           Read/Write TLP 交给外部 pcie_work RC driver；driver 再通过已绑定的
 //           host_mem_api 访问共享 Host memory，并为 Memory Read 发 Completion。
 // 主要依赖：pcie_work 的 pcie_tl_base_monitor/pcie_tl_rc_driver、host_mem、
-//           virtio_pcie_iova_host_mem_proxy 和 virtio_iommu_model。
+//           virtio_host_mem_view 和 virtio_iommu_model。
 // 所有权与生命周期：monitor、driver、Host manager、IOMMU 都由顶层环境拥有，
 //                     本类只借用句柄；clone 出来的 TLP 由异步 worker 临时拥有，
 //                     worker 结束后自动释放。shutdown() 只等待在途 worker，
@@ -14,8 +14,8 @@
 // 设计边界：本类不是 virtio 设备模型，不解析 virtqueue、不产生 notify、不更新
 //            used ring；已有完整 PCIe RC/FULL-VIP responder 时必须禁用本类，
 //            否则同一请求会得到重复 Completion。
-class virtio_pcie_real_dut_host_mem_responder extends uvm_subscriber #(pcie_tl_tlp);
-    `uvm_component_utils(virtio_pcie_real_dut_host_mem_responder)
+class virtio_pcie_dma_responder extends uvm_subscriber #(pcie_tl_tlp);
+    `uvm_component_utils(virtio_pcie_dma_responder)
 
     // EP-originated DMA is observed by the RC-side monitor in pcie_work:
     // the RC adapter receives the EP->RC direction.  The EP monitor observes
@@ -23,7 +23,7 @@ class virtio_pcie_real_dut_host_mem_responder extends uvm_subscriber #(pcie_tl_t
     protected pcie_tl_base_monitor m_rc_monitor;
     protected pcie_tl_rc_driver    m_rc_driver;
     protected host_mem_manager      m_host_mem;
-    protected virtio_pcie_iova_host_mem_proxy m_iova_mem_proxy;
+    protected virtio_host_mem_view m_iova_mem_proxy;
     protected virtio_iommu_model    m_iommu;
     protected semaphore             m_service_lock;
     protected bit                   m_bound;
@@ -45,7 +45,7 @@ class virtio_pcie_real_dut_host_mem_responder extends uvm_subscriber #(pcie_tl_t
     //       统计状态，不创建 Host memory、IOMMU 映射或 PCIe agent。
     // 输入：name/parent 为 UVM 层次信息。输出：新组件句柄；调用方仍需 bind_function。
     function new(
-        string name = "virtio_pcie_real_dut_host_mem_responder",
+        string name = "virtio_pcie_dma_responder",
         uvm_component parent = null
     );
         super.new(name, parent);
@@ -137,7 +137,7 @@ class virtio_pcie_real_dut_host_mem_responder extends uvm_subscriber #(pcie_tl_t
         // adapter/tag/ordering state; only install the shared memory backend
         // and enable its request handler.
         if (iommu != null) begin
-            m_iova_mem_proxy = virtio_pcie_iova_host_mem_proxy::type_id::create(
+            m_iova_mem_proxy = virtio_host_mem_view::type_id::create(
                 "real_dut_iova_mem_proxy");
             if (!m_iova_mem_proxy.configure(
                     host_mem, iommu, host_id, endpoint_bdf, why)) begin
@@ -209,7 +209,7 @@ class virtio_pcie_real_dut_host_mem_responder extends uvm_subscriber #(pcie_tl_t
     function int unsigned completion_count(); return m_completion_count; endfunction
     function int unsigned inflight_count(); return m_inflight; endfunction
     function bit using_iova_translation(); return (m_iova_mem_proxy != null); endfunction
-    function virtio_pcie_iova_host_mem_proxy iova_mem_proxy();
+    function virtio_host_mem_view iova_mem_proxy();
         return m_iova_mem_proxy;
     endfunction
 
@@ -276,6 +276,6 @@ class virtio_pcie_real_dut_host_mem_responder extends uvm_subscriber #(pcie_tl_t
         join_none
     endfunction
 
-endclass : virtio_pcie_real_dut_host_mem_responder
+endclass : virtio_pcie_dma_responder
 
 `endif

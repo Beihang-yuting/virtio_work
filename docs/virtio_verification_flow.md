@@ -172,12 +172,12 @@ tests/virtio_real_driver_flow_fixture.sv:196-237）：
 | BAR/config 访问 | 不装 TLM override，走基类 seq 发真 TLP 等 `rb_done`；EP 不装寄存器镜像，config/BAR 响应全部来自 RTL |
 | kick | 驱动侧完全不变；MemWr TLP 经 `rc_adapter.vif`（pcie_tl_if）串行化到线上被 DUT 采样 |
 | 设备行为 | 不创建设备模型——设备行为全部是 RTL 自己的 |
-| DUT DMA | `virtio_pcie_real_dut_host_mem_responder` 订阅 **RC monitor** 的 EP→RC 流量（real_dut_host_mem_responder.sv:159），按 requester BDF 过滤、串行交 RC driver 回 CplD；内存经 `virtio_pcie_iova_host_mem_proxy`：读走 `translate_for_host`，写走 `write_from_device_for_host`（权限+脏页一体，iova_proxy.sv:160-187） |
+| DUT DMA | `virtio_pcie_dma_responder` 订阅 **RC monitor** 的 EP→RC 流量，按 requester BDF 过滤、串行交 RC driver 回 CplD；内存经 `virtio_host_mem_view` 完成 IOVA→GPA 翻译、权限检查和 dirty-page 记录 |
 | 中断 | DUT 发真实 MSI-X MemWr（0xFEE0_xxxx），`observer_adapter::decode_msi_memory_write`（:234）比对 MSI-X 表解码 vector；INTx Message 亦有解码分支（:200-224） |
 | used 回收 | 与 MODEL 完全一致——读的是 DUT 经 proxy 写进共享 host_mem 的同一批字节 |
 
 内置护栏：REAL_DUT 要求双向 VIF（fixture:462-465）；要求
-`+VIRTIO_REAL_DUT_HOST_MEM_RESPONDER=1`（:470-477）；与 pcie_work
+`+VIRTIO_PCIE_DMA_RESPONDER=1`（:470-477）；与 pcie_work
 backend bridge（cosim）互斥防重复 Completion（:375-379）。
 
 ## 7. 真实 DUT 集成步骤
@@ -186,7 +186,7 @@ backend bridge（cosim）互斥防重复 Completion（:375-379）。
    注释态）：实例化 RC→EP / EP→RC 两条 `pcie_tl_if` 并 config_db set；
    DUT 为 PIPE/SerDes 口时中间接 pcie_work 的 SVT/PIPE 桥。
 2. 启动参数：`+VIRTIO_EXEC_MODE=REAL_DUT
-   +VIRTIO_REAL_DUT_HOST_MEM_RESPONDER=1`，fixture 自动完成模式切换。
+   +VIRTIO_PCIE_DMA_RESPONDER=1`，fixture 自动完成模式切换。
 3. DUT DMA 服务链自动就位（见第 6 节），无需额外代码。
 4. 中断路径自动解码（MSI-X 表比对 / INTx Message）。
 5. **建议先"伪 DUT 点亮"**：用 pcie_tl_vip 的 EP agent 当假 DUT 把

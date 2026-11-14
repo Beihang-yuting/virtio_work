@@ -383,8 +383,8 @@ virtio_net_vip/
 |   +-- pcie/
 |   |   +-- pcie_tl_dpu_reg_backend.sv      -- dpu_common 寄存器计划 -> PCIe TLP
 |   |   +-- virtio_pcie_model_dma_adapter.sv -- MODEL 设备 DMA -> EP MemRd/MemWr
-|   |   +-- virtio_pcie_iova_host_mem_proxy.sv -- REAL_DUT IOVA -> Host memory 适配
-|   |   +-- virtio_pcie_real_dut_host_mem_responder.sv -- REAL_DUT EP->RC Memory TLP 应答
+|   |   +-- virtio_host_mem_view.sv -- REAL_DUT IOVA -> Host memory 适配
+|   |   +-- virtio_pcie_dma_responder.sv -- REAL_DUT EP->RC Memory TLP 应答
 |   +-- sriov/
 |   |   +-- vio_snapshot_ctx.sv             -- 一次校验、此后只读的 VIO snapshot 上下文
 |   |   +-- virtio_resource_client.sv       -- 单 service qpair 绑定只读视图 + device-ready
@@ -1436,7 +1436,7 @@ BAR reservation：BAR 完全位于 host memory aperture 时会被排除，位于
 PCIe executor 默默替换 BAR 地址。
 
 真实 DUT 的 PCIe DMA responder 复用这个 manager，不在 VIO 环境内复制 Host
-memory 或 allocator；其 `virtio_pcie_iova_host_mem_proxy` 负责把设备 IOVA 翻译为
+memory 或 allocator；其 `virtio_host_mem_view` 负责把设备 IOVA 翻译为
 共享 Host GPA，并执行权限/dirty-page 检查。顶层先创建所有 Host entry，再把 VIO
 和 PCIe 配置指向同一所有权源：
 
@@ -1924,11 +1924,11 @@ endfunction
 
 REAL_DUT 的 fixture 使用 `SV_IF_MODE`，必须发布独立的
 `pcie_tl_rc_vif`（RC→EP）和 `pcie_tl_ep_vif`（EP→RC）。plain `pcie_work` 链路还
-需要 `+VIRTIO_REAL_DUT_HOST_MEM_RESPONDER=1`，由
-`virtio_pcie_real_dut_host_mem_responder` 代理 EP→RC Memory Read/Write；若外部
+需要 `+VIRTIO_PCIE_DMA_RESPONDER=1`，由
+`virtio_pcie_dma_responder` 代理 EP→RC Memory Read/Write；若外部
 FULL-VIP/backend 已提供该 responder，则禁止同时打开 plusarg，以免重复
 Completion 或重复写入。该 responder 通过
-`virtio_pcie_iova_host_mem_proxy` 将 DUT IOVA 翻译为共享 Host GPA，不创建第二份
+`virtio_host_mem_view` 将 DUT IOVA 翻译为共享 Host GPA，不创建第二份
 内存（仅在本地 responder 被 plusarg 或显式 API 启用时安装）。缺少双向 VIF 或
 EP→RC responder 时，`build_flow()` 必须失败。
 本地 responder 一次只绑定一个 `{host_id, BDF}`；多 PF/VF 平台需要为每个 Function
